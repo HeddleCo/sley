@@ -5,16 +5,14 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use sley::plumbing::sley_config::{ConfigEntry, ConfigSection};
-use sley::plumbing::sley_object::{ObjectType, Tag};
-use sley::plumbing::sley_odb::{FileObjectDatabase, ObjectReader};
-use sley::plumbing::sley_refs::{FileRefStore, resolve_ref_peeled, validate_symref_name};
 use sley::{GitConfig, GitError, Index, ObjectFormat, ObjectId, Result};
+use sley_config::{ConfigEntry, ConfigSection};
+use sley_object::{ObjectType, Tag};
+use sley_odb::{FileObjectDatabase, ObjectReader};
+use sley_refs::{FileRefStore, resolve_ref_peeled, validate_symref_name};
 
 use crate::collect_short_status;
 use crate::collect_short_status_with_options;
-use crate::sley_index;
-use crate::sley_worktree;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AddAction {
@@ -142,7 +140,7 @@ pub(crate) fn resolve_add_update_actions(
                     display.to_string_lossy()
                 );
             }
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     Ok(actions)
@@ -377,10 +375,10 @@ pub(crate) fn delete_symbolic_ref(store: &FileRefStore, name: &str) -> Result<()
 
 pub(crate) fn symbolic_ref_delete_head() -> Result<()> {
     eprintln!("fatal: deleting 'HEAD' is not allowed");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 pub(crate) fn symbolic_ref_cannot_delete(name: &str) -> Result<()> {
     eprintln!("fatal: Cannot delete {name}, not a symbolic ref");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }

@@ -2,8 +2,7 @@
 #![allow(clippy::expect_used)]
 
 use crate::*;
-use sley::plumbing::sley_diff_merge::range::{PatchRef, assign_patch_series};
-use sley::plumbing::sley_rev;
+use sley_diff_merge::range::{PatchRef, assign_patch_series};
 use sley_notes::{NotesRef, read_note_bytes};
 
 const DEFAULT_CREATION_FACTOR: i32 = 60;
@@ -68,10 +67,11 @@ pub(crate) fn cmd_range_diff(
     let parsed = parse_range_diff_args(&repo, args, &mut options)?;
     if options.left_only && options.right_only {
         eprintln!("error: options '--left-only' and '--right-only' cannot be used together");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     let notes_refs = resolve_notes_refs(&repo, &options.notes)?;
     let rendered = render_range_diff(
+        &cli_session.remote_policy,
         &repo,
         &parsed,
         &options,
@@ -101,6 +101,7 @@ fn default_options(repo: &RepositoryContext) -> Result<RangeDiffOptions> {
 }
 
 pub(crate) fn render_format_patch_range_diff(
+    policy: &sley_remote::RemotePolicy,
     repo: &RepositoryContext,
     previous: &str,
     new_range_args: &[String],
@@ -139,7 +140,7 @@ pub(crate) fn render_format_patch_range_diff(
         range2: new_range_args.to_vec(),
         pathspecs: pathspecs.to_vec(),
     };
-    render_range_diff(repo, &parsed, &options, notes_refs, lazy_fetch)
+    render_range_diff(policy, repo, &parsed, &options, notes_refs, lazy_fetch)
 }
 
 fn range_tip(repo: &RepositoryContext, setup_args: &[String]) -> Result<ObjectId> {
@@ -164,6 +165,7 @@ fn range_tip(repo: &RepositoryContext, setup_args: &[String]) -> Result<ObjectId
 }
 
 fn render_range_diff(
+    policy: &sley_remote::RemotePolicy,
     repo: &RepositoryContext,
     parsed: &ParsedRangeDiff,
     options: &RangeDiffOptions,
@@ -171,6 +173,7 @@ fn render_range_diff(
     lazy_fetch: bool,
 ) -> Result<Vec<u8>> {
     let mut left = read_patches(
+        policy,
         repo,
         &parsed.range1,
         &parsed.pathspecs,
@@ -179,6 +182,7 @@ fn render_range_diff(
         lazy_fetch,
     )?;
     let mut right = read_patches(
+        policy,
         repo,
         &parsed.range2,
         &parsed.pathspecs,
@@ -282,7 +286,7 @@ fn parse_range_diff_args(
         1 => {
             let Some((left, right)) = positionals[0].split_once("...") else {
                 eprintln!("fatal: need two commit ranges");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             };
             let left = if left.is_empty() { "HEAD" } else { left };
             let right = if right.is_empty() { "HEAD" } else { right };
@@ -297,7 +301,7 @@ fn parse_range_diff_args(
             )?;
             if bases.is_empty() {
                 eprintln!("fatal: no merge base between '{left}' and '{right}'");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             let mut range1 = bases
                 .iter()
@@ -327,7 +331,7 @@ fn parse_range_diff_args(
                 _ => {
                     eprintln!("fatal: need two commit ranges");
                     eprintln!("fatal: not a commit range");
-                    Err(GitError::Exit(129))
+                    Err(crate::cli_exit(129))
                 }
             }
         }
@@ -338,7 +342,7 @@ fn parse_range_diff_args(
         }),
         _ => {
             eprintln!("fatal: need two commit ranges");
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
     }
 }
@@ -416,6 +420,7 @@ fn parse_i32_option(value: &str, name: &str) -> Result<i32> {
 }
 
 fn read_patches(
+    policy: &sley_remote::RemotePolicy,
     repo: &RepositoryContext,
     setup_args: &[String],
     pathspecs: &[String],
@@ -483,6 +488,7 @@ fn read_patches(
     let mut out = Vec::with_capacity(selected.len());
     for (idx, record) in selected.iter().enumerate() {
         let (patch, diff_offset, diff_size) = build_patch_text(
+            policy,
             repo,
             record,
             &setup.pathspecs,
@@ -505,6 +511,7 @@ fn read_patches(
 }
 
 fn build_patch_text(
+    policy: &sley_remote::RemotePolicy,
     repo: &RepositoryContext,
     record: &sley_rev::CommitRecord,
     pathspecs: &[String],
@@ -611,7 +618,7 @@ fn build_patch_text(
                 anchors: &[],
                 allow_textconv: false,
                 db,
-                lazy_fetch: crate::diff_lazy_fetch(lazy_fetch),
+                lazy_fetch: crate::diff_lazy_fetch(policy, lazy_fetch).as_option(),
                 worktree_root: None,
                 use_worktree_new: false,
                 format,

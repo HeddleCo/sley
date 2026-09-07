@@ -1,7 +1,7 @@
 //! `init` engine parity.
 
-use sley::plumbing::sley_formats::RepositoryLayout;
 use sley::{ObjectFormat, Repository};
+use sley_formats::RepositoryLayout;
 use sley_testkit::engine_parity::{
     EngineOutput, EngineParityCase, git_bool_line, git_config_line, git_path_line,
     git_symbolic_ref_line,

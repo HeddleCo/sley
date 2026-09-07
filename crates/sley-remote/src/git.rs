@@ -248,6 +248,7 @@ pub fn discover_git_upload_pack_advertisements(
 }
 
 pub fn install_fetch_pack_via_git_upload_pack(
+    policy: &crate::RemotePolicy,
     request: GitFetchPackRequest<'_>,
     progress: &mut dyn ProgressSink,
     cancel: CancelFlag<'_>,
@@ -259,11 +260,9 @@ pub fn install_fetch_pack_via_git_upload_pack(
     if request.deepen.is_none() && all_wants_present(&local_db, &request.wants)? {
         return Ok(Vec::new());
     }
-    let haves = request
-        .haves
-        .clone()
-        .map(Ok)
-        .unwrap_or_else(|| crate::local::local_have_oids(request.git_dir, request.format))?;
+    let haves = request.haves.clone().map(Ok).unwrap_or_else(|| {
+        crate::local::local_have_oids(policy, request.git_dir, request.format)
+    })?;
     if request.protocol_v2 {
         return git_protocol_v2_fetch_into_repository(&request, haves, &local_db, progress, cancel);
     }

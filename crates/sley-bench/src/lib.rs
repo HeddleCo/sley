@@ -381,9 +381,7 @@ pub fn run_sley(cwd: &Path, args: &[&str], stdin: &[u8]) -> Result<Vec<u8>> {
             .stdin
             .as_mut()
             .ok_or_else(|| GitError::Command("missing sley stdin".into()))?;
-        stdin_handle
-            .write_all(stdin)
-            .map_err(|err| GitError::Io(err.to_string()))?;
+        stdin_handle.write_all(stdin).map_err(GitError::from)?;
     }
     let output = child
         .wait_with_output()
@@ -415,9 +413,7 @@ pub fn run_git(cwd: &Path, args: &[&str], stdin: &[u8]) -> Result<Vec<u8>> {
             .stdin
             .as_mut()
             .ok_or_else(|| GitError::Command("missing git stdin".into()))?;
-        stdin_handle
-            .write_all(stdin)
-            .map_err(|err| GitError::Io(err.to_string()))?;
+        stdin_handle.write_all(stdin).map_err(GitError::from)?;
     }
     let output = child
         .wait_with_output()

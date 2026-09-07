@@ -123,6 +123,7 @@ pub fn checkout_change_summary(
 }
 
 pub fn checkout_branch(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
@@ -146,10 +147,16 @@ pub fn checkout_branch(
     };
     let current_head = resolve_head_commit_oid(git_dir, format)?;
     let files = if current_head == Some(target) {
-        reapply_active_sparse_checkout(worktree_root, git_dir, format)?;
+        reapply_active_sparse_checkout(original_cwd, worktree_root, git_dir, format)?;
         0
     } else {
-        checkout_commit_to_index_and_worktree(worktree_root, git_dir, format, &target)?
+        checkout_commit_to_index_and_worktree(
+            original_cwd,
+            worktree_root,
+            git_dir,
+            format,
+            &target,
+        )?
     };
     checkout_switch_head_symbolic(
         &refs,
@@ -167,6 +174,7 @@ pub fn checkout_branch(
 }
 
 pub fn checkout_detached(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
@@ -176,7 +184,13 @@ pub fn checkout_detached(
 ) -> Result<CheckoutResult> {
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
-    let files = checkout_commit_to_index_and_worktree(worktree_root, git_dir, format, target)?;
+    let files = checkout_commit_to_index_and_worktree(
+        original_cwd,
+        worktree_root,
+        git_dir,
+        format,
+        target,
+    )?;
     let refs = FileRefStore::new(git_dir, format);
     let zero = ObjectId::null(format);
     let mut tx = refs.transaction();
@@ -204,6 +218,7 @@ pub fn checkout_detached(
 /// drivers) on each blob as it is written to the worktree. `config` is the
 /// repository config used to resolve the filters.
 pub fn checkout_branch_filtered(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
@@ -228,10 +243,11 @@ pub fn checkout_branch_filtered(
     };
     let current_head = resolve_head_commit_oid(git_dir, format)?;
     let files = if current_head == Some(target) {
-        reapply_active_sparse_checkout(worktree_root, git_dir, format)?;
+        reapply_active_sparse_checkout(original_cwd, worktree_root, git_dir, format)?;
         0
     } else {
         checkout_commit_to_index_and_worktree_filtered(
+            original_cwd,
             worktree_root,
             git_dir,
             format,
@@ -270,6 +286,7 @@ pub fn checkout_branch_filtered(
 /// skip-worktree bits, removes clean out-of-cone files, and converts the index
 /// back to sparse form without advertising a full-index expansion.
 pub fn reapply_active_sparse_checkout(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -277,13 +294,14 @@ pub fn reapply_active_sparse_checkout(
     let Some((sparse, mode)) = active_sparse_checkout(git_dir)? else {
         return Ok(());
     };
-    apply_sparse_checkout_with_mode(worktree_root, git_dir, format, &sparse, mode)?;
+    apply_sparse_checkout_with_mode(original_cwd, worktree_root, git_dir, format, &sparse, mode)?;
     Ok(())
 }
 
 /// Like [`checkout_detached`], but runs the smudge-side content filters (see
 /// [`checkout_branch_filtered`]).
 pub fn checkout_detached_filtered(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
@@ -295,6 +313,7 @@ pub fn checkout_detached_filtered(
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let files = checkout_commit_to_index_and_worktree_filtered(
+        original_cwd,
         worktree_root,
         git_dir,
         format,
@@ -325,12 +344,14 @@ pub fn checkout_detached_filtered(
 }
 
 pub(crate) fn checkout_commit_to_index_and_worktree(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
     target: &ObjectId,
 ) -> Result<usize> {
     checkout_commit_to_index_and_worktree_filtered(
+        original_cwd,
         worktree_root,
         git_dir,
         format,
@@ -345,6 +366,7 @@ pub(crate) fn checkout_commit_to_index_and_worktree(
 /// it is written to the worktree. Attribute lookups use the `.gitattributes`
 /// recorded in the *target tree* so the rules of the checked-out commit apply.
 pub(crate) fn checkout_commit_to_index_and_worktree_filtered(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -354,6 +376,7 @@ pub(crate) fn checkout_commit_to_index_and_worktree_filtered(
 ) -> Result<usize> {
     if let Some((sparse, mode)) = active_sparse_checkout(git_dir)? {
         return checkout_commit_to_index_and_worktree_sparse(
+            original_cwd,
             worktree_root,
             git_dir,
             format,
@@ -390,7 +413,7 @@ pub(crate) fn checkout_commit_to_index_and_worktree_filtered(
     let commit = read_commit(&db, format, target)?;
     let mut target_entries = BTreeMap::new();
     collect_tree_entries(&db, format, &commit.tree, &mut target_entries)?;
-    refuse_if_current_working_directory_becomes_file(worktree_root, &target_entries)?;
+    refuse_if_current_working_directory_becomes_file(original_cwd, worktree_root, &target_entries)?;
 
     let attributes = smudge_config
         .map(|_| build_tree_attribute_matcher(worktree_root, &db, format, &commit.tree))
@@ -399,7 +422,7 @@ pub(crate) fn checkout_commit_to_index_and_worktree_filtered(
     let old_index_entries = read_index_entries(git_dir, format)?;
     for (path, old_entry) in &old_index_entries {
         if !target_entries.contains_key(path) {
-            remove_checkout_tracked_path(worktree_root, path, old_entry)?;
+            remove_checkout_tracked_path(original_cwd, worktree_root, path, old_entry)?;
         }
     }
 
@@ -461,11 +484,13 @@ pub(crate) fn checkout_commit_to_index_and_worktree_filtered(
     drop(collision_probe);
     let default_config = GitConfig::default();
     index_entries.extend(materialize_prepared_checkout_entries(
+        original_cwd,
         worktree_root,
         smudge_config.unwrap_or(&default_config),
         prepared_entries,
     )?);
-    let mut delayed_updates = finish_delayed_checkout(worktree_root, delayed_checkout)?;
+    let mut delayed_updates =
+        finish_delayed_checkout(original_cwd, worktree_root, delayed_checkout)?;
     for entry in &mut index_entries {
         if let Some(updated) = delayed_updates.remove(entry.path.as_bytes()) {
             *entry = updated;
@@ -486,24 +511,27 @@ pub(crate) fn checkout_commit_to_index_and_worktree_filtered(
 }
 
 fn remove_checkout_tracked_path(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
     path: &[u8],
     entry: &TrackedEntry,
 ) -> Result<()> {
     if !sley_index::is_gitlink(entry.mode) {
-        return remove_worktree_file(worktree_root, path);
+        return remove_worktree_file(original_cwd, worktree_root, path);
     }
     let file = worktree_path(worktree_root, path)?;
     if !file.exists() {
         return Ok(());
     }
     if !file.is_dir() {
-        return remove_worktree_file(worktree_root, path);
+        return remove_worktree_file(original_cwd, worktree_root, path);
     }
     match fs::remove_dir(&file) {
-        Ok(()) => prune_empty_parents(worktree_root, file.parent())?,
+        Ok(()) => prune_empty_parents(original_cwd, worktree_root, file.parent())?,
         Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "warning: unable to rmdir '{}': Directory not empty",
                 String::from_utf8_lossy(path)
             );
@@ -733,6 +761,7 @@ fn prepare_checkout_entry(
 }
 
 fn prepare_index_checkout_entry(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -744,7 +773,7 @@ fn prepare_index_checkout_entry(
 ) -> Result<Option<PreparedCheckoutResult>> {
     if sley_index::is_gitlink(entry.mode) {
         let dir_path = worktree_path(worktree_root, entry.path.as_bytes())?;
-        materialize_gitlink_dir(worktree_root, &dir_path)?;
+        materialize_gitlink_dir(original_cwd, worktree_root, &dir_path)?;
         return Ok(None);
     }
     let file_path = worktree_path(worktree_root, entry.path.as_bytes())?;
@@ -821,6 +850,7 @@ fn prepare_index_checkout_entry(
 }
 
 fn materialize_prepared_checkout_entry(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
     prepared: PreparedCheckoutEntry,
 ) -> Result<IndexEntry> {
@@ -832,7 +862,7 @@ fn materialize_prepared_checkout_entry(
     } = prepared;
     if sley_index::is_gitlink(entry.mode) {
         let dir_path = worktree_path(worktree_root, &path)?;
-        materialize_gitlink_dir(worktree_root, &dir_path)?;
+        materialize_gitlink_dir(original_cwd, worktree_root, &dir_path)?;
         return Ok(index_template.unwrap_or_else(|| unmaterialized_index_entry(&path, &entry)));
     }
     let body = body.ok_or_else(|| {
@@ -840,7 +870,7 @@ fn materialize_prepared_checkout_entry(
     })?;
     let file_path = worktree_path(worktree_root, &path)?;
     prepare_blob_parent_dirs(worktree_root, &file_path)?;
-    remove_existing_worktree_path(&file_path)?;
+    remove_existing_worktree_path(original_cwd, &file_path)?;
     write_blob_body_or_symlink(&file_path, entry.mode, &body, &body)?;
     let metadata = fs::symlink_metadata(&file_path)?;
     let mut index_entry = match index_template {
@@ -859,6 +889,7 @@ fn checkout_worker_collision_key(path: &[u8]) -> Vec<u8> {
 }
 
 fn materialize_prepared_checkout_entries(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
     config: &GitConfig,
     prepared: Vec<PreparedCheckoutEntry>,
@@ -867,7 +898,7 @@ fn materialize_prepared_checkout_entries(
     if plan.worker_count == 0 {
         return prepared
             .into_iter()
-            .map(|entry| materialize_prepared_checkout_entry(worktree_root, entry))
+            .map(|entry| materialize_prepared_checkout_entry(original_cwd, worktree_root, entry))
             .collect();
     }
 
@@ -897,7 +928,7 @@ fn materialize_prepared_checkout_entries(
             let queue = std::sync::Arc::clone(&queue);
             let results = std::sync::Arc::clone(&results);
             let locks = std::sync::Arc::clone(&locks);
-            scope.spawn(move || {
+            scope.spawn(sley_core::diagnostics::inherit(move || {
                 loop {
                     let next = queue
                         .lock()
@@ -911,15 +942,15 @@ fn materialize_prepared_checkout_entries(
                         let _guard = path_lock
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        materialize_prepared_checkout_entry(worktree_root, entry)
+                        materialize_prepared_checkout_entry(original_cwd, worktree_root, entry)
                     } else {
-                        materialize_prepared_checkout_entry(worktree_root, entry)
+                        materialize_prepared_checkout_entry(original_cwd, worktree_root, entry)
                     };
                     results
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())[position] = Some(result);
                 }
-            });
+            }));
         }
     });
 
@@ -944,6 +975,7 @@ fn materialize_prepared_checkout_entries(
 /// remain single-session/sequential while independent filesystem writes run in
 /// parallel. Recursive gitlinks deliberately stay with the caller.
 pub fn materialize_checkout_entries_with_database(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
@@ -989,7 +1021,8 @@ pub fn materialize_checkout_entries_with_database(
             index_template: None,
         });
     }
-    let materialized = materialize_prepared_checkout_entries(worktree_root, config, prepared)?;
+    let materialized =
+        materialize_prepared_checkout_entries(original_cwd, worktree_root, config, prepared)?;
     let stats = materialized
         .into_iter()
         .map(|entry| {
@@ -1028,12 +1061,13 @@ impl DelayedCheckoutQueue {
 }
 
 pub(crate) fn finish_delayed_checkout(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
     delayed: DelayedCheckoutQueue,
 ) -> Result<BTreeMap<Vec<u8>, IndexEntry>> {
-    let outcome = finish_delayed_checkout_outcome(worktree_root, delayed)?;
+    let outcome = finish_delayed_checkout_outcome(original_cwd, worktree_root, delayed)?;
     if outcome.had_error {
-        return Err(GitError::Exit(1));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     }
     Ok(outcome.updates)
 }
@@ -1045,6 +1079,7 @@ struct DelayedCheckoutFinishOutcome {
 }
 
 fn finish_delayed_checkout_outcome(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
     mut delayed: DelayedCheckoutQueue,
 ) -> Result<DelayedCheckoutFinishOutcome> {
@@ -1067,7 +1102,12 @@ fn finish_delayed_checkout_outcome(
                 Ok(paths) => paths,
                 Err(err) => {
                     if err.protocol {
-                        eprintln!("error: external filter '{}' failed", process);
+                        sley_core::diagnostic!(
+                            Stderr,
+                            true,
+                            "error: external filter '{}' failed",
+                            process
+                        );
                     }
                     had_error = true;
                     continue;
@@ -1082,7 +1122,9 @@ fn finish_delayed_checkout_outcome(
             let mut keep_filter = true;
             for path in available {
                 let Some(delayed_entry) = delayed.pending.remove(path.as_slice()) else {
-                    eprintln!(
+                    sley_core::diagnostic!(
+                        Stderr,
+                        true,
                         "error: external filter '{}' signaled that '{}' is now available although it has not been delayed earlier",
                         process,
                         String::from_utf8_lossy(&path)
@@ -1093,7 +1135,9 @@ fn finish_delayed_checkout_outcome(
                     continue;
                 };
                 if delayed_entry.process != process {
-                    eprintln!(
+                    sley_core::diagnostic!(
+                        Stderr,
+                        true,
                         "error: external filter '{}' signaled that '{}' is now available although it has not been delayed earlier",
                         process,
                         String::from_utf8_lossy(&path)
@@ -1114,6 +1158,7 @@ fn finish_delayed_checkout_outcome(
                 ) {
                     Ok(ProcessFilterOutcome::Filtered(output)) => {
                         match write_delayed_checkout_output(
+                            original_cwd,
                             worktree_root,
                             &path,
                             &delayed_entry.entry,
@@ -1133,13 +1178,20 @@ fn finish_delayed_checkout_outcome(
                         }
                     }
                     Ok(ProcessFilterOutcome::Unsupported) => {
-                        eprintln!("error: external filter '{}' failed", process);
+                        sley_core::diagnostic!(
+                            Stderr,
+                            true,
+                            "error: external filter '{}' failed",
+                            process
+                        );
                         had_error = true;
                         failed_paths.insert(path);
                         keep_filter = false;
                     }
                     Ok(ProcessFilterOutcome::Status(status)) => {
-                        eprintln!(
+                        sley_core::diagnostic!(
+                            Stderr,
+                            true,
                             "error: external filter '{}' returned status {status}",
                             process
                         );
@@ -1149,7 +1201,12 @@ fn finish_delayed_checkout_outcome(
                     }
                     Err(err) => {
                         if err.protocol {
-                            eprintln!("error: external filter '{}' failed", process);
+                            sley_core::diagnostic!(
+                                Stderr,
+                                true,
+                                "error: external filter '{}' failed",
+                                process
+                            );
                         }
                         had_error = true;
                         failed_paths.insert(path);
@@ -1166,7 +1223,9 @@ fn finish_delayed_checkout_outcome(
     }
 
     for path in delayed.pending.keys() {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "error: '{}' was not filtered properly",
             String::from_utf8_lossy(path)
         );
@@ -1182,6 +1241,7 @@ fn finish_delayed_checkout_outcome(
 }
 
 fn write_delayed_checkout_output(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
     path: &[u8],
     entry: &TrackedEntry,
@@ -1192,7 +1252,7 @@ fn write_delayed_checkout_output(
     }
     let file_path = worktree_path(worktree_root, path)?;
     prepare_blob_parent_dirs(worktree_root, &file_path)?;
-    remove_existing_worktree_path(&file_path)?;
+    remove_existing_worktree_path(original_cwd, &file_path)?;
     fs::write(&file_path, body)?;
     set_worktree_file_mode(&file_path, entry.mode)?;
     // Prefer symlink_metadata so a replaced symlink is not followed, and force
@@ -1233,9 +1293,9 @@ fn warn_checkout_collisions(collided_paths: &BTreeSet<Vec<u8>>) {
     if collided_paths.is_empty() {
         return;
     }
-    eprintln!("warning: the following paths have collided:");
+    sley_core::diagnostic!(Stderr, true, "warning: the following paths have collided:");
     for path in collided_paths {
-        eprintln!("{}", String::from_utf8_lossy(path));
+        sley_core::diagnostic!(Stderr, true, "{}", String::from_utf8_lossy(path));
     }
 }
 
@@ -1266,6 +1326,7 @@ pub(crate) fn build_tree_attribute_matcher(
 }
 
 pub(crate) fn materialize_tree_entry_with_optional_smudge(
+    original_cwd: Option<&std::path::Path>,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     worktree_root: &Path,
@@ -1285,13 +1346,13 @@ pub(crate) fn materialize_tree_entry_with_optional_smudge(
         || sley_index::is_gitlink(entry.mode)
         || (entry.mode & 0o170000) == 0o120000
     {
-        return materialize_tree_entry(db, worktree_root, path, entry);
+        return materialize_tree_entry(original_cwd, db, worktree_root, path, entry);
     }
     let Some(config) = smudge_config else {
-        return materialize_tree_entry(db, worktree_root, path, entry);
+        return materialize_tree_entry(original_cwd, db, worktree_root, path, entry);
     };
     let Some(matcher) = attributes else {
-        return materialize_tree_entry(db, worktree_root, path, entry);
+        return materialize_tree_entry(original_cwd, db, worktree_root, path, entry);
     };
     let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
     let checks = matcher.attributes_for_path(path, filter_attribute_names(), false);
@@ -1316,7 +1377,7 @@ pub(crate) fn materialize_tree_entry_with_optional_smudge(
     };
     let file_path = worktree_path(worktree_root, path)?;
     prepare_blob_parent_dirs(worktree_root, &file_path)?;
-    remove_existing_worktree_path(&file_path)?;
+    remove_existing_worktree_path(original_cwd, &file_path)?;
     fs::write(&file_path, &body)?;
     set_worktree_file_mode(&file_path, entry.mode)?;
     let metadata = fs::metadata(&file_path)?;
@@ -1338,6 +1399,7 @@ pub(crate) fn materialize_tree_entry_with_optional_smudge(
 /// Sparse-aware checkout of a commit: only materializes in-cone paths; out-of-cone
 /// index entries get skip-worktree and no worktree file (blobs may be absent).
 pub fn checkout_commit_to_index_and_worktree_sparse(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -1408,7 +1470,7 @@ pub fn checkout_commit_to_index_and_worktree_sparse(
         if previously_skipped.contains(path) {
             continue;
         }
-        remove_worktree_file(worktree_root, path)?;
+        remove_worktree_file(original_cwd, worktree_root, path)?;
     }
 
     let mut index_entries = Vec::new();
@@ -1420,6 +1482,7 @@ pub fn checkout_commit_to_index_and_worktree_sparse(
         );
         let index_entry = if in_cone {
             materialize_tree_entry_with_optional_smudge(
+                original_cwd,
                 &db,
                 format,
                 worktree_root,
@@ -1433,14 +1496,15 @@ pub fn checkout_commit_to_index_and_worktree_sparse(
             // Out of cone: ensure no stale worktree file remains and synthesize
             // an index entry straight from the tree (no worktree metadata),
             // then mark it skip-worktree.
-            remove_worktree_file(worktree_root, path)?;
+            remove_worktree_file(original_cwd, worktree_root, path)?;
             let mut index_entry = restored_head_index_entry(worktree_root, &db, path, entry)?;
             set_skip_worktree(&mut index_entry);
             index_entry
         };
         index_entries.push(index_entry);
     }
-    let mut delayed_updates = finish_delayed_checkout(worktree_root, delayed_checkout)?;
+    let mut delayed_updates =
+        finish_delayed_checkout(original_cwd, worktree_root, delayed_checkout)?;
     for entry in &mut index_entries {
         if let Some(updated) = delayed_updates.remove(entry.path.as_bytes()) {
             *entry = updated;
@@ -1513,12 +1577,17 @@ fn checkout_index_has_staged_changes(
 }
 
 pub fn restore_worktree_paths(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
     paths: &[PathBuf],
 ) -> Result<RestoreResult> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     restore_worktree_paths_inner(
+        original_cwd,
+        precompose,
         worktree_root.as_ref(),
         git_dir.as_ref(),
         format,
@@ -1530,6 +1599,7 @@ pub fn restore_worktree_paths(
 /// Like [`restore_worktree_paths`], applying the smudge-side content filters
 /// (CRLF / ident / filter drivers) the way a checkout writes blobs.
 pub fn restore_worktree_paths_filtered(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
@@ -1537,6 +1607,8 @@ pub fn restore_worktree_paths_filtered(
     config: &GitConfig,
 ) -> Result<RestoreResult> {
     restore_worktree_paths_inner(
+        original_cwd,
+        config.precompose_unicode(),
         worktree_root.as_ref(),
         git_dir.as_ref(),
         format,
@@ -1546,6 +1618,8 @@ pub fn restore_worktree_paths_filtered(
 }
 
 pub(crate) fn restore_worktree_paths_inner(
+    original_cwd: Option<&std::path::Path>,
+    precompose: sley_core::PrecomposeUnicode,
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -1554,13 +1628,14 @@ pub(crate) fn restore_worktree_paths_inner(
 ) -> Result<RestoreResult> {
     let index_path = repository_index_path(git_dir);
     if !index_path.exists() {
-        return Err(GitError::Exit(1));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     }
     let mut index = Index::parse(&fs::read(&index_path)?, format)?;
     let stat_cache = IndexStatCache::from_index(&index, &index_path);
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let mut restored = BTreeSet::new();
     let selected = checkout_selected_positions(
+        precompose,
         worktree_root,
         paths,
         index
@@ -1572,6 +1647,7 @@ pub(crate) fn restore_worktree_paths_inner(
     )?;
     for position in selected {
         let refreshed = restore_index_entry(
+            original_cwd,
             worktree_root,
             git_dir,
             format,
@@ -1592,6 +1668,7 @@ pub(crate) fn restore_worktree_paths_inner(
 }
 
 pub fn checkout_index_paths(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
@@ -1600,7 +1677,15 @@ pub fn checkout_index_paths(
 ) -> Result<RestoreResult> {
     let git_dir = git_dir.as_ref();
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    checkout_index_paths_with_database(worktree_root, git_dir, format, paths, &db, options)
+    checkout_index_paths_with_database(
+        original_cwd,
+        worktree_root,
+        git_dir,
+        format,
+        paths,
+        &db,
+        options,
+    )
 }
 
 /// Restore index paths using an explicitly configured object database.
@@ -1609,6 +1694,7 @@ pub fn checkout_index_paths(
 /// policy such as replacement refs. Index parsing/writing remains keyed by
 /// the raw object ids stored in the index; only blob content reads use `db`.
 pub fn checkout_index_paths_with_database(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
@@ -1617,6 +1703,7 @@ pub fn checkout_index_paths_with_database(
     options: CheckoutIndexPathOptions<'_>,
 ) -> Result<RestoreResult> {
     let outcome = checkout_index_paths_with_database_outcome(
+        original_cwd,
         worktree_root,
         git_dir,
         format,
@@ -1639,6 +1726,7 @@ pub fn checkout_index_paths_with_database(
 /// delayed filters from finishing. Callers still decide how to render the
 /// successful count and which retained error determines their exit status.
 pub fn checkout_index_paths_with_database_outcome(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
@@ -1647,6 +1735,7 @@ pub fn checkout_index_paths_with_database_outcome(
     options: CheckoutIndexPathOptions<'_>,
 ) -> Result<CheckoutIndexPathOutcome> {
     checkout_index_paths_with_database_outcome_sparse(
+        original_cwd,
         worktree_root,
         git_dir,
         format,
@@ -1663,6 +1752,7 @@ pub fn checkout_index_paths_with_database_outcome(
 /// porcelain should use this operation with [`CheckoutIndexSparsePolicy::Honor`]
 /// by default and switch to `Ignore` only for its explicit override.
 pub fn checkout_index_paths_with_database_outcome_sparse(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
@@ -1671,27 +1761,31 @@ pub fn checkout_index_paths_with_database_outcome_sparse(
     sparse_policy: CheckoutIndexSparsePolicy,
     options: CheckoutIndexPathOptions<'_>,
 ) -> Result<CheckoutIndexPathOutcome> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
     if !index_path.exists() {
-        return Err(GitError::Exit(1));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     }
     let mut index = Index::parse(&fs::read(&index_path)?, format)?;
     if options.merge {
-        checkout_unmerge_resolve_undo_paths(worktree_root, &mut index, format, paths)?;
+        checkout_unmerge_resolve_undo_paths(precompose, worktree_root, &mut index, format, paths)?;
     }
     let stat_cache = IndexStatCache::from_index(&index, &index_path);
-    let selected = checkout_selected_index_paths(worktree_root, &index, paths)?;
+    let selected = checkout_selected_index_paths(precompose, worktree_root, &index, paths)?;
 
     if options.stage.is_none() && !options.merge && !options.force {
         for path in &selected {
             if checkout_path_is_unmerged(&index, path) {
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "error: path '{}' is unmerged",
                     String::from_utf8_lossy(path)
                 );
-                return Err(GitError::Exit(1));
+                return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
             }
         }
     }
@@ -1736,11 +1830,13 @@ pub fn checkout_index_paths_with_database_outcome_sparse(
                     .find(|position| index.entries[*position].stage() == wanted)
                 else {
                     if !options.overlay {
-                        remove_worktree_file(worktree_root, &path)?;
+                        remove_worktree_file(original_cwd, worktree_root, &path)?;
                         restored.insert(path);
                         continue;
                     }
-                    eprintln!(
+                    sley_core::diagnostic!(
+                        Stderr,
+                        true,
                         "error: path '{}' does not have {} version",
                         String::from_utf8_lossy(&path),
                         match stage {
@@ -1748,9 +1844,10 @@ pub fn checkout_index_paths_with_database_outcome_sparse(
                             CheckoutStage::Theirs => "their",
                         }
                     );
-                    return Err(GitError::Exit(1));
+                    return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
                 };
                 if restore_index_entry_maybe_delayed(
+                    original_cwd,
                     worktree_root,
                     git_dir,
                     format,
@@ -1768,6 +1865,7 @@ pub fn checkout_index_paths_with_database_outcome_sparse(
             }
             if options.merge {
                 checkout_merge_unmerged_path(
+                    original_cwd,
                     worktree_root,
                     db,
                     &index,
@@ -1788,6 +1886,7 @@ pub fn checkout_index_paths_with_database_outcome_sparse(
                 clear_skip_worktree(&mut checkout_entry);
             }
             let prepared = prepare_index_checkout_entry(
+                original_cwd,
                 worktree_root,
                 git_dir,
                 format,
@@ -1814,6 +1913,7 @@ pub fn checkout_index_paths_with_database_outcome_sparse(
 
     let default_config = GitConfig::default();
     let materialized = materialize_prepared_checkout_entries(
+        original_cwd,
         worktree_root,
         options.smudge_config.unwrap_or(&default_config),
         prepared_entries,
@@ -1824,11 +1924,12 @@ pub fn checkout_index_paths_with_database_outcome_sparse(
         }
     }
 
-    let mut delayed_finish = finish_delayed_checkout_outcome(worktree_root, delayed_checkout)?;
+    let mut delayed_finish =
+        finish_delayed_checkout_outcome(original_cwd, worktree_root, delayed_checkout)?;
     for path in delayed_finish.failed_paths {
         failures.push(CheckoutPathFailure {
             path,
-            error: GitError::Exit(1),
+            error: GitError::Rejected(sley_core::RejectionKind::Incomplete),
         });
     }
     let mut delayed_updates = std::mem::take(&mut delayed_finish.updates);
@@ -1857,6 +1958,8 @@ pub fn unresolve_index_paths(
     format: ObjectFormat,
     paths: &[PathBuf],
 ) -> Result<()> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
@@ -1864,11 +1967,12 @@ pub fn unresolve_index_paths(
         return Ok(());
     }
     let mut index = Index::parse(&fs::read(&index_path)?, format)?;
-    checkout_unmerge_resolve_undo_paths(worktree_root, &mut index, format, paths)?;
+    checkout_unmerge_resolve_undo_paths(precompose, worktree_root, &mut index, format, paths)?;
     write_repository_index_ref(git_dir, format, &index)
 }
 
 pub(crate) fn checkout_selected_index_paths(
+    precompose: sley_core::PrecomposeUnicode,
     worktree_root: &Path,
     index: &Index,
     paths: &[PathBuf],
@@ -1879,6 +1983,7 @@ pub(crate) fn checkout_selected_index_paths(
         .map(|entry| entry.path.as_bytes().to_vec())
         .collect::<BTreeSet<_>>();
     checkout_selected_paths(
+        precompose,
         worktree_root,
         paths,
         index_paths.iter().map(Vec::as_slice),
@@ -1900,11 +2005,15 @@ struct CheckoutPathspecs {
 }
 
 impl CheckoutPathspecs {
-    fn parse(worktree_root: &Path, paths: &[PathBuf]) -> Result<Self> {
+    fn parse_precomposed(
+        precompose: sley_core::PrecomposeUnicode,
+        worktree_root: &Path,
+        paths: &[PathBuf],
+    ) -> Result<Self> {
         let mut specs = Vec::with_capacity(paths.len());
         let mut have_include = false;
         for path in paths {
-            let git_path = checkout_pathspec_pattern(worktree_root, path)?;
+            let git_path = checkout_pathspec_pattern(precompose, worktree_root, path)?;
             let element = PathspecElement::parse(&git_path, PathspecMatchMagic::default())
                 .map_err(|err| GitError::Command(format!("bad pathspec: {err}")))?;
             have_include |= !element.is_exclude();
@@ -1954,17 +2063,23 @@ impl CheckoutPathspecs {
             .iter()
             .find(|spec| !spec.element.is_exclude() && !spec.matched)
         {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "error: pathspec '{}' did not match any file(s) known to git",
                 spec.display
             );
-            return Err(GitError::Exit(1));
+            return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
         }
         Ok(())
     }
 }
 
-fn checkout_pathspec_pattern(worktree_root: &Path, path: &Path) -> Result<Vec<u8>> {
+fn checkout_pathspec_pattern(
+    precompose: sley_core::PrecomposeUnicode,
+    worktree_root: &Path,
+    path: &Path,
+) -> Result<Vec<u8>> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -1974,10 +2089,11 @@ fn checkout_pathspec_pattern(worktree_root: &Path, path: &Path) -> Result<Vec<u8
     let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
         GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
     })?;
-    git_path_bytes(relative)
+    git_path_bytes(precompose, relative)
 }
 
 fn checkout_selected_paths<'a, I>(
+    precompose: sley_core::PrecomposeUnicode,
     worktree_root: &Path,
     paths: &[PathBuf],
     candidates: I,
@@ -1986,7 +2102,7 @@ fn checkout_selected_paths<'a, I>(
 where
     I: IntoIterator<Item = &'a [u8]>,
 {
-    let mut pathspecs = CheckoutPathspecs::parse(worktree_root, paths)?;
+    let mut pathspecs = CheckoutPathspecs::parse_precomposed(precompose, worktree_root, paths)?;
     if pathspecs.is_empty() {
         return Ok(BTreeSet::new());
     }
@@ -2002,6 +2118,7 @@ where
 }
 
 fn checkout_selected_positions<'a, I>(
+    precompose: sley_core::PrecomposeUnicode,
     worktree_root: &Path,
     paths: &[PathBuf],
     candidates: I,
@@ -2010,7 +2127,7 @@ fn checkout_selected_positions<'a, I>(
 where
     I: IntoIterator<Item = (usize, &'a [u8])>,
 {
-    let mut pathspecs = CheckoutPathspecs::parse(worktree_root, paths)?;
+    let mut pathspecs = CheckoutPathspecs::parse_precomposed(precompose, worktree_root, paths)?;
     if pathspecs.is_empty() {
         return Ok(BTreeSet::new());
     }
@@ -2026,6 +2143,7 @@ where
 }
 
 pub(crate) fn checkout_unmerge_resolve_undo_paths(
+    precompose: sley_core::PrecomposeUnicode,
     worktree_root: &Path,
     index: &mut Index,
     format: ObjectFormat,
@@ -2035,7 +2153,7 @@ pub(crate) fn checkout_unmerge_resolve_undo_paths(
     if records.is_empty() {
         return Ok(());
     }
-    let mut pathspecs = CheckoutPathspecs::parse(worktree_root, paths)?;
+    let mut pathspecs = CheckoutPathspecs::parse_precomposed(precompose, worktree_root, paths)?;
     let mut remaining = Vec::new();
     let mut unmerged_any = false;
     for record in records {
@@ -2100,6 +2218,7 @@ pub(crate) fn checkout_path_is_unmerged(index: &Index, path: &[u8]) -> bool {
 }
 
 pub(crate) fn checkout_merge_unmerged_path(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
     db: &FileObjectDatabase,
     index: &Index,
@@ -2155,7 +2274,7 @@ pub(crate) fn checkout_merge_unmerged_path(
     );
     let file_path = worktree_path(worktree_root, ours.path.as_bytes())?;
     prepare_blob_parent_dirs(worktree_root, &file_path)?;
-    remove_existing_worktree_path(&file_path)?;
+    remove_existing_worktree_path(original_cwd, &file_path)?;
     fs::write(&file_path, result.content)?;
     set_worktree_file_mode(&file_path, ours.mode)?;
     Ok(())
@@ -2167,6 +2286,8 @@ pub fn restore_index_paths_from_head(
     format: ObjectFormat,
     paths: &[PathBuf],
 ) -> Result<RestoreResult> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
@@ -2187,6 +2308,7 @@ pub fn restore_index_paths_from_head(
         None => BTreeMap::new(),
     };
     restore_index_paths_from_entries(
+        precompose,
         worktree_root,
         git_dir,
         format,
@@ -2206,6 +2328,8 @@ pub fn restore_index_paths_from_tree(
     tree_oid: &ObjectId,
     paths: &[PathBuf],
 ) -> Result<RestoreResult> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
@@ -2223,6 +2347,7 @@ pub fn restore_index_paths_from_tree(
     let source_entries = tree_entries(&db, format, tree_oid)?;
     let source_directories = tree_directory_entries(&db, format, tree_oid)?;
     restore_index_paths_from_entries(
+        precompose,
         worktree_root,
         git_dir,
         format,
@@ -2242,6 +2367,8 @@ pub fn restore_index_paths_from_tree_allow_unmatched(
     tree_oid: &ObjectId,
     paths: &[PathBuf],
 ) -> Result<RestoreResult> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
@@ -2259,6 +2386,7 @@ pub fn restore_index_paths_from_tree_allow_unmatched(
     let source_entries = tree_entries(&db, format, tree_oid)?;
     let source_directories = tree_directory_entries(&db, format, tree_oid)?;
     restore_index_paths_from_entries(
+        precompose,
         worktree_root,
         git_dir,
         format,
@@ -2272,6 +2400,7 @@ pub fn restore_index_paths_from_tree_allow_unmatched(
 }
 
 pub(crate) fn restore_index_paths_from_entries(
+    precompose: sley_core::PrecomposeUnicode,
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -2288,6 +2417,7 @@ pub(crate) fn restore_index_paths_from_entries(
     // in-cone path such as `deep/a` is already an explicit index entry, so a
     // reset of that path must not inflate unrelated out-of-cone directories.
     let matched_paths = checkout_selected_paths(
+        precompose,
         worktree_root,
         paths,
         index
@@ -2438,12 +2568,15 @@ fn tree_directory_entries(
 }
 
 pub fn restore_index_and_worktree_paths_from_head(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
     paths: &[PathBuf],
     overlay: bool,
 ) -> Result<RestoreResult> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
@@ -2460,6 +2593,8 @@ pub fn restore_index_and_worktree_paths_from_head(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let head_entries = head_tree_entries(git_dir, format, &db)?;
     restore_index_and_worktree_paths_from_entries(
+        original_cwd,
+        precompose,
         worktree_root,
         git_dir,
         format,
@@ -2472,6 +2607,7 @@ pub fn restore_index_and_worktree_paths_from_head(
 }
 
 pub fn restore_index_and_worktree_paths_from_tree(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
@@ -2479,6 +2615,8 @@ pub fn restore_index_and_worktree_paths_from_tree(
     paths: &[PathBuf],
     overlay: bool,
 ) -> Result<RestoreResult> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
@@ -2495,6 +2633,8 @@ pub fn restore_index_and_worktree_paths_from_tree(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let source_entries = tree_entries(&db, format, tree_oid)?;
     restore_index_and_worktree_paths_from_entries(
+        original_cwd,
+        precompose,
         worktree_root,
         git_dir,
         format,
@@ -2507,6 +2647,8 @@ pub fn restore_index_and_worktree_paths_from_tree(
 }
 
 pub(crate) fn restore_index_and_worktree_paths_from_entries(
+    original_cwd: Option<&std::path::Path>,
+    precompose: sley_core::PrecomposeUnicode,
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -2526,6 +2668,7 @@ pub(crate) fn restore_index_and_worktree_paths_from_entries(
         .chain(source_entries.keys().cloned())
         .collect::<BTreeSet<_>>();
     let matched_paths = checkout_selected_paths(
+        precompose,
         worktree_root,
         paths,
         candidate_paths.iter().map(Vec::as_slice),
@@ -2574,6 +2717,7 @@ pub(crate) fn restore_index_and_worktree_paths_from_entries(
                 continue;
             }
             replacement_entries.push(materialize_path_restore_entry_filtered(
+                original_cwd,
                 db,
                 format,
                 worktree_root,
@@ -2591,7 +2735,7 @@ pub(crate) fn restore_index_and_worktree_paths_from_entries(
         } else {
             // No-overlay mode (git restore default, checkout --no-overlay):
             // drop the path from the index and the working tree.
-            remove_worktree_file(worktree_root, &path)?;
+            remove_worktree_file(original_cwd, worktree_root, &path)?;
         }
         replaced_paths.insert(path.clone());
         restored.insert(path);
@@ -2646,6 +2790,7 @@ pub(crate) fn restore_index_and_worktree_paths_from_entries(
 /// recursion is deliberately NOT performed here — porcelain layers it on top
 /// (see the CLI reset/read-tree wrappers), matching git's layering.
 pub fn reset_index_and_worktree_to_commit(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
@@ -2675,7 +2820,7 @@ pub fn reset_index_and_worktree_to_commit(
         } else {
             BTreeSet::new()
         };
-    refuse_if_current_working_directory_becomes_file(worktree_root, &target_entries)?;
+    refuse_if_current_working_directory_becomes_file(original_cwd, worktree_root, &target_entries)?;
     let config = effective_worktree_config(git_dir, None).unwrap_or_default();
     let attributes = build_tree_attribute_matcher(worktree_root, &db, format, &commit.tree)?;
 
@@ -2687,7 +2832,7 @@ pub fn reset_index_and_worktree_to_commit(
     // (deduped across stages) to match git and delete the moved-aside file.
     for path in current_index_paths(git_dir, format, &db)? {
         if !target_entries.contains_key(&path) {
-            remove_worktree_file(worktree_root, &path)?;
+            remove_worktree_file(original_cwd, worktree_root, &path)?;
         }
     }
 
@@ -2705,7 +2850,7 @@ pub fn reset_index_and_worktree_to_commit(
             // Rebuilding every target path unconditionally made a sparse-index
             // reset appear as a mass deletion to status after those files were
             // removed again by the next sparse-aware command.
-            remove_worktree_file(worktree_root, path)?;
+            remove_worktree_file(original_cwd, worktree_root, path)?;
             let mut skipped = restored_head_index_entry(worktree_root, &db, path, entry)?;
             skipped.set_skip_worktree(true);
             index_entries.push(skipped);
@@ -2725,11 +2870,13 @@ pub fn reset_index_and_worktree_to_commit(
         }
     }
     index_entries.extend(materialize_prepared_checkout_entries(
+        original_cwd,
         worktree_root,
         &config,
         prepared_entries,
     )?);
-    let mut delayed_updates = finish_delayed_checkout(worktree_root, delayed_checkout)?;
+    let mut delayed_updates =
+        finish_delayed_checkout(original_cwd, worktree_root, delayed_checkout)?;
     for entry in &mut index_entries {
         if let Some(updated) = delayed_updates.remove(entry.path.as_bytes()) {
             *entry = updated;
@@ -2775,6 +2922,7 @@ pub fn reset_index_and_worktree_to_commit(
 /// contract (git's `subprocess` filter context). Prefer the plain form when no
 /// process filters are configured.
 pub fn reset_index_and_worktree_to_commit_with_process_filter_metadata(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
@@ -2782,7 +2930,7 @@ pub fn reset_index_and_worktree_to_commit_with_process_filter_metadata(
     process_metadata: Option<ProcessFilterMetadata>,
 ) -> Result<RestoreResult> {
     let _process_filter_metadata = set_process_filter_metadata(process_metadata);
-    reset_index_and_worktree_to_commit(worktree_root, git_dir, format, commit_oid)
+    reset_index_and_worktree_to_commit(original_cwd, worktree_root, git_dir, format, commit_oid)
 }
 
 /// All paths the current index references, deduped across stages (a conflicted
@@ -2813,6 +2961,7 @@ pub(crate) fn current_index_paths(
 /// records the oid in the index with a zeroed stat so status re-evaluates the
 /// gitlink against the embedded repository's HEAD.
 pub(crate) fn materialize_tree_entry(
+    original_cwd: Option<&std::path::Path>,
     db: &FileObjectDatabase,
     worktree_root: &Path,
     path: &[u8],
@@ -2820,7 +2969,7 @@ pub(crate) fn materialize_tree_entry(
 ) -> Result<IndexEntry> {
     if sley_index::is_gitlink(entry.mode) {
         let dir_path = worktree_path(worktree_root, path)?;
-        materialize_gitlink_dir(worktree_root, &dir_path)?;
+        materialize_gitlink_dir(original_cwd, worktree_root, &dir_path)?;
         return Ok(IndexEntry {
             ctime_seconds: 0,
             ctime_nanoseconds: 0,
@@ -2838,14 +2987,18 @@ pub(crate) fn materialize_tree_entry(
             path: BString::from(path),
         });
     }
-    let file_path = write_worktree_blob_entry(db, worktree_root, path, entry)?;
+    let file_path = write_worktree_blob_entry(original_cwd, db, worktree_root, path, entry)?;
     let metadata = fs::symlink_metadata(&file_path)?;
     let mut index_entry = index_entry_from_metadata(path.to_vec(), entry.oid, &metadata);
     index_entry.mode = entry.mode;
     Ok(index_entry)
 }
 
-pub(crate) fn materialize_gitlink_dir(worktree_root: &Path, dir_path: &Path) -> Result<()> {
+pub(crate) fn materialize_gitlink_dir(
+    original_cwd: Option<&std::path::Path>,
+    worktree_root: &Path,
+    dir_path: &Path,
+) -> Result<()> {
     prepare_blob_parent_dirs(worktree_root, dir_path)?;
     // git's `validate_submodule_path` / entry.c: never replace a symlink with a
     // gitlink directory. Doing so would destroy the link and let a later
@@ -2857,7 +3010,7 @@ pub(crate) fn materialize_gitlink_dir(worktree_root: &Path, dir_path: &Path) -> 
             return Ok(());
         }
         if !metadata.is_dir() {
-            remove_existing_worktree_path(dir_path)?;
+            remove_existing_worktree_path(original_cwd, dir_path)?;
         }
     }
     fs::create_dir_all(dir_path)?;
@@ -2865,6 +3018,7 @@ pub(crate) fn materialize_gitlink_dir(worktree_root: &Path, dir_path: &Path) -> 
 }
 
 pub(crate) fn materialize_path_restore_entry_filtered(
+    original_cwd: Option<&std::path::Path>,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     worktree_root: &Path,
@@ -2874,7 +3028,7 @@ pub(crate) fn materialize_path_restore_entry_filtered(
     config: &GitConfig,
 ) -> Result<IndexEntry> {
     if sley_index::is_gitlink(entry.mode) || (entry.mode & 0o170000) == 0o120000 {
-        return materialize_tree_entry(db, worktree_root, path, entry);
+        return materialize_tree_entry(original_cwd, db, worktree_root, path, entry);
     }
     let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
     let checks = smudge_attribute_checks_from_index(worktree_root, git_dir, format, path)?;
@@ -2887,7 +3041,7 @@ pub(crate) fn materialize_path_restore_entry_filtered(
     )?;
     let file_path = worktree_path(worktree_root, path)?;
     prepare_blob_parent_dirs(worktree_root, &file_path)?;
-    remove_existing_worktree_path(&file_path)?;
+    remove_existing_worktree_path(original_cwd, &file_path)?;
     fs::write(&file_path, &body)?;
     set_worktree_file_mode(&file_path, entry.mode)?;
     let metadata = fs::symlink_metadata(&file_path)?;
@@ -2907,6 +3061,7 @@ pub(crate) fn materialize_path_restore_entry_filtered(
 /// symlink and would write *through* it (leaving the link), so the unlink is
 /// load-bearing for the symlink-stash / reset-hard type-change cases.
 pub(crate) fn write_worktree_blob_entry(
+    original_cwd: Option<&std::path::Path>,
     db: &FileObjectDatabase,
     worktree_root: &Path,
     path: &[u8],
@@ -2919,7 +3074,7 @@ pub(crate) fn write_worktree_blob_entry(
     prepare_blob_parent_dirs(worktree_root, &file_path)?;
     // Clear whatever sits at the leaf — including a directory where the target
     // wants a plain file (reverse D/F) — before writing.
-    remove_existing_worktree_path(&file_path)?;
+    remove_existing_worktree_path(original_cwd, &file_path)?;
     write_blob_body_or_symlink(&file_path, entry.mode, &object.body, &object.body)?;
     Ok(file_path)
 }
@@ -3046,14 +3201,17 @@ pub(crate) fn prepare_blob_parent_dirs(worktree_root: &Path, file_path: &Path) -
 /// object there — a symlink (even a dangling one, which `Path::exists` misses),
 /// a regular file, or a directory subtree. Uses `symlink_metadata` (lstat) so a
 /// symlink is removed as the link, never followed.
-pub(crate) fn remove_existing_worktree_path(file_path: &Path) -> Result<()> {
+pub(crate) fn remove_existing_worktree_path(
+    original_cwd: Option<&std::path::Path>,
+    file_path: &Path,
+) -> Result<()> {
     let metadata = match fs::symlink_metadata(file_path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err.into()),
     };
     if metadata.is_dir() {
-        if path_is_original_cwd(file_path) {
+        if path_is_original_cwd(original_cwd, file_path) {
             return refuse_remove_current_working_directory(file_path);
         }
         // A directory in the way of a file (D/F transition) or a populated
@@ -3107,6 +3265,7 @@ pub(crate) fn set_worktree_file_mode(_file_path: &Path, _entry_mode: u32) -> Res
 
 /// Materialize a tree object into the index and worktree.
 pub fn checkout_tree_to_index_and_worktree(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
@@ -3120,13 +3279,19 @@ pub fn checkout_tree_to_index_and_worktree(
 
     for path in read_index_entries(git_dir, format)?.keys() {
         if !target_entries.contains_key(path) {
-            remove_worktree_file(worktree_root, path)?;
+            remove_worktree_file(original_cwd, worktree_root, path)?;
         }
     }
 
     let mut index_entries = Vec::new();
     for (path, entry) in &target_entries {
-        index_entries.push(materialize_tree_entry(&db, worktree_root, path, entry)?);
+        index_entries.push(materialize_tree_entry(
+            original_cwd,
+            &db,
+            worktree_root,
+            path,
+            entry,
+        )?);
     }
     index_entries.sort_by(|left, right| left.path.cmp(&right.path));
     let extensions = preserved_index_extensions(git_dir, format)?;
@@ -3363,12 +3528,14 @@ pub fn active_sparse_checkout(
 /// Conflicted entries (stage != 0) are never given the skip-worktree bit and
 /// are left alone, matching upstream Git. The index is rewritten in place.
 pub fn apply_sparse_checkout(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
     sparse: &SparseCheckout,
 ) -> Result<ApplySparseResult> {
     apply_sparse_checkout_with_mode(
+        original_cwd,
         worktree_root,
         git_dir,
         format,
@@ -3380,12 +3547,15 @@ pub fn apply_sparse_checkout(
 /// Like [`apply_sparse_checkout`] but lets the caller force the pattern
 /// interpretation instead of auto-detecting it.
 pub fn apply_sparse_checkout_with_mode(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
     sparse: &SparseCheckout,
     mode: SparseCheckoutMode,
 ) -> Result<ApplySparseResult> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
@@ -3427,7 +3597,7 @@ pub fn apply_sparse_checkout_with_mode(
             clear_skip_worktree(entry);
             let file_path = worktree_path(worktree_root, entry.path.as_bytes())?;
             if !file_path.exists() {
-                materialize_index_entry_file(&db, worktree_root, &file_path, entry)?;
+                materialize_index_entry_file(original_cwd, &db, worktree_root, &file_path, entry)?;
                 let metadata = fs::symlink_metadata(&file_path)?;
                 *entry = index_entry_with_refreshed_stat(entry, &metadata);
             }
@@ -3455,7 +3625,7 @@ pub fn apply_sparse_checkout_with_mode(
                 }
                 _ => {
                     set_skip_worktree(entry);
-                    remove_worktree_file(worktree_root, entry.path.as_bytes())?;
+                    remove_worktree_file(original_cwd, worktree_root, entry.path.as_bytes())?;
                     skipped.push(entry.path.as_bytes().to_vec());
                 }
             }
@@ -3465,7 +3635,7 @@ pub fn apply_sparse_checkout_with_mode(
     unmerged.sort();
     unmerged.dedup();
     let untracked_sparse_directories = if matches!(mode, SparseCheckoutMode::Cone) {
-        clean_tracked_sparse_directories(worktree_root, &index)?
+        clean_tracked_sparse_directories(precompose, worktree_root, &index)?
     } else {
         Vec::new()
     };
@@ -3493,7 +3663,11 @@ pub fn apply_sparse_checkout_with_mode(
 /// skip-worktree. Ignored leftovers are removed with such a directory, while a
 /// non-ignored untracked file preserves the directory and is reported to the
 /// caller. This mirrors sparse-checkout's temporary sparse-index cleanup pass.
-fn clean_tracked_sparse_directories(worktree_root: &Path, index: &Index) -> Result<Vec<Vec<u8>>> {
+fn clean_tracked_sparse_directories(
+    precompose: sley_core::PrecomposeUnicode,
+    worktree_root: &Path,
+    index: &Index,
+) -> Result<Vec<Vec<u8>>> {
     let mut directory_blocked = BTreeMap::<Vec<u8>, bool>::new();
     for entry in &index.entries {
         if index_entry_stage(entry) != 0 {
@@ -3549,7 +3723,12 @@ fn clean_tracked_sparse_directories(worktree_root: &Path, index: &Index) -> Resu
                 let file_type = item.file_type()?;
                 if file_type.is_dir() {
                     stack.push((item.path(), git_path));
-                } else if !path_matches_standard_ignore(worktree_root, &git_path, false)? {
+                } else if !path_matches_standard_ignore(
+                    precompose,
+                    worktree_root,
+                    &git_path,
+                    false,
+                )? {
                     has_untracked = true;
                     break;
                 }
@@ -4107,6 +4286,7 @@ pub(crate) fn metadata_lock_path(path: &Path) -> Result<PathBuf> {
 /// to reconcile an existing checkout under an explicit mode use
 /// [`apply_sparse_checkout_with_mode`].
 pub fn checkout_detached_sparse(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
@@ -4118,6 +4298,7 @@ pub fn checkout_detached_sparse(
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let files = checkout_commit_to_index_and_worktree_sparse(
+        original_cwd,
         worktree_root,
         git_dir,
         format,
@@ -4149,6 +4330,7 @@ pub fn checkout_detached_sparse(
 }
 
 pub(crate) fn materialize_index_entry_file(
+    original_cwd: Option<&std::path::Path>,
     db: &FileObjectDatabase,
     worktree_root: &Path,
     file_path: &Path,
@@ -4160,12 +4342,12 @@ pub(crate) fn materialize_index_entry_file(
     // sparse re-materialization of a submodule path would fail with "not found:
     // blob object <commit-oid>".
     if sley_index::is_gitlink(entry.mode) {
-        materialize_gitlink_dir(worktree_root, file_path)?;
+        materialize_gitlink_dir(original_cwd, worktree_root, file_path)?;
         return Ok(());
     }
     let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
     prepare_blob_parent_dirs(worktree_root, file_path)?;
-    remove_existing_worktree_path(file_path)?;
+    remove_existing_worktree_path(original_cwd, file_path)?;
     write_blob_body_or_symlink(file_path, entry.mode, &object.body, &object.body)?;
     Ok(())
 }
@@ -4183,11 +4365,14 @@ pub(crate) fn clear_skip_worktree(entry: &mut IndexEntry) {
 }
 
 pub fn restore_worktree_paths_from_head(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
     paths: &[PathBuf],
 ) -> Result<RestoreResult> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
@@ -4204,6 +4389,8 @@ pub fn restore_worktree_paths_from_head(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let head_entries = head_tree_entries(git_dir, format, &db)?;
     restore_worktree_paths_from_entries(
+        original_cwd,
+        precompose,
         worktree_root,
         git_dir,
         format,
@@ -4215,12 +4402,15 @@ pub fn restore_worktree_paths_from_head(
 }
 
 pub fn restore_worktree_paths_from_tree(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
     tree_oid: &ObjectId,
     paths: &[PathBuf],
 ) -> Result<RestoreResult> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
@@ -4237,6 +4427,8 @@ pub fn restore_worktree_paths_from_tree(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let source_entries = tree_entries(&db, format, tree_oid)?;
     restore_worktree_paths_from_entries(
+        original_cwd,
+        precompose,
         worktree_root,
         git_dir,
         format,
@@ -4248,6 +4440,8 @@ pub fn restore_worktree_paths_from_tree(
 }
 
 pub(crate) fn restore_worktree_paths_from_entries(
+    original_cwd: Option<&std::path::Path>,
+    precompose: sley_core::PrecomposeUnicode,
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -4264,6 +4458,7 @@ pub(crate) fn restore_worktree_paths_from_entries(
     let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
     let mut restored = BTreeSet::new();
     let matched_paths = checkout_selected_paths(
+        precompose,
         worktree_root,
         paths,
         index_entries
@@ -4275,6 +4470,7 @@ pub(crate) fn restore_worktree_paths_from_entries(
     for path in matched_paths {
         if let Some(entry) = source_entries.get(&path) {
             materialize_path_restore_entry_filtered(
+                original_cwd,
                 db,
                 format,
                 worktree_root,
@@ -4284,7 +4480,7 @@ pub(crate) fn restore_worktree_paths_from_entries(
                 &config,
             )?;
         } else {
-            remove_worktree_file(worktree_root, &path)?;
+            remove_worktree_file(original_cwd, worktree_root, &path)?;
         }
         restored.insert(path);
     }
@@ -4511,7 +4707,7 @@ mod checkout_parent_safety_tests {
             })
             .collect();
 
-        let entries = materialize_prepared_checkout_entries(root.path(), &config, prepared)
+        let entries = materialize_prepared_checkout_entries(None, root.path(), &config, prepared)
             .expect("parallel materialization");
 
         assert_eq!(entries.len(), 2);

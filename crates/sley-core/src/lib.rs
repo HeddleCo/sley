@@ -6,9 +6,9 @@ use std::fmt;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::OnceLock;
 
 mod cancel;
+pub mod diagnostics;
 
 #[cfg(feature = "fetch-profile")]
 pub mod fetch_profile;
@@ -33,27 +33,10 @@ pub mod paths;
 pub mod precompose;
 pub mod primitives;
 pub mod text;
-pub use precompose::{
-    activate_precompose_unicode, has_non_ascii, precompose_argv_if_needed,
-    precompose_bytes_if_needed, precompose_os_str_bytes_if_needed, precompose_path_if_needed,
-    precompose_string_if_needed, precompose_unicode_enabled, set_precompose_unicode,
-};
+pub use precompose::{PrecomposeUnicode, has_non_ascii};
 
 pub mod namespace;
-pub use namespace::{
-    clear_git_namespace_override, expand_namespace, get_git_namespace, namespace_active,
-    ref_is_hidden, set_git_namespace_override, strip_namespace, trim_hidden_ref_pattern,
-};
-
-static ORIGINAL_CWD: OnceLock<Option<PathBuf>> = OnceLock::new();
-
-pub fn set_original_cwd(path: Option<PathBuf>) {
-    let _ = ORIGINAL_CWD.set(path);
-}
-
-pub fn original_cwd() -> Option<PathBuf> {
-    ORIGINAL_CWD.get()?.clone()
-}
+pub use namespace::{Namespace, ref_is_hidden, trim_hidden_ref_pattern};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub enum DateMode {
@@ -1678,27 +1661,43 @@ impl NotFoundKind {
     }
 }
 
-/// Git-compatible CLI exit status. See `git help exit-code` for the upstream taxonomy.
+/// Why an operation stopped after delivering its detailed diagnostics to its sink.
+/// This carries library semantics; applications decide how to report the outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CliExit {
-    /// Success (exit 0).
-    Ok,
-    /// User-facing fatal error (exit 128).
-    UserError,
-    /// Invalid usage / bad arguments (exit 129).
-    Usage,
-    /// Command-specific exit code (e.g. grep returning 1 when no matches).
-    Custom(i32),
+pub enum RejectionKind {
+    InvalidArguments,
+    Refused,
+    Incomplete,
 }
 
-impl CliExit {
-    pub const fn code(self) -> i32 {
-        match self {
-            Self::Ok => 0,
-            Self::UserError => 128,
-            Self::Usage => 129,
-            Self::Custom(code) => code,
-        }
+/// Failure returned by a caller-provided service (editor, renderer, hydration, etc.).
+/// The dynamic boundary preserves the caller's concrete error for downcasting.
+/// Clones share identity; independently constructed errors are distinct.
+#[derive(Debug, Clone)]
+pub struct CallbackError(std::sync::Arc<dyn Error + Send + Sync>);
+
+impl CallbackError {
+    pub fn new(error: impl Error + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(error))
+    }
+    pub fn downcast_ref<T: Error + 'static>(&self) -> Option<&T> {
+        self.0.downcast_ref()
+    }
+}
+impl PartialEq for CallbackError {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for CallbackError {}
+impl fmt::Display for CallbackError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl Error for CallbackError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.0.as_ref())
     }
 }
 
@@ -1766,14 +1765,12 @@ impl fmt::Display for ResourceLimitKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitError {
-    Io(String),
     /// An I/O failure that preserves the [`std::io::ErrorKind`] of the
     /// underlying [`std::io::Error`].
     ///
     /// Produced by `From<std::io::Error>` so downstream code can branch on
     /// [`GitError::io_kind`] instead of sniffing rendered message text. The
-    /// legacy [`GitError::Io`](Self::Io) variant remains for hand-built
-    /// messages and compatibility this cycle.
+    /// same typed channel is used for manually described I/O failures.
     IoKind {
         kind: std::io::ErrorKind,
         message: String,
@@ -1792,10 +1789,20 @@ pub enum GitError {
     NotFound(NotFoundKind),
     Transaction(String),
     Command(String),
-    /// Typed CLI exit with a user-facing message printed by the binary entrypoint.
-    Cli(CliExit, String),
-    /// Legacy explicit exit code; the message (if any) was already printed by the command.
-    Exit(i32),
+    /// An operation was rejected; details were sent to the operation's sink.
+    Rejected(RejectionKind),
+    /// A caller-provided service failed; its concrete error is preserved.
+    Callback(CallbackError),
+    /// An actual child process failed (not a request to exit this process).
+    ChildProcessFailed {
+        status: Option<i32>,
+    },
+    RemoteHelperAborted {
+        name: String,
+    },
+    EmptyPreferredPack {
+        path: std::path::PathBuf,
+    },
     /// Cooperative cancellation of a streaming or long-running operation.
     ///
     /// Raised when a [`CancelFlag`] trips mid-stream (pack index/install, pack
@@ -1823,7 +1830,6 @@ pub type Result<T> = std::result::Result<T, GitError>;
 impl fmt::Display for GitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io(msg) => write!(f, "io error: {msg}"),
             // Message text already carries the OS detail (`value.to_string()`
             // of the source error); keep the rendering identical to `Io`.
             Self::IoKind { kind: _, message } => write!(f, "io error: {message}"),
@@ -1836,8 +1842,17 @@ impl fmt::Display for GitError {
             Self::NotFound(kind) => write!(f, "not found: {kind}"),
             Self::Transaction(msg) => write!(f, "transaction failed: {msg}"),
             Self::Command(msg) => write!(f, "command failed: {msg}"),
-            Self::Cli(_, msg) => f.write_str(msg),
-            Self::Exit(code) => write!(f, "exit {code}"),
+            Self::Rejected(kind) => write!(f, "operation rejected: {kind:?}"),
+            Self::Callback(error) => fmt::Display::fmt(error, f),
+            Self::ChildProcessFailed { status } => write!(f, "child process failed: {status:?}"),
+            Self::RemoteHelperAborted { name } => {
+                write!(f, "remote helper '{name}' aborted session")
+            }
+            Self::EmptyPreferredPack { path } => write!(
+                f,
+                "cannot select preferred pack {} with no objects",
+                path.display()
+            ),
             Self::Cancelled => f.write_str("operation cancelled"),
             Self::CountMismatch { expected, actual } => {
                 write!(f, "count mismatch: expected {expected}, yielded {actual}")
@@ -1854,25 +1869,16 @@ impl fmt::Display for GitError {
     }
 }
 
-impl Error for GitError {}
+impl Error for GitError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Callback(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl GitError {
-    pub fn usage(msg: impl Into<String>) -> Self {
-        Self::Cli(CliExit::Usage, msg.into())
-    }
-
-    pub fn user_error(msg: impl Into<String>) -> Self {
-        Self::Cli(CliExit::UserError, msg.into())
-    }
-
-    pub fn cli_exit(kind: CliExit, msg: impl Into<String>) -> Self {
-        Self::Cli(kind, msg.into())
-    }
-
-    pub fn cli_exit_code(&self) -> i32 {
-        cli_exit_code(self)
-    }
-
     pub fn not_found(msg: impl Into<String>) -> Self {
         Self::NotFound(NotFoundKind::Message(msg.into()))
     }
@@ -1946,8 +1952,7 @@ impl GitError {
     /// The preserved I/O [`std::io::ErrorKind`], when this error originated
     /// from (or was constructed with) an I/O error kind.
     ///
-    /// `None` for non-I/O variants and for the legacy string-only
-    /// [`GitError::Io`](Self::Io) form, whose kind was erased at construction.
+    /// `None` for non-I/O variants.
     pub fn io_kind(&self) -> Option<std::io::ErrorKind> {
         match self {
             Self::IoKind { kind, .. } => Some(*kind),
@@ -1969,7 +1974,6 @@ impl GitError {
     pub fn is_cancelled(&self) -> bool {
         match self {
             Self::Cancelled => true,
-            Self::Io(message) => message.contains("cancelled"),
             Self::IoKind { kind, message } => {
                 matches!(kind, std::io::ErrorKind::Interrupted) || message.contains("cancelled")
             }
@@ -1999,21 +2003,6 @@ impl From<std::io::Error> for GitError {
             kind: value.kind(),
             message: value.to_string(),
         }
-    }
-}
-
-/// Map a [`GitError`] to the process exit code the CLI should use.
-pub fn cli_exit_code(err: &GitError) -> i32 {
-    match err {
-        GitError::Exit(code) => *code,
-        GitError::Cli(kind, _) => kind.code(),
-        // During migration, usage-style validation still returns `Command`; treat as
-        // general failure until those call sites adopt `GitError::usage`.
-        GitError::Command(_) => 1,
-        // User/library stop of a long-running stream: non-zero but not a usage
-        // or corruption failure. Matches common CLI "interrupted" convention.
-        GitError::Cancelled => 130,
-        _ => 1,
     }
 }
 
@@ -2494,7 +2483,13 @@ mod tests {
             interrupted.is_cancelled(),
             "Interrupted kind is cancel-flavored"
         );
-        assert!(GitError::Io("operation cancelled".into()).is_cancelled());
+        assert!(
+            GitError::IoKind {
+                kind: ErrorKind::Interrupted,
+                message: "operation cancelled".into()
+            }
+            .is_cancelled()
+        );
         assert!(!GitError::from(std::io::Error::other("disk full")).is_cancelled());
         assert_eq!(
             GitError::from(std::io::Error::other("disk full")).io_kind(),
@@ -2737,39 +2732,6 @@ mod tests {
         assert!(FullName::new("refs/heads/main ").is_err());
         assert!(FullName::new("refs//heads/main").is_err());
         assert!(FullName::new("refs/heads/\nmain").is_err());
-    }
-
-    #[test]
-    fn cli_exit_codes_match_git_taxonomy() {
-        assert_eq!(CliExit::Ok.code(), 0);
-        assert_eq!(CliExit::UserError.code(), 128);
-        assert_eq!(CliExit::Usage.code(), 129);
-        assert_eq!(CliExit::Custom(1).code(), 1);
-        assert_eq!(CliExit::Custom(5).code(), 5);
-    }
-
-    #[test]
-    fn git_error_cli_exit_code_mapping() {
-        assert_eq!(GitError::Exit(129).cli_exit_code(), 129);
-        assert_eq!(GitError::Exit(128).cli_exit_code(), 128);
-        assert_eq!(GitError::usage("unknown option").cli_exit_code(), 129);
-        assert_eq!(
-            GitError::user_error("not a git repository").cli_exit_code(),
-            128
-        );
-        assert_eq!(
-            GitError::cli_exit(CliExit::Custom(2), "diff found changes").cli_exit_code(),
-            2
-        );
-        assert_eq!(GitError::Command("bad value".into()).cli_exit_code(), 1);
-        assert_eq!(GitError::not_found("missing ref").cli_exit_code(), 1);
-        assert_eq!(GitError::Cancelled.cli_exit_code(), 130);
-    }
-
-    #[test]
-    fn git_error_cli_displays_message_only() {
-        let err = GitError::usage("unknown option `--foo'");
-        assert_eq!(err.to_string(), "unknown option `--foo'");
     }
 
     #[test]

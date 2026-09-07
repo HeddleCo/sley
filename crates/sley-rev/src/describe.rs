@@ -197,7 +197,7 @@ pub fn describe_search(
                 let depth = (seen_commits - 1) as u32;
                 *flags.entry(oid).or_insert(0) |= flag;
                 if options.debug {
-                    eprintln!(" annotated {depth:>10} {}", best.name);
+                    sley_core::diagnostic!(Stderr, true, " annotated {depth:>10} {}", best.name);
                 }
                 possible.push(PossibleTag {
                     tag: best,

@@ -17,8 +17,7 @@
 #![allow(clippy::expect_used)]
 
 use crate::*;
-use sley::plumbing::sley_object::TreeEntries;
-use sley::plumbing::{sley_diff_merge, sley_rev, sley_worktree};
+use sley_object::TreeEntries;
 use std::cell::{Ref, RefCell};
 
 /// How the per-object diff (for commits) is rendered.
@@ -538,7 +537,12 @@ pub(crate) fn cmd_show(cli_session: &crate::session::CliSession, args: &[String]
     let show_userdiff_attributes = repo
         .worktree_root()
         .ok()
-        .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
+        .map(|root| {
+            sley_worktree::StandardAttributeMatcher::from_worktree_root(
+                cli_session.precompose_unicode(),
+                root,
+            )
+        })
         .transpose()?;
     let show_userdiff = commands::userdiff::UserdiffResolver::with_attributes(
         show_userdiff_attributes,
@@ -585,6 +589,7 @@ pub(crate) fn cmd_show(cli_session: &crate::session::CliSession, args: &[String]
             continue;
         }
         show_object(
+            &cli_session.remote_policy,
             &mut stdout,
             &context,
             &tip.rev,
@@ -667,6 +672,7 @@ fn show_tip_matches_grep(
 /// later such entries. `suppress_separator` is `true` when this object is the
 /// immediate target of an annotated tag, whose block has already emitted the gap.
 fn show_object(
+    policy: &sley_remote::RemotePolicy,
     stdout: &mut io::Stdout,
     context: &ShowContext<'_>,
     name: &str,
@@ -678,7 +684,15 @@ fn show_object(
     match object.object_type {
         ObjectType::Commit => {
             let commit = Commit::parse(context.format, &object.body)?;
-            show_commit(stdout, context, oid, &commit, shown_one, suppress_separator)
+            show_commit(
+                policy,
+                stdout,
+                context,
+                oid,
+                &commit,
+                shown_one,
+                suppress_separator,
+            )
         }
         ObjectType::Tag => {
             let tag = Tag::parse(context.format, &object.body)?;
@@ -687,7 +701,7 @@ fn show_object(
             // through (git keeps `obj->name` from the original argument). The tag
             // block already supplied the gap line, so the target must not add its
             // own leading separator.
-            show_object(stdout, context, name, &tag.object, shown_one, true)
+            show_object(policy, stdout, context, name, &tag.object, shown_one, true)
         }
         ObjectType::Tree => show_tree(stdout, context.format, name, &object.body),
         ObjectType::Blob => {
@@ -725,6 +739,7 @@ fn show_object(
 /// gap as if a diff had run. `suppress_separator` is set when this commit is the
 /// immediate target of an annotated tag, whose block already supplied the gap.
 fn show_commit(
+    policy: &sley_remote::RemotePolicy,
     stdout: &mut io::Stdout,
     context: &ShowContext<'_>,
     oid: &ObjectId,
@@ -804,6 +819,7 @@ fn show_commit(
         && matches!(options.commit_format, ShowCommitFormat::Medium)
     {
         return show_commit_separate_merge(
+            policy,
             stdout,
             context,
             oid,
@@ -1047,6 +1063,7 @@ fn show_commit(
     );
 
     let result = write_commit_trailer(
+        policy,
         stdout,
         context,
         CommitTrailerLayout {
@@ -1084,6 +1101,7 @@ fn show_commit_needs_first_parent_entries(
 }
 
 fn show_commit_separate_merge(
+    policy: &sley_remote::RemotePolicy,
     stdout: &mut io::Stdout,
     context: &ShowContext<'_>,
     oid: &ObjectId,
@@ -1114,6 +1132,7 @@ fn show_commit_separate_merge(
             &parent_commit,
         )?;
         write_commit_trailer(
+            policy,
             stdout,
             context,
             CommitTrailerLayout {
@@ -1219,6 +1238,7 @@ fn write_show_commit_header(
 /// suppresses the patch / raw / name listings but still renders the `--stat`
 /// family against the first parent.
 fn write_commit_trailer(
+    policy: &sley_remote::RemotePolicy,
     stdout: &mut io::Stdout,
     context: &ShowContext<'_>,
     layout: CommitTrailerLayout,
@@ -1276,11 +1296,12 @@ fn write_commit_trailer(
             writeln!(stdout)?;
         }
         return if combined_merge {
-            write_show_combined(stdout, context, &layout, commit, entries)
+            write_show_combined(policy, stdout, context, &layout, commit, entries)
         } else if remerge_merge {
-            write_show_remerge(stdout, context, commit)
+            write_show_remerge(policy, stdout, context, commit)
         } else if layout.is_merge && !first_parent_merge {
             write_merge_stat(
+                policy,
                 stdout,
                 context.db,
                 context.config,
@@ -1290,6 +1311,7 @@ fn write_commit_trailer(
             )
         } else {
             write_commit_diff(
+                policy,
                 stdout,
                 context.git_dir,
                 context.db,
@@ -1339,6 +1361,7 @@ fn merge_renders_stat(options: &ShowOptions) -> bool {
 /// Render the stat-family output for a merge commit's first-parent diff. The
 /// patch and raw listings git suppresses for merges are intentionally omitted.
 fn write_merge_stat(
+    policy: &sley_remote::RemotePolicy,
     stdout: &mut io::Stdout,
     db: &FileObjectDatabase,
     config: &GitConfig,
@@ -1347,8 +1370,9 @@ fn write_merge_stat(
     lazy_fetch: bool,
 ) -> Result<()> {
     let color = diff_color_enabled(config);
+    let lazy_fetch_adapter_1 = crate::diff_lazy_fetch(policy, lazy_fetch);
     let stat_entries =
-        collect_diff_stat_entries(entries, db, None, false, crate::diff_lazy_fetch(lazy_fetch))?;
+        collect_diff_stat_entries(entries, db, None, false, lazy_fetch_adapter_1.as_option())?;
     if options.numstat {
         for entry in &stat_entries {
             write_diff_numstat_materialized_entry(stdout, entry.entry, entry.stats, false)?;
@@ -1385,6 +1409,7 @@ fn write_merge_stat(
 /// (when patch output is active). `entries` is the first-parent name-status
 /// list reused for the stat family.
 fn write_show_combined(
+    policy: &sley_remote::RemotePolicy,
     stdout: &mut io::Stdout,
     context: &ShowContext<'_>,
     layout: &CommitTrailerLayout,
@@ -1393,15 +1418,10 @@ fn write_show_combined(
 ) -> Result<()> {
     let options = context.options;
     let db = context.db;
+    let lazy_fetch_adapter_2 = crate::diff_lazy_fetch(policy, context.lazy_fetch);
     let _stat_entries =
         if options.numstat || options.stat || options.compact_summary || options.shortstat {
-            collect_diff_stat_entries(
-                entries,
-                db,
-                None,
-                false,
-                crate::diff_lazy_fetch(context.lazy_fetch),
-            )?
+            collect_diff_stat_entries(entries, db, None, false, lazy_fetch_adapter_2.as_option())?
         } else {
             Vec::new()
         };
@@ -1467,6 +1487,7 @@ fn write_show_combined(
     let stat_active = merge_renders_stat(options);
     if stat_active {
         write_merge_stat(
+            policy,
             stdout,
             db,
             context.config,
@@ -1485,7 +1506,7 @@ fn write_show_combined(
         writeln!(stdout)?;
     }
     for path in &paths {
-        commands::combined::write_combined_patch(stdout, &render_ctx, path)?;
+        commands::combined::write_combined_patch(policy, stdout, &render_ctx, path)?;
     }
     Ok(())
 }
@@ -1565,6 +1586,7 @@ fn show_effective_rename_detection(options: &ShowOptions, config: &GitConfig) ->
 /// `--remerge-diff` body for a two-parent merge: re-merge parents, diff that
 /// tree against the commit, inject `remerge CONFLICT (...)` headers.
 fn write_show_remerge(
+    policy: &sley_remote::RemotePolicy,
     stdout: &mut io::Stdout,
     context: &ShowContext<'_>,
     commit: &Commit,
@@ -1681,7 +1703,7 @@ fn write_show_remerge(
                 anchors: &[],
                 allow_textconv: true,
                 db,
-                lazy_fetch: crate::diff_lazy_fetch(context.lazy_fetch),
+                lazy_fetch: crate::diff_lazy_fetch(policy, context.lazy_fetch).as_option(),
                 worktree_root: None,
                 use_worktree_new: false,
                 format,
@@ -1762,6 +1784,7 @@ fn show_remerge_conflict_header(kind: &sley_diff_merge::MergeConflictKind, path:
 }
 
 fn write_commit_diff(
+    policy: &sley_remote::RemotePolicy,
     stdout: &mut io::Stdout,
     git_dir: &Path,
     db: &FileObjectDatabase,
@@ -1792,7 +1815,7 @@ fn write_commit_diff(
             Ok(())
         }
         ShowDiffMode::Patch => write_commit_diff_patch(
-            stdout, git_dir, db, format, config, options, entries, lazy_fetch,
+            policy, stdout, git_dir, db, format, config, options, entries, lazy_fetch,
         ),
     }
 }
@@ -1801,6 +1824,7 @@ fn write_commit_diff(
 /// requested machine/stat sub-modes first, then a blank line, then the unified
 /// patch (unless an explicit sub-mode replaced it).
 fn write_commit_diff_patch(
+    policy: &sley_remote::RemotePolicy,
     stdout: &mut io::Stdout,
     git_dir: &Path,
     db: &FileObjectDatabase,
@@ -1828,11 +1852,12 @@ fn write_commit_diff_patch(
     // does one promisor negotiation in a partial clone (t4067 #1).
     if show_patch || options.numstat || options.stat || options.compact_summary || options.shortstat
     {
-        crate::prefetch_diff_entry_blobs(db, entries, false, lazy_fetch)?;
+        crate::prefetch_diff_entry_blobs(policy, db, entries, false, lazy_fetch)?;
     }
+    let lazy_fetch_adapter_3 = crate::diff_lazy_fetch(policy, lazy_fetch);
     let stat_entries =
         if options.numstat || options.stat || options.compact_summary || options.shortstat {
-            collect_diff_stat_entries(entries, db, None, false, crate::diff_lazy_fetch(lazy_fetch))?
+            collect_diff_stat_entries(entries, db, None, false, lazy_fetch_adapter_3.as_option())?
         } else {
             Vec::new()
         };
@@ -1846,7 +1871,12 @@ fn write_commit_diff_patch(
     if show_patch {
         let userdiff_attributes = sley_worktree::worktree_root_for_git_dir(git_dir)?
             .as_deref()
-            .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
+            .map(|root| {
+                sley_worktree::StandardAttributeMatcher::from_worktree_root(
+                    config.precompose_unicode(),
+                    root,
+                )
+            })
             .transpose()?;
         let userdiff = commands::userdiff::UserdiffResolver::with_attributes(
             userdiff_attributes,
@@ -1894,6 +1924,7 @@ fn write_commit_diff_patch(
             },
             |_| false,
             |stdout, entry| {
+                let lazy_fetch_adapter_4 = crate::diff_lazy_fetch(policy, lazy_fetch);
                 let patch_options = DiffRenderOptions {
                     line_indicators: sley_diff_merge::render::LineIndicators::default(),
                     suppress_blank_empty: config
@@ -1903,7 +1934,7 @@ fn write_commit_diff_patch(
                     anchors: &options.anchored,
                     allow_textconv: options.textconv != Some(false),
                     db,
-                    lazy_fetch: crate::diff_lazy_fetch(lazy_fetch),
+                    lazy_fetch: lazy_fetch_adapter_4.as_option(),
                     worktree_root: None,
                     use_worktree_new: false,
                     format,
@@ -2288,7 +2319,7 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
             "--no-decorate" | "--decorate=no" => options.decorate = LogDecorationMode::Off,
             value if let Some(rest) = value.strip_prefix("--decorate=") => {
                 eprintln!("fatal: invalid --decorate option: {rest}");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             // --- accepted-but-inert diff knobs ----------------------------------
             // These influence rendering details sley does not yet model; accept
@@ -2326,7 +2357,7 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
                     "none" => None,
                     _ => {
                         eprintln!("error: bad --word-diff argument: {mode}");
-                        return Err(GitError::Exit(129));
+                        return Err(crate::cli_exit(129));
                     }
                 };
             }
@@ -2420,7 +2451,7 @@ fn show_parse_diff_merges(value: &str) -> Result<ShowMergeMode> {
         "remerge" | "r" => Ok(ShowMergeMode::Remerge),
         _ => {
             eprintln!("fatal: invalid value for '--diff-merges': '{value}'");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -2466,7 +2497,7 @@ fn parse_pretty_value(value: &str) -> Result<ShowCommitFormat> {
         }),
         other => {
             eprintln!("fatal: invalid --pretty format: {other}");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }

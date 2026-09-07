@@ -14,8 +14,12 @@ pub fn parse_rev_list_blob_limit(value: &str) -> Result<usize> {
     git_parse_blob_limit(value)
         .and_then(|limit| usize::try_from(limit).ok())
         .ok_or_else(|| {
-            eprintln!("fatal: invalid filter-spec 'blob:limit={value}'");
-            GitError::Exit(128)
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "fatal: invalid filter-spec 'blob:limit={value}'"
+            );
+            GitError::Rejected(sley_core::RejectionKind::Refused)
         })
 }
 
@@ -46,8 +50,8 @@ pub fn git_parse_blob_limit(value: &str) -> Option<u64> {
 
 pub fn parse_rev_list_tree_depth(value: &str) -> Result<usize> {
     value.parse::<usize>().map_err(|_| {
-        eprintln!("fatal: expected 'tree:<depth>'");
-        GitError::Exit(128)
+        sley_core::diagnostic!(Stderr, true, "fatal: expected 'tree:<depth>'");
+        GitError::Rejected(sley_core::RejectionKind::Refused)
     })
 }
 
@@ -58,8 +62,12 @@ pub fn parse_rev_list_object_type_filter(value: &str) -> Result<ObjectType> {
         "commit" => Ok(ObjectType::Commit),
         "tag" => Ok(ObjectType::Tag),
         _ => {
-            eprintln!("fatal: '{value}' for 'object:type=<type>' is not a valid object type");
-            Err(GitError::Exit(128))
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "fatal: '{value}' for 'object:type=<type>' is not a valid object type"
+            );
+            Err(GitError::Rejected(sley_core::RejectionKind::Refused))
         }
     }
 }

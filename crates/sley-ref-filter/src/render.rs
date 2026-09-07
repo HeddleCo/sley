@@ -736,8 +736,12 @@ pub fn print_for_each_ref_format_with_is_bases(
                     {
                         // A `%(contents:XXX)` that none of the contents sub-atoms
                         // above recognized — git reports the bare contents arg.
-                        eprintln!("fatal: unrecognized %(contents) argument: {arg}");
-                        return Err(GitError::Exit(128));
+                        sley_core::diagnostic!(
+                            Stderr,
+                            true,
+                            "fatal: unrecognized %(contents) argument: {arg}"
+                        );
+                        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
                     } else if (hooks.describe_renderer)(stdout, other, context)? {
                         // %(describe[:opts]) / %(*describe[:opts]) are rendered by
                         // the CLI-injected describe engine (the engine itself lives
@@ -745,8 +749,12 @@ pub fn print_for_each_ref_format_with_is_bases(
                         // treats describe failures as an empty placeholder.
                     } else if other.starts_with("HEAD:") {
                         // git's head_atom_parser: %(HEAD) takes no arguments.
-                        eprintln!("fatal: %(HEAD) does not take arguments");
-                        return Err(GitError::Exit(128));
+                        sley_core::diagnostic!(
+                            Stderr,
+                            true,
+                            "fatal: %(HEAD) does not take arguments"
+                        );
+                        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
                     } else if let Some(arg) = other
                         .strip_prefix("subject:")
                         .or_else(|| other.strip_prefix("*subject:"))
@@ -754,8 +762,12 @@ pub fn print_for_each_ref_format_with_is_bases(
                         // The only valid %(subject) arg is `sanitize` (matched
                         // above); anything else is rejected like git's
                         // subject_atom_parser.
-                        eprintln!("fatal: unrecognized %(subject) argument: {arg}");
-                        return Err(GitError::Exit(128));
+                        sley_core::diagnostic!(
+                            Stderr,
+                            true,
+                            "fatal: unrecognized %(subject) argument: {arg}"
+                        );
+                        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
                     } else {
                         return Err(GitError::Command(format!(
                             "unsupported for-each-ref format placeholder %({other})"

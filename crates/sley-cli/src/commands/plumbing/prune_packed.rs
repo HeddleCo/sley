@@ -84,7 +84,7 @@ fn prune_packed_usage<T>() -> Result<T> {
     eprintln!("    -n, --[no-]dry-run    dry run");
     eprintln!("    -q, --[no-]quiet      be quiet");
     eprintln!();
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn prune_packed_object_ids(pack_dir: &Path, format: ObjectFormat) -> Result<HashSet<ObjectId>> {

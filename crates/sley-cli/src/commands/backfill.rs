@@ -8,13 +8,12 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::{self, BufRead};
 use std::path::Path;
 
-use sley::plumbing::sley_object::{Commit, ObjectType, TreeEntries, tree_entry_object_type};
-use sley::plumbing::sley_odb::{FileObjectDatabase, ObjectReader};
-use sley::plumbing::sley_rev::{
+use sley_object::{Commit, ObjectType, TreeEntries, tree_entry_object_type};
+use sley_odb::{FileObjectDatabase, ObjectReader};
+use sley_rev::{
     RevWalk, RevWalkDateWindow, RevWalkOrder, RevisionOptions, RevisionOrder, RevisionSetupContext,
     setup_revisions,
 };
-use sley::plumbing::{sley_remote, sley_rev, sley_worktree};
 use sley_worktree::{
     SparseCheckout, SparseCheckoutMode, path_in_sparse_checkout, worktree_root_for_git_dir,
 };
@@ -51,7 +50,7 @@ pub(crate) fn cmd_backfill(
     let mut rev_args = options.remaining.clone();
     if options.stdin {
         for line in io::stdin().lock().lines() {
-            let line = line.map_err(|err| GitError::Io(err.to_string()))?;
+            let line = line.map_err(GitError::from)?;
             let line = line.trim();
             if !line.is_empty() {
                 rev_args.push(line.to_string());
@@ -172,10 +171,10 @@ pub(crate) fn cmd_backfill(
         }
     }
     for tree in tree_roots {
-        walker.walk_tree(tree, "")?;
+        walker.walk_tree(&cli_session.remote_policy, tree, "")?;
     }
-    walker.flush_paths()?;
-    walker.download_batch()?;
+    walker.flush_paths(&cli_session.remote_policy)?;
+    walker.download_batch(&cli_session.remote_policy)?;
     sley_core::trace2::data("path-walk", "paths", walker.visited_paths.len() as u64);
     Ok(())
 }
@@ -231,7 +230,12 @@ struct BackfillWalker<'a> {
 }
 
 impl BackfillWalker<'_> {
-    fn walk_tree(&mut self, tree_oid: ObjectId, prefix: &str) -> Result<()> {
+    fn walk_tree(
+        &mut self,
+        policy: &sley_remote::RemotePolicy,
+        tree_oid: ObjectId,
+        prefix: &str,
+    ) -> Result<()> {
         if !self.seen_trees.insert(tree_oid) {
             return Ok(());
         }
@@ -239,6 +243,7 @@ impl BackfillWalker<'_> {
         self.visited_paths.insert(prefix.to_string());
         if !self.db.contains(&tree_oid)? {
             let _ = hydrate_oids(
+                policy,
                 self.git_dir,
                 self.cwd,
                 self.config,
@@ -279,7 +284,7 @@ impl BackfillWalker<'_> {
                     if !self.pathspecs.is_empty() && !pathspec_may_contain(self.pathspecs, &path) {
                         continue;
                     }
-                    self.walk_tree(entry.oid, &path)?;
+                    self.walk_tree(policy, entry.oid, &path)?;
                 }
                 ObjectType::Blob => {
                     if let Some(matcher) = self.sparse
@@ -304,7 +309,7 @@ impl BackfillWalker<'_> {
         Ok(())
     }
 
-    fn flush_paths(&mut self) -> Result<()> {
+    fn flush_paths(&mut self, policy: &sley_remote::RemotePolicy) -> Result<()> {
         let paths: Vec<String> = self.by_path.keys().cloned().collect();
         for path in paths {
             let Some(oids) = self.by_path.remove(&path) else {
@@ -312,18 +317,19 @@ impl BackfillWalker<'_> {
             };
             self.batch.extend(oids);
             if self.batch.len() >= self.min_batch_size {
-                self.download_batch()?;
+                self.download_batch(policy)?;
             }
         }
         Ok(())
     }
 
-    fn download_batch(&mut self) -> Result<()> {
+    fn download_batch(&mut self, policy: &sley_remote::RemotePolicy) -> Result<()> {
         if self.batch.is_empty() {
             return Ok(());
         }
         let batch = std::mem::take(&mut self.batch);
         let hydrated = hydrate_oids(
+            policy,
             self.git_dir,
             self.cwd,
             self.config,
@@ -342,6 +348,7 @@ impl BackfillWalker<'_> {
 }
 
 fn hydrate_oids(
+    policy: &sley_remote::RemotePolicy,
     git_dir: &Path,
     cwd: &Path,
     config: &GitConfig,
@@ -391,6 +398,7 @@ fn hydrate_oids(
                 .get("remote", Some(remote_name), "partialclonefilter")
                 .and_then(sley_remote::pack_filter_from_spec);
             let _ = sley_remote::install_fetch_pack_via_local_upload_pack(
+                policy,
                 git_dir,
                 &remote_git_dir,
                 format,
@@ -409,14 +417,15 @@ fn hydrate_oids(
         }
         // Network promisor (HTTP/HTTPS): exact-OID want via smart HTTP, same
         // path as partial-clone checkout blob top-up (t5620 #26).
-        if let Ok(()) = hydrate_oids_via_http(git_dir, format, url, &missing) {
+        if let Ok(()) = hydrate_oids_via_http(policy, git_dir, format, url, &missing) {
             db.refresh_read_cache();
             missing.retain(|oid| !db.contains(oid).unwrap_or(false));
         }
     }
     if !missing.is_empty()
-        && let Ok(got) =
-            sley_remote::hydrate_objects_from_local_promisor_remotes(git_dir, format, &missing)
+        && let Ok(got) = sley_remote::hydrate_objects_from_local_promisor_remotes(
+            policy, git_dir, format, &missing,
+        )
         && !got.is_empty()
     {
         db.refresh_read_cache();
@@ -428,6 +437,7 @@ fn hydrate_oids(
 
 /// Fetch exact missing object ids from a smart-HTTP promisor remote.
 fn hydrate_oids_via_http(
+    policy: &sley_remote::RemotePolicy,
     git_dir: &Path,
     format: ObjectFormat,
     url: &str,
@@ -480,6 +490,7 @@ fn hydrate_oids_via_http(
     let mut progress = sley_remote::SilentProgress;
     if let Some(handshake) = discovered.handshake.as_ref() {
         sley_remote::install_fetch_pack_via_http_protocol_v2_fetch(
+            policy,
             pack_request,
             handshake,
             &mut credentials,
@@ -488,6 +499,7 @@ fn hydrate_oids_via_http(
         )?;
     } else {
         sley_remote::install_fetch_pack_via_http_upload_pack(
+            policy,
             pack_request,
             &mut credentials,
             &mut progress,
@@ -515,7 +527,7 @@ fn parse_backfill_options(args: &[String]) -> Result<BackfillOptions> {
         match arg.as_str() {
             "-h" | "--help" => {
                 println!("{USAGE}");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             "--" => {
                 saw_dashdash = true;
@@ -634,7 +646,7 @@ fn load_sparse_matcher(git_dir: &Path, config: &GitConfig) -> Result<SparseMatch
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Err(GitError::Command("problem loading sparse-checkout".into()));
         }
-        Err(err) => return Err(GitError::Io(err.to_string())),
+        Err(err) => return Err(GitError::from(err)),
     };
     let patterns = contents
         .split(|&b| b == b'\n')

@@ -1,9 +1,6 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 #![allow(clippy::expect_used)]
 
-use sley::plumbing::{
-    sley_diff_merge, sley_index, sley_object, sley_refs, sley_rev, sley_worktree,
-};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
@@ -335,7 +332,7 @@ pub(crate) fn cmd_status(cli_session: &crate::session::CliSession, args: &[Strin
     }
     if explicit_long && z {
         eprintln!("fatal: options '--long' and '-z' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let cwd = cli_session.cwd().to_path_buf();
     let git_dir = cli_session.git_dir()?;
@@ -654,7 +651,7 @@ fn apply_status_split_index_config(
 /// `git status -h`: usage synopsis + exit 129, mirroring commit_usage().
 fn status_usage() -> Result<()> {
     eprintln!("usage: git status [<options>] [--] [<pathspec>...]");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 /// Display knobs for the long ("porcelain off") `git status` output, derived
@@ -919,12 +916,12 @@ fn lazy_submodule_ignore_resolver<'a>(
 
 fn status_option_takes_no_value_error(option: &str) -> Result<()> {
     eprintln!("error: option `{option}' takes no value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn status_invalid_untracked_files_mode_error(mode: &str) -> Result<()> {
     eprintln!("fatal: Invalid untracked files mode '{mode}'");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 /// Parse a `-u<mode>` / `--untracked-files=<mode>` value. Upstream accepts the
@@ -944,22 +941,22 @@ fn parse_status_untracked_mode(value: &str) -> Result<sley_worktree::StatusUntra
 
 fn status_invalid_ignored_mode_error(mode: &str) -> Result<()> {
     eprintln!("fatal: Invalid ignored mode '{mode}'");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn status_unsupported_porcelain_version_error(version: &str) -> Result<()> {
     eprintln!("fatal: unsupported porcelain version '{version}'");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn status_bad_ignore_submodules_argument_error(value: &str) -> Result<()> {
     eprintln!("fatal: bad --ignore-submodules argument: {value}");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn status_unsupported_column_option_error(value: &str) -> Result<()> {
     eprintln!("error: unsupported option '{value}'");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 struct StatusPathspec {
@@ -1793,7 +1790,7 @@ fn adjust_comment_line_char(message: &[u8]) -> Result<String> {
             eprintln!(
                 "fatal: unable to select a comment character that is not used\nin the current commit message"
             );
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }

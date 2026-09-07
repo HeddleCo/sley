@@ -1,7 +1,6 @@
 //! Repository config read/write and remote name helpers.
 
 use crate::*;
-use sley::plumbing::{sley_config, sley_refs};
 use std::path::Path;
 
 pub(crate) fn read_repo_config(git_dir: &Path) -> Result<GitConfig> {
@@ -58,7 +57,6 @@ pub(crate) fn read_effective_repo_config_resolved(
         cwd,
     )?;
     sley_config::remotes::augment_with_legacy_remote_files(&mut config, git_dir);
-    sley_core::activate_precompose_unicode(config.get_bool("core", None, "precomposeunicode"));
     Ok(config)
 }
 
@@ -163,7 +161,7 @@ pub(crate) fn write_repo_config(git_dir: &Path, config: &GitConfig) -> Result<()
             "error: could not lock config file {}: File exists",
             git_dir.join("config").display()
         );
-        return Err(GitError::Exit(255));
+        return Err(crate::cli_exit(255));
     }
     fs::write(git_dir.join("config"), config.to_canonical_bytes())?;
     Ok(())
@@ -202,7 +200,7 @@ pub(crate) fn validate_remote_name(name: &str) -> Result<()> {
         // Upstream `builtin/remote.c` (add / rename): `die("'%s' is not a valid
         // remote name")` — a `fatal:` line and exit 128.
         eprintln!("fatal: '{name}' is not a valid remote name");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(())
 }

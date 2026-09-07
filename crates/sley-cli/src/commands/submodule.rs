@@ -1,6 +1,5 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
-use sley::plumbing::{sley_core, sley_diff_merge, sley_index, sley_rev, sley_worktree};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
@@ -71,7 +70,7 @@ pub(crate) fn cmd_submodule(
                 // `git submodule -h` uses parse-options help semantics: usage
                 // goes to stdout, but the process exits 129.
                 println!("{}", submodule_usage_text());
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             // A bare `--` / `--end-of-options` (or any other unknown leading
             // option) is a usage error.
@@ -250,7 +249,7 @@ fn cmd_submodule_add(
         eprintln!(
             "fatal: relative repository paths can only be used from the toplevel of the working tree"
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     // git's `module_add`: a `./` or `../` repository is resolved against the
@@ -284,14 +283,14 @@ fn cmd_submodule_add(
             "fatal: Unable to create '{}': File exists.",
             git_dir.join("index.lock").display()
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let existing_repo =
         destination.is_dir() && sley_diff_merge::gitlink_git_dir(&destination).is_some();
     if existing_repo && submodule_head(&destination).is_err() {
         eprintln!("fatal: '{normalized_path}' does not have a commit checked out");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if !options.force
         && let Some(index) = read_repository_index(git_dir, format)?
@@ -301,16 +300,17 @@ fn cmd_submodule_add(
             .any(|entry| path_matches_or_is_beneath(&entry.path, normalized_path.as_bytes()))
     {
         eprintln!("fatal: '{normalized_path}' already exists in the index");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     // Upstream add_submodule(): an existing directory must be a populated
     // (non-bare) repository — anything else, even an empty directory, is fatal.
     if destination.is_dir() && !existing_repo {
         eprintln!("fatal: '{normalized_path}' already exists and is not a valid git repo");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if !options.force
         && sley_worktree::path_matches_standard_ignore(
+            cli_session.precompose_unicode(),
             worktree_root,
             normalized_path.as_bytes(),
             true,
@@ -320,7 +320,7 @@ fn cmd_submodule_add(
         eprintln!("{normalized_path}");
         eprintln!("hint: Use -f if you really want to add them.");
         eprintln!("hint: Disable this message with \"git config set advice.addIgnoredFile false\"");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
 
     ensure_writing_gitmodules_ok(git_dir, format, worktree_root)?;
@@ -362,7 +362,7 @@ fn cmd_submodule_add(
     let submodule_format = repository_object_format(&submodule_git_dir)?;
     if submodule_format != format {
         eprintln!("fatal: cannot add a submodule of a different hash algorithm");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     write_submodule_mapping(
@@ -478,7 +478,7 @@ fn cmd_submodule_update(
                     "Failed to clone '{}' a second time, aborting",
                     submodule.name
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
     }
@@ -566,12 +566,12 @@ fn update_one_submodule(
             "fatal: cannot clone submodule '{}' without a URL",
             submodule.name
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
 
     if submodule_path_contains_symlink(&context.worktree_root, &submodule.path)? {
         eprintln!("fatal: refusing to update submodule path '{display}' through a symlink");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let just_populated = submodule_head(&path).is_err();
@@ -588,7 +588,7 @@ fn update_one_submodule(
             // A failed fresh clone (missing alternate, network, etc.) is
             // non-fatal for the sibling loop: git schedules a retry and only
             // aborts after the second failure.
-            Err(GitError::Exit(128)) | Err(GitError::Exit(1)) => {
+            Err(error) if matches!(crate::cli_reported_status(&error), Some(128 | 1)) => {
                 return Ok(UpdateOutcome::CloneFailed);
             }
             Err(err) => return Err(err),
@@ -616,7 +616,7 @@ fn update_one_submodule(
                 "fatal: Invalid update mode '{value}' configured for submodule path '{}'",
                 submodule.path
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     };
 
@@ -695,7 +695,7 @@ fn populate_submodule_worktree(
                     "fatal: destination path '{}' already exists and is not an empty directory",
                     submodule.path
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         } else {
             fs::create_dir_all(path)?;
@@ -796,7 +796,7 @@ fn superproject_alternate_reference_args(git_dir: &Path, name: &str) -> Result<V
             let err = format!("path '{candidate_display}' does not exist");
             if require {
                 eprintln!("fatal: submodule '{name}' cannot add alternate: {err}");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             eprintln!("submodule '{name}' cannot add alternate: {err}");
             continue;
@@ -872,7 +872,7 @@ fn remote_target_oid(
         let status = self_sley_fetch(path, &remote)?;
         if !status.success() {
             eprintln!("fatal: Unable to fetch in submodule path '{display}'");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
 
@@ -884,7 +884,7 @@ fn remote_target_oid(
         "fatal: Unable to find {remote_ref} revision in submodule path '{}'",
         display
     );
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 /// Run `sley fetch <remote>` inside the submodule worktree (git's `git -C
@@ -894,10 +894,7 @@ fn self_sley_fetch(path: &Path, remote: &str) -> Result<std::process::ExitStatus
     let mut command = ProcessCommand::new(exe);
     clear_submodule_child_repo_env(&mut command);
     command.arg("fetch").arg(remote);
-    command
-        .current_dir(path)
-        .status()
-        .map_err(|err| GitError::Io(err.to_string()))
+    command.current_dir(path).status().map_err(GitError::from)
 }
 
 /// git's `remote_submodule_branch`: `submodule.<name>.branch` from
@@ -929,7 +926,7 @@ fn resolve_remote_branch(
         "fatal: Submodule ({}) branch configured to inherit branch from superproject, but the superproject is not on any branch",
         submodule.name
     );
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 /// Read the `.gitmodules` `branch` value for a submodule (the typed config
@@ -1038,10 +1035,7 @@ fn run_submodule_update_command(
     clear_submodule_child_repo_env(&mut command);
 
     io::stdout().flush()?;
-    let status = command
-        .current_dir(path)
-        .status()
-        .map_err(|err| GitError::Io(err.to_string()))?;
+    let status = command.current_dir(path).status().map_err(GitError::from)?;
 
     if !status.success() {
         match strategy.kind {
@@ -1050,7 +1044,7 @@ fn run_submodule_update_command(
                 // git returns the `git checkout` exit code (1) WITHOUT die()ing
                 // the whole run, so sibling submodules still update (the loop in
                 // update_submodules continues on any code != 128).
-                return Ok(UpdateOutcome::NonFatalCheckoutError(GitError::Exit(1)));
+                return Ok(UpdateOutcome::NonFatalCheckoutError(crate::cli_exit(1)));
             }
             UpdateType::Rebase => {
                 eprintln!("fatal: Unable to rebase '{oid}' in submodule path '{display}'");
@@ -1066,7 +1060,7 @@ fn run_submodule_update_command(
         }
         // rebase/merge/command failures are git's `die_message` (exit 128):
         // fatal, stop the whole run immediately.
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     if !quiet {
@@ -1123,7 +1117,7 @@ fn recurse_submodule_update(
     let status = command
         .current_dir(submodule_root)
         .status()
-        .map_err(|err| GitError::Io(err.to_string()))?;
+        .map_err(GitError::from)?;
     if status.success() {
         return Ok(UpdateOutcome::Done);
     }
@@ -1134,9 +1128,9 @@ fn recurse_submodule_update(
     // outer loop preserves that distinction.
     let code = status.code().unwrap_or(128);
     if code == 128 {
-        Err(GitError::Exit(128))
+        Err(crate::cli_exit(128))
     } else {
-        Ok(UpdateOutcome::NonFatalCheckoutError(GitError::Exit(code)))
+        Ok(UpdateOutcome::NonFatalCheckoutError(crate::cli_exit(code)))
     }
 }
 
@@ -1176,7 +1170,7 @@ fn submodule_usage_text() -> &'static str {
 
 fn submodule_usage<T>() -> Result<T> {
     eprintln!("{}", submodule_usage_text());
-    Err(GitError::Exit(1))
+    Err(crate::cli_exit(1))
 }
 
 fn default_submodule_path(repository: &str) -> String {
@@ -1198,7 +1192,7 @@ fn normalize_submodule_add_path(cwd: &Path, worktree_root: &Path, path: &str) ->
     let normalized = normalize_lexical_path(&absolute);
     let relative = normalized.strip_prefix(worktree_root).map_err(|_| {
         eprintln!("fatal: submodule path '{}' is outside repository", path);
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })?;
     let path = relative
         .components()
@@ -1222,7 +1216,7 @@ fn submodule_add_name(
     if let Some(name) = name_override {
         if !sley_submodule::check_submodule_name(name) {
             eprintln!("fatal: '{name}' is not a valid submodule name");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         return Ok(name.to_string());
     }
@@ -1231,7 +1225,7 @@ fn submodule_add_name(
     let name = submodule_name_for_exact_path(&gitmodules, path).unwrap_or_else(|| path.to_string());
     if !sley_submodule::check_submodule_name(&name) {
         eprintln!("fatal: '{name}' is not a valid submodule name");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(name)
 }
@@ -1257,7 +1251,7 @@ fn validate_submodule_add_name_available(
             "fatal: A git directory for '{}' is found locally with remote(s). Name '{}' is already used for path '{}'",
             path, name, existing_path
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(())
 }
@@ -1401,7 +1395,7 @@ fn cmd_submodule_init(
         }
         if !known_paths.contains(path) {
             eprintln!("fatal: No url found for submodule path '{path}' in .gitmodules");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
 
@@ -1428,7 +1422,7 @@ fn cmd_submodule_init(
         Err(sley_submodule::InitPlanError::MissingUrl { path }) => {
             let display = submodule_displaypath(cwd, worktree_root, &path, &super_prefix)?;
             eprintln!("fatal: No url found for submodule path '{display}' in .gitmodules");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     };
     if !quiet {
@@ -1479,7 +1473,7 @@ fn cmd_submodule_deinit(
     } else {
         if options.paths.is_empty() {
             eprintln!("fatal: Use '--all' if you really want to deinitialize all submodules");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         filter_submodule_configs(cwd, worktree_root, &submodules, &options.paths)?
     };
@@ -1498,7 +1492,7 @@ fn cmd_submodule_deinit(
                 "fatal: Submodule work tree '{}' contains local modifications; use '-f' to discard them",
                 submodule.path
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         let submodule_root = worktree_root.join(&submodule.path);
         if submodule_root.join(".git").is_dir() {
@@ -1684,12 +1678,12 @@ fn recurse_submodule_sync(submodule_root: &Path, display: &str, quiet: bool) -> 
     let status = command
         .current_dir(submodule_root)
         .status()
-        .map_err(|err| GitError::Io(err.to_string()))?;
+        .map_err(GitError::from)?;
     if status.success() {
         return Ok(());
     }
     eprintln!("fatal: failed to recurse into submodule '{display}'");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn cmd_submodule_absorbgitdirs(
@@ -1773,7 +1767,7 @@ fn index_gitlink_paths(
     }
     if let Some((spec, _)) = paths.iter().zip(&matched).find(|(_, hit)| !**hit) {
         eprintln!("error: pathspec '{spec}' did not match any file(s) known to git");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(result)
 }
@@ -1804,7 +1798,7 @@ fn absorb_git_dir_into_superproject(
         if !real_dot.starts_with(&real_common) {
             let Some(name) = name else {
                 eprintln!("fatal: could not lookup name for submodule '{path}'");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             };
             relocate_submodule_git_dir(git_dir, &sub_root, name, &display, quiet)?;
         }
@@ -1814,7 +1808,7 @@ fn absorb_git_dir_into_superproject(
         if !gitfile_resolves(&dot_git) {
             let Some(name) = name else {
                 eprintln!("fatal: could not lookup name for submodule '{path}'");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             };
             let modules_git_dir = git_dir.join("modules").join(name);
             connect_work_tree_and_git_dir(&sub_root, &modules_git_dir)?;
@@ -1899,12 +1893,12 @@ fn recurse_submodule_absorbgitdirs(sub_root: &Path, display: &str, quiet: bool) 
     let status = command
         .current_dir(sub_root)
         .status()
-        .map_err(|err| GitError::Io(err.to_string()))?;
+        .map_err(GitError::from)?;
     if status.success() {
         return Ok(());
     }
     let code = status.code().unwrap_or(128);
-    Err(GitError::Exit(code))
+    Err(crate::cli_exit(code))
 }
 
 fn cmd_submodule_foreach(
@@ -2206,7 +2200,7 @@ fn summary_worktree_side(
     let metadata = match fs::symlink_metadata(&worktree_path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(GitError::Io(err.to_string())),
+        Err(err) => return Err(GitError::from(err)),
     };
     let file_type = metadata.file_type();
     if file_type.is_dir() {
@@ -2331,7 +2325,7 @@ fn cmd_submodule_set_url(
     let mut gitmodules = GitConfig::read(&gitmodules_path)?;
     let Some(name) = submodule_name_for_exact_path(&gitmodules, path) else {
         eprintln!("fatal: no submodule mapping found in .gitmodules for path '{path}'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
     set_submodule_config_value(&mut gitmodules, &name, "url", new_url);
     fs::write(&gitmodules_path, gitmodules.to_canonical_bytes())?;
@@ -2393,7 +2387,7 @@ fn cmd_submodule_set_branch(
     let mut gitmodules = GitConfig::read(&gitmodules_path)?;
     let Some(name) = submodule_name_for_exact_path(&gitmodules, path) else {
         eprintln!("fatal: no submodule mapping found in .gitmodules for path '{path}'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
     match action {
         SubmoduleSetBranchAction::Branch(branch) => {
@@ -2438,14 +2432,14 @@ fn submodule_set_branch_usage<T>() -> Result<T> {
     eprintln!(
         "usage: git submodule set-branch [-q|--quiet] (-d|--default) <path>\n   or: git submodule set-branch [-q|--quiet] (-b|--branch) <branch> <path>\n\n    -d, --[no-]default    set the default tracking branch to master\n    -b, --[no-]branch <branch>\n                          set the default tracking branch\n"
     );
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn submodule_set_url_usage<T>() -> Result<T> {
     eprintln!(
         "usage: git submodule set-url [--quiet] <path> <newurl>\n\n    -q, --[no-]quiet      suppress output for setting url of a submodule\n"
     );
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 pub(super) fn parse_submodule_summary_limit(value: &str) -> Result<isize> {
@@ -2453,7 +2447,7 @@ pub(super) fn parse_submodule_summary_limit(value: &str) -> Result<isize> {
         eprintln!(
             "error: option `summary-limit' expects an integer value with an optional k/m/g suffix"
         );
-        GitError::Exit(129)
+        crate::cli_exit(129)
     })
 }
 
@@ -2489,7 +2483,7 @@ fn filter_submodule_configs<'a>(
             .collect::<Vec<_>>();
         if matching.is_empty() {
             eprintln!("error: pathspec '{path}' did not match any file(s) known to git");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         selected.extend(matching);
     }
@@ -2522,7 +2516,7 @@ fn validate_status_submodule_mappings(
         }
         if !known_paths.contains(path.as_ref()) {
             eprintln!("fatal: no submodule mapping found in .gitmodules for path '{path}'");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     Ok(())
@@ -2558,7 +2552,7 @@ fn filter_update_submodule_configs<'a>(
                 continue;
             }
             eprintln!("error: pathspec '{path}' did not match any file(s) known to git");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         selected.extend(matching);
     }
@@ -2900,13 +2894,13 @@ fn run_submodule_foreach_command(
     let status = command
         .current_dir(&submodule_root)
         .status()
-        .map_err(|err| GitError::Io(err.to_string()))?;
+        .map_err(GitError::from)?;
     if status.success() {
         return Ok(());
     }
     eprintln!("fatal: run_command returned non-zero status for {display_path}");
     eprintln!(".");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 /// `run-command.c prepare_shell_cmd`'s metacharacter test: argv[0] needs a shell
@@ -3296,7 +3290,7 @@ pub(crate) fn read_submodule_configs(worktree_root: &Path) -> Result<Vec<Submodu
         .find(|w| matches!(w, sley_submodule::ParseWarning::InvalidUpdate { .. }))
     {
         eprintln!("fatal: invalid value for 'submodule.{name}.update'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     // git's `.gitmodules` parser warns (and drops the value) for a path/url that
     // could be mistaken for a command-line option (`warn_command_line_option`).
@@ -3406,7 +3400,7 @@ fn ensure_writing_gitmodules_ok(
         || gitmodules_oid_from_head(git_dir, format, &db)?.is_some();
     if tracked {
         eprintln!("fatal: please make sure that the .gitmodules file is in the working tree");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(())
 }
@@ -3499,7 +3493,7 @@ fn ensure_gitlink_head_readable(sub_root: &Path, format: ObjectFormat) -> Result
 
 fn broken_submodule_repository(git_dir: &Path) -> GitError {
     eprintln!("fatal: not a git repository: {}", git_dir.display());
-    GitError::Exit(128)
+    crate::cli_exit(128)
 }
 
 /// Re-stringify a typed update strategy back to the raw `.gitmodules` value the
@@ -3547,7 +3541,7 @@ fn filter_submodules(
             .collect::<Vec<_>>();
         if matching.is_empty() {
             eprintln!("error: pathspec '{path}' did not match any file(s) known to git");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         for submodule in matching {
             selected.push(SubmoduleStatusEntry {
@@ -3830,11 +3824,11 @@ pub(crate) fn cmd_submodule_helper(
         Some("get-default-remote") => submodule_helper_get_default_remote(cli_session, &args[1..]),
         Some(other) => {
             eprintln!("fatal: '{other}' is not a valid submodule--helper subcommand");
-            Err(GitError::Exit(1))
+            Err(crate::cli_exit(1))
         }
         None => {
             eprintln!("usage: git submodule--helper");
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
     }
 }
@@ -3862,13 +3856,13 @@ fn submodule_helper_get_default_remote(
         }
         if !end_opts && arg.len() > 1 && arg.starts_with('-') {
             eprintln!("{USAGE}");
-            return Err(GitError::Exit(129));
+            return Err(crate::cli_exit(129));
         }
         paths.push(arg.clone());
     }
     if paths.len() != 1 {
         eprintln!("{USAGE}");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     let path_arg = &paths[0];
 
@@ -3893,7 +3887,7 @@ fn submodule_helper_get_default_remote(
         .or_else(|| modules_gitdir_for_worktree_path(worktree_root, super_git_dir, &abs_path));
     let Some(sub_git_dir) = sub_git_dir else {
         eprintln!("fatal: could not get a repository handle for submodule '{path_arg}'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
     let sub_format = repository_object_format(&sub_git_dir)?;
     let sub_config = read_repo_config(&sub_git_dir)?;

@@ -1,7 +1,6 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use sley::plumbing::{sley_core, sley_diff_merge, sley_object, sley_odb, sley_rev};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
@@ -279,7 +278,7 @@ pub(crate) fn cmd_rev_list(
                      the only allowed format is 'human'",
                     &value["--disk-usage=".len()..]
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             "--object-names" => object_names = true,
             "--no-object-names" => object_names = false,
@@ -396,7 +395,7 @@ pub(crate) fn cmd_rev_list(
     }
     if object_filter != RevListObjectFilter::None && !objects {
         eprintln!("fatal: object filtering requires --objects");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let author_filters = parse_log_filter_patterns(&author_patterns, regexp_mode)?;
     let committer_filters = parse_log_filter_patterns(&committer_patterns, regexp_mode)?;
@@ -479,8 +478,12 @@ pub(crate) fn cmd_rev_list(
     {
         let oid = ObjectId::from_hex(format, candidate)?;
         if !db.contains(&oid)?
-            && let Err(err) =
-                crate::read_object_maybe_prefetch_promisor(&db, &oid, cli_session.lazy_fetch())
+            && let Err(err) = crate::read_object_maybe_prefetch_promisor(
+                &cli_session.remote_policy,
+                &db,
+                &oid,
+                cli_session.lazy_fetch(),
+            )
             && !matches!(err, GitError::NotFound(_))
         {
             return Err(err);
@@ -536,7 +539,7 @@ pub(crate) fn cmd_rev_list(
     // used together` (revision.c). Graph rendering needs a full parent walk.
     if graph && !matches!(walk_mode, RevListWalkMode::Walk) {
         eprintln!("fatal: options '--no-walk' and '--graph' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let first_parent = revision_options.first_parent;
     let pathspecs = setup.pathspecs;
@@ -697,7 +700,7 @@ pub(crate) fn cmd_rev_list(
         verify_roots.extend(provided_tree_roots.iter().map(|object| object.oid));
         verify_roots.extend(bitmap_object_tips.iter().copied());
         if rev_list_verify_objects(&db, format, verify_roots) {
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
     }
 
@@ -1174,6 +1177,7 @@ pub(crate) fn cmd_rev_list(
     }
     let patchsame_oids = if cherry_mode != RevListCherryMode::None {
         rev_list_patchsame_oids(
+            &cli_session.remote_policy,
             &db,
             format,
             &selected,
@@ -1232,6 +1236,7 @@ pub(crate) fn cmd_rev_list(
     let (mut selected_objects, mut omitted_objects, mut missing_objects, object_origin_commits) =
         if objects {
             rev_list_objects(
+                &cli_session.remote_policy,
                 &db,
                 format,
                 &selected,
@@ -1947,6 +1952,7 @@ fn write_rev_list_commit_header_line(
 }
 
 fn rev_list_patchsame_oids(
+    policy: &sley_remote::RemotePolicy,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     selected: &[&sley_rev::CommitRecord],
@@ -1987,9 +1993,14 @@ fn rev_list_patchsame_oids(
         if left_first != on_left {
             continue;
         }
-        if let Some(id) =
-            rev_list_commit_patch_id(db, format, record, diff_pathspec.as_ref(), lazy_fetch)?
-        {
+        if let Some(id) = rev_list_commit_patch_id(
+            policy,
+            db,
+            format,
+            record,
+            diff_pathspec.as_ref(),
+            lazy_fetch,
+        )? {
             ids.entry(id).or_default().push(record.oid);
         }
     }
@@ -2000,8 +2011,14 @@ fn rev_list_patchsame_oids(
         if left_first == on_left {
             continue;
         }
-        let Some(id) =
-            rev_list_commit_patch_id(db, format, record, diff_pathspec.as_ref(), lazy_fetch)?
+        let Some(id) = rev_list_commit_patch_id(
+            policy,
+            db,
+            format,
+            record,
+            diff_pathspec.as_ref(),
+            lazy_fetch,
+        )?
         else {
             continue;
         };
@@ -2016,6 +2033,7 @@ fn rev_list_patchsame_oids(
 }
 
 fn rev_list_commit_patch_id(
+    policy: &sley_remote::RemotePolicy,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     record: &sley_rev::CommitRecord,
@@ -2031,6 +2049,7 @@ fn rev_list_commit_patch_id(
     };
     let diff = match diff_pathspec {
         Some(pathspec) => rev_list_render_tree_to_tree_patch(
+            policy,
             db,
             format,
             &parent_tree,
@@ -2038,15 +2057,21 @@ fn rev_list_commit_patch_id(
             pathspec,
             lazy_fetch,
         )?,
-        None => {
-            render_tree_to_tree_patch(db, format, &parent_tree, &record.commit.tree, lazy_fetch)
-                .unwrap_or_default()
-        }
+        None => render_tree_to_tree_patch(
+            policy,
+            db,
+            format,
+            &parent_tree,
+            &record.commit.tree,
+            lazy_fetch,
+        )
+        .unwrap_or_default(),
     };
     Ok(commands::patch_id::patch_id_for_diff(&diff, format))
 }
 
 fn rev_list_render_tree_to_tree_patch(
+    policy: &sley_remote::RemotePolicy,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     old_tree: &ObjectId,
@@ -2074,7 +2099,7 @@ fn rev_list_render_tree_to_tree_patch(
                 anchors: &[],
                 allow_textconv: false,
                 db,
-                lazy_fetch: crate::diff_lazy_fetch(lazy_fetch),
+                lazy_fetch: crate::diff_lazy_fetch(policy, lazy_fetch).as_option(),
                 worktree_root: None,
                 use_worktree_new: false,
                 format,
@@ -2401,12 +2426,12 @@ fn validate_rev_list_stdin_args(args: &[String]) -> Result<()> {
             "--end-of-options" => end_of_options = true,
             "--glob" | "--exclude" | "--exclude-hidden" => {
                 eprintln!("fatal: Option '{arg}' requires a value");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             value if value.starts_with("--no-walk=") => {
                 eprintln!("error: invalid argument to --no-walk");
                 eprintln!("fatal: invalid option '{value}' in --stdin mode");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             "--all"
             | "--no-all"
@@ -2452,7 +2477,7 @@ fn validate_rev_list_stdin_args(args: &[String]) -> Result<()> {
                     || value.starts_with("--before=") => {}
             value if value.starts_with('-') => {
                 eprintln!("fatal: invalid option '{value}' in --stdin mode");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             _ => {}
         }
@@ -2599,12 +2624,12 @@ impl RevListObjectFilter {
         }
         if spec.starts_with("sparse:path=") {
             eprintln!("fatal: sparse:path filters support has been dropped");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if let Some(value) = spec.strip_prefix("combine:") {
             if value.is_empty() {
                 eprintln!("fatal: expected something after combine:");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             let mut filters = Vec::new();
             for raw in value.split('+') {
@@ -2614,7 +2639,7 @@ impl RevListObjectFilter {
             return Ok(Self::Combine(filters));
         }
         eprintln!("fatal: invalid filter-spec '{spec}'");
-        Err(GitError::Exit(128))
+        Err(crate::cli_exit(128))
     }
 
     fn combine_with(self, other: Self) -> Self {
@@ -2648,7 +2673,7 @@ impl RevListObjectFilter {
                 let object = db.read_object(&oid)?;
                 if object.object_type != ObjectType::Blob {
                     eprintln!("fatal: expected blob for sparse:oid filter");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 Ok(Self::Sparse(
                     object
@@ -2797,7 +2822,7 @@ fn rev_list_decode_sub_filter(raw: &str) -> Result<String> {
                     "fatal: must escape char in sub-filter-spec: '{}'",
                     bytes[idx] as char
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             b'%' => {
                 let Some(high) = bytes
@@ -2805,14 +2830,14 @@ fn rev_list_decode_sub_filter(raw: &str) -> Result<String> {
                     .and_then(|byte| (*byte as char).to_digit(16))
                 else {
                     eprintln!("fatal: invalid filter-spec");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 };
                 let Some(low) = bytes
                     .get(idx + 2)
                     .and_then(|byte| (*byte as char).to_digit(16))
                 else {
                     eprintln!("fatal: invalid filter-spec");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 };
                 out.push((high * 16 + low) as u8);
                 idx += 3;
@@ -2862,6 +2887,7 @@ fn rev_list_selected_tag_objects(
 }
 
 fn rev_list_objects(
+    policy: &sley_remote::RemotePolicy,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     records: &[&sley_rev::CommitRecord],
@@ -2909,6 +2935,7 @@ fn rev_list_objects(
     for record in records {
         state.current_commit = Some(record.oid);
         rev_list_collect_tree_objects(
+            policy,
             &walk,
             &record.commit.tree,
             Vec::new(),
@@ -2921,6 +2948,7 @@ fn rev_list_objects(
     state.current_commit = None;
     for root in tree_roots {
         rev_list_collect_tree_objects(
+            policy,
             &walk,
             &root.oid,
             root.name.clone(),
@@ -2989,6 +3017,7 @@ fn rev_list_mark_tree_objects(
 }
 
 fn rev_list_collect_tree_objects(
+    policy: &sley_remote::RemotePolicy,
     walk: &RevListObjectWalk<'_>,
     tree_oid: &ObjectId,
     path: Vec<u8>,
@@ -3039,7 +3068,7 @@ fn rev_list_collect_tree_objects(
             .and_modify(|seen_depth| *seen_depth = (*seen_depth).min(depth))
             .or_insert(depth);
     }
-    let object = match rev_list_read_object(walk, tree_oid) {
+    let object = match rev_list_read_object(policy, walk, tree_oid) {
         Ok(object) => object,
         Err(err) => {
             return rev_list_handle_missing_object(
@@ -3078,6 +3107,7 @@ fn rev_list_collect_tree_objects(
         let entry_path = rev_list_join_object_path(&path, entry.name);
         if entry_type == ObjectType::Tree {
             rev_list_collect_tree_objects(
+                policy,
                 walk,
                 &entry.oid,
                 entry_path,
@@ -3093,7 +3123,7 @@ fn rev_list_collect_tree_objects(
                         walk.missing_action,
                         RevListMissingAction::AllowAny | RevListMissingAction::AllowPromisor
                     )) {
-                let object = match rev_list_read_object(walk, &entry.oid) {
+                let object = match rev_list_read_object(policy, walk, &entry.oid) {
                     Ok(object) => object,
                     Err(err) => {
                         rev_list_handle_missing_object(
@@ -3142,11 +3172,12 @@ fn rev_list_collect_tree_objects(
 }
 
 fn rev_list_read_object(
+    policy: &sley_remote::RemotePolicy,
     walk: &RevListObjectWalk<'_>,
     oid: &ObjectId,
 ) -> Result<Arc<EncodedObject>> {
     if matches!(walk.missing_action, RevListMissingAction::Error) {
-        crate::read_object_maybe_prefetch_promisor(walk.db, oid, walk.lazy_fetch)
+        crate::read_object_maybe_prefetch_promisor(policy, walk.db, oid, walk.lazy_fetch)
     } else {
         walk.db.read_object(oid)
     }
@@ -3853,11 +3884,11 @@ fn rev_list_test_bitmap(
     let objects_dir = sley_odb::repository_objects_dir(git_dir);
     let Some(bitmap) = sley_odb::load_pack_bitmap(&objects_dir, format)? else {
         eprintln!("fatal: failed to load bitmap indexes");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
     if include_commits.len() != 1 || !exclude_tips.is_empty() {
         eprintln!("fatal: you must specify exactly one commit to test");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let tip = include_commits[0];
     eprintln!(
@@ -3866,7 +3897,7 @@ fn rev_list_test_bitmap(
     );
     let Some(stored) = bitmap.bitmap_for_commit(&tip) else {
         eprintln!("fatal: commit '{tip}' doesn't have an indexed bitmap");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
     let stored = std::sync::Arc::clone(stored);
     eprintln!("Found bitmap for '{tip}'. {} bits", bitmap.object_count());
@@ -3876,6 +3907,6 @@ fn rev_list_test_bitmap(
         Ok(())
     } else {
         eprintln!("fatal: mismatch in bitmap results");
-        Err(GitError::Exit(128))
+        Err(crate::cli_exit(128))
     }
 }

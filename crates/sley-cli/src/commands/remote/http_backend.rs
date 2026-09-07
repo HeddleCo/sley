@@ -4,12 +4,12 @@ use std::env;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use sley::plumbing::sley_remote::{
+use sley::Result;
+use sley_protocol::write_pkt_line_payload;
+use sley_remote::{
     HttpBackendOperation, HttpBackendRequest, HttpBackendService, http_backend_service_enabled,
     plan_http_backend_request,
 };
-use sley::{GitError, Result};
-use sley_protocol::write_pkt_line_payload;
 
 use super::resolve::RemoteCommandContext;
 use super::{cmd_receive_pack, cmd_upload_pack, ls_remote_git_dir, read_repo_config};
@@ -19,7 +19,7 @@ pub(crate) fn cmd_http_backend(
     args: &[String],
 ) -> Result<()> {
     if !args.is_empty() {
-        return Err(GitError::usage("usage: git http-backend"));
+        return Err(crate::cli_usage("usage: git http-backend"));
     }
     let path_info = env::var("PATH_INFO").ok();
     let path_translated = env::var_os("PATH_TRANSLATED").map(PathBuf::from);

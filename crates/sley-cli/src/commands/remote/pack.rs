@@ -13,7 +13,7 @@ use super::resolve::{RemoteCommandContext, ls_remote_git_dir};
 use crate::commands::config_cmd::{ConfigKey, config_set_value};
 use crate::remote::{remote_config_values, resolve_remote_push_url, rewrite_url_with_config};
 use crate::*;
-use sley::plumbing::sley_odb::ObjectReader;
+use sley_odb::ObjectReader;
 #[cfg(test)]
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -49,7 +49,7 @@ fn read_capped_packfile<R: Read>(reader: &mut R, max_input_size: Option<u64>) ->
                     "fatal: pack exceeds maximum allowed size ({})",
                     crate::commands::pack::humanise_byte_count(limit)
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
         None => {
@@ -115,7 +115,8 @@ pub(crate) fn cmd_receive_pack(
     features.push_options = config
         .get_bool("receive", None, "advertisepushoptions")
         .unwrap_or(false);
-    let mut advertisements = sley_remote::local_fetch_advertisements(&git_dir, format)?;
+    let mut advertisements =
+        sley_remote::local_fetch_advertisements(&cli_session.remote_policy, &git_dir, format)?;
     sley_remote::attach_receive_pack_capabilities(&mut advertisements, format, &features)?;
 
     if advertise_refs || !stateless_rpc {
@@ -156,19 +157,23 @@ pub(crate) fn cmd_receive_pack(
         .any(|cap| cap.name == "report-status" || cap.name == "report-status-v2");
     let mut hook_stderr = Vec::new();
     let push_options = header.push_options.as_deref().unwrap_or(&[]);
-    let outcome = sley_remote::serve_receive_pack(sley_remote::ReceivePackServerRequest {
-        git_dir: &git_dir,
-        format,
-        header: &header,
-        pack_reader: &mut stdin,
-        config: &config,
-        validation: &validation,
-        options: sley_remote::ReceivePackServerOptions {
-            quiet,
-            remote_stderr: Some(&mut hook_stderr),
-            run_post_hooks: false,
+    let outcome = sley_remote::serve_receive_pack(
+        cli_session.original_cwd.as_deref(),
+        sley_remote::ReceivePackServerRequest {
+            policy: &cli_session.remote_policy,
+            git_dir: &git_dir,
+            format,
+            header: &header,
+            pack_reader: &mut stdin,
+            config: &config,
+            validation: &validation,
+            options: sley_remote::ReceivePackServerOptions {
+                quiet,
+                remote_stderr: Some(&mut hook_stderr),
+                run_post_hooks: false,
+            },
         },
-    })?;
+    )?;
     if use_sideband {
         let stdout = io::stdout();
         let mut stdout = stdout.lock();
@@ -299,6 +304,7 @@ pub(crate) fn cmd_upload_pack(
         let mut stdout = stdout.lock();
         return if stateless_rpc {
             sley_remote::serve_upload_pack_v2_stateless_with_config(
+                &cli_session.remote_policy,
                 &git_dir,
                 format,
                 &config,
@@ -307,6 +313,7 @@ pub(crate) fn cmd_upload_pack(
             )
         } else {
             sley_remote::serve_upload_pack_v2_with_config(
+                &cli_session.remote_policy,
                 &git_dir,
                 format,
                 &config,
@@ -315,8 +322,9 @@ pub(crate) fn cmd_upload_pack(
             )
         };
     }
-    let features = sley_remote::upload_pack_features(&git_dir, format)?;
-    let mut advertisements = sley_remote::local_fetch_advertisements(&git_dir, format)?;
+    let features = sley_remote::upload_pack_features(&cli_session.remote_policy, &git_dir, format)?;
+    let mut advertisements =
+        sley_remote::local_fetch_advertisements(&cli_session.remote_policy, &git_dir, format)?;
     sley_remote::attach_upload_pack_capabilities(&mut advertisements, format, &features)?;
 
     {
@@ -385,7 +393,7 @@ pub(crate) fn cmd_send_pack(
     // it works outside a git repo too (the `nongit` case in t5400).
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
         println!("{SEND_PACK_USAGE}");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
 
     let remote_context = RemoteCommandContext::require_repository(cli_session)?;
@@ -411,7 +419,7 @@ pub(crate) fn cmd_send_pack(
         match arg.as_str() {
             "-h" | "--help" => {
                 println!("{SEND_PACK_USAGE}");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             "-f" | "--force" => force = true,
             "-n" | "--dry-run" => dry_run = true,
@@ -459,7 +467,7 @@ pub(crate) fn cmd_send_pack(
             value if value.starts_with('-') => {
                 eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
                 eprintln!("{SEND_PACK_USAGE}");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             value => positional.push(value.to_string()),
         }
@@ -471,7 +479,7 @@ pub(crate) fn cmd_send_pack(
 
     let Some((dest, refs)) = positional.split_first() else {
         eprintln!("{SEND_PACK_USAGE}");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     };
     let mut refs = refs.to_vec();
     if from_stdin {
@@ -487,11 +495,11 @@ pub(crate) fn cmd_send_pack(
     }
     if refs.is_empty() && !all_refs && !mirror {
         eprintln!("{SEND_PACK_USAGE}");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     if !refs.is_empty() && (all_refs || mirror) {
         eprintln!("{SEND_PACK_USAGE}");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
 
     let remote_git_dir = ls_remote_git_dir(&remote_context, dest)?;
@@ -530,8 +538,11 @@ pub(crate) fn cmd_send_pack(
 
     // `--mirror` deletes remote refs the local repo no longer has.
     if mirror {
-        let remote_advertisements =
-            sley_remote::local_fetch_advertisements(&remote_git_dir, format)?;
+        let remote_advertisements = sley_remote::local_fetch_advertisements(
+            &cli_session.remote_policy,
+            &remote_git_dir,
+            format,
+        )?;
         let local_names: std::collections::HashSet<String> = store
             .list_refs()?
             .into_iter()
@@ -564,26 +575,30 @@ pub(crate) fn cmd_send_pack(
         progress: false,
         thin,
     };
-    run_push_local_report(RunPushLocalReport {
-        git_dir: &git_dir,
-        common_git_dir: &common_git_dir,
-        format,
-        remote: dest,
-        resolved_remote: dest,
-        remote_git_dir: &remote_git_dir,
-        remote_common_git_dir: &remote_common_git_dir,
-        refspecs: &refspecs,
-        options,
-        porcelain: false,
-        atomic,
-        force_if_includes: false,
-        push_options: &[],
-        force_with_lease: &force_with_lease,
-        force_with_lease_default: false,
-        replace_objects: cli_session.replace_objects(),
-        receive_pack_command: receive_pack_command.as_deref(),
-        receive_config_overrides: &receive_config_overrides,
-    })
+    run_push_local_report(
+        cli_session.original_cwd.as_deref(),
+        &cli_session.remote_policy,
+        RunPushLocalReport {
+            git_dir: &git_dir,
+            common_git_dir: &common_git_dir,
+            format,
+            remote: dest,
+            resolved_remote: dest,
+            remote_git_dir: &remote_git_dir,
+            remote_common_git_dir: &remote_common_git_dir,
+            refspecs: &refspecs,
+            options,
+            porcelain: false,
+            atomic,
+            force_if_includes: false,
+            push_options: &[],
+            force_with_lease: &force_with_lease,
+            force_with_lease_default: false,
+            replace_objects: cli_session.replace_objects(),
+            receive_pack_command: receive_pack_command.as_deref(),
+            receive_config_overrides: &receive_config_overrides,
+        },
+    )
 }
 
 fn reject_duplicate_push_destinations(refspecs: &[String]) -> Result<()> {
@@ -596,7 +611,7 @@ fn reject_duplicate_push_destinations(refspecs: &[String]) -> Result<()> {
         }
         if !seen.insert(dst.to_string()) {
             eprintln!("error: multiple updates for ref '{dst}' not allowed");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     Ok(())
@@ -721,7 +736,7 @@ pub(crate) fn cmd_push(cli_session: &crate::session::CliSession, args: &[String]
             value if value.starts_with('-') => {
                 eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
                 eprintln!("usage: git push [<options>] [<repository> [<refspec>...]]");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             value => positional.push(value.to_string()),
         }
@@ -833,6 +848,7 @@ pub(crate) fn cmd_push(cli_session: &crate::session::CliSession, args: &[String]
             remote.as_str()
         };
         if super::helper::push_with_remote_helper(
+            &cli_session.remote_policy,
             &git_dir,
             format,
             helper_remote,
@@ -847,7 +863,7 @@ pub(crate) fn cmd_push(cli_session: &crate::session::CliSession, args: &[String]
         {
             continue;
         }
-        check_transport_allowed_url(&resolved_remote, Some(&config))?;
+        check_transport_allowed_url(&cli_session.remote_policy, &resolved_remote, Some(&config))?;
         let parsed_remote = parse_remote_url(&resolved_remote)?;
         // All transports delegate the git work to `sley_remote::push`, picked purely
         // by the resolved `PushDestination`; this command keeps owning URL/repo
@@ -882,6 +898,7 @@ pub(crate) fn cmd_push(cli_session: &crate::session::CliSession, args: &[String]
             // `--mirror` also deletes remote refs the local repo no longer has.
             let remote_advertisements = if mirror || prune || follow_tags {
                 Some(sley_remote::local_fetch_advertisements(
+                    &cli_session.remote_policy,
                     remote_git_dir,
                     format,
                 )?)
@@ -938,6 +955,8 @@ pub(crate) fn cmd_push(cli_session: &crate::session::CliSession, args: &[String]
             )?;
             if force_with_lease_default {
                 expand_default_force_with_lease(
+                    cli_session.original_cwd.as_deref(),
+                    &cli_session.remote_policy,
                     &git_dir,
                     &common_git_dir,
                     format,
@@ -1002,26 +1021,30 @@ pub(crate) fn cmd_push(cli_session: &crate::session::CliSession, args: &[String]
                 }
             }
             trace_configured_local_protocol_version(Some(config));
-            let result = run_push_local_report(RunPushLocalReport {
-                git_dir: &git_dir,
-                common_git_dir: &common_git_dir,
-                format,
-                remote: &remote,
-                resolved_remote: &resolved_remote,
-                remote_git_dir,
-                remote_common_git_dir,
-                refspecs: &refspecs,
-                options,
-                porcelain,
-                atomic,
-                force_if_includes,
-                push_options: &push_options,
-                force_with_lease: &force_with_lease,
-                force_with_lease_default,
-                replace_objects: cli_session.replace_objects(),
-                receive_pack_command: receive_pack_command.as_deref(),
-                receive_config_overrides: &receive_config_overrides,
-            });
+            let result = run_push_local_report(
+                cli_session.original_cwd.as_deref(),
+                &cli_session.remote_policy,
+                RunPushLocalReport {
+                    git_dir: &git_dir,
+                    common_git_dir: &common_git_dir,
+                    format,
+                    remote: &remote,
+                    resolved_remote: &resolved_remote,
+                    remote_git_dir,
+                    remote_common_git_dir,
+                    refspecs: &refspecs,
+                    options,
+                    porcelain,
+                    atomic,
+                    force_if_includes,
+                    push_options: &push_options,
+                    force_with_lease: &force_with_lease,
+                    force_with_lease_default,
+                    replace_objects: cli_session.replace_objects(),
+                    receive_pack_command: receive_pack_command.as_deref(),
+                    receive_config_overrides: &receive_config_overrides,
+                },
+            );
             if result.is_ok() {
                 trace2_local_transfer_negotiation(config, receive_pack_command.as_deref());
             }
@@ -1034,6 +1057,7 @@ pub(crate) fn cmd_push(cli_session: &crate::session::CliSession, args: &[String]
             None => push_options_from_config(&repo_config)?,
         };
         run_push(
+            cli_session.original_cwd.as_deref(),
             &remote_context,
             &git_dir,
             &common_git_dir,
@@ -1291,6 +1315,8 @@ fn resolve_force_with_lease(
 }
 
 fn expand_default_force_with_lease(
+    original_cwd: Option<&std::path::Path>,
+    policy: &sley_remote::RemotePolicy,
     git_dir: &Path,
     common_git_dir: &Path,
     format: ObjectFormat,
@@ -1309,6 +1335,8 @@ fn expand_default_force_with_lease(
 ) -> Result<()> {
     let source_db = crate::repository::open_object_database(git_dir, format, replace_objects)?;
     let preview = sley_remote::push_local_with_report_and_objects(
+        original_cwd,
+        policy,
         sley_remote::PushReportRequest {
             git_dir,
             common_git_dir,
@@ -1616,7 +1644,7 @@ fn push_options_from_config(config: &GitConfig) -> Result<Vec<String>> {
             Some(value) => out.push(value.to_string()),
             None => {
                 eprintln!("fatal: push.pushOption must have a value");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
     }
@@ -1679,7 +1707,7 @@ fn check_one_submodule_target(
             "fatal: submodule path '{}' contains changes that are not found on any remote",
             submodule.path
         );
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -1820,17 +1848,17 @@ fn push_on_demand_submodules(
         let status = command
             .current_dir(&submodule_root)
             .status()
-            .map_err(|err| GitError::Io(err.to_string()))?;
+            .map_err(GitError::from)?;
         if !status.success() {
             eprintln!("fatal: failed to push all needed submodules");
-            return Err(GitError::Exit(status.code().unwrap_or(1)));
+            return Err(crate::cli_exit(status.code().unwrap_or(1)));
         }
         if submodule_commit_needs_push(&submodule, Some(&child_remote))? {
             eprintln!(
                 "fatal: submodule path '{}' contains changes that could not be pushed",
                 submodule.path
             );
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
     }
     Ok(())
@@ -1880,7 +1908,7 @@ fn ensure_push_submodule_commit_oid(submodule: &PushSubmodule, oid: &ObjectId) -
             "fatal: submodule path '{}' does not contain commit {}",
             submodule.path, oid
         );
-        GitError::Exit(1)
+        crate::cli_exit(1)
     })?;
     if object.object_type != sley_object::ObjectType::Commit {
         eprintln!(
@@ -1889,7 +1917,7 @@ fn ensure_push_submodule_commit_oid(submodule: &PushSubmodule, oid: &ObjectId) -
             oid,
             object.object_type.as_str()
         );
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -1949,7 +1977,7 @@ fn submodule_push_remote(
             "fatal: remote '{}' not found in submodule path '{}'",
             parent_remote, submodule.path
         );
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(Some(default_push_remote_name(
         &submodule.git_dir,
@@ -2009,7 +2037,7 @@ fn validate_submodule_push_refspecs(submodule: &PushSubmodule, refspecs: &[Strin
                 "fatal: cannot propagate object-id refspec into submodule path '{}'",
                 submodule.path
             );
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         if src == "HEAD"
             && let Some(branch) = dst.strip_prefix("refs/heads/")
@@ -2019,7 +2047,7 @@ fn validate_submodule_push_refspecs(submodule: &PushSubmodule, refspecs: &[Strin
                 "fatal: HEAD refspec does not match current branch in submodule path '{}'",
                 submodule.path
             );
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
     }
     Ok(())
@@ -2078,11 +2106,11 @@ fn parse_push_recurse_submodules(value: &str) -> Result<PushRecurseSubmodules> {
         "no" | "false" | "off" => Ok(PushRecurseSubmodules::Off),
         "yes" | "true" | "on" => {
             eprintln!("fatal: unsupported --recurse-submodules mode '{value}'");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
         other => {
             eprintln!("fatal: bad --recurse-submodules argument: {other}");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -2095,7 +2123,7 @@ fn parse_push_recurse_submodules_config(value: &str) -> Result<PushRecurseSubmod
         "no" | "false" | "off" => Ok(PushRecurseSubmodules::Off),
         "yes" | "true" | "on" => {
             eprintln!("fatal: unsupported push.recurseSubmodules mode '{value}'");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
         _ => Ok(PushRecurseSubmodules::Default),
     }
@@ -2223,6 +2251,7 @@ fn push_command_was_forced(
 }
 
 fn run_push(
+    original_cwd: Option<&std::path::Path>,
     context: &RemoteCommandContext,
     git_dir: &Path,
     common_git_dir: &Path,
@@ -2240,6 +2269,7 @@ fn run_push(
     let mut credentials = sley_remote::CredentialHelperProvider::new(Some(&config));
     let mut progress = StdoutProgress::default();
     let remote_options = sley_remote::PushOptions {
+        policy: context.remote_policy.clone(),
         quiet: options.quiet,
         force: options.force,
         thin: options.thin,
@@ -2269,11 +2299,11 @@ fn run_push(
     let plan = match sley_remote::plan_push(request, &mut services) {
         Err(GitError::InvalidFormat(message)) if message.contains("push-options") => {
             eprintln!("fatal: the receiving end does not support push options");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         Err(GitError::InvalidFormat(message)) if message.contains("atomic") => {
             eprintln!("fatal: the receiving end does not support --atomic push");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         result => result?,
     };
@@ -2328,7 +2358,7 @@ fn run_push(
         }
         if had_errors {
             eprintln!("error: failed to push some refs to '{url}'");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         return Ok(());
     }
@@ -2344,7 +2374,7 @@ fn run_push(
         sley_refs::RefTransactionPhase::Prepared,
     )?;
     let preflight_rejections = plan.preflight_rejections.clone();
-    let outcome = sley_remote::execute_push_plan(request, &mut services, plan)?;
+    let outcome = sley_remote::execute_push_plan(original_cwd, request, &mut services, plan)?;
     run_local_receive_reference_transaction_hook_phase(
         destination,
         &outcome.commands,
@@ -2417,7 +2447,7 @@ fn run_push(
     }
     if had_errors {
         eprintln!("error: failed to push some refs to '{url}'");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -2447,7 +2477,11 @@ struct RunPushLocalReport<'a> {
 /// Drive a file:// push through [`sley_remote::push_local_with_report`], render
 /// git's `transport_print_push_status`, update remote-tracking refs, run hooks,
 /// and return the git exit code (1 when any ref was rejected).
-fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
+fn run_push_local_report(
+    original_cwd: Option<&std::path::Path>,
+    policy: &sley_remote::RemotePolicy,
+    req: RunPushLocalReport<'_>,
+) -> Result<()> {
     let config = read_repo_config(req.git_dir).unwrap_or_default();
     let source_db =
         crate::repository::open_object_database(req.git_dir, req.format, req.replace_objects)?;
@@ -2462,7 +2496,7 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
             .unwrap_or(true)
     {
         eprintln!("fatal: the receiving end does not support --atomic push");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if !req.push_options.is_empty()
         && !remote_config
@@ -2470,7 +2504,7 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
             .unwrap_or(false)
     {
         eprintln!("fatal: the receiving end does not support push options");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     // First pass: classify every ref WITHOUT applying anything (a dry-run plan).
@@ -2478,6 +2512,8 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
     // is written, matching git's receive-pack ordering, and reject all refs when
     // a hook declines.
     let plan = sley_remote::push_local_with_report_and_objects(
+        original_cwd,
+        policy,
         sley_remote::PushReportRequest {
             git_dir: req.git_dir,
             common_git_dir: req.common_git_dir,
@@ -2512,7 +2548,7 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
             eprintln!("Perhaps you should specify a branch.");
             eprintln!("fatal: the remote end hung up unexpectedly");
             eprintln!("error: failed to push some refs to '{url}'");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         return Ok(());
     }
@@ -2550,6 +2586,7 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
     {
         let local_db = FileObjectDatabase::from_git_dir(req.common_git_dir, req.format);
         sley_remote::stage_local_push_quarantine(
+            policy,
             req.remote_git_dir,
             req.remote_common_git_dir,
             req.format,
@@ -2590,6 +2627,8 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
         plan
     } else {
         sley_remote::push_local_with_report_and_objects(
+            original_cwd,
+            policy,
             sley_remote::PushReportRequest {
                 git_dir: req.git_dir,
                 common_git_dir: req.common_git_dir,
@@ -2750,14 +2789,14 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
 
     if had_errors {
         eprintln!("error: failed to push some refs to '{url}'");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     if let Some(command) = req.receive_pack_command
         && !custom_receive_pack_command_is_native_git(command)
         && !custom_receive_pack_command_exits_successfully(command, req.remote_git_dir)?
     {
         eprintln!("error: failed to push some refs to '{url}'");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -3349,7 +3388,7 @@ fn print_push_ref(
     local_db: &FileObjectDatabase,
     remote_db: &FileObjectDatabase,
 ) {
-    use sley::plumbing::sley_remote::PushRefStatus;
+    use sley_remote::PushRefStatus;
     let (flag, summary, msg): (char, String, Option<String>) = match &reference.status {
         PushRefStatus::Ok => push_ok_summary(reference, local_db, remote_db),
         PushRefStatus::UpToDate => ('=', "[up to date]".to_string(), None),
@@ -4022,7 +4061,7 @@ fn reject_empty_branch_config(config: &GitConfig) -> Result<()> {
                 .map(|entry| entry.key.as_str())
                 .unwrap_or("");
             eprintln!("fatal: bad config variable 'branch..{key}' in file '.git/config'");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     Ok(())
@@ -4167,7 +4206,7 @@ fn default_push_refspecs(
             eprintln!(
                 "fatal: You didn't specify any refspecs to push, and push.default is \"nothing\"."
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         _ => {}
     }
@@ -4179,7 +4218,7 @@ To push the history leading to the current (detached HEAD)\n\
 state now, use\n\n\
     git push {remote} HEAD:<name-of-remote-branch>"
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
 
     let mode = push_default_mode(config);
@@ -4207,7 +4246,7 @@ state now, use\n\n\
 your current branch '{branch}', without telling me what to push\n\
 to update which remote branch."
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             dst = push_upstream_ref(config, branch, remote, auto_setup)?;
         }
@@ -4265,7 +4304,7 @@ Either specify the URL from the command-line or configure a remote repository us
 and then push using the remote name\n\n\
     git push <name>"
     );
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn default_fetch_remote_for_branch(config: &GitConfig, branch: &str) -> String {
@@ -4308,13 +4347,13 @@ To push the current branch and set the remote as upstream, use\n\n\
     git push --set-upstream {remote} {branch}\n\
 {advice}"
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if merges.len() != 1 {
         eprintln!(
             "fatal: The current branch {branch} has multiple upstream branches, refusing to push."
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(merges[0].to_string())
 }
@@ -4335,7 +4374,7 @@ To push to the branch of the same name on the remote, use\n\n\
     git push {remote} HEAD\n\
 {advice_pushdefault}"
     );
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn configure_push_upstreams_from_report(
@@ -4459,8 +4498,8 @@ mod receive_max_input_size_tests {
         let err = read_capped_packfile(&mut &data[..], Some(16))
             .expect_err("over the cap must error rather than buffer it all");
         match err {
-            GitError::Exit(128) => {}
-            other => panic!("expected GitError::Exit(128), got {other:?}"),
+            error if crate::cli_reported_status(&error) == Some(128) => {}
+            other => panic!("expected reported CLI status 128, got {other:?}"),
         }
     }
 }

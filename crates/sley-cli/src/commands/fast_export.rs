@@ -1,16 +1,16 @@
 //! `git fast-export` — emit a fast-import stream for the given revisions.
 
 use crate::*;
-use sley::plumbing::sley_diff_merge::{
+use sley_diff_merge::{
     DiffNameStatusOptions, NameStatus, NameStatusEntry, diff_name_status_empty_tree_with_options,
     diff_name_status_trees_with_options,
 };
-use sley::plumbing::sley_rev::revlist::{rev_list_topo_order, rev_list_walk_commits_with_missing};
-use sley::plumbing::sley_rev::{
+use sley_pathspec::{Pathspec, normalized_revwalk_pathspec};
+use sley_rev::revlist::{rev_list_topo_order, rev_list_walk_commits_with_missing};
+use sley_rev::{
     CommitRecord, SimplifyOptions, ancestry_path_on_set, peel_to_commit,
     simplify_history_with_bottoms,
 };
-use sley_pathspec::{Pathspec, normalized_revwalk_pathspec};
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum SignMode {
@@ -127,7 +127,7 @@ pub(crate) fn cmd_fast_export(
         eprintln!(
             "fatal: options '--import-marks' and '--import-marks-if-exists' cannot be used together"
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let setup = sley_rev::setup_revisions(
@@ -620,7 +620,7 @@ impl FastExporter {
                 eprintln!(
                     "fatal: encountered signed commit {oid}; use --signed-commits=<mode> to handle it"
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             SignMode::WarnVerbatim => {
                 eprintln!(
@@ -675,7 +675,7 @@ impl FastExporter {
                     String::from_utf8_lossy(encoding),
                     commit_oid,
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             (Some(_), ReencodeMode::No) => (commit.message.clone(), true),
             _ => (commit.message.clone(), false),
@@ -837,7 +837,7 @@ impl FastExporter {
         if tag.object_type == ObjectType::Tag {
             if !self.options.mark_tags {
                 eprintln!("fatal: cannot export nested tags unless --mark-tags is specified.");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             self.emit_tag_ref(full_name, tag.object)?;
             write!(
@@ -914,7 +914,7 @@ impl FastExporter {
                 eprintln!(
                     "fatal: tag {tag_oid} tags unexported object; use --tag-of-filtered-object=<mode> to handle it"
                 );
-                Err(GitError::Exit(128))
+                Err(crate::cli_exit(128))
             }
             TagOfFilteredMode::Drop => Ok(()),
             TagOfFilteredMode::Rewrite => match tagged_type {
@@ -944,7 +944,7 @@ impl FastExporter {
                 }
                 ObjectType::Tag if !self.options.mark_tags => {
                     eprintln!("fatal: cannot export nested tags unless --mark-tags is specified.");
-                    Err(GitError::Exit(128))
+                    Err(crate::cli_exit(128))
                 }
                 ObjectType::Blob => {
                     self.emit_rewritten_tag(full_name, tag_oid, tag, 0)?;
@@ -1032,7 +1032,7 @@ impl FastExporter {
         match self.options.signed_tags {
             SignMode::Abort if sig_start < message.len() => {
                 eprintln!("fatal: encountered signed tag; use --signed-tags=<mode> to handle it");
-                Err(GitError::Exit(128))
+                Err(crate::cli_exit(128))
             }
             SignMode::WarnVerbatim if sig_start < message.len() => {
                 eprintln!("warning: exporting signed tag");
@@ -1317,7 +1317,7 @@ fn parse_sign_mode(value: &str, option: &str) -> Result<SignMode> {
         "strip" => Ok(SignMode::Strip),
         other => {
             eprintln!("fatal: unknown {option} mode: {other}");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -1329,7 +1329,7 @@ fn parse_tag_of_filtered_mode(value: &str) -> Result<TagOfFilteredMode> {
         "rewrite" => Ok(TagOfFilteredMode::Rewrite),
         other => {
             eprintln!("fatal: unknown tag-of-filtered mode: {other}");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -1341,7 +1341,7 @@ fn parse_reencode_mode(value: &str) -> Result<ReencodeMode> {
         "abort" => Ok(ReencodeMode::Abort),
         other => {
             eprintln!("fatal: unknown reencoding mode: {other}");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -1354,7 +1354,7 @@ fn import_marks_into(
 ) -> Result<u64> {
     let contents = fs::read_to_string(path).map_err(|err| {
         eprintln!("fatal: unable to open marks file {path:?} for reading: {err}");
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })?;
     import_marks_from_str(db, format, &contents, marks)
 }
@@ -1371,23 +1371,23 @@ fn import_marks_from_str(
             line.strip_prefix(':').and_then(|rest| rest.split_once(' '))
         else {
             eprintln!("fatal: corrupt mark line: {line}");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         };
         let mark: u64 = mark_text.parse().map_err(|_| {
             eprintln!("fatal: corrupt mark line: {line}");
-            GitError::Exit(128)
+            crate::cli_exit(128)
         })?;
         if mark == 0 {
             eprintln!("fatal: corrupt mark line: {line}");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         let oid = ObjectId::from_hex(format, oid_text.trim()).map_err(|_| {
             eprintln!("fatal: corrupt mark line: {line}");
-            GitError::Exit(128)
+            crate::cli_exit(128)
         })?;
         let object = db.read_object(&oid).map_err(|_| {
             eprintln!("fatal: object not found: {oid_text}");
-            GitError::Exit(128)
+            crate::cli_exit(128)
         })?;
         if object.object_type != ObjectType::Commit {
             continue;
@@ -1403,7 +1403,7 @@ fn export_marks(path: &Path, marks: &HashMap<ObjectId, u64>, _format: ObjectForm
     entries.sort_by_key(|(mark, _)| *mark);
     let mut file = fs::File::create(path).map_err(|err| {
         eprintln!("fatal: unable to open marks file {path:?} for writing: {err}");
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })?;
     for (mark, oid) in entries {
         writeln!(file, ":{mark} {}", oid.to_hex())?;
@@ -1449,7 +1449,7 @@ fn validate_fast_export_tag_refs(
                 Ok(target) => target,
                 Err(_) => {
                     eprintln!("fatal: could not read tagged object '{}'", tag.object);
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
             };
             if target.object_type != tag.object_type {
@@ -1459,7 +1459,7 @@ fn validate_fast_export_tag_refs(
                     tag.object_type.as_str(),
                     target.object_type.as_str()
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             continue;
         }
@@ -1483,7 +1483,7 @@ fn validate_fast_export_tag_refs(
             );
         }
         if has_error {
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     Ok(())

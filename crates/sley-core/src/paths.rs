@@ -166,7 +166,7 @@ pub fn relative_path_lexical(target: &Path, base: &Path) -> String {
 /// is returned unchanged (rendered lossily) — there is no meaningful relative
 /// spelling across roots.
 pub fn relative_path_from_absolute(cwd: &Path, target: &Path) -> Result<String> {
-    let cwd = fs::canonicalize(cwd).map_err(|err| GitError::Io(err.to_string()))?;
+    let cwd = fs::canonicalize(cwd).map_err(GitError::from)?;
     relative_path_from_absolute_components(&cwd, target)
 }
 

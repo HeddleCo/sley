@@ -1,7 +1,6 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
 use crate::*;
-use sley::plumbing::{sley_index, sley_worktree};
 
 use super::add::{
     active_sparse_checkout_for_add, add_git_path_bytes, add_index_entries_path_range,
@@ -27,7 +26,7 @@ pub(crate) fn cmd_rm(cli_session: &crate::session::CliSession, args: &[String]) 
                 eprintln!(
                     "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             paths.push(PathBuf::from(arg));
             continue;
@@ -54,7 +53,7 @@ pub(crate) fn cmd_rm(cli_session: &crate::session::CliSession, args: &[String]) 
                     eprintln!(
                         "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 let value = iter.next().ok_or_else(|| {
                     GitError::Command("--pathspec-from-file requires a value".into())
@@ -67,7 +66,7 @@ pub(crate) fn cmd_rm(cli_session: &crate::session::CliSession, args: &[String]) 
                     eprintln!(
                         "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 let value = value.strip_prefix("--pathspec-from-file=").ok_or_else(|| {
                     GitError::Command("--pathspec-from-file requires a value".into())
@@ -99,7 +98,7 @@ pub(crate) fn cmd_rm(cli_session: &crate::session::CliSession, args: &[String]) 
                     eprintln!(
                         "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 paths.push(PathBuf::from(value));
             }
@@ -107,20 +106,20 @@ pub(crate) fn cmd_rm(cli_session: &crate::session::CliSession, args: &[String]) 
     }
     if pathspec_file_nul && pathspec_from_file.is_none() {
         eprintln!("fatal: the option '--pathspec-file-nul' requires '--pathspec-from-file'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if let Some(pathspec_file) = pathspec_from_file {
         paths.extend(read_pathspecs_from_file(&pathspec_file, pathspec_file_nul)?);
     }
     if paths.is_empty() {
         eprintln!("fatal: No pathspec was given. Which files should I remove?");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if paths.iter().any(|path| path.as_os_str().is_empty()) {
         eprintln!(
             "fatal: empty string is not a valid pathspec. please use . instead if you meant to match all paths"
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let cwd = cli_session.cwd().to_path_buf();
     let git_dir = cli_session.git_dir()?;
@@ -142,6 +141,7 @@ pub(crate) fn cmd_rm(cli_session: &crate::session::CliSession, args: &[String]) 
         .collect::<Vec<_>>();
     let config_parameters_env = effective_config_parameters_env();
     let result = sley_worktree::remove_index_and_worktree_paths(
+        cli_session.original_cwd.as_deref(),
         worktree_root,
         git_dir,
         format,
@@ -235,7 +235,7 @@ pub(crate) fn cmd_mv(cli_session: &crate::session::CliSession, args: &[String]) 
             "fatal: destination '{}' is not a directory",
             destination.display()
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if paths.len() > 2 {
         validate_mv_sources_do_not_overlap(&cwd, &worktree_root, &paths[..paths.len() - 1])?;
@@ -251,6 +251,7 @@ pub(crate) fn cmd_mv(cli_session: &crate::session::CliSession, args: &[String]) 
         vec![false; sources.len()]
     } else {
         let (rejected_paths, per_source) = mv_sparse_rejections(
+            cli_session.precompose_unicode(),
             &cwd,
             &worktree_root,
             &git_dir,
@@ -261,7 +262,7 @@ pub(crate) fn cmd_mv(cli_session: &crate::session::CliSession, args: &[String]) 
         if !rejected_paths.is_empty() {
             advise_on_updating_sparse_paths(&git_dir, &rejected_paths);
             if !skip_errors {
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
         }
         per_source
@@ -278,6 +279,7 @@ pub(crate) fn cmd_mv(cli_session: &crate::session::CliSession, args: &[String]) 
             cwd.join(source)
         };
         let result = sley_worktree::move_index_and_worktree_path(
+            cli_session.original_cwd.as_deref(),
             &worktree_root,
             &git_dir,
             format,
@@ -309,7 +311,7 @@ pub(crate) fn cmd_mv(cli_session: &crate::session::CliSession, args: &[String]) 
         }
         if let Some(fatal) = results.iter().find_map(|result| result.fatal.as_deref()) {
             eprintln!("{fatal}");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     if dry_run || verbose {
@@ -343,6 +345,7 @@ pub(crate) fn cmd_mv(cli_session: &crate::session::CliSession, args: &[String]) 
 /// absent skip-worktree index entry (git's "lstat fails + ce_skip_worktree"
 /// branch). A destination is sparse when it lies outside the cone.
 fn mv_sparse_rejections(
+    precompose: sley_core::PrecomposeUnicode,
     cwd: &Path,
     worktree_root: &Path,
     git_dir: &Path,
@@ -358,7 +361,7 @@ fn mv_sparse_rejections(
     // disk (but still tracks) as a directory; detect that from the index so a
     // contained file's mapped destination path is computed correctly.
     let dest_is_dir = destination.is_dir()
-        || mv_git_relative_path(worktree_root, destination).is_some_and(|dest_git| {
+        || mv_git_relative_path(precompose, worktree_root, destination).is_some_and(|dest_git| {
             let mut prefix = dest_git;
             prefix.push(b'/');
             index.as_ref().is_some_and(|index| {
@@ -383,10 +386,10 @@ fn mv_sparse_rejections(
         } else {
             destination.to_path_buf()
         };
-        let Some(src_git) = mv_git_relative_path(worktree_root, &source_abs) else {
+        let Some(src_git) = mv_git_relative_path(precompose, worktree_root, &source_abs) else {
             continue;
         };
-        let dst_git = mv_git_relative_path(worktree_root, &dest_abs);
+        let dst_git = mv_git_relative_path(precompose, worktree_root, &dest_abs);
         // A directory source (still tracked under a prefix even after its files
         // were sparsified off disk) expands to its contained entries: git lists
         // each contained file's source and mapped destination that is sparse.
@@ -440,9 +443,13 @@ fn mv_sparse_rejections(
     Ok((rejected, per_source))
 }
 
-fn mv_git_relative_path(worktree_root: &Path, absolute: &Path) -> Option<Vec<u8>> {
+fn mv_git_relative_path(
+    precompose: sley_core::PrecomposeUnicode,
+    worktree_root: &Path,
+    absolute: &Path,
+) -> Option<Vec<u8>> {
     let relative = absolute.strip_prefix(worktree_root).ok()?;
-    let git_path = add_git_path_bytes(relative).ok()?;
+    let git_path = add_git_path_bytes(precompose, relative).ok()?;
     (!git_path.is_empty()).then_some(git_path)
 }
 
@@ -478,11 +485,11 @@ fn validate_mv_sources_do_not_overlap(
         for right in normalized.iter().skip(left_index + 1) {
             if mv_path_is_parent(left, right) {
                 print_mv_parent_child_error(right, left);
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             if mv_path_is_parent(right, left) {
                 print_mv_parent_child_error(left, right);
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
     }

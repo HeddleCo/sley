@@ -9,7 +9,6 @@
 //! is a drop-in replacement.
 #![allow(clippy::expect_used)]
 
-use sley::plumbing::sley_worktree;
 // Pull shared plumbing (RepositoryContext, ObjectReader, Index/IndexEntry,
 // GitError/Result, std::* re-exports, …) from the crate root.
 // A submodule can see its ancestors' items, so the glob keeps this file in step
@@ -182,7 +181,7 @@ fn setup_checkout_index_options(args: &[String]) -> Result<CheckoutIndexOptions>
                 eprintln!("error: {message}");
             }
             print_checkout_index_usage();
-            return Err(GitError::Exit(129));
+            return Err(crate::cli_exit(129));
         }
     };
     let mut options = CheckoutIndexOptions::default();
@@ -236,7 +235,7 @@ fn parse_checkout_index_stage(value: &str) -> Result<CheckoutIndexStage> {
         "all" => Ok(CheckoutIndexStage::All),
         _ => {
             eprintln!("fatal: stage should be between 1 and 3 or all");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -247,29 +246,29 @@ fn run_checkout_index(
 ) -> Result<()> {
     if options.all && !options.paths.is_empty() {
         eprintln!("fatal: git checkout-index: don't mix '--all' and explicit filenames");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if options.stdin && !options.paths.is_empty() {
         eprintln!("fatal: git checkout-index: don't mix '--stdin' and explicit filenames");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if options.all && options.stdin {
         eprintln!("fatal: git checkout-index: don't mix '--all' and '--stdin'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let temp = options
         .temp
         .unwrap_or(matches!(options.stage, CheckoutIndexStage::All));
     if matches!(options.stage, CheckoutIndexStage::All) && !temp {
         eprintln!("fatal: options '--stage=all' and '--no-temp' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let repo = match RepositoryContext::from_session(cli_session) {
         Ok(repo) => repo,
         Err(GitError::NotFound(_)) => {
             eprintln!("fatal: not a git repository (or any of the parent directories): .git");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         Err(err) => return Err(err),
     };
@@ -471,7 +470,7 @@ fn run_checkout_index(
     }
 
     if had_error {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -618,9 +617,10 @@ fn checkout_temp_create_path(worktree_root: &Path) -> Result<(String, PathBuf)> 
             Err(err) => return Err(err),
         }
     }
-    Err(GitError::Io(
-        "unable to create temporary checkout file".into(),
-    ))
+    Err(GitError::IoKind {
+        kind: std::io::ErrorKind::Other,
+        message: "unable to create temporary checkout file".into(),
+    })
 }
 
 fn checkout_index_print_temp_record(
@@ -1061,7 +1061,7 @@ fn read_checkout_index_stdin(nul: bool) -> Result<Vec<Vec<u8>>> {
 
 fn checkout_index_help() -> GitError {
     print_checkout_index_usage_to_stdout();
-    GitError::Exit(129)
+    crate::cli_exit(129)
 }
 
 const CHECKOUT_INDEX_USAGE: &str = "\

@@ -5,11 +5,9 @@
 //! behavior in one place while preserving command-specific parsing and errors.
 #![allow(clippy::expect_used)]
 
-use sley::plumbing::{sley_core, sley_odb, sley_rev};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use crate::sley_worktree;
 use sley::ObjectDatabase as FileObjectDatabase;
 use sley::RefStore as FileRefStore;
 use sley::{GitConfig, Repository, ResolvedRepositoryOpen};
@@ -33,7 +31,7 @@ pub(crate) enum ObjectAccess {
 /// The canonical definition lives in the shared setup engine
 /// ([`sley_worktree::discovery::setup::WorktreePolicy`]); this alias keeps the
 /// CLI call sites unchanged.
-pub(crate) use crate::sley_worktree::discovery::setup::WorktreePolicy;
+pub(crate) use sley_worktree::discovery::setup::WorktreePolicy;
 
 pub(crate) struct RepositoryContext {
     cwd: PathBuf,

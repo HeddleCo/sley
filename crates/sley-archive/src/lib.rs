@@ -149,12 +149,14 @@ impl<'a> ArchiveConvert<'a> {
     /// the object database; only attribute lookup comes from the current
     /// worktree chain.
     pub fn from_worktree(
+        precompose: sley_core::PrecomposeUnicode,
         worktree_root: impl AsRef<std::path::Path>,
         config: &'a GitConfig,
     ) -> Result<Self> {
         Ok(Self {
             config,
             attributes: ArchiveAttributes::Worktree(StandardAttributeMatcher::from_worktree_root(
+                precompose,
                 worktree_root,
             )?),
             subst: None,
@@ -512,12 +514,8 @@ where
         Vec::new(),
         flate2::Compression::new(compression_level.min(9)),
     );
-    encoder
-        .write_all(&tar)
-        .map_err(|err| GitError::Io(err.to_string()))?;
-    let gz = encoder
-        .finish()
-        .map_err(|err| GitError::Io(err.to_string()))?;
+    encoder.write_all(&tar).map_err(GitError::from)?;
+    let gz = encoder.finish().map_err(GitError::from)?;
     writer.write_all(&gz)?;
     Ok(())
 }
@@ -577,7 +575,7 @@ struct TarSink<'a, 'w, W: Write + ?Sized> {
 impl<W: Write + ?Sized> ArchiveSink for TarSink<'_, '_, W> {
     fn emit(&mut self, entry: ArchiveEntry<'_>) -> Result<()> {
         if self.verbose {
-            eprintln!("{}", String::from_utf8_lossy(entry.path()));
+            sley_core::diagnostic!(Stderr, true, "{}", String::from_utf8_lossy(entry.path()));
         }
         match entry {
             ArchiveEntry::Directory { path } => {

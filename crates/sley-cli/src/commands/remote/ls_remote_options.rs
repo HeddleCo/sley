@@ -195,7 +195,7 @@ fn parse_ls_remote_sort(value: &str) -> Result<LsRemoteSort> {
         "-creatordate" => Ok(LsRemoteSort::CreatorDateDescending),
         other => {
             eprintln!("fatal: unknown field name: {other}");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -220,5 +220,5 @@ fn ls_remote_usage<T>() -> Result<T> {
     eprintln!("    -o, --[no-]server-option <server-specific>");
     eprintln!("                          option to transmit");
     eprintln!();
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }

@@ -13,7 +13,6 @@
 //! (`git rev-list <target> ^<tag>`). The winner is the candidate with the
 //! smallest depth, ties broken by registration order (which follows commit date).
 
-use sley::plumbing::{sley_rev, sley_worktree};
 // Glob the crate root for shared plumbing; see commands::stash for rationale.
 use crate::*;
 
@@ -119,7 +118,7 @@ pub(crate) fn cmd_describe(
             "--" => positional_only = true,
             "-h" | "--help" => {
                 print_describe_usage(&mut io::stdout());
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             "--all" => options.all = true,
             "--no-all" => options.all = false,
@@ -199,18 +198,18 @@ pub(crate) fn cmd_describe(
 
     if options.long && options.abbrev == Some(0) {
         eprintln!("fatal: options '--long' and '--abbrev=0' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if options.contains {
         return describe_contains(cli_session, &options, &commits);
     }
     if options.dirty.is_some() && !commits.is_empty() {
         eprintln!("fatal: option '--dirty' and commit-ishes cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if options.broken.is_some() && !commits.is_empty() {
         eprintln!("fatal: option '--broken' and commit-ishes cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let repo = RepositoryContext::from_session(cli_session)?;
@@ -232,7 +231,7 @@ pub(crate) fn cmd_describe(
     // then suggests `--tags`).
     if tags.by_commit.is_empty() && !options.always {
         eprintln!("fatal: No names found, cannot describe anything.");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     if commits.is_empty() {
@@ -678,7 +677,7 @@ fn describe_commit_text(
     // matches are acceptable; without one, git errors even under `--always`.
     if options.max_candidates == 0 {
         eprintln!("fatal: no tag exactly matches '{}'", target.to_hex());
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     if options.debug {
@@ -786,7 +785,7 @@ fn describe_no_candidate(
         eprintln!("fatal: No tags can describe '{oid}'.");
         eprintln!("Try --always, or create some tags.");
     }
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 /// `--always` still respects an explicit `--abbrev=0` request by widening to the
@@ -835,10 +834,10 @@ fn describe_commit_parents(
 fn resolve_describe_commit(repo: &RepositoryContext, rev: &str) -> Result<ObjectId> {
     let oid = match repo.resolve_revision(rev) {
         Ok(oid) => oid,
-        Err(GitError::Exit(code)) => return Err(GitError::Exit(code)),
+        Err(error) if crate::cli_reported_status(&error).is_some() => return Err(error),
         Err(_) => {
             eprintln!("fatal: Not a valid object name {rev}");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     };
     let object = repo.objects().read_object(&oid)?;
@@ -848,7 +847,7 @@ fn resolve_describe_commit(repo: &RepositoryContext, rev: &str) -> Result<Object
         other => {
             eprintln!("fatal: {} is neither a commit nor blob", oid.to_hex());
             let _ = other;
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -861,10 +860,10 @@ enum DescribeTarget {
 fn resolve_describe_target(repo: &RepositoryContext, rev: &str) -> Result<DescribeTarget> {
     let oid = match repo.resolve_revision(rev) {
         Ok(oid) => oid,
-        Err(GitError::Exit(code)) => return Err(GitError::Exit(code)),
+        Err(error) if crate::cli_reported_status(&error).is_some() => return Err(error),
         Err(_) => {
             eprintln!("fatal: Not a valid object name {rev}");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     };
     let object = repo.objects().read_object(&oid)?;
@@ -875,12 +874,12 @@ fn resolve_describe_target(repo: &RepositoryContext, rev: &str) -> Result<Descri
             Ok(commit) => Ok(DescribeTarget::Commit(commit)),
             Err(_) => {
                 eprintln!("fatal: {rev} is neither a commit nor blob");
-                Err(GitError::Exit(128))
+                Err(crate::cli_exit(128))
             }
         },
         _ => {
             eprintln!("fatal: {rev} is neither a commit nor blob");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -901,13 +900,13 @@ fn describe_blob(
                 "fatal: cannot search for blob '{}' on an unborn branch",
                 blob.to_hex()
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     };
     let head_object = db.read_object(&head)?;
     if head_object.object_type != ObjectType::Commit {
         eprintln!("fatal: blob '{}' not reachable from HEAD", blob.to_hex());
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     for commit_oid in describe_reachable_commits_reverse(format, db, &head)? {
@@ -930,7 +929,7 @@ fn describe_blob(
     }
 
     eprintln!("fatal: blob '{}' not reachable from HEAD", blob.to_hex());
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn describe_reachable_commits_reverse(
@@ -1118,7 +1117,7 @@ fn parse_describe_abbrev(value: &str) -> Result<usize> {
         Ok(parsed) => Ok(parsed as usize),
         Err(_) => {
             eprintln!("error: option `abbrev' expects a numerical value");
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
     }
 }
@@ -1133,7 +1132,7 @@ fn parse_describe_candidates(value: &str) -> Result<usize> {
             eprintln!(
                 "error: option `candidates' expects an integer value with an optional k/m/g suffix"
             );
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
     }
 }
@@ -1153,19 +1152,19 @@ fn parse_describe_magnitude(value: &str) -> Option<i64> {
 
 fn describe_option_requires_value_error(option: &str) -> Result<()> {
     eprintln!("error: option `{option}' requires a value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn describe_unknown_option_error(option: &str) -> Result<()> {
     eprintln!("error: unknown option `{option}'");
     print_describe_usage(&mut io::stderr());
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn describe_unknown_switch_error(switch: char) -> Result<()> {
     eprintln!("error: unknown switch `{switch}'");
     print_describe_usage(&mut io::stderr());
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn print_describe_usage(out: &mut impl Write) {

@@ -150,8 +150,12 @@ pub(crate) fn parse_reflog_expire_time(value: &str, option: &str) -> Result<i64>
     if let Some(ts) = sley_core::date::approxidate::parse_approxidate(value) {
         return Ok(ts);
     }
-    eprintln!("fatal: invalid timestamp '{value}' given to '{option}'");
-    Err(GitError::Exit(128))
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "fatal: invalid timestamp '{value}' given to '{option}'"
+    );
+    Err(GitError::Rejected(sley_core::RejectionKind::Refused))
 }
 
 fn parse_reflog_expire_date(value: &str) -> Option<i64> {

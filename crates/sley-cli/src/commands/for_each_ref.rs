@@ -1,7 +1,6 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 #![allow(clippy::expect_used)]
 
-use sley::plumbing::{sley_object, sley_refs, sley_rev};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
@@ -96,7 +95,7 @@ pub(crate) fn for_each_ref_core_with_config(
     // -h before eager sort validation can error.
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
         print_for_each_ref_usage(usage_cmd);
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     let mut idx = 0;
     while idx < args.len() {
@@ -298,11 +297,11 @@ pub(crate) fn for_each_ref_core_with_config(
     }
     if start_after.is_some() && sort_explicit {
         eprintln!("fatal: cannot use --start-after with custom sort options");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if start_after.is_some() && !patterns.is_empty() {
         eprintln!("fatal: cannot use --start-after with patterns");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if sorts.is_empty() {
         sorts.push(ForEachRefSort::Refname);
@@ -310,7 +309,7 @@ pub(crate) fn for_each_ref_core_with_config(
     // git: `if (HAS_MULTI_BITS(format.quote_style))` -> error + usage (exit 129).
     if quote_styles > 1 {
         eprintln!("error: more than one quoting style?");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     let format_spec = ForEachRefFormat::parse(&format_spec)?;
     let is_base_targets = for_each_ref_is_base_targets(&format_spec)?;
@@ -321,7 +320,7 @@ pub(crate) fn for_each_ref_core_with_config(
     ) && for_each_ref_format_has_bare_raw(&format_spec)
     {
         eprintln!("fatal: --format=%(raw) cannot be used with --python, --shell, --tcl");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let needs = ForEachRefNeeds::analyze(&format_spec);
     let format = repository_object_format(&git_dir)?;
@@ -583,7 +582,7 @@ pub(crate) fn for_each_ref_core_with_config(
                     let next = db.read_object(&next_oid)?;
                     if declared_type != next.object_type {
                         eprintln!("error: bad tag pointer to {next_oid} in {target_oid}");
-                        return Err(GitError::Exit(128));
+                        return Err(crate::cli_exit(128));
                     }
                     target_oid = next_oid;
                     target = next;
@@ -884,7 +883,7 @@ struct ForEachRefNeeds {
 fn for_each_ref_missing_object(err: GitError, oid: &ObjectId, refname: &str) -> GitError {
     if matches!(err, GitError::NotFound(_)) {
         eprintln!("fatal: missing object {oid} for {refname}");
-        return GitError::Exit(128);
+        return crate::cli_exit(128);
     }
     err
 }
@@ -965,7 +964,7 @@ pub(crate) fn for_each_ref_parse_describe_opts(opts: &str) -> Result<sley_pretty
 
 fn for_each_ref_bad_describe_arg(bad: &str) -> GitError {
     eprintln!("fatal: unrecognized %(describe) argument: {bad}");
-    GitError::Exit(128)
+    crate::cli_exit(128)
 }
 
 /// Trailers hook: render `%(trailers[:opts])` / `%(contents:trailers[:opts])`
@@ -1004,11 +1003,11 @@ fn for_each_ref_render_trailers(
             Ok(options) => options,
             Err(None) => {
                 eprintln!("fatal: expected %(trailers:key=<value>)");
-                return Some(Err(GitError::Exit(128)));
+                return Some(Err(crate::cli_exit(128)));
             }
             Err(Some(invalid)) => {
                 eprintln!("fatal: unknown %(trailers) argument: {invalid}");
-                return Some(Err(GitError::Exit(128)));
+                return Some(Err(crate::cli_exit(128)));
             }
         },
     };
@@ -1104,11 +1103,11 @@ fn for_each_ref_validate_ahead_behind(
         };
         let Some(base) = base.filter(|base| !base.is_empty()) else {
             eprintln!("fatal: expected format: %(ahead-behind:<committish>)");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         };
         if for_each_ref_resolve_revision(git_dir, format, db, base).is_err() {
             eprintln!("fatal: failed to find '{base}'");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     Ok(())
@@ -1129,7 +1128,7 @@ fn for_each_ref_is_base_targets(format_spec: &ForEachRefFormat) -> Result<Vec<St
         let Some(target) = target.filter(|target| !target.is_empty()) else {
             if placeholder == "is-base" || placeholder == "is-base:" {
                 eprintln!("fatal: expected format: %(is-base:<committish>)");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             continue;
         };
@@ -1170,7 +1169,7 @@ fn for_each_ref_compute_is_base_refs(
             Ok(tip) => tip,
             Err(_) => {
                 eprintln!("fatal: failed to find '{target}'");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         };
         let tip_history = for_each_ref_first_parent_history(db, format, tip)?;

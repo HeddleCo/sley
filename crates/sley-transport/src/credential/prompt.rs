@@ -76,11 +76,11 @@ fn run_askpass(
         }
         return read_prompt_output(&mut command);
     }
-    eprint!("{prompt}");
+    sley_core::diagnostic!(Stderr, false, "{prompt}");
     let mut line = String::new();
     std::io::stdin()
         .read_line(&mut line)
-        .map_err(|err| GitError::Io(err.to_string()))?;
+        .map_err(GitError::from)?;
     Ok(line.trim_end_matches(['\n', '\r']).to_string())
 }
 
@@ -99,18 +99,14 @@ fn resolve_askpass_program(
 
 fn read_prompt_output(command: &mut Command) -> Result<String> {
     command.stdout(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|err| GitError::Io(err.to_string()))?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| GitError::Io("askpass stdout was not piped".into()))?;
+    let mut child = command.spawn().map_err(GitError::from)?;
+    let mut stdout = child.stdout.take().ok_or_else(|| GitError::IoKind {
+        kind: std::io::ErrorKind::Other,
+        message: "askpass stdout was not piped".into(),
+    })?;
     let mut output = String::new();
-    stdout
-        .read_to_string(&mut output)
-        .map_err(|err| GitError::Io(err.to_string()))?;
-    let status = child.wait().map_err(|err| GitError::Io(err.to_string()))?;
+    stdout.read_to_string(&mut output).map_err(GitError::from)?;
+    let status = child.wait().map_err(GitError::from)?;
     if !status.success() {
         return Err(GitError::Command("askpass failed".into()));
     }

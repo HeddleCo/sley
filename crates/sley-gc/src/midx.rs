@@ -129,12 +129,20 @@ pub fn write_with_pack_names(
     let pack_dir = object_dir.join("pack");
     fs::create_dir_all(&pack_dir)?;
     if !write_chain_file && !incremental {
-        eprintln!("error: cannot use --no-write-chain-file without --incremental");
-        return Err(GitError::Exit(128));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "error: cannot use --no-write-chain-file without --incremental"
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     if base_checksum.is_some() && write_chain_file {
-        eprintln!("error: cannot use --base without --no-write-chain-file");
-        return Err(GitError::Exit(128));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "error: cannot use --base without --no-write-chain-file"
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     if incremental {
         return write_incremental(MidxWriteIncremental {
@@ -155,7 +163,7 @@ pub fn write_with_pack_names(
         // Upstream shows a delayed progress meter labelled this way; with
         // GIT_PROGRESS_DELAY=0 it appears immediately. We emit a single line so
         // `--progress` produces non-empty stderr and the default stays silent.
-        eprintln!("Adding packfiles to multi-pack-index");
+        sley_core::diagnostic!(Stderr, true, "Adding packfiles to multi-pack-index");
     }
 
     // If a midx already exists on disk but its trailing checksum does not match
@@ -170,7 +178,11 @@ pub fn write_with_pack_names(
         if let Ok(actual) = sley_core::digest_bytes(format, &bytes[..checksum_offset])
             && actual.as_bytes() != &bytes[checksum_offset..]
         {
-            eprintln!("warning: ignoring existing multi-pack-index; checksum mismatch");
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "warning: ignoring existing multi-pack-index; checksum mismatch"
+            );
         }
     }
 
@@ -207,10 +219,10 @@ pub fn write_with_pack_names(
         // write a midx that would index zero packs (midx-write.c: "no pack
         // files to index."), exiting non-zero.
         if let Some(name) = &preferred_pack_name {
-            eprintln!("warning: unknown preferred pack: '{name}'");
+            sley_core::diagnostic!(Stderr, true, "warning: unknown preferred pack: '{name}'");
         }
-        eprintln!("error: no pack files to index.");
-        return Err(GitError::Exit(1));
+        sley_core::diagnostic!(Stderr, true, "error: no pack files to index.");
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     }
     let write_reverse_index = write_bitmap
         && env::var("GIT_TEST_MIDX_WRITE_REV").is_ok_and(|value| value == "1" || value == "true");
@@ -296,10 +308,14 @@ where
 fn render_midx_event(event: sley_odb::MultiPackIndexEvent) {
     match event {
         sley_odb::MultiPackIndexEvent::UnknownPreferredPack(name) => {
-            eprintln!("warning: unknown preferred pack: '{name}'");
+            sley_core::diagnostic!(Stderr, true, "warning: unknown preferred pack: '{name}'");
         }
         sley_odb::MultiPackIndexEvent::RefusingEmptyBitmap => {
-            eprintln!("warning: refusing to write multi-pack .bitmap without any objects");
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "warning: refusing to write multi-pack .bitmap without any objects"
+            );
         }
     }
 }
@@ -308,19 +324,21 @@ fn render_midx_error(err: sley_odb::MultiPackIndexLayerError) -> GitError {
     match err {
         sley_odb::MultiPackIndexLayerError::Source(err) => err,
         sley_odb::MultiPackIndexLayerError::CouldNotLoadPack => {
-            eprintln!("error: could not load pack");
-            GitError::Exit(1)
+            sley_core::diagnostic!(Stderr, true, "error: could not load pack");
+            GitError::Rejected(sley_core::RejectionKind::Incomplete)
         }
         sley_odb::MultiPackIndexLayerError::EmptyPreferredPack(path) => {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "error: cannot select preferred pack {} with no objects",
                 path.display()
             );
-            GitError::Exit(255)
+            GitError::EmptyPreferredPack { path }
         }
         sley_odb::MultiPackIndexLayerError::BitmapUnavailable => {
-            eprintln!("fatal: could not write multi-pack bitmap");
-            GitError::Exit(1)
+            sley_core::diagnostic!(Stderr, true, "fatal: could not write multi-pack bitmap");
+            GitError::Rejected(sley_core::RejectionKind::Incomplete)
         }
     }
 }
@@ -346,7 +364,7 @@ struct IncrementalMidxLayer {
 
 fn write_incremental(options: MidxWriteIncremental<'_>) -> Result<()> {
     if options.progress {
-        eprintln!("Adding packfiles to multi-pack-index");
+        sley_core::diagnostic!(Stderr, true, "Adding packfiles to multi-pack-index");
     }
 
     let mut chain = read_midx_chain(options.pack_dir)?;
@@ -371,10 +389,10 @@ fn write_incremental(options: MidxWriteIncremental<'_>) -> Result<()> {
     if pack_names.is_empty() {
         if chain.is_empty() {
             if let Some(name) = options.preferred_pack_name {
-                eprintln!("warning: unknown preferred pack: '{name}'");
+                sley_core::diagnostic!(Stderr, true, "warning: unknown preferred pack: '{name}'");
             }
-            eprintln!("error: no pack files to index.");
-            return Err(GitError::Exit(1));
+            sley_core::diagnostic!(Stderr, true, "error: no pack files to index.");
+            return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
         }
         if options.write_chain_file {
             write_midx_chain(options.pack_dir, &chain)?;
@@ -399,7 +417,7 @@ fn write_incremental(options: MidxWriteIncremental<'_>) -> Result<()> {
         write_midx_chain(options.pack_dir, &chain)?;
         clear_incremental_midx_sidecars(options.pack_dir, options.format)?;
     } else {
-        println!("{}", layer.checksum);
+        sley_core::diagnostic!(Stdout, true, "{}", layer.checksum);
     }
     Ok(())
 }
@@ -418,8 +436,12 @@ fn incremental_midx_base_chain(
         Some("none") => Ok(Vec::new()),
         Some(base) => {
             let Some(index) = chain.iter().position(|checksum| checksum == base) else {
-                eprintln!("error: unknown incremental MIDX base: {base}");
-                return Err(GitError::Exit(1));
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "error: unknown incremental MIDX base: {base}"
+                );
+                return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
             };
             Ok(chain[..=index].to_vec())
         }
@@ -640,12 +662,10 @@ fn remove_incremental_midx_dir(pack_dir: &Path) -> Result<()> {
     let midx_dir = incremental_midx_dir(pack_dir);
     let preserve_empty_dir = midx_dir.exists();
     match fs::remove_dir_all(&midx_dir) {
-        Ok(()) if preserve_empty_dir => {
-            fs::create_dir_all(&midx_dir).map_err(|err| GitError::Io(err.to_string()))
-        }
+        Ok(()) if preserve_empty_dir => fs::create_dir_all(&midx_dir).map_err(GitError::from),
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(GitError::Io(err.to_string())),
+        Err(err) => Err(GitError::from(err)),
     }
 }
 
@@ -712,8 +732,10 @@ pub fn compact(cwd: &Path, git_dir: &Path, args: &[String]) -> Result<()> {
         }
     }
     if endpoints.len() != 2 {
-        eprint!("{MULTI_PACK_INDEX_USAGE}");
-        return Err(GitError::Exit(129));
+        sley_core::diagnostic!(Stderr, false, "{MULTI_PACK_INDEX_USAGE}");
+        return Err(GitError::Rejected(
+            sley_core::RejectionKind::InvalidArguments,
+        ));
     }
     let config = read_repo_config(git_dir)?;
     if config
@@ -721,8 +743,12 @@ pub fn compact(cwd: &Path, git_dir: &Path, args: &[String]) -> Result<()> {
         .flatten()
         .is_some_and(|value| value.trim() == "1")
     {
-        eprintln!("fatal: cannot perform MIDX compaction with v1 format");
-        return Err(GitError::Exit(128));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "fatal: cannot perform MIDX compaction with v1 format"
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
 
     let object_dir = object_dir.unwrap_or_else(|| repository_objects_dir(git_dir));
@@ -730,23 +756,30 @@ pub fn compact(cwd: &Path, git_dir: &Path, args: &[String]) -> Result<()> {
     let mut chain = read_midx_chain(&pack_dir)?;
     let layers = read_incremental_midx_layers(&pack_dir, format, &chain)?;
     let Some(from_idx) = chain.iter().position(|checksum| checksum == &endpoints[0]) else {
-        eprintln!("fatal: could not find MIDX: {}", endpoints[0]);
-        return Err(GitError::Exit(128));
+        sley_core::diagnostic!(Stderr, true, "fatal: could not find MIDX: {}", endpoints[0]);
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     };
     let Some(to_idx) = chain.iter().position(|checksum| checksum == &endpoints[1]) else {
-        eprintln!("fatal: could not find MIDX: {}", endpoints[1]);
-        return Err(GitError::Exit(128));
+        sley_core::diagnostic!(Stderr, true, "fatal: could not find MIDX: {}", endpoints[1]);
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     };
     if from_idx == to_idx {
-        eprintln!("fatal: MIDX compaction endpoints must be unique");
-        return Err(GitError::Exit(128));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "fatal: MIDX compaction endpoints must be unique"
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     if from_idx > to_idx {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "fatal: MIDX {} must be an ancestor of {}",
-            endpoints[0], endpoints[1]
+            endpoints[0],
+            endpoints[1]
         );
-        return Err(GitError::Exit(128));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
 
     let mut pack_names = Vec::new();
@@ -1089,7 +1122,7 @@ pub fn repack(cwd: &Path, git_dir: &Path, args: &[String]) -> Result<()> {
         // Upstream forwards `--progress` to the spawned pack-objects, which
         // prints its own meters once it actually has packs to combine. A single
         // line keeps `--progress` non-empty while the default stays silent.
-        eprintln!("Repacking multi-pack-index");
+        sley_core::diagnostic!(Stderr, true, "Repacking multi-pack-index");
     }
 
     // Collect the oids whose copy lives in an included pack, then build one new
@@ -1168,7 +1201,7 @@ pub fn verify(cwd: &Path, git_dir: &Path, args: &[String]) -> Result<()> {
 
 /// Run the full upstream `verify_midx_file` pass over the multi-pack-index in
 /// `<object_dir>/pack/multi-pack-index`, emitting git-exact error substrings to
-/// stderr and returning `GitError::Exit(1)` on any detected corruption.
+/// stderr and returning `GitError::Rejected(sley_core::RejectionKind::Incomplete)` on any detected corruption.
 ///
 /// Parse-time corruptions (signature, version, hash version, chunk table,
 /// fanout order, pack names order, pack-int-id) abort with git's load-time
@@ -1191,17 +1224,17 @@ pub fn verify_midx_at(object_dir: &Path, format: ObjectFormat, progress: bool) -
         Ok(parsed) => parsed,
         Err(message) => {
             if message == "multi-pack-index large offset out of bounds" {
-                eprintln!("error: incorrect object offset");
+                sley_core::diagnostic!(Stderr, true, "error: incorrect object offset");
             } else {
-                eprintln!("error: {message}");
+                sley_core::diagnostic!(Stderr, true, "error: {message}");
             }
-            return Err(GitError::Exit(1));
+            return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
         }
     };
 
     let mut reported = false;
     let mut report = |message: String| {
-        eprintln!("error: {message}");
+        sley_core::diagnostic!(Stderr, true, "error: {message}");
         reported = true;
     };
 
@@ -1214,7 +1247,7 @@ pub fn verify_midx_at(object_dir: &Path, format: ObjectFormat, progress: bool) -
     }
 
     if progress {
-        eprintln!("Looking for referenced packfiles");
+        sley_core::diagnostic!(Stderr, true, "Looking for referenced packfiles");
     }
 
     // Load each referenced pack-index; a missing/corrupt one is reported but
@@ -1236,14 +1269,14 @@ pub fn verify_midx_at(object_dir: &Path, format: ObjectFormat, progress: bool) -
     if parsed.object_count == 0 {
         report("the midx contains no oid".to_string());
         return if reported {
-            Err(GitError::Exit(1))
+            Err(GitError::Rejected(sley_core::RejectionKind::Incomplete))
         } else {
             Ok(())
         };
     }
 
     if progress {
-        eprintln!("Verifying OID order in multi-pack-index");
+        sley_core::diagnostic!(Stderr, true, "Verifying OID order in multi-pack-index");
     }
     for window in parsed.entries.windows(2) {
         if window[0].oid.as_bytes() >= window[1].oid.as_bytes() {
@@ -1256,7 +1289,7 @@ pub fn verify_midx_at(object_dir: &Path, format: ObjectFormat, progress: bool) -
     }
 
     if progress {
-        eprintln!("Verifying object offsets");
+        sley_core::diagnostic!(Stderr, true, "Verifying object offsets");
     }
     // Build per-pack offset lookups once, then check each midx entry's offset
     // against the pack's own .idx.
@@ -1282,7 +1315,7 @@ pub fn verify_midx_at(object_dir: &Path, format: ObjectFormat, progress: bool) -
     }
 
     if reported {
-        Err(GitError::Exit(1))
+        Err(GitError::Rejected(sley_core::RejectionKind::Incomplete))
     } else {
         Ok(())
     }
@@ -1502,7 +1535,7 @@ pub fn expire(cwd: &Path, git_dir: &Path, args: &[String]) -> Result<()> {
         // Upstream shows two delayed progress meters during expiration; with
         // GIT_PROGRESS_DELAY=0 they appear immediately, even when nothing is
         // dropped. Emit a line so `--progress` is non-empty and default silent.
-        eprintln!("Counting referenced objects");
+        sley_core::diagnostic!(Stderr, true, "Counting referenced objects");
     }
     let num_packs = midx.pack_names.len();
 

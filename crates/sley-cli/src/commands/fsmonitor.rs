@@ -1,8 +1,8 @@
 //! Thin CLI adapter for the engine-owned fsmonitor daemon lifecycle.
 
 use crate::session::CliSession;
-use sley::plumbing::sley_worktree::{FsmonitorDaemonSession, FsmonitorDaemonState};
 use sley::{GitError, Result};
+use sley_worktree::{FsmonitorDaemonSession, FsmonitorDaemonState};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -23,7 +23,7 @@ pub(crate) fn cmd_fsmonitor_daemon(cli_session: &CliSession, args: &[String]) ->
     let repository = cli_session.open_repository()?;
     let Some(worktree) = repository.workdir() else {
         eprintln!("fatal: fsmonitor--daemon does not support bare repositories");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
     let daemon = FsmonitorDaemonSession::new(repository.git_dir());
 
@@ -34,7 +34,7 @@ pub(crate) fn cmd_fsmonitor_daemon(cli_session: &CliSession, args: &[String]) ->
         "status" => status_daemon(&daemon, &worktree),
         other => {
             eprintln!("fatal: Unhandled subcommand '{other}'");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -104,7 +104,7 @@ fn parse_positive(value: &str, name: &str) -> Result<usize> {
     let parsed = value.parse::<usize>().unwrap_or(0);
     if parsed == 0 {
         eprintln!("fatal: invalid '{name}' value ({value})");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(parsed)
 }
@@ -112,13 +112,13 @@ fn parse_positive(value: &str, name: &str) -> Result<usize> {
 fn parse_nonnegative(value: &str, name: &str) -> Result<u64> {
     value.parse::<u64>().map_err(|_| {
         eprintln!("fatal: invalid '{name}' value ({value})");
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })
 }
 
 fn usage<T>() -> Result<T> {
     eprintln!("{USAGE}");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn start_daemon(daemon: &FsmonitorDaemonSession, worktree: &Path, args: &DaemonArgs) -> Result<()> {
@@ -127,7 +127,7 @@ fn start_daemon(daemon: &FsmonitorDaemonSession, worktree: &Path, args: &DaemonA
             "fatal: fsmonitor--daemon is already running '{}'",
             worktree.display()
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let executable = daemon_executable()?;
@@ -148,25 +148,23 @@ fn start_daemon(daemon: &FsmonitorDaemonSession, worktree: &Path, args: &DaemonA
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let mut child = command
-        .spawn()
-        .map_err(|err| GitError::Io(format!("could not start fsmonitor daemon: {err}")))?;
+    let mut child = command.spawn().map_err(|err| GitError::IoKind {
+        kind: std::io::ErrorKind::Other,
+        message: format!("could not start fsmonitor daemon: {err}"),
+    })?;
 
     let started = Instant::now();
     loop {
         if daemon.state()? == FsmonitorDaemonState::Listening {
             return Ok(());
         }
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|err| GitError::Io(err.to_string()))?
-        {
+        if let Some(status) = child.try_wait().map_err(GitError::from)? {
             eprintln!("error: daemon terminated with status {status}");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         if started.elapsed() >= args.start_timeout {
             eprintln!("error: daemon not online yet");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -178,7 +176,7 @@ fn run_daemon(daemon: &FsmonitorDaemonSession, worktree: &Path, _detach: bool) -
             "fatal: fsmonitor--daemon is already running '{}'",
             worktree.display()
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     daemon.serve()
 }
@@ -186,7 +184,7 @@ fn run_daemon(daemon: &FsmonitorDaemonSession, worktree: &Path, _detach: bool) -
 fn stop_daemon(daemon: &FsmonitorDaemonSession) -> Result<()> {
     if daemon.state()? != FsmonitorDaemonState::Listening {
         eprintln!("fatal: fsmonitor--daemon is not running");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     daemon.request_stop(Duration::from_secs(30))
 }
@@ -197,7 +195,7 @@ fn status_daemon(daemon: &FsmonitorDaemonSession, worktree: &Path) -> Result<()>
         Ok(())
     } else {
         println!("fsmonitor-daemon is not watching '{}'", worktree.display());
-        Err(GitError::Exit(1))
+        Err(crate::cli_exit(1))
     }
 }
 
@@ -208,7 +206,7 @@ fn status_daemon(daemon: &FsmonitorDaemonSession, worktree: &Path) -> Result<()>
 /// locate a sibling `sley` executable. Deliberately do not fall back to a
 /// sibling or PATH-resolved `git`: Scalar must never borrow installed Git.
 fn daemon_executable() -> Result<PathBuf> {
-    let current = env::current_exe().map_err(|err| GitError::Io(err.to_string()))?;
+    let current = env::current_exe().map_err(GitError::from)?;
     daemon_executable_from(
         &current,
         env::var_os("SLEY_BIN").map(PathBuf::from).as_deref(),
@@ -223,9 +221,10 @@ fn daemon_executable_from(current: &Path, configured: Option<&Path>) -> Result<P
         .file_stem()
         .is_some_and(|name| name.eq_ignore_ascii_case("scalar"))
     {
-        let directory = current
-            .parent()
-            .ok_or_else(|| GitError::Io("Scalar executable has no parent directory".into()))?;
+        let directory = current.parent().ok_or_else(|| GitError::IoKind {
+            kind: std::io::ErrorKind::Other,
+            message: "Scalar executable has no parent directory".into(),
+        })?;
         let mut sibling = directory.join("sley");
         if cfg!(windows) {
             sibling.set_extension("exe");
@@ -233,9 +232,10 @@ fn daemon_executable_from(current: &Path, configured: Option<&Path>) -> Result<P
         if sibling.is_file() {
             return Ok(sibling);
         }
-        return Err(GitError::Io(
-            "could not locate Sley beside the Scalar executable".into(),
-        ));
+        return Err(GitError::IoKind {
+            kind: std::io::ErrorKind::Other,
+            message: "could not locate Sley beside the Scalar executable".into(),
+        });
     }
     Ok(current.to_path_buf())
 }
@@ -262,7 +262,7 @@ mod tests {
     fn rejects_zero_ipc_threads() {
         let err = parse_args(&["run".into(), "--ipc-threads=0".into()])
             .expect_err("zero threads must fail");
-        assert_eq!(err, GitError::Exit(128));
+        assert_eq!(crate::cli_reported_status(&err), Some(128));
     }
 
     #[cfg(unix)]

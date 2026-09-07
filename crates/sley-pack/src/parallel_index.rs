@@ -300,9 +300,9 @@ fn scan_candidates_parallel(
             if start >= end {
                 continue;
             }
-            handles.push(scope.spawn(move || {
+            handles.push(scope.spawn(sley_core::diagnostics::inherit(move || {
                 scan_candidate_range(pack, format, trailer_offset, start, end, cancel)
-            }));
+            })));
         }
         let mut candidates = Vec::new();
         for handle in handles {
@@ -944,7 +944,7 @@ where
         let mut handles = Vec::with_capacity(worker_count);
         for chunk in items.chunks(chunk_len) {
             let work = &work;
-            handles.push(scope.spawn(move || work(chunk)));
+            handles.push(scope.spawn(sley_core::diagnostics::inherit(move || work(chunk))));
         }
         let mut output = Vec::with_capacity(items.len());
         for handle in handles {

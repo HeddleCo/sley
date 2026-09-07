@@ -29,7 +29,6 @@
 //! `git blame` exactly, and for explicit revisions it always matches.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use sley::plumbing::{sley_index, sley_rev, sley_worktree};
 // Glob the crate root for shared plumbing (RepositoryContext, repository_abbrev,
 // FileObjectDatabase, FileRefStore, Commit, Tree, the identity/date formatting
 // helpers, and so on). See commands::stash for the rationale: a submodule can
@@ -37,13 +36,14 @@ use sley::plumbing::{sley_index, sley_rev, sley_worktree};
 // root is in scope here without re-listing it.
 use crate::*;
 use sley::Signature;
-use sley::plumbing::sley_rev::blame::{
+use sley_rev::blame::{
     BlameContentConverter, BlameObjectSource, BlameRequest, LineBlame, PreviousMap,
 };
 
 /// The object-read hook blame's walk uses: plain repository reads plus
 /// promisor hydration when partial-clone lazy fetching is enabled.
 struct BlamePrefetchReader<'a> {
+    policy: &'a sley_remote::RemotePolicy,
     db: &'a FileObjectDatabase,
     lazy_fetch: bool,
 }
@@ -53,7 +53,7 @@ impl BlameObjectSource for BlamePrefetchReader<'_> {
         &self,
         oid: &ObjectId,
     ) -> Result<std::sync::Arc<sley_object::EncodedObject>> {
-        read_object_maybe_prefetch_promisor(self.db, oid, self.lazy_fetch)
+        read_object_maybe_prefetch_promisor(self.policy, self.db, oid, self.lazy_fetch)
     }
 }
 
@@ -245,6 +245,7 @@ fn run_blame(
     let format = repo.format();
     let db = repo.objects();
     let blame_reader = BlamePrefetchReader {
+        policy: &cli_session.remote_policy,
         db,
         lazy_fetch: cli_session.lazy_fetch(),
     };
@@ -321,7 +322,13 @@ fn run_blame(
         resolver: repo
             .worktree_root()
             .ok()
-            .and_then(|root| sley_worktree::StandardAttributeMatcher::from_worktree_root(root).ok())
+            .and_then(|root| {
+                sley_worktree::StandardAttributeMatcher::from_worktree_root(
+                    cli_session.precompose_unicode(),
+                    root,
+                )
+                .ok()
+            })
             .map(|attrs| {
                 commands::userdiff::UserdiffResolver::with_attributes(
                     Some(attrs),
@@ -402,7 +409,7 @@ fn run_blame(
                 // argument (so blaming a missing file from a subdirectory still
                 // names `<dir>/<file>`).
                 eprintln!("fatal: no such path '{repo_path}' in {rev_spec}");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
     };
@@ -794,7 +801,7 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
                 // keeping its leading dash(es): `error: unknown option `-Q'`.
                 eprintln!("error: unknown option `{other}'");
                 eprint!("{BLAME_USAGE}");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             _ => {
                 positionals.push(arg.clone());
@@ -844,7 +851,7 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
 /// Parse a `--diff-algorithm <value>` argument to a [`DiffAlgorithm`]. An
 /// unknown value is the same fatal git reports.
 fn parse_blame_diff_algorithm(value: &str) -> Result<sley_diff_merge::DiffAlgorithm> {
-    use sley::plumbing::sley_diff_merge::DiffAlgorithm;
+    use sley_diff_merge::DiffAlgorithm;
     Ok(match value {
         "myers" | "default" => DiffAlgorithm::Myers,
         "minimal" => DiffAlgorithm::Minimal,
@@ -855,7 +862,7 @@ fn parse_blame_diff_algorithm(value: &str) -> Result<sley_diff_merge::DiffAlgori
                 "fatal: option diff-algorithm accepts \"myers\", \"minimal\", \"patience\" and \"histogram\""
             );
             let _ = other;
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     })
 }
@@ -1118,7 +1125,7 @@ impl BlameContentConverter for TextconvContext {
             Some(converted) => Ok(converted),
             None => {
                 eprintln!("fatal: unable to read files to diff");
-                Err(GitError::Exit(128))
+                Err(crate::cli_exit(128))
             }
         }
     }
@@ -1140,7 +1147,8 @@ fn read_index_blob(
     }) else {
         return Ok(None);
     };
-    let object = read_object_maybe_prefetch_promisor(db, &entry.oid, reader.lazy_fetch)?;
+    let object =
+        read_object_maybe_prefetch_promisor(reader.policy, db, &entry.oid, reader.lazy_fetch)?;
     if object.object_type != ObjectType::Blob {
         return Ok(None);
     }
@@ -1185,7 +1193,7 @@ fn build_ignore_set(repo: &RepositoryContext, options: &BlameOptions) -> Result<
             }
             None => {
                 eprintln!("fatal: cannot find revision {rev} to ignore");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
     }
@@ -1220,7 +1228,7 @@ fn parse_ignore_revs_file(
     };
     let Ok(content) = std::fs::read(&full) else {
         eprintln!("fatal: could not open object name list: {path}");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
     for raw in content.split(|b| *b == b'\n') {
         // Strip a trailing `#` comment, then surrounding ASCII whitespace.
@@ -1237,11 +1245,11 @@ fn parse_ignore_revs_file(
                 "fatal: invalid object name: {}",
                 String::from_utf8_lossy(token)
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         };
         let Ok(oid) = ObjectId::from_hex(format, text) else {
             eprintln!("fatal: invalid object name: {text}");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         };
         // Peel to a commit; a non-commit (e.g. a tree) is silently accepted.
         if let Ok(commit) = sley_rev::peel_to_commit(db, format, &oid) {
@@ -1277,9 +1285,7 @@ fn read_contents_file(cwd: &Path, spec: &str) -> Result<Vec<u8>> {
     if spec == "-" {
         use std::io::Read as _;
         let mut buf = Vec::new();
-        io::stdin()
-            .read_to_end(&mut buf)
-            .map_err(|err| GitError::Io(err.to_string()))?;
+        io::stdin().read_to_end(&mut buf).map_err(GitError::from)?;
         return Ok(buf);
     }
     let path = Path::new(spec);
@@ -1290,7 +1296,7 @@ fn read_contents_file(cwd: &Path, spec: &str) -> Result<Vec<u8>> {
     };
     std::fs::read(&full).map_err(|_| {
         eprintln!("fatal: Cannot stat '{spec}'");
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })
 }
 
@@ -1316,7 +1322,7 @@ fn read_worktree_image(
     let in_index = path_in_index_any_stage(repo.git_dir(), format, repo_path)?;
     if committed.is_none() && !in_index {
         eprintln!("fatal: no such path '{repo_path}' in HEAD");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     // Read the actual work-tree file. A symlink contributes its *link text*
     // (git's `strbuf_readlink`), not the pointed-at file's contents, with a
@@ -1385,7 +1391,7 @@ fn read_worktree_image(
                 // sparse-checkout path is therefore an lstat failure, not an
                 // invitation to fall back to its staged or committed blob.
                 eprintln!("fatal: Cannot lstat '{repo_path}': No such file or directory");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             Err(_) => {}
         }
@@ -1399,7 +1405,7 @@ fn read_worktree_image(
         return Ok((blob, mode));
     }
     eprintln!("fatal: no such path '{repo_path}' in HEAD");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 /// Whether `repo_path` is present in the index in any stage (0–3). Mirrors
@@ -1473,7 +1479,7 @@ fn resolve_regex_bound(
     use sley_grep::{Regex, RegexMode};
     let re = Regex::compile(pattern, RegexMode::Bre, false, false).map_err(|_| {
         eprintln!("fatal: -L parameter '{pattern}': invalid regex");
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })?;
     let start_idx = from.saturating_sub(1); // 0-based
     for (idx, line) in contents.iter().enumerate().skip(start_idx) {
@@ -1482,7 +1488,7 @@ fn resolve_regex_bound(
         }
     }
     eprintln!("fatal: -L parameter '{pattern}' starting at line {from}: No match");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 /// Resolve a `:funcname` `-L` bound. git delegates this to the active funcname
@@ -1498,7 +1504,7 @@ fn resolve_function_bound(
     use sley_grep::{Regex, RegexMode};
     let re = Regex::compile(pattern, RegexMode::Bre, false, false).map_err(|_| {
         eprintln!("fatal: -L parameter '{pattern}': invalid regex");
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })?;
     let start_idx = from.saturating_sub(1);
     for idx in start_idx..contents.len() {
@@ -1507,7 +1513,7 @@ fn resolve_function_bound(
         }
     }
     eprintln!("fatal: -L parameter '{pattern}' starting at line {from}: No match");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 /// Return the 0-based inclusive end line for a function whose header is at
@@ -1579,7 +1585,7 @@ fn resolve_range(
     // `-L 0,3` both report the zero error rather than an empty-range/clamp).
     if start == 0 {
         eprintln!("fatal: -L invalid line number: 0");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     // `begin` mirrors git's `*begin` (the start endpoint); `end` is the explicit
@@ -1591,7 +1597,7 @@ fn resolve_range(
         RangeBound::Absolute(n) => {
             if *n == 0 {
                 eprintln!("fatal: -L invalid line number: 0");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             *n
         }
@@ -1608,7 +1614,7 @@ fn resolve_range(
         RangeBound::Relative(count) => {
             if *count == 0 {
                 eprintln!("fatal: -L invalid empty range");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             start + count - 1
         }
@@ -1616,7 +1622,7 @@ fn resolve_range(
         RangeBound::RelativeNeg(count) => {
             if *count == 0 {
                 eprintln!("fatal: -L invalid empty range");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             begin = start.saturating_sub(count - 1).max(1);
             start
@@ -1634,7 +1640,7 @@ fn resolve_range(
     if total < begin {
         let lines_word = if total == 1 { "line" } else { "lines" };
         eprintln!("fatal: file {path} has only {total} {lines_word}");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     // Default/clamp the upper endpoint to end-of-file (blame.c:1217).
     let top = if end == 0 || total < end { total } else { end };
@@ -2503,18 +2509,18 @@ const BLAME_USAGE: &str = "usage: git blame [<options>] [<rev-opts>] [<rev>] [--
 
 fn blame_usage_error() -> GitError {
     eprint!("{BLAME_USAGE}");
-    GitError::Exit(129)
+    crate::cli_exit(129)
 }
 
 fn blame_too_many_paths() -> GitError {
     eprintln!("fatal: git blame supports blaming a single path at a time");
-    GitError::Exit(129)
+    crate::cli_exit(129)
 }
 
 fn blame_option_requires_value(option: &str) -> GitError {
     eprintln!("error: switch `{option}' requires a value");
     eprint!("{BLAME_USAGE}");
-    GitError::Exit(129)
+    crate::cli_exit(129)
 }
 
 #[cfg(test)]
@@ -2538,7 +2544,7 @@ mod tests {
             end: RangeBound::Omitted,
         };
         let r = resolve_range(&range, 3, &contents, 1, "f");
-        assert!(matches!(r, Err(GitError::Exit(128))));
+        assert!(matches!(r, Err(error) if crate::cli_reported_status(&error) == Some(128)));
     }
 
     #[test]
@@ -2579,7 +2585,7 @@ mod tests {
         // No match is the fatal error.
         assert!(matches!(
             resolve_regex_bound("zzz", &contents, 1, 4),
-            Err(GitError::Exit(128))
+            Err(error) if crate::cli_reported_status(&error) == Some(128)
         ));
     }
 }

@@ -6,7 +6,6 @@
 //! (`objects-local.txt`) into virtual files, optionally adding the raw `.git`
 //! metadata for `--mode=all`, and write them as a zip of the empty tree.
 
-use sley::plumbing::{sley_config, sley_core};
 use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::fs;
@@ -38,7 +37,7 @@ pub(crate) fn cmd_diagnose(
         match arg.as_str() {
             "-h" | "--help" => {
                 println!("{USAGE}");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             "-o" | "--output-directory" => {
                 output = Some(take_value(args, &mut index, "output-directory")?);
@@ -65,7 +64,7 @@ pub(crate) fn cmd_diagnose(
             other => {
                 eprintln!("error: unknown option `{}'", other.trim_start_matches('-'));
                 eprintln!("{USAGE}");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
         }
     }
@@ -102,7 +101,7 @@ fn take_value(args: &[String], index: &mut usize, name: &str) -> Result<String> 
         None => {
             eprintln!("error: option `{name}' requires a value");
             eprintln!("{USAGE}");
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
     }
 }
@@ -113,7 +112,7 @@ fn parse_mode(value: &str) -> Result<DiagnoseMode> {
         "all" => Ok(DiagnoseMode::All),
         other => {
             eprintln!("error: invalid --mode value '{other}'");
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
     }
 }

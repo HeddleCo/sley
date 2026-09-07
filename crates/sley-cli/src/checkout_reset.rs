@@ -4,10 +4,10 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::path::PathBuf;
 
-use sley::plumbing::sley_object::{Commit, ObjectType};
-use sley::plumbing::sley_odb::{FileObjectDatabase, ObjectReader};
-use sley::plumbing::sley_refs::{FileRefStore, RefUpdate, ReflogEntry, branch_ref_name};
 use sley::{GitError, ObjectFormat, ObjectId, ReferenceTarget as RefTarget, Result};
+use sley_object::{Commit, ObjectType};
+use sley_odb::{FileObjectDatabase, ObjectReader};
+use sley_refs::{FileRefStore, RefUpdate, ReflogEntry, branch_ref_name};
 
 use crate::commands::remote::read_repo_config;
 use crate::commit_subject_bytes;
@@ -16,8 +16,6 @@ use crate::log_output_encoding;
 use crate::log_reencode_message;
 use crate::resolve_revision;
 use crate::setup;
-use crate::sley_rev;
-use crate::sley_worktree;
 
 pub(crate) fn update_reset_head_ref(
     git_dir: &Path,
@@ -118,13 +116,13 @@ pub(crate) fn checkout_create_or_reset_branch(
     let store = FileRefStore::new(git_dir, format);
     if branch == "HEAD" || branch == "@" {
         eprintln!("fatal: '{branch}' is not a valid branch name");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let name = branch_ref_name(branch)?;
     let existing = store.read_ref(&name)?;
     if existing.is_some() && !force {
         eprintln!("fatal: a branch named '{branch}' already exists");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     // The start point (often the implicit "HEAD") is resolved against the
     // worktree the command runs from — `git worktree add` from a linked
@@ -238,11 +236,11 @@ pub(crate) fn resolve_checkout_merge_base_start_oid(
         [base] => Ok(Some(*base)),
         [] => {
             eprintln!("fatal: no merge base found");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
         _ => {
             eprintln!("fatal: multiple merge bases found");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -255,19 +253,19 @@ pub(crate) fn require_work_tree(
         if result.worktree_config_bogus {
             eprintln!("warning: core.bare and core.worktree do not make sense");
             eprintln!("fatal: unable to set up work tree using invalid config");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if let Some(worktree) = result.worktree {
             return Ok(worktree);
         }
         eprintln!("fatal: this operation must be run in a work tree");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     match sley_worktree::worktree_root_for_git_dir(git_dir)? {
         Some(root) => Ok(root),
         None => {
             eprintln!("fatal: this operation must be run in a work tree");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }

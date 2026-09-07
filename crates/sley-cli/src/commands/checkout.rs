@@ -1,6 +1,5 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
-use sley::plumbing::{sley_refs, sley_remote, sley_rev, sley_worktree};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use super::status::{StatusLineSink, status_long_tracking_lines};
@@ -189,7 +188,7 @@ pub(crate) fn cmd_checkout(
             "-lb" => {
                 if !matches!(branch_mode, CheckoutBranchMode::Existing) {
                     eprintln!("fatal: options '--detach' and '-b' cannot be used together");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 create_reflog = true;
                 let branch = iter
@@ -204,7 +203,7 @@ pub(crate) fn cmd_checkout(
             "-b" => {
                 if !matches!(branch_mode, CheckoutBranchMode::Existing) {
                     eprintln!("fatal: options '--detach' and '-b' cannot be used together");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 let branch = iter
                     .next()
@@ -218,7 +217,7 @@ pub(crate) fn cmd_checkout(
             "-B" => {
                 if !matches!(branch_mode, CheckoutBranchMode::Existing) {
                     eprintln!("fatal: options '--detach' and '-B' cannot be used together");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 let branch = iter
                     .next()
@@ -232,7 +231,7 @@ pub(crate) fn cmd_checkout(
             "--detach" => {
                 if !matches!(branch_mode, CheckoutBranchMode::Existing) {
                     eprintln!("fatal: options '-b' and '--detach' cannot be used together");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 branch_mode = CheckoutBranchMode::Detach;
             }
@@ -256,29 +255,29 @@ pub(crate) fn cmd_checkout(
     }
     if no_auto_advance && !patch {
         eprintln!("fatal: the option '--no-auto-advance' requires '--interactive/--patch'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if unified_context.is_some() && !patch {
         eprintln!("fatal: the option '--unified' requires '--interactive/--patch'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if inter_hunk_context.is_some() && !patch {
         eprintln!("fatal: the option '--inter-hunk-context' requires '--interactive/--patch'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     // `--orphan` cannot set up branch tracking.
     if matches!(branch_mode, CheckoutBranchMode::Create { orphan: true, .. }) && track.is_some() {
         eprintln!("fatal: '--orphan' cannot be used with '-t'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     // `-p --overlay` is forbidden; only the implicit-overlay default pairs with -p.
     if patch && overlay_mode == Some(true) {
         eprintln!("fatal: options '-p' and '--overlay' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if pathspec_file_nul && pathspec_from_file.is_none() {
         eprintln!("fatal: the option '--pathspec-file-nul' requires '--pathspec-from-file'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if pathspec_from_file.is_some() {
         // Git rejects pathspec args, then --detach, then --patch (in that order).
@@ -290,19 +289,19 @@ pub(crate) fn cmd_checkout(
             eprintln!(
                 "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if matches!(branch_mode, CheckoutBranchMode::Detach) {
             eprintln!(
                 "fatal: options '--pathspec-from-file' and '--detach' cannot be used together"
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if patch {
             eprintln!(
                 "fatal: options '--pathspec-from-file' and '--patch' cannot be used together"
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     let context = CheckoutContext::open(cli_session)?;
@@ -486,7 +485,7 @@ pub(crate) fn cmd_checkout(
                         eprintln!(
                             "fatal: '--merge' cannot be used when checking out paths from a tree"
                         );
-                        return Err(GitError::Exit(128));
+                        return Err(crate::cli_exit(128));
                     }
                     let oid =
                         checkout_resolve_start_oid(git_dir, format, rev, context.replace_objects)?;
@@ -496,6 +495,7 @@ pub(crate) fn cmd_checkout(
                     // `checkout HEAD~1 bar` does one negotiation (t4067 #6).
                     if cli_session.lazy_fetch() {
                         prefetch_pathspec_tree_blobs(
+                            &cli_session.remote_policy,
                             cwd,
                             git_dir,
                             format,
@@ -506,6 +506,7 @@ pub(crate) fn cmd_checkout(
                         )?;
                     }
                     sley_worktree::restore_index_and_worktree_paths_from_tree(
+                        cli_session.original_cwd.as_deref(),
                         worktree_root,
                         git_dir,
                         format,
@@ -532,6 +533,7 @@ pub(crate) fn cmd_checkout(
                         sley_worktree::CheckoutIndexSparsePolicy::Honor
                     };
                     let outcome = sley_worktree::checkout_index_paths_with_database_outcome_sparse(
+                        cli_session.original_cwd.as_deref(),
                         worktree_root,
                         git_dir,
                         format,
@@ -553,6 +555,7 @@ pub(crate) fn cmd_checkout(
                     }
                     if recurse_submodules {
                         commands::read_tree::checkout_submodules_for_paths(
+                            cli_session.original_cwd.as_deref(),
                             worktree_root,
                             git_dir,
                             format,
@@ -599,6 +602,7 @@ pub(crate) fn cmd_checkout(
             if !switches_to_other_branch {
                 if recurse_submodules {
                     commands::read_tree::reset_index_and_worktree_to_commit(
+                        cli_session.original_cwd.as_deref(),
                         worktree_root,
                         git_dir,
                         format,
@@ -607,6 +611,7 @@ pub(crate) fn cmd_checkout(
                     )?;
                 } else {
                     sley_worktree::reset_index_and_worktree_to_commit(
+                        cli_session.original_cwd.as_deref(),
                         worktree_root,
                         git_dir,
                         format,
@@ -632,6 +637,7 @@ pub(crate) fn cmd_checkout(
     if force {
         if let Ok(Some(head_oid)) = resolve_ref_peeled(store, "HEAD") {
             sley_worktree::reset_index_and_worktree_to_commit(
+                cli_session.original_cwd.as_deref(),
                 worktree_root,
                 git_dir,
                 format,
@@ -676,15 +682,30 @@ pub(crate) fn cmd_checkout(
             let target_oid = sley_rev::peel_to_commit(db, format, &target_oid)?;
             let from = checkout_reflog_from_name(store);
             let config = checkout_config;
-            prefetch_local_promisor_checkout_blobs(cwd, git_dir, format, db, config, &target_oid)?;
+            prefetch_local_promisor_checkout_blobs(
+                &cli_session.remote_policy,
+                cwd,
+                git_dir,
+                format,
+                db,
+                config,
+                &target_oid,
+            )?;
             let old_head_direct = checkout_direct_head(store)?;
             let subject = detached_checkout_subject(git_dir, format, &target_oid);
             let message = format!("checkout: moving from {from} to {target}").into_bytes();
             if recurse_submodules {
-                checkout_twoway_dirty(&context, Some(&target_oid), recurse_submodules, force)?;
+                checkout_twoway_dirty(
+                    cli_session.original_cwd.as_deref(),
+                    &context,
+                    Some(&target_oid),
+                    recurse_submodules,
+                    force,
+                )?;
                 detach_head_with_reflog(git_dir, format, &target_oid, message, checkout_config)?;
             } else {
                 match sley_worktree::checkout_detached_filtered(
+                    cli_session.original_cwd.as_deref(),
                     worktree_root,
                     git_dir,
                     format,
@@ -696,6 +717,7 @@ pub(crate) fn cmd_checkout(
                     Ok(_) => {}
                     Err(err) if checkout_is_dirty_tree_error(&err) => {
                         checkout_twoway_dirty(
+                            cli_session.original_cwd.as_deref(),
                             &context,
                             Some(&target_oid),
                             recurse_submodules,
@@ -742,7 +764,7 @@ pub(crate) fn cmd_checkout(
             let [branch] = positional.as_slice() else {
                 if checkout_stage.is_some() {
                     eprintln!("fatal: '--ours/--theirs' needs the paths to check out");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 if positional.is_empty() {
                     // `git checkout` with no branch and no paths stays on the
@@ -750,9 +772,14 @@ pub(crate) fn cmd_checkout(
                     // succeeds (no error), leaving the index/worktree untouched.
                     let Some(head) = resolve_ref_peeled(store, "HEAD")? else {
                         eprintln!("fatal: You are on a branch yet to be born");
-                        return Err(GitError::Exit(128));
+                        return Err(crate::cli_exit(128));
                     };
-                    sley_worktree::reapply_active_sparse_checkout(worktree_root, git_dir, format)?;
+                    sley_worktree::reapply_active_sparse_checkout(
+                        cli_session.original_cwd.as_deref(),
+                        worktree_root,
+                        git_dir,
+                        format,
+                    )?;
                     let _ = checkout_show_local_changes(cli_session, git_dir, &head, quiet, force);
                     return Ok(());
                 }
@@ -762,7 +789,7 @@ pub(crate) fn cmd_checkout(
             };
             if checkout_stage.is_some() {
                 eprintln!("fatal: '--ours/--theirs' cannot be used with switching branches");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             // A target that is not an existing branch but resolves to a commit-ish
             // (e.g. `A^0`, a tag, a raw oid) is a *detached HEAD* checkout, not a
@@ -803,6 +830,7 @@ pub(crate) fn cmd_checkout(
                 let target_oid = sley_rev::peel_to_commit(db, format, &target_oid)?;
                 let config = checkout_config;
                 prefetch_local_promisor_checkout_blobs(
+                    &cli_session.remote_policy,
                     cwd,
                     git_dir,
                     format,
@@ -815,7 +843,13 @@ pub(crate) fn cmd_checkout(
                 let from = checkout_reflog_from_name(store);
                 let message = format!("checkout: moving from {from} to {branch}").into_bytes();
                 if recurse_submodules {
-                    checkout_twoway_dirty(&context, Some(&target_oid), recurse_submodules, force)?;
+                    checkout_twoway_dirty(
+                        cli_session.original_cwd.as_deref(),
+                        &context,
+                        Some(&target_oid),
+                        recurse_submodules,
+                        force,
+                    )?;
                     detach_head_with_reflog(
                         git_dir,
                         format,
@@ -825,6 +859,7 @@ pub(crate) fn cmd_checkout(
                     )?;
                 } else {
                     match sley_worktree::checkout_detached_filtered(
+                        cli_session.original_cwd.as_deref(),
                         worktree_root,
                         git_dir,
                         format,
@@ -836,6 +871,7 @@ pub(crate) fn cmd_checkout(
                         Ok(_) => {}
                         Err(err) if checkout_is_dirty_tree_error(&err) => {
                             checkout_twoway_dirty(
+                                cli_session.original_cwd.as_deref(),
                                 &context,
                                 Some(&target_oid),
                                 recurse_submodules,
@@ -927,7 +963,7 @@ pub(crate) fn cmd_checkout(
                     }
                 } else {
                     eprintln!("error: pathspec '{branch}' did not match any file(s) known to git");
-                    return Err(GitError::Exit(1));
+                    return Err(crate::cli_exit(1));
                 }
             } else {
                 CheckoutMessage::Existing {
@@ -947,14 +983,14 @@ pub(crate) fn cmd_checkout(
                     eprintln!(
                         "fatal: Cannot update paths and switch to branch '{branch}' at the same time."
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 // --orphan cannot reuse an existing branch name (there is no
                 // force variant); reject before touching the index or HEAD.
                 let branch_ref = branch_ref_name(&branch)?;
                 if store.read_ref(&branch_ref)?.is_some() {
                     eprintln!("fatal: a branch named '{branch}' already exists");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 if let Some(start) = positional.first().map(String::as_str) {
                     let Some(start_oid) = resolve_checkout_start_oid(
@@ -967,13 +1003,19 @@ pub(crate) fn cmd_checkout(
                         eprintln!(
                             "fatal: '{start}' is not a commit and a branch '{branch}' cannot be created from it"
                         );
-                        return Err(GitError::Exit(128));
+                        return Err(crate::cli_exit(128));
                     };
                     // Switch the index + worktree to the start point through the
                     // shared two-way engine (git's merge_working_tree), so local
                     // modifications that would be overwritten abort the switch
                     // and leave HEAD on the current branch.
-                    checkout_twoway_dirty(&context, Some(&start_oid), recurse_submodules, force)?;
+                    checkout_twoway_dirty(
+                        cli_session.original_cwd.as_deref(),
+                        &context,
+                        Some(&start_oid),
+                        recurse_submodules,
+                        force,
+                    )?;
                 }
                 checkout_switch_to_unborn_branch(git_dir, &branch)?;
                 if create_reflog {
@@ -989,7 +1031,7 @@ pub(crate) fn cmd_checkout(
                 eprintln!(
                     "fatal: Cannot update paths and switch to branch '{branch}' at the same time."
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             let start = positional.first().map(String::as_str).unwrap_or("HEAD");
             if matches!(
@@ -1000,14 +1042,14 @@ pub(crate) fn cmd_checkout(
                 eprintln!(
                     "fatal: cannot set up tracking information; starting point '{start}' is not a branch"
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             if resolve_checkout_start_oid(git_dir, format, start, context.replace_objects).is_err()
             {
                 eprintln!(
                     "fatal: '{start}' is not a commit and a branch '{branch}' cannot be created from it"
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             let branch_ref = branch_ref_name(&branch)?;
             branch_update_rollback = Some((branch_ref.clone(), store.read_ref(&branch_ref)?));
@@ -1072,7 +1114,7 @@ pub(crate) fn cmd_checkout(
             worktree.path.display()
         );
         checkout_rollback_branch_update(git_dir, format, &branch_update_rollback);
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let branch_target = if store.read_ref(&branch_ref)?.is_some() {
         sley_refs::resolve_ref_peeled(store, &branch_ref)?
@@ -1080,10 +1122,19 @@ pub(crate) fn cmd_checkout(
         None
     };
     if let Some(target) = branch_target {
-        prefetch_local_promisor_checkout_blobs(cwd, git_dir, format, db, &config, &target)?;
+        prefetch_local_promisor_checkout_blobs(
+            &cli_session.remote_policy,
+            cwd,
+            git_dir,
+            format,
+            db,
+            &config,
+            &target,
+        )?;
         let head_at_target = resolve_ref_peeled(store, "HEAD")? == Some(target);
         if head_at_target && checkout_index_empty(git_dir, format)? {
             sley_worktree::reset_index_and_worktree_to_commit(
+                cli_session.original_cwd.as_deref(),
                 worktree_root,
                 git_dir,
                 format,
@@ -1100,6 +1151,7 @@ pub(crate) fn cmd_checkout(
             let old_tree = commands::merge_rebase::commit_tree_oid(db, format, &checkout_old_head)?;
             let target_tree = commands::merge_rebase::commit_tree_oid(db, format, &target)?;
             if let Err(err) = commands::read_tree::checkout_two_way_engine(
+                cli_session.original_cwd.as_deref(),
                 git_dir,
                 worktree_root,
                 format,
@@ -1172,9 +1224,13 @@ pub(crate) fn cmd_checkout(
             ]));
             let _process_filter_cwd =
                 sley_worktree::set_process_filter_cwd(Some(worktree_root.clone()));
-            if let Err(err) =
-                checkout_twoway_dirty(&context, Some(&target), recurse_submodules, force)
-            {
+            if let Err(err) = checkout_twoway_dirty(
+                cli_session.original_cwd.as_deref(),
+                &context,
+                Some(&target),
+                recurse_submodules,
+                force,
+            ) {
                 checkout_rollback_branch_update(git_dir, format, &branch_update_rollback);
                 return Err(err);
             }
@@ -1189,6 +1245,7 @@ pub(crate) fn cmd_checkout(
         // Same-HEAD, no force, no recurse: preserve index extensions (UNTR) via
         // the lightweight path — `checkout -b new` at the current tip.
         match sley_worktree::checkout_branch_filtered(
+            cli_session.original_cwd.as_deref(),
             worktree_root,
             git_dir.clone(),
             format,
@@ -1201,9 +1258,13 @@ pub(crate) fn cmd_checkout(
                 let from = checkout_reflog_from.clone();
                 let target = sley_refs::resolve_ref_peeled(store, &branch_ref_name(branch)?)?
                     .ok_or_else(|| GitError::reference_not_found("branch"))?;
-                if let Err(err) =
-                    checkout_twoway_dirty(&context, Some(&target), recurse_submodules, force)
-                {
+                if let Err(err) = checkout_twoway_dirty(
+                    cli_session.original_cwd.as_deref(),
+                    &context,
+                    Some(&target),
+                    recurse_submodules,
+                    force,
+                ) {
                     checkout_rollback_branch_update(git_dir, format, &branch_update_rollback);
                     return Err(err);
                 }
@@ -1309,7 +1370,7 @@ fn checkout_conflict_style(value: &str) -> Result<sley_worktree::CheckoutConflic
         "diff3" | "zdiff3" => Ok(sley_worktree::CheckoutConflictStyle::Diff3),
         other => {
             eprintln!("error: unknown conflict style '{other}'");
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
     }
 }
@@ -1685,7 +1746,7 @@ fn checkout_dwim_remote_branch(
             eprintln!(
                 "fatal: '{name}' could be both a local file and a tracking branch.\nPlease use -- (and optionally --no-guess) to disambiguate"
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         let remote_ref = matches.remove(0);
         let oid = sley_refs::resolve_ref_peeled(store, &remote_ref)?
@@ -1707,7 +1768,7 @@ fn checkout_dwim_remote_branch(
         "fatal: '{name}' matched multiple ({}) remote tracking branches",
         matches.len()
     );
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn checkout_dwim_remote_candidates(
@@ -1786,7 +1847,13 @@ pub(crate) fn cmd_switch(cli_session: &crate::session::CliSession, args: &[Strin
             ));
         };
         let context = CheckoutContext::open(cli_session)?;
-        checkout_twoway_dirty(&context, None, false, false)?;
+        checkout_twoway_dirty(
+            cli_session.original_cwd.as_deref(),
+            &context,
+            None,
+            false,
+            false,
+        )?;
         checkout_switch_to_unborn_branch(&context.git_dir, branch)?;
         sley_sequencer::replay::remove_branch_state(&context.git_dir);
         if !args.iter().any(|arg| arg == "-q" || arg == "--quiet") {
@@ -1865,7 +1932,7 @@ pub(crate) fn cmd_restore(cli_session: &crate::session::CliSession, args: &[Stri
                 eprintln!(
                     "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             paths.push(PathBuf::from(arg));
             continue;
@@ -1982,7 +2049,7 @@ pub(crate) fn cmd_restore(cli_session: &crate::session::CliSession, args: &[Stri
                     eprintln!(
                         "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 let value = iter.next().ok_or_else(|| {
                     GitError::Command("restore --pathspec-from-file requires a value".into())
@@ -1995,7 +2062,7 @@ pub(crate) fn cmd_restore(cli_session: &crate::session::CliSession, args: &[Stri
                     eprintln!(
                         "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 let value = value.strip_prefix("--pathspec-from-file=").ok_or_else(|| {
                     GitError::Command("restore --pathspec-from-file requires a value".into())
@@ -2027,7 +2094,7 @@ pub(crate) fn cmd_restore(cli_session: &crate::session::CliSession, args: &[Stri
                     eprintln!(
                         "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 paths.push(PathBuf::from(value));
             }
@@ -2035,43 +2102,43 @@ pub(crate) fn cmd_restore(cli_session: &crate::session::CliSession, args: &[Stri
     }
     if pathspec_file_nul && pathspec_from_file.is_none() {
         eprintln!("fatal: the option '--pathspec-file-nul' requires '--pathspec-from-file'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if unified_context.is_some() && !patch {
         eprintln!("fatal: the option '--unified' requires '--interactive/--patch'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if inter_hunk_context.is_some() && !patch {
         eprintln!("fatal: the option '--inter-hunk-context' requires '--interactive/--patch'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if ignore_unmerged && patch {
         eprintln!("fatal: '--ignore-unmerged' cannot be used with updating paths");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if ignore_unmerged && path_merge {
         eprintln!("fatal: options '--ignore-unmerged' and '-m' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if staged {
         if checkout_stage.is_some() {
             eprintln!("fatal: '--ours' or '--theirs' cannot be used with --staged");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if path_merge || conflict_implies_merge {
             eprintln!("fatal: '--merge' or '--conflict' cannot be used with --staged");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     if source.is_some() && (path_merge || conflict_implies_merge || checkout_stage.is_some()) {
         eprintln!(
             "fatal: '--merge', '--ours', or '--theirs' cannot be used when checking out of a tree"
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if pathspec_from_file.is_some() && patch {
         eprintln!("fatal: options '--pathspec-from-file' and '--patch' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if patch {
         let context = CheckoutContext::open(cli_session)?;
@@ -2092,7 +2159,7 @@ pub(crate) fn cmd_restore(cli_session: &crate::session::CliSession, args: &[Stri
     }
     if paths.is_empty() {
         eprintln!("fatal: you must specify path(s) to restore");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let context = CheckoutContext::open(cli_session)?;
     let cwd = &context.cwd;
@@ -2121,6 +2188,7 @@ pub(crate) fn cmd_restore(cli_session: &crate::session::CliSession, args: &[Stri
         // removed from the index and working tree.
         if let Some(tree_oid) = source_tree.as_ref() {
             sley_worktree::restore_index_and_worktree_paths_from_tree(
+                cli_session.original_cwd.as_deref(),
                 worktree_root,
                 git_dir,
                 format,
@@ -2130,6 +2198,7 @@ pub(crate) fn cmd_restore(cli_session: &crate::session::CliSession, args: &[Stri
             )?;
         } else {
             sley_worktree::restore_index_and_worktree_paths_from_head(
+                cli_session.original_cwd.as_deref(),
                 worktree_root,
                 git_dir,
                 format,
@@ -2156,6 +2225,7 @@ pub(crate) fn cmd_restore(cli_session: &crate::session::CliSession, args: &[Stri
         }
     } else if let Some(tree_oid) = source_tree.as_ref() {
         sley_worktree::restore_worktree_paths_from_tree(
+            cli_session.original_cwd.as_deref(),
             worktree_root,
             git_dir,
             format,
@@ -2170,6 +2240,7 @@ pub(crate) fn cmd_restore(cli_session: &crate::session::CliSession, args: &[Stri
                 _ => sley_worktree::CheckoutConflictStyle::Merge,
             });
         sley_worktree::checkout_index_paths(
+            cli_session.original_cwd.as_deref(),
             worktree_root,
             git_dir,
             format,
@@ -2255,6 +2326,7 @@ fn write_checkout_change_summary(
 }
 
 fn prefetch_local_promisor_checkout_blobs(
+    policy: &sley_remote::RemotePolicy,
     cwd: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -2295,6 +2367,7 @@ fn prefetch_local_promisor_checkout_blobs(
             continue;
         };
         let _ = sley_remote::install_fetch_pack_via_local_upload_pack(
+            policy,
             git_dir,
             &remote_git_dir,
             format,
@@ -2314,7 +2387,7 @@ fn prefetch_local_promisor_checkout_blobs(
     db.refresh_read_cache();
     if let Some(missing) = wants.iter().find(|oid| !db.contains(oid).unwrap_or(false)) {
         eprintln!("fatal: could not fetch {missing} from promisor remote");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(true)
 }
@@ -2387,6 +2460,7 @@ fn collect_missing_tree_blob_wants(
 /// Prefetch missing non-gitlink blobs under `paths` from `tree_oid` in one
 /// promisor batch (pathspec checkout in a partial clone).
 fn prefetch_pathspec_tree_blobs(
+    policy: &sley_remote::RemotePolicy,
     cwd: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -2426,7 +2500,7 @@ fn prefetch_pathspec_tree_blobs(
     if wants.is_empty() {
         return Ok(());
     }
-    crate::prefetch_promisor_objects(db, &wants, true)
+    crate::prefetch_promisor_objects(policy, db, &wants, true)
 }
 
 fn checkout_index_empty(git_dir: &Path, format: ObjectFormat) -> Result<bool> {
@@ -2486,20 +2560,34 @@ fn checkout_merge_autostash_branch_switch(
     let git_dir = &context.git_dir;
     let worktree_root = &context.worktree_root;
     let format = context.format;
-    if checkout_twoway_dirty(context, Some(target), recurse_submodules, false).is_ok() {
+    if checkout_twoway_dirty(
+        cli_session.original_cwd.as_deref(),
+        context,
+        Some(target),
+        recurse_submodules,
+        false,
+    )
+    .is_ok()
+    {
         return Ok(());
     }
 
-    let stash_oid = match commands::stash::create_stash_for_autostash_at(git_dir, worktree_root)? {
+    let stash_oid = match commands::stash::create_stash_for_autostash_at(
+        cli_session.original_cwd.as_deref(),
+        cli_session.precompose_unicode(),
+        git_dir,
+        worktree_root,
+    )? {
         Some(oid) => oid,
         None => {
             eprintln!("fatal: Cannot autostash");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     };
     let head = resolve_revision(git_dir, format, "HEAD", context.replace_objects)?;
     if recurse_submodules {
         commands::read_tree::reset_index_and_worktree_to_commit(
+            cli_session.original_cwd.as_deref(),
             worktree_root,
             git_dir,
             format,
@@ -2507,7 +2595,13 @@ fn checkout_merge_autostash_branch_switch(
             true,
         )?;
     } else {
-        sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &head)?;
+        sley_worktree::reset_index_and_worktree_to_commit(
+            cli_session.original_cwd.as_deref(),
+            worktree_root,
+            git_dir,
+            format,
+            &head,
+        )?;
     }
     // Retry the switch WITHOUT clobbering untracked files. The autostash above
     // only removed *tracked* local modifications; if the switch still fails now,
@@ -2515,8 +2609,16 @@ fn checkout_merge_autostash_branch_switch(
     // `checkout -m` fails atomically rather than nuking it (t2500 "checkout -m
     // does not nuke untracked file"). Restore the stashed changes to the worktree
     // and propagate the error, leaving HEAD and the untracked file untouched.
-    if let Err(err) = checkout_twoway_dirty(context, Some(target), recurse_submodules, false) {
+    if let Err(err) = checkout_twoway_dirty(
+        cli_session.original_cwd.as_deref(),
+        context,
+        Some(target),
+        recurse_submodules,
+        false,
+    ) {
         let _ = commands::stash::apply_stash_commit_quietly_at(
+            cli_session.original_cwd.as_deref(),
+            &cli_session.remote_policy,
             git_dir,
             worktree_root,
             &stash_oid,
@@ -2525,6 +2627,8 @@ fn checkout_merge_autostash_branch_switch(
         return Err(err);
     }
     let applied = commands::stash::apply_stash_commit_quietly_at(
+        cli_session.original_cwd.as_deref(),
+        &cli_session.remote_policy,
         git_dir,
         worktree_root,
         &stash_oid,
@@ -2545,7 +2649,7 @@ fn checkout_merge_autostash_branch_switch(
         }
     } else {
         eprintln!("error: cannot store {}", stash_oid.to_hex());
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(())
 }
@@ -2559,6 +2663,7 @@ fn checkout_print_autostash_conflict_advice() {
 }
 
 fn checkout_twoway_dirty(
+    original_cwd: Option<&std::path::Path>,
     context: &CheckoutContext,
     target: Option<&ObjectId>,
     recurse_submodules: bool,
@@ -2591,6 +2696,7 @@ fn checkout_twoway_dirty(
     };
 
     commands::read_tree::checkout_two_way_engine(
+        original_cwd,
         git_dir,
         worktree_root,
         format,

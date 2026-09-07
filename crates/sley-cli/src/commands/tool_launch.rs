@@ -65,7 +65,7 @@ pub(crate) fn resolve_tool_command(
                     name,
                     name
                 );
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             };
             match mode {
                 ToolMode::Diff => format!("\"{path}\" \"$LOCAL\" \"$REMOTE\""),

@@ -29,7 +29,7 @@ const BRANCH_USAGE_LINES: [&str; 8] = [
 
 fn branch_usage_error(error: UsageError) -> GitError {
     eprint!("{}", error.render_stderr());
-    GitError::Exit(error.exit_code())
+    crate::cli_exit(error.exit_code())
 }
 
 fn branch_error_is_unknown(error: &UsageError) -> bool {
@@ -607,7 +607,7 @@ fn branch_sort_from_key(
         }
         _ => {
             eprintln!("fatal: unknown field name: {key}");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -792,7 +792,7 @@ pub(super) fn setup_branch_verbose_list_options(
     }
     if saw_column && verbosity > 0 {
         eprintln!("fatal: options '--column' and '--verbose' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let (patterns, filters) = branch_verbose_patterns_and_filters(args)?;
     if !explicit_list

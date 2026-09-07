@@ -1,7 +1,6 @@
 //! `git cat-file`: inspect objects and run the batch object-query protocol.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use sley::plumbing::{sley_index, sley_rev, sley_worktree};
 use std::fmt::Write as _;
 use std::io::{self, BufRead, BufWriter, Write};
 use std::path::Path;
@@ -10,9 +9,9 @@ use std::sync::Arc;
 use super::args::{GitArgCursor, LongOption, option_takes_no_value, switch_requires_value};
 use crate::*;
 use sley::ObjectDatabase as FileObjectDatabase;
-use sley::plumbing::sley_object::ObjectType;
-use sley::plumbing::sley_odb::ObjectStorageInfo;
 use sley::{GitError, ObjectFormat, ObjectId, Result};
+use sley_object::ObjectType;
+use sley_odb::ObjectStorageInfo;
 
 pub(crate) fn cmd_cat_file(
     cli_session: &crate::session::CliSession,
@@ -369,8 +368,12 @@ impl CatFileObjectRequest {
             CatFileObjectMode::Command(
                 mode @ (CatFileCmdMode::Textconv | CatFileCmdMode::Filters),
             ) => query.print_transform(mode, self.force_path.as_deref()),
-            CatFileObjectMode::Command(mode) => query.print_command_mode(mode),
-            CatFileObjectMode::Typed(object_type) => query.print_typed_body(object_type),
+            CatFileObjectMode::Command(mode) => {
+                query.print_command_mode(&cli_session.remote_policy, mode)
+            }
+            CatFileObjectMode::Typed(object_type) => {
+                query.print_typed_body(&cli_session.remote_policy, object_type)
+            }
         }
     }
 }
@@ -534,12 +537,16 @@ impl ObjectQuery<'_> {
         }
     }
 
-    fn print_command_mode(&self, mode: CatFileCmdMode) -> Result<()> {
+    fn print_command_mode(
+        &self,
+        policy: &sley_remote::RemotePolicy,
+        mode: CatFileCmdMode,
+    ) -> Result<()> {
         match mode {
             CatFileCmdMode::Exists => self.print_exists(),
             CatFileCmdMode::Type => self.print_type(),
             CatFileCmdMode::Size => self.print_size(),
-            CatFileCmdMode::Pretty => self.print_pretty(),
+            CatFileCmdMode::Pretty => self.print_pretty(policy),
             // `--textconv`/`--filters` are dispatched to `print_transform` before
             // reaching here (they need the recorded path + mode, not just an oid).
             CatFileCmdMode::Textconv | CatFileCmdMode::Filters => {
@@ -605,7 +612,7 @@ impl ObjectQuery<'_> {
                 } else {
                     eprintln!("fatal: Not a valid object name {}", self.name);
                 }
-                Err(GitError::Exit(128))
+                Err(crate::cli_exit(128))
             }
             Some(0) => {
                 let (stage, path) = parse_index_stage_path(&self.name[1..]);
@@ -624,7 +631,7 @@ impl ObjectQuery<'_> {
                         } else {
                             eprintln!("fatal: invalid object name '{rev}'.");
                         }
-                        Err(GitError::Exit(128))
+                        Err(crate::cli_exit(128))
                     }
                 }
             }
@@ -635,8 +642,10 @@ impl ObjectQuery<'_> {
     /// id and recorded mode (the mode lets the caller skip textconv on symlinks).
     fn resolve_index_entry(&self, stage: u8, path: &str) -> Result<(ObjectId, u32)> {
         let index_path = sley_worktree::repository_index_path(self.view.git_dir());
-        let bytes =
-            std::fs::read(&index_path).map_err(|err| GitError::Io(format!("read index: {err}")))?;
+        let bytes = std::fs::read(&index_path).map_err(|err| GitError::IoKind {
+            kind: std::io::ErrorKind::Other,
+            message: format!("read index: {err}"),
+        })?;
         let index = sley_index::Index::parse(&bytes, self.view.format())?;
         let want = path.as_bytes();
         for entry in &index.entries {
@@ -658,7 +667,7 @@ impl ObjectQuery<'_> {
             return Ok(());
         }
         // Upstream's `-e` exits 1 with no message when the object is absent.
-        Err(GitError::Exit(1))
+        Err(crate::cli_exit(1))
     }
 
     /// `-t` / `-s`: read only object info. A missing full-hex oid yields "could not get object
@@ -709,10 +718,11 @@ impl ObjectQuery<'_> {
 
     /// `-p`: read object info, then emit the body (pretty-printing a tree). Upstream routes a
     /// missing object or unreadable header through "Not a valid object name".
-    fn print_pretty(&self) -> Result<()> {
+    fn print_pretty(&self, policy: &sley_remote::RemotePolicy) -> Result<()> {
         let (oid, _) = self.resolve_command_oid()?;
         let read_oid = self.view.replacement_oid(&oid)?;
         let object = match crate::read_object_maybe_prefetch_promisor(
+            policy,
             self.view.db(),
             &read_oid,
             self.view.lazy_fetch,
@@ -765,7 +775,11 @@ impl ObjectQuery<'_> {
         }
     }
 
-    fn print_typed_body(&self, object_type: ObjectType) -> Result<()> {
+    fn print_typed_body(
+        &self,
+        policy: &sley_remote::RemotePolicy,
+        object_type: ObjectType,
+    ) -> Result<()> {
         let is_full_hex = self.name.len() == self.view.format().hex_len()
             && self.name.bytes().all(|byte| byte.is_ascii_hexdigit());
         let oid = if is_full_hex {
@@ -776,6 +790,7 @@ impl ObjectQuery<'_> {
         let oid = self.view.replacement_oid(&oid)?;
         if is_full_hex {
             let object = match crate::read_object_maybe_prefetch_promisor(
+                policy,
                 self.view.db(),
                 &oid,
                 self.view.lazy_fetch,
@@ -811,7 +826,7 @@ impl ObjectQuery<'_> {
         };
         if object.object_type != object_type {
             eprintln!("fatal: git cat-file {}: bad file", self.name);
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         let mailmap = self.cat_file_mailmap()?;
         let body = cat_file_apply_mailmap_body(&object.body, object.object_type, &mailmap);
@@ -833,7 +848,7 @@ impl ObjectQuery<'_> {
                 "fatal: loose object {oid} (stored in {}) is corrupt",
                 loose_object_display_path(self.view.db(), oid)
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         Err(err)
     }
@@ -1150,7 +1165,7 @@ impl CatFileBatchRequest {
                 BatchCommand::Flush => {
                     if !self.buffer {
                         eprintln!("fatal: flush is only for --buffer mode");
-                        return Err(GitError::Exit(128));
+                        return Err(crate::cli_exit(128));
                     }
                     for (queued_command, queued_mailmap) in std::mem::take(&mut queued) {
                         self.run_batch_command(
@@ -1287,7 +1302,7 @@ fn read_batch_record<'a, R: BufRead>(
     buffer.clear();
     let read = reader
         .read_until(delimiter, buffer)
-        .map_err(|err| GitError::Io(err.to_string()))?;
+        .map_err(GitError::from)?;
     if read == 0 {
         return Ok(None);
     }
@@ -1305,11 +1320,11 @@ fn read_batch_record<'a, R: BufRead>(
 fn parse_batch_command(line: &str) -> Result<BatchCommand<'_>> {
     if line.is_empty() {
         eprintln!("fatal: empty command in input");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if line.starts_with(|ch: char| ch.is_ascii_whitespace()) {
         eprintln!("fatal: whitespace before command: '{line}'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     for (name, takes_args) in [
         ("contents", true),
@@ -1324,7 +1339,7 @@ fn parse_batch_command(line: &str) -> Result<BatchCommand<'_>> {
             // Upstream requires the byte right after the command name to be a literal space.
             let Some(arg) = rest.strip_prefix(' ') else {
                 eprintln!("fatal: {name} requires arguments");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             };
             return match name {
                 "info" => Ok(BatchCommand::Info(arg)),
@@ -1333,7 +1348,7 @@ fn parse_batch_command(line: &str) -> Result<BatchCommand<'_>> {
                     Some(enabled) => Ok(BatchCommand::Mailmap(enabled)),
                     None => {
                         eprintln!("fatal: mailmap: invalid boolean '{arg}'");
-                        Err(GitError::Exit(128))
+                        Err(crate::cli_exit(128))
                     }
                 },
                 _ => unreachable!(),
@@ -1341,12 +1356,12 @@ fn parse_batch_command(line: &str) -> Result<BatchCommand<'_>> {
         }
         if !rest.is_empty() {
             eprintln!("fatal: {name} takes no arguments");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         return Ok(BatchCommand::Flush);
     }
     eprintln!("fatal: unknown command: '{line}'");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 /// The test-only `GIT_TEST_CAT_FILE_NO_FLUSH_ON_EXIT` knob: when truthy, `--batch-command
@@ -1548,7 +1563,7 @@ fn print_cat_file_batch_record(
         // reading; a genuinely absent object is reported as `missing` (or `submodule`).
         Err(GitError::InvalidObject(message)) if message.starts_with("unknown object type") => {
             eprintln!("fatal: invalid object type");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         // A corrupt loose object (over-long header, unpackable stream, broken body) is
         // non-fatal in batch mode: git emits the `error:` line and reports the oid as
@@ -1586,7 +1601,7 @@ fn print_cat_file_batch_record(
     {
         if record.rest.is_empty() {
             eprintln!("fatal: missing path for '{oid}'");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         // Upstream's `print_object_or_die` passes the regular-file mode 0100644.
         let transformed = cat_file_transform_blob(
@@ -1622,7 +1637,7 @@ fn batch_object_header(
         }
         Err(GitError::InvalidObject(message)) if message.starts_with("unknown object type") => {
             eprintln!("fatal: invalid object type");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
         Err(err) => {
             // A corrupt loose object is not fatal in batch mode: git prints the
@@ -2056,7 +2071,12 @@ fn cat_file_transform_blob(
             let config = read_repo_config(git_dir).unwrap_or_default();
             let attributes = view
                 .worktree_root()
-                .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
+                .map(|root| {
+                    sley_worktree::StandardAttributeMatcher::from_worktree_root(
+                        config.precompose_unicode(),
+                        root,
+                    )
+                })
                 .transpose()?;
             let resolver = commands::userdiff::UserdiffResolver::with_attributes(
                 attributes,
@@ -2084,7 +2104,7 @@ fn cat_file_transform_blob(
                             // Upstream's fill_textconv dies when run_textconv
                             // yields NULL.
                             eprintln!("fatal: unable to read files to diff");
-                            Err(GitError::Exit(128))
+                            Err(crate::cli_exit(128))
                         }
                     }
                 }
@@ -2102,33 +2122,33 @@ fn cat_file_transform_blob(
 fn cat_file_usage_msg<T>(message: &str) -> Result<T> {
     eprintln!("fatal: {message}\n");
     eprint!("{CAT_FILE_USAGE}");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 /// `parse_options`-style cmdmode conflict: no usage block, just the `error:` line. The
 /// option being parsed is named first, the previously-recorded one second.
 fn cat_file_cannot_use_together<T>(current: &str, previous: &str) -> Result<T> {
     eprintln!("error: options '{current}' and '{previous}' cannot be used together");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn cat_file_only_one_batch_option<T>() -> Result<T> {
     eprintln!("error: only one batch option may be specified");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 /// `fatal: Not a valid object name <name>` (exit 128). Upstream's `die` when
 /// `get_oid_with_context` (or, for `-p`, the object-info read) fails to find the object.
 fn cat_file_not_a_valid_object_name<T>(name: &str) -> Result<T> {
     eprintln!("fatal: Not a valid object name {name}");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 /// `fatal: git cat-file: could not get object info` (exit 128). Upstream's `die` for `-t`/`-s`
 /// when `odb_read_object_info_extended` fails on an oid that resolved syntactically.
 fn cat_file_could_not_get_object_info<T>() -> Result<T> {
     eprintln!("fatal: git cat-file: could not get object info");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 /// Which `cmd_object` path is mapping an object-info error, so the right trailing `fatal:` is
@@ -2154,7 +2174,7 @@ fn cat_file_object_info_error<T>(
             // `parse_loose_header` sets the type to "invalid" and upstream dies with this exact,
             // oid-less message for both `-t`/`-s` and `-p`.
             eprintln!("fatal: invalid object type");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if is_loose_corruption_message(message) {
             // The odb already formatted git's exact `error:`-level text (too-long header,
@@ -2219,39 +2239,39 @@ fn cat_file_object_info_failed<T>(user: CatFileObjectInfoUser<'_>) -> Result<T> 
 /// block). Mirrors the fall-through in `gently_parse_list_objects_filter`.
 fn cat_file_invalid_filter_spec<T>(spec: &str) -> Result<T> {
     eprintln!("fatal: invalid filter-spec '{spec}'");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 /// `--filter=tree:<non-numeric>`: `fatal: expected 'tree:<depth>'` (exit 128).
 fn cat_file_expected_tree_depth<T>() -> Result<T> {
     eprintln!("fatal: expected 'tree:<depth>'");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 /// `--filter=sparse:path=...`: `fatal: sparse:path filters support has been dropped` (exit 128).
 fn cat_file_sparse_path_dropped<T>() -> Result<T> {
     eprintln!("fatal: sparse:path filters support has been dropped");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 /// `--filter=object:type=<bad>`: not a valid object type (exit 128).
 fn cat_file_invalid_object_type_filter<T>(value: &str) -> Result<T> {
     eprintln!("fatal: '{value}' for 'object:type=<type>' is not a valid object type");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 /// A parseable-but-unimplemented filter kind: `usage: objects filter not supported: '<name>'`
 /// (exit 129, no usage block — upstream's `usagef`).
 fn cat_file_objects_filter_unsupported<T>(name: &str) -> Result<T> {
     eprintln!("usage: objects filter not supported: '{name}'");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 /// An implemented filter used outside batch mode: `usage: objects filter only supported in
 /// batch mode` (exit 129, no usage block).
 fn cat_file_objects_filter_only_in_batch_mode<T>() -> Result<T> {
     eprintln!("usage: objects filter only supported in batch mode");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn cat_file_path_needs_filters_or_textconv<T>() -> Result<T> {
@@ -2292,14 +2312,14 @@ fn cat_file_two_arguments_required<T>(argc: usize) -> Result<T> {
 /// with no `fatal:` line. Mirrors git's `usage_with_options`.
 fn cat_file_bare_usage<T>() -> Result<T> {
     eprint!("{CAT_FILE_USAGE}");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 /// `<type> <object>` mode with an unrecognized type string. Upstream resolves the type via
 /// `type_from_string`, which dies (exit 128) rather than emitting a usage error.
 fn cat_file_unknown_type<T>(exp_type: &str, _obj_name: &str) -> Result<T> {
     eprintln!("fatal: invalid object type \"{exp_type}\"");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 #[cfg(test)]
@@ -2312,7 +2332,7 @@ mod tests {
         let args = vec!["-e".to_string(), "--batch".to_string()];
         assert!(matches!(
             CatFileInvocation::parse(&args),
-            Err(GitError::Exit(129))
+            Err(error) if crate::cli_reported_status(&error) == Some(129)
         ));
     }
 
@@ -2321,7 +2341,7 @@ mod tests {
         let args = vec!["-e".to_string(), "-p".to_string(), "HEAD".to_string()];
         assert!(matches!(
             CatFileInvocation::parse(&args),
-            Err(GitError::Exit(129))
+            Err(error) if crate::cli_reported_status(&error) == Some(129)
         ));
     }
 
@@ -2330,7 +2350,7 @@ mod tests {
         let args = vec!["-e".to_string()];
         assert!(matches!(
             CatFileInvocation::parse(&args),
-            Err(GitError::Exit(129))
+            Err(error) if crate::cli_reported_status(&error) == Some(129)
         ));
     }
 
@@ -2339,7 +2359,7 @@ mod tests {
         let args = vec!["-e".to_string(), "HEAD".to_string(), "extra".to_string()];
         assert!(matches!(
             CatFileInvocation::parse(&args),
-            Err(GitError::Exit(129))
+            Err(error) if crate::cli_reported_status(&error) == Some(129)
         ));
     }
 
@@ -2348,7 +2368,7 @@ mod tests {
         let args = vec!["--batch".to_string(), "HEAD".to_string()];
         assert!(matches!(
             CatFileInvocation::parse(&args),
-            Err(GitError::Exit(129))
+            Err(error) if crate::cli_reported_status(&error) == Some(129)
         ));
     }
 
@@ -2357,7 +2377,7 @@ mod tests {
         let args = vec!["--textconv=value".to_string(), "HEAD".to_string()];
         assert!(matches!(
             CatFileInvocation::parse(&args),
-            Err(GitError::Exit(129))
+            Err(error) if crate::cli_reported_status(&error) == Some(129)
         ));
     }
 
@@ -2365,7 +2385,7 @@ mod tests {
     fn filter_unknown_spec_dies_128() {
         assert!(matches!(
             CatFileObjectsFilter::parse("unknown"),
-            Err(GitError::Exit(128))
+            Err(error) if crate::cli_reported_status(&error) == Some(128)
         ));
     }
 
@@ -2373,7 +2393,7 @@ mod tests {
     fn filter_sparse_path_dropped_dies_128() {
         assert!(matches!(
             CatFileObjectsFilter::parse("sparse:path=x"),
-            Err(GitError::Exit(128))
+            Err(error) if crate::cli_reported_status(&error) == Some(128)
         ));
     }
 
@@ -2381,7 +2401,7 @@ mod tests {
     fn filter_tree_non_numeric_dies_128() {
         assert!(matches!(
             CatFileObjectsFilter::parse("tree:notanumber"),
-            Err(GitError::Exit(128))
+            Err(error) if crate::cli_reported_status(&error) == Some(128)
         ));
     }
 
@@ -2389,7 +2409,7 @@ mod tests {
     fn filter_object_type_bad_dies_128() {
         assert!(matches!(
             CatFileObjectsFilter::parse("object:type=bogus"),
-            Err(GitError::Exit(128))
+            Err(error) if crate::cli_reported_status(&error) == Some(128)
         ));
     }
 
@@ -2411,7 +2431,7 @@ mod tests {
         let args = vec!["--filter=tree:1".to_string()];
         assert!(matches!(
             CatFileInvocation::parse(&args),
-            Err(GitError::Exit(129))
+            Err(error) if crate::cli_reported_status(&error) == Some(129)
         ));
     }
 
@@ -2421,7 +2441,7 @@ mod tests {
         let args = vec!["--filter=blob:none".to_string()];
         assert!(matches!(
             CatFileInvocation::parse(&args),
-            Err(GitError::Exit(129))
+            Err(error) if crate::cli_reported_status(&error) == Some(129)
         ));
     }
 
@@ -2461,22 +2481,24 @@ mod tests {
 
     #[test]
     fn batch_command_parse_diagnostics() {
-        assert!(matches!(parse_batch_command(""), Err(GitError::Exit(128))));
+        assert!(
+            matches!(parse_batch_command(""), Err(error) if crate::cli_reported_status(&error) == Some(128))
+        );
         assert!(matches!(
             parse_batch_command(" info x"),
-            Err(GitError::Exit(128))
+            Err(error) if crate::cli_reported_status(&error) == Some(128)
         ));
         assert!(matches!(
             parse_batch_command("info"),
-            Err(GitError::Exit(128))
+            Err(error) if crate::cli_reported_status(&error) == Some(128)
         ));
         assert!(matches!(
             parse_batch_command("flush x"),
-            Err(GitError::Exit(128))
+            Err(error) if crate::cli_reported_status(&error) == Some(128)
         ));
         assert!(matches!(
             parse_batch_command("bogus"),
-            Err(GitError::Exit(128))
+            Err(error) if crate::cli_reported_status(&error) == Some(128)
         ));
         assert!(matches!(
             parse_batch_command("info HEAD"),
@@ -2500,7 +2522,7 @@ mod tests {
         ));
         assert!(matches!(
             parse_batch_command("mailmap maybe"),
-            Err(GitError::Exit(128))
+            Err(error) if crate::cli_reported_status(&error) == Some(128)
         ));
     }
 }

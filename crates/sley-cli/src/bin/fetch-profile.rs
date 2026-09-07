@@ -1,4 +1,4 @@
-use sley::plumbing::sley_core::fetch_profile::{self, Stage};
+use sley_core::fetch_profile::{self, Stage};
 use std::error::Error;
 use std::fmt::Write as _;
 use std::fs;

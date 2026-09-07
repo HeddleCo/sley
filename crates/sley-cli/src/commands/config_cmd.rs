@@ -2,7 +2,6 @@
 #![allow(clippy::expect_used)]
 
 use crate::*;
-use sley::plumbing::{sley_config, sley_rev};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConfigAction {
@@ -171,7 +170,7 @@ impl ConfigModeTracker {
         if let Some((existing, existing_flag)) = self.chosen {
             if existing != mode {
                 eprintln!("error: options '{flag}' and '{existing_flag}' cannot be used together");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
         } else {
             self.chosen = Some((mode, flag));
@@ -391,7 +390,7 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
             "--default" => {
                 let Some(value) = iter.next() else {
                     eprintln!("error: option `default' requires a value");
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 };
                 default_value = Some(value.to_string());
             }
@@ -456,7 +455,7 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
             }
             value if value.starts_with("--no-") => {
                 eprintln!("error: unknown option `{}'", &value[2..]);
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             value => {
                 positional.push(value);
@@ -470,7 +469,7 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
         match positional.len() {
             0 => {
                 eprintln!("error: no action specified");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             1 if positional[0].contains('=') && !config_key_is_valid(positional[0]) => {
                 ConfigAction::Set
@@ -533,15 +532,15 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
         }
         ConfigAction::GetColor if !(1..=2).contains(&positional.len()) => {
             eprintln!("error: wrong number of arguments, should be from 1 to 2");
-            return Err(GitError::Exit(129));
+            return Err(crate::cli_exit(129));
         }
         ConfigAction::GetColorBool if !(1..=2).contains(&positional.len()) => {
             eprintln!("error: wrong number of arguments, should be from 1 to 2");
-            return Err(GitError::Exit(129));
+            return Err(crate::cli_exit(129));
         }
         ConfigAction::GetUrlMatch if positional.len() != 2 => {
             eprintln!("error: wrong number of arguments, should be 2");
-            return Err(GitError::Exit(129));
+            return Err(crate::cli_exit(129));
         }
         ConfigAction::Unset | ConfigAction::UnsetAll if !(1..=2).contains(&positional.len()) => {
             return Err(GitError::Command(
@@ -578,11 +577,11 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
         // `--all`. Both abort via `die()` (exit 128).
         if fixed_value && subcommand_value_pattern.is_none() {
             eprintln!("fatal: --fixed-value only applies with 'value-pattern'");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if default_value.is_some() && (action == ConfigAction::GetAll || subcommand_url.is_some()) {
             eprintln!("fatal: --default= cannot be used with --all or --url=");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if subcommand_url.is_some()
             && (action == ConfigAction::GetAll
@@ -590,11 +589,11 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
                 || subcommand_value_pattern.is_some())
         {
             eprintln!("fatal: --url= cannot be used with --all, --regexp or --value");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     } else if default_value.is_some() && action != ConfigAction::Get {
         eprintln!("error: --default is only applicable to --get");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     // git restricts `--show-origin` to the four read actions; `--show-scope`
     // carries no such check (it works with `--get-urlmatch`, see t1300).
@@ -606,11 +605,11 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
         eprintln!(
             "error: --show-origin is only applicable to --get, --get-all, --get-regexp, and --list"
         );
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     if action == ConfigAction::GetUrlMatch && name_only {
         eprintln!("error: --name-only is only applicable to --list or --get-regexp");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     if comment.is_some()
         && !matches!(
@@ -619,7 +618,7 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
         )
     {
         eprintln!("error: --comment is only applicable to add/set/replace operations");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     // Classic-form `--fixed-value` (git's `cmd_config_legacy`) only applies when
     // a value-pattern is supplied in the appropriate positional, and only for
@@ -639,7 +638,7 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
         };
         if !allowed {
             eprintln!("error: --fixed-value only applies with 'value-pattern'");
-            return Err(GitError::Exit(129));
+            return Err(crate::cli_exit(129));
         }
     }
     // The value-pattern positional, parsed as git's value-pattern (a leading `!`
@@ -694,21 +693,21 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
         + usize::from(blob.is_some());
     if file_sources > 1 {
         eprintln!("error: only one config file at a time");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     let repo_git_dir = cli_session.git_dir();
     if repo_git_dir.is_err() {
         if use_local {
             eprintln!("fatal: --local can only be used inside a git repository");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if blob.is_some() {
             eprintln!("fatal: --blob can only be used inside a git repository");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if use_worktree {
             eprintln!("fatal: --worktree can only be used inside a git repository");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     let editor_repo_git_dir = match &repo_git_dir {
@@ -745,7 +744,7 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
             eprintln!(
                 "fatal: --worktree cannot be used with multiple working trees unless the config\nextension worktreeConfig is enabled. Please read \"CONFIGURATION FILE\"\nsection in \"git help worktree\" for details"
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         } else {
             common.join("config")
         };
@@ -784,7 +783,7 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
                 );
                 if is_write {
                     eprintln!("fatal: not in a git directory");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 return Err(err);
             }
@@ -831,7 +830,7 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
                 let value = normalize_set_value(&key, positional[1], value_type)?;
                 if !config_raw_edit(&source, &key, Some(&value), comment.as_deref(), None, false)? {
                     print_config_multiple_values_error(&key);
-                    return Err(GitError::Exit(5));
+                    return Err(crate::cli_exit(5));
                 }
             }
             ConfigAction::SetAll => {
@@ -849,7 +848,7 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
                     false,
                 )? {
                     print_config_multiple_values_error(&key);
-                    return Err(GitError::Exit(5));
+                    return Err(crate::cli_exit(5));
                 }
             }
             ConfigAction::ReplaceAll => {
@@ -885,14 +884,14 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
                 let key = key.expect("validated config key");
                 let pred = value_pattern_filter.map(filter_predicate);
                 if !config_raw_edit(&source, &key, None, None, pred.as_deref(), false)? {
-                    return Err(GitError::Exit(5));
+                    return Err(crate::cli_exit(5));
                 }
             }
             ConfigAction::UnsetAll => {
                 let key = key.expect("validated config key");
                 let pred = value_pattern_filter.map(filter_predicate);
                 if !config_raw_edit(&source, &key, None, None, pred.as_deref(), true)? {
-                    return Err(GitError::Exit(5));
+                    return Err(crate::cli_exit(5));
                 }
             }
             ConfigAction::RenameSection => {
@@ -952,7 +951,7 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
         if let Some(url) = subcommand_url.as_deref() {
             let target = parse_config_urlmatch_target(positional[0])?;
             if !config_get_urlmatch(&entries, &target, url, null_terminate, display, value_type)? {
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
             return Ok(());
         }
@@ -979,7 +978,7 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
             default_value.as_deref(),
             null_terminate,
         )? {
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         return Ok(());
     }
@@ -1023,7 +1022,7 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
                     default_value.as_deref(),
                     null_terminate,
                 )? {
-                    return Err(GitError::Exit(1));
+                    return Err(crate::cli_exit(1));
                 }
                 return Ok(());
             }
@@ -1045,10 +1044,10 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
                 Some(selected) => selected,
                 None => {
                     let Some(default) = default_value.as_deref() else {
-                        return Err(GitError::Exit(1));
+                        return Err(crate::cli_exit(1));
                     };
                     let Some(value) = format_default_config_value(default, value_type)? else {
-                        return Err(GitError::Exit(1));
+                        return Err(crate::cli_exit(1));
                     };
                     (
                         ConfigValueMeta::command_line(),
@@ -1102,7 +1101,7 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
                         eprintln!(
                             "fatal: bad boolean config value '{stdout_is_tty}' for 'command line'"
                         );
-                        return Err(GitError::Exit(128));
+                        return Err(crate::cli_exit(128));
                     };
                     Some(parsed)
                 }
@@ -1125,7 +1124,7 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
             if stdout_tty_hint.is_some() {
                 writeln!(io::stdout(), "{enabled}")?;
             } else if !enabled {
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
         }
         ConfigAction::GetUrlMatch => {
@@ -1138,7 +1137,7 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
                 display,
                 value_type,
             )? {
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
         }
         ConfigAction::GetAll => {
@@ -1160,14 +1159,14 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
                     None,
                     null_terminate,
                 )? {
-                    return Err(GitError::Exit(1));
+                    return Err(crate::cli_exit(1));
                 }
                 return Ok(());
             }
             let name = config_key_name(&key);
             let values = entries_get_all(&entries, &key);
             if values.is_empty() {
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
             let mut stdout = io::stdout();
             let mut wrote = false;
@@ -1192,7 +1191,7 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
                 )?;
             }
             if !wrote {
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
         }
         ConfigAction::GetRegexp => {
@@ -1210,7 +1209,7 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
                 value_type,
                 null_terminate,
             )? {
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
         }
         _ => unreachable!("write actions handled above"),
@@ -1353,7 +1352,7 @@ fn load_entries_from_file(
                 "fatal: unable to read config file '{}': {err}",
                 path.display()
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     };
     let (parsed, tail_error) = parse_config_bytes(&bytes, action, Some(path))?;
@@ -1444,7 +1443,7 @@ fn config_edit(
             ConfigSource::Stdin => eprintln!("fatal: editing stdin is not supported"),
             _ => eprintln!("fatal: editing blobs is not supported"),
         }
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
     let editor = config_editor_command(cli_session, repo_git_dir)?;
     if editor == ":" {
@@ -1562,7 +1561,7 @@ fn config_raw_edit(
             ConfigSource::Stdin => eprintln!("fatal: writing to stdin is not supported"),
             _ => eprintln!("fatal: writing config blobs is not supported"),
         }
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
     let contents = match fs::read(&path) {
         Ok(bytes) => bytes,
@@ -1572,7 +1571,7 @@ fn config_raw_edit(
                 "fatal: unable to read config file '{}': {err}",
                 path.display()
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     };
     let mut editor = sley_config::raw_edit::RawConfigEditor::new(
@@ -1596,7 +1595,7 @@ fn write_raw_config_file(path: &std::path::Path, bytes: Vec<u8>) -> Result<()> {
         &bytes,
         sley_config::raw_edit::ConfigFileWriteOptions::default(),
     )
-    .map_err(|err| GitError::Io(err.to_string()))
+    .map_err(GitError::from)
 }
 
 /// git's `section_name_is_ok`: a new section name must be non-empty, and the
@@ -1642,7 +1641,7 @@ fn config_rename_or_remove_section(
             let rendered = section_name_string(&parsed);
             if !section_name_is_ok(&rendered) {
                 eprintln!("error: invalid section name: {rendered}");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             Some(rendered)
         }
@@ -1655,7 +1654,7 @@ fn config_rename_or_remove_section(
             ConfigSource::Stdin => eprintln!("fatal: writing to stdin is not supported"),
             _ => eprintln!("fatal: writing config blobs is not supported"),
         }
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
     let display_path = config_source_display_name(source, &path);
     let contents = match fs::read(&path) {
@@ -1667,7 +1666,7 @@ fn config_rename_or_remove_section(
                 "fatal: unable to read config file '{}': {err}",
                 path.display()
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     };
     match sley_config::raw_edit::rename_or_remove_section(
@@ -1681,13 +1680,13 @@ fn config_rename_or_remove_section(
         }
         sley_config::raw_edit::SectionEditOutcome::NotFound => {
             eprintln!("fatal: no such section: {old_rendered}");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
         sley_config::raw_edit::SectionEditOutcome::LineTooLong(line) => {
             eprintln!(
                 "error: refusing to work with overly long line in '{display_path}' on line {line}"
             );
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -1738,7 +1737,7 @@ fn global_config_file_path() -> Result<PathBuf> {
     }
     let Some(home) = sley_config::home_dir() else {
         eprintln!("fatal: $HOME not set");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
     let user = PathBuf::from(&home).join(".gitconfig");
     if !user.exists() {
@@ -1804,14 +1803,14 @@ fn read_config_blob(cli_session: &crate::session::CliSession, spec: &str) -> Res
     };
     if object.object_type != ObjectType::Blob {
         eprintln!("fatal: reference '{spec}' does not point to a blob");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(object.body.clone())
 }
 
 fn config_blob_resolve_error<T>(spec: &str) -> Result<T> {
     eprintln!("fatal: unable to resolve config blob '{spec}'");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn report_config_parse_error(err: GitError, path: Option<&Path>) -> GitError {
@@ -1823,11 +1822,11 @@ fn report_config_parse_error(err: GitError, path: Option<&Path>) -> GitError {
                     == "remote URLs cannot be configured in file directly or indirectly included by includeIf.hasconfig:remote.*.url"
             {
                 eprintln!("fatal: {message}");
-                return GitError::Exit(128);
+                return crate::cli_exit(128);
             }
             if let Some((line, message_path)) = parse_bad_config_line_with_path(&message) {
                 eprintln!("fatal: bad config line {line} in file {message_path}");
-                return GitError::Exit(128);
+                return crate::cli_exit(128);
             }
             if let Some(line) = parse_bad_config_line_without_path(&message) {
                 if let Some(path) = path {
@@ -1835,7 +1834,7 @@ fn report_config_parse_error(err: GitError, path: Option<&Path>) -> GitError {
                 } else {
                     eprintln!("fatal: bad config line {line}");
                 }
-                return GitError::Exit(128);
+                return crate::cli_exit(128);
             }
             GitError::InvalidFormat(message)
         }
@@ -1848,7 +1847,7 @@ fn report_config_stdin_parse_error(err: GitError) -> GitError {
         GitError::InvalidFormat(message) => {
             if let Some(line) = parse_bad_config_line_without_path(&message) {
                 eprintln!("fatal: bad config line {line} in standard input");
-                return GitError::Exit(128);
+                return crate::cli_exit(128);
             }
             GitError::InvalidFormat(message)
         }
@@ -1861,7 +1860,7 @@ fn report_config_blob_parse_error(err: GitError, spec: &str) -> GitError {
         GitError::InvalidFormat(message) => {
             if let Some(line) = parse_bad_config_line_without_path(&message) {
                 eprintln!("fatal: bad config line {line} in blob {spec}");
-                return GitError::Exit(128);
+                return crate::cli_exit(128);
             }
             GitError::InvalidFormat(message)
         }
@@ -1882,7 +1881,7 @@ fn parse_config_type_arg(value: &str) -> Result<ConfigValueType> {
         "path" => Ok(ConfigValueType::Path),
         other => {
             eprintln!("fatal: unrecognized --type argument, {other}");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -1897,7 +1896,7 @@ fn set_config_type(
 ) -> Result<()> {
     if *type_set && *current != new {
         eprintln!("error: only one type at a time");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     *current = new;
     *type_set = true;
@@ -1982,7 +1981,7 @@ fn config_bad_bool_value<T>(value: &str, name: Option<&str>) -> Result<T> {
         Some(name) => eprintln!("fatal: bad boolean config value '{value}' for '{name}'"),
         None => eprintln!("fatal: bad boolean config value '{value}'"),
     }
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 /// git's `die_bad_number`: the message names the key and the source when they
@@ -2013,7 +2012,7 @@ fn config_bad_numeric_value(
         }
         _ => eprintln!("fatal: bad numeric config value '{value}': {kind}"),
     }
-    GitError::Exit(128)
+    crate::cli_exit(128)
 }
 
 fn format_config_expiry_date_value(value: &str) -> Result<String> {
@@ -2028,13 +2027,13 @@ fn format_config_expiry_date_value(value: &str) -> Result<String> {
 
 fn config_bad_expiry_date_value(value: &str) -> GitError {
     eprintln!("error: '{value}' is not a valid timestamp");
-    GitError::Exit(128)
+    crate::cli_exit(128)
 }
 
 fn format_config_default_color_value(value: &str) -> Result<String> {
     format_config_color_value(value).map_err(|_| {
         eprintln!("error: unable to parse default color value");
-        GitError::Exit(255)
+        crate::cli_exit(255)
     })
 }
 
@@ -2063,7 +2062,7 @@ fn config_colorbool_setting(key: &ConfigKey, value: &str) -> Result<ConfigColorB
                 "fatal: bad boolean config value '{value}' for '{}'",
                 config_key_name(key)
             );
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -2103,7 +2102,7 @@ pub(crate) fn try_format_config_color_value(value: &str) -> std::result::Result<
 
 fn config_bad_color_value(value: &str) -> GitError {
     eprintln!("error: invalid color value: {value}");
-    GitError::Exit(128)
+    crate::cli_exit(128)
 }
 
 fn format_config_path_value(value: &str) -> Result<std::borrow::Cow<'_, str>> {
@@ -2111,7 +2110,7 @@ fn format_config_path_value(value: &str) -> Result<std::borrow::Cow<'_, str>> {
         if optional_path_exists(optional) {
             return Ok(std::borrow::Cow::Borrowed(optional));
         }
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     if value == "~" {
         return expand_config_home_path(value, "");
@@ -2140,7 +2139,7 @@ fn optional_path_exists(value: &str) -> bool {
 fn expand_config_home_path<'a>(original: &str, rest: &str) -> Result<std::borrow::Cow<'a, str>> {
     let Some(home) = env::var_os("HOME") else {
         eprintln!("error: failed to expand user dir in: '{original}'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
     Ok(std::borrow::Cow::Owned(
         PathBuf::from(home).join(rest).display().to_string(),
@@ -2167,7 +2166,7 @@ fn config_missing_path_value<T>(name: &str, entry: &sley_config::ConfigStackEntr
             eprintln!("fatal: bad config line");
         }
     }
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn config_entry_physical_line(
@@ -2284,17 +2283,17 @@ pub(crate) fn parse_config_key(value: &str) -> Result<ConfigKey> {
     let parts = value.split('.').collect::<Vec<_>>();
     if parts.len() < 2 {
         eprintln!("error: key does not contain a section: {value}");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     let section = parts[0].to_string();
     let key = parts[parts.len() - 1].to_string();
     if key.is_empty() {
         eprintln!("error: key does not contain variable name: {value}");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     if validate_config_name(&section).is_err() || validate_config_key_name(&key).is_err() {
         eprintln!("error: invalid key: {value}");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     let subsection = if parts.len() > 2 {
         let subsection = parts[1..parts.len() - 1].join(".");
@@ -2303,7 +2302,7 @@ pub(crate) fn parse_config_key(value: &str) -> Result<ConfigKey> {
             .any(|byte| matches!(byte, b'\n' | b'\r' | 0))
         {
             eprintln!("error: invalid key: {value}");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         Some(subsection)
     } else {
@@ -2357,7 +2356,7 @@ fn config_missing_set_value(value: &str) -> Result<()> {
     {
         eprintln!("hint: did you mean \"git config set {name} {suggested_value}\"?");
     }
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn parse_config_urlmatch_target(value: &str) -> Result<ConfigUrlMatchTarget> {
@@ -3124,7 +3123,7 @@ fn format_default_config_value(value: &str, value_type: ConfigValueType) -> Resu
             return format_config_value_with(value, value_type, None, None).map(Some);
         }
         eprintln!("fatal: failed to format default config value: {value}");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     format_config_value_with(value, value_type, None, None).map(Some)
 }
@@ -3328,7 +3327,7 @@ fn write_config_entry(
         }
         None if options.value_type == ConfigValueType::Path => {
             eprintln!("error: missing value for '{name}'");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         // A value-less entry with no requested type prints just the key (git
         // backs out the key delimiter), so there is no value to render.
@@ -3473,7 +3472,7 @@ fn normalize_set_value(
                 Err(()) => {
                     eprintln!("error: invalid color value: {value}");
                     eprintln!("fatal: cannot parse color '{value}'");
-                    Err(GitError::Exit(128))
+                    Err(crate::cli_exit(128))
                 }
             }
         }
@@ -3500,7 +3499,7 @@ fn filter_predicate(filter: &ConfigValuePatternFilter) -> Box<dyn Fn(Option<&str
 fn parse_config_comment(value: &str) -> Result<String> {
     if value.contains('\n') {
         eprintln!("fatal: no multi-line comment allowed: '{value}'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let leading_blanks = value.len() - value.trim_start_matches([' ', '\t']).len();
     let prepared = if leading_blanks > 0 && value[leading_blanks..].starts_with('#') {

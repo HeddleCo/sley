@@ -7,9 +7,9 @@
 //! lives with the log output code.
 
 use crate::*;
-use sley::plumbing::sley_rev::{CommitRecord, resolve_tree_path_entry};
 use sley_rev::line_log::{FileRange, RangeList, is_funcname_line, line_at, line_ends};
 pub(crate) use sley_rev::line_log::{LineLogResult, PrintedFile};
+use sley_rev::{CommitRecord, resolve_tree_path_entry};
 
 /// One `-L` argument before resolution: the raw `<range>:<file>` string.
 #[derive(Debug, Clone)]
@@ -20,7 +20,7 @@ pub(crate) struct LineLogArg {
 /// Error type for `-L` parsing failures that should print git's exact message.
 fn line_log_fatal(msg: impl AsRef<str>) -> GitError {
     eprintln!("fatal: {}", msg.as_ref());
-    GitError::Exit(128)
+    crate::cli_exit(128)
 }
 
 /// Outcome of parsing the leading `<range>` portion of a `-L` argument.

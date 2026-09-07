@@ -10,7 +10,6 @@
 
 use crate::commands::cli_options::opt_bool;
 use crate::*;
-use sley::plumbing::{sley_diff_merge, sley_worktree};
 use sley_options::{OptionSpec, parse_options};
 use std::io;
 
@@ -56,9 +55,13 @@ pub(crate) fn cmd_rerere(cli_session: &crate::session::CliSession, args: &[Strin
             .map(|_| ()),
         Some(RerereSubcommand::Status) => rerere_status(&git_dir),
         Some(RerereSubcommand::Remaining) => rerere_remaining(&git_dir, &worktree_root, format),
-        Some(RerereSubcommand::Diff) => {
-            rerere_diff(&git_dir, &worktree_root, format, cli_session.lazy_fetch())
-        }
+        Some(RerereSubcommand::Diff) => rerere_diff(
+            &cli_session.remote_policy,
+            &git_dir,
+            &worktree_root,
+            format,
+            cli_session.lazy_fetch(),
+        ),
         Some(RerereSubcommand::Clear) => commands::rerere::rerere_clear(&git_dir),
         Some(RerereSubcommand::Forget) => rerere_forget(
             &git_dir,
@@ -133,7 +136,7 @@ fn rerere_usage<T>() -> Result<T> {
     eprintln!("    --[no-]rerere-autoupdate");
     eprintln!("                          register clean resolutions in index");
     eprintln!();
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn rerere_usage_stdout<T>() -> Result<T> {
@@ -142,7 +145,7 @@ fn rerere_usage_stdout<T>() -> Result<T> {
     println!("    --[no-]rerere-autoupdate");
     println!("                          register clean resolutions in index");
     println!();
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 pub(crate) fn is_rerere_enabled(git_dir: &Path) -> bool {
@@ -266,6 +269,7 @@ fn rerere_remaining(git_dir: &Path, worktree_root: &Path, format: ObjectFormat) 
 /// (git's `rerere diff`): a hunk-header-only unified diff with the
 /// `diff --git` / `index` lines stripped.
 fn rerere_diff(
+    policy: &sley_remote::RemotePolicy,
     git_dir: &Path,
     worktree_root: &Path,
     format: ObjectFormat,
@@ -308,7 +312,7 @@ fn rerere_diff(
                 anchors: &[],
                 allow_textconv: false,
                 db: &db,
-                lazy_fetch: crate::diff_lazy_fetch(lazy_fetch),
+                lazy_fetch: crate::diff_lazy_fetch(policy, lazy_fetch).as_option(),
                 worktree_root: None,
                 use_worktree_new: false,
                 format,

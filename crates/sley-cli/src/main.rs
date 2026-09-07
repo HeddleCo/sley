@@ -1,5 +1,5 @@
 use sley::GitError;
-use sley::plumbing::sley_core::cli_exit_code;
+use sley_cli::cli_exit_code;
 fn main() {
     // Use args_os rather than env::args(), which panics (Result::unwrap) on any
     // argument that is not valid UTF-8. Git accepts arbitrary bytes on the
@@ -19,13 +19,13 @@ fn main() {
 fn report_cli_error(err: &GitError) {
     match err {
         // Message was already printed by the command (e.g. `usage_error` in args.rs).
-        GitError::Exit(_) => {}
+        _ if sley_cli::cli_reported_status(err).is_some() => {}
         GitError::InvalidFormat(msg)
             if msg.starts_with("fatal: ") || msg.starts_with("error: ") =>
         {
             eprintln!("{msg}")
         }
-        GitError::Cli(_, msg) => eprintln!("sley: {msg}"),
+        _ if sley_cli::cli_message(err).is_some() => eprintln!("sley: {err}"),
         _ => eprintln!("sley: {err}"),
     }
 }

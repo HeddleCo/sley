@@ -229,7 +229,7 @@ fn parse_pattern_type_arg(arg: &str) -> Result<PatternTypeOption> {
         "perl" => PatternTypeOption::Pcre,
         other => {
             eprintln!("fatal: bad grep.patternType argument: {other}");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     })
 }
@@ -488,7 +488,7 @@ pub(crate) fn cmd_grep(cli_session: &crate::session::CliSession, args: &[String]
     if !have_pattern {
         if positionals.is_empty() {
             eprintln!("fatal: no pattern given");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         opts.push_pattern(positionals.remove(0));
     }
@@ -508,7 +508,7 @@ pub(crate) fn cmd_grep(cli_session: &crate::session::CliSession, args: &[String]
     // dies as soon as the default attr source is computed (attr.c).
     if repo.is_none() && std::env::var_os("GIT_ATTR_SOURCE").is_some() {
         eprintln!("fatal: cannot use --attr-source or GIT_ATTR_SOURCE without repo");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     // Resolve `--recurse-submodules` (CLI override beats the `submodule.recurse`
@@ -524,7 +524,7 @@ pub(crate) fn cmd_grep(cli_session: &crate::session::CliSession, args: &[String]
     }
     if recurse && opts.untracked {
         eprintln!("fatal: --untracked not supported with --recurse-submodules");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     opts.recurse_submodules = recurse;
 
@@ -563,7 +563,7 @@ pub(crate) fn cmd_grep(cli_session: &crate::session::CliSession, args: &[String]
         {
             run_open_pager(pager, &opts, &collector.borrow())?;
         }
-        return if any { Ok(()) } else { Err(GitError::Exit(1)) };
+        return if any { Ok(()) } else { Err(crate::cli_exit(1)) };
     }
 
     let repo = repo.expect("repository discovery succeeded above");
@@ -646,7 +646,7 @@ pub(crate) fn cmd_grep(cli_session: &crate::session::CliSession, args: &[String]
     // `-O` works only on the worktree, never against `--cached` or a tree-ish.
     if pager_cmd.is_some() && (opts.cached || !opts.revs.is_empty()) {
         eprintln!("fatal: --open-files-in-pager only works on the worktree");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let pattern_bytes = grep_pattern_bytes(&opts.patterns);
@@ -664,7 +664,8 @@ pub(crate) fn cmd_grep(cli_session: &crate::session::CliSession, args: &[String]
         Ok(root) if root.is_dir() => Some(root),
         _ => None,
     };
-    let pathspec = GrepPathspec::new(
+    let pathspec = GrepPathspec::with_precomposed_paths(
+        cli_session.precompose_unicode(),
         worktree_root.as_deref(),
         cwd,
         opts.full_name,
@@ -673,7 +674,12 @@ pub(crate) fn cmd_grep(cli_session: &crate::session::CliSession, args: &[String]
     )?;
     let userdiff_attributes = worktree_root
         .as_deref()
-        .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
+        .map(|root| {
+            sley_worktree::StandardAttributeMatcher::from_worktree_root(
+                cli_session.precompose_unicode(),
+                root,
+            )
+        })
         .transpose()?;
     let userdiff = commands::userdiff::UserdiffResolver::with_attributes(
         userdiff_attributes,
@@ -697,6 +703,7 @@ pub(crate) fn cmd_grep(cli_session: &crate::session::CliSession, args: &[String]
             return Err(GitError::Command("grep: missing worktree".into()));
         };
         any_match = grep_index_source(
+            &cli_session.remote_policy,
             GrepIndexSource {
                 git_dir,
                 worktree_root,
@@ -715,6 +722,7 @@ pub(crate) fn cmd_grep(cli_session: &crate::session::CliSession, args: &[String]
             let oid = repo.resolve_revision(rev)?;
             let tree_oid = sley_rev::peel_to_tree(db, format, &oid)?;
             let matched = grep_tree_source(
+                &cli_session.remote_policy,
                 GrepTreeSource {
                     db,
                     format,
@@ -745,7 +753,7 @@ pub(crate) fn cmd_grep(cli_session: &crate::session::CliSession, args: &[String]
     if any_match {
         Ok(())
     } else {
-        Err(GitError::Exit(1))
+        Err(crate::cli_exit(1))
     }
 }
 
@@ -828,14 +836,14 @@ fn is_negative_number(value: &str) -> bool {
 fn parse_int_arg(value: &str, flag: &str) -> Result<i64> {
     value.parse::<i64>().map_err(|_| {
         eprintln!("fatal: invalid number for '{flag}': {value}");
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })
 }
 
 fn parse_context_arg(value: &str) -> Result<usize> {
     let n: i64 = value.parse().map_err(|_| {
         eprintln!("fatal: invalid context length argument: {value}");
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })?;
     Ok(n.max(0) as usize)
 }
@@ -853,7 +861,7 @@ fn load_pattern_file(file: &str, opts: &mut GrepOptions) -> Result<()> {
             Ok(bytes) => bytes,
             Err(_) => {
                 eprintln!("fatal: cannot open '{file}'");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
     };
@@ -874,7 +882,7 @@ fn reject_nul_pattern_without_pcre(opts: &GrepOptions) -> Result<()> {
         eprintln!(
             "fatal: given pattern contains NULL byte (This is only supported with -P under PCRE v2)"
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(())
 }
@@ -1032,13 +1040,13 @@ fn grep_option_requires_value(flag: &str) -> Result<()> {
         "fatal: switch `{}' requires a value",
         flag.trim_start_matches('-')
     );
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn grep_unknown_option(flag: &str) -> Result<()> {
     eprintln!("error: unknown option `{flag}'");
     eprintln!("usage: git grep [<options>] [-e] <pattern> [<rev>...] [[--] <path>...]");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn grep_fallback_to_no_index() -> Result<bool> {
@@ -1148,7 +1156,7 @@ fn run_open_pager(pager: &str, opts: &GrepOptions, files: &[Vec<u8>]) -> Result<
         .args(&extra)
         .status()?;
     if !status.success() {
-        return Err(GitError::Exit(status.code().unwrap_or(1)));
+        return Err(crate::cli_exit(status.code().unwrap_or(1)));
     }
     Ok(())
 }
@@ -1180,7 +1188,8 @@ fn grep_no_index(
         None
     };
     let pathspec_args: &[String] = if opts.untracked { &raw_paths } else { &[] };
-    let pathspec = GrepPathspec::new(
+    let pathspec = GrepPathspec::with_precomposed_paths(
+        cli_session.precompose_unicode(),
         worktree_root.as_deref(),
         &cwd,
         opts.full_name,
@@ -1277,7 +1286,7 @@ fn no_index_paths(positionals: &[String], dashdash: &str) -> Result<Vec<String>>
         };
         if split > 0 {
             eprintln!("fatal: option '--no-index' cannot be used with revs");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         let paths: Vec<String> = positionals[split + 1..].to_vec();
         return Ok(if paths.is_empty() {
@@ -1354,12 +1363,12 @@ fn collect_no_index_path(
     let path = cwd.join(raw);
     if !path.exists() {
         eprintln!("fatal: {raw}: no such path in the working tree");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let canon = fs::canonicalize(&path)?;
     if !canon.starts_with(cwd_canon) {
         eprintln!("fatal: {raw}: '{raw}' is outside the directory tree");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if path.is_dir() {
         collect_no_index_dir(cwd, &path, ignore, match_root, out)?;
@@ -1606,16 +1615,18 @@ struct GrepIndexSource<'a> {
 }
 
 fn grep_index_source(
+    policy: &sley_remote::RemotePolicy,
     source: GrepIndexSource<'_>,
     prefix: &[u8],
     plan: &GrepPlan<'_>,
     out: &mut impl Write,
 ) -> Result<bool> {
     let mut printed_file = false;
-    grep_index_level(&source, prefix, plan, out, &mut printed_file)
+    grep_index_level(policy, &source, prefix, plan, out, &mut printed_file)
 }
 
 fn grep_index_level(
+    policy: &sley_remote::RemotePolicy,
     source: &GrepIndexSource<'_>,
     prefix: &[u8],
     plan: &GrepPlan<'_>,
@@ -1711,7 +1722,8 @@ fn grep_index_level(
                     replace_objects: source.replace_objects,
                 };
                 let sub_prefix = submodule_prefix(prefix, &path);
-                let matched = grep_index_level(&sub_source, &sub_prefix, plan, out, printed_file)?;
+                let matched =
+                    grep_index_level(policy, &sub_source, &sub_prefix, plan, out, printed_file)?;
                 any = any || matched;
             }
             i = next(false, i);
@@ -1756,8 +1768,12 @@ fn grep_index_level(
                 i = next(false, i);
                 continue;
             }
-            let object =
-                grep_read_object_maybe_prefetch_promisor(source.db, &oid, source.lazy_fetch)?;
+            let object = grep_read_object_maybe_prefetch_promisor(
+                policy,
+                source.db,
+                &oid,
+                source.lazy_fetch,
+            )?;
             Cow::Owned(object.body.to_vec())
         } else {
             let absolute = source.worktree_root.join(bytes_to_path(&path));
@@ -1799,16 +1815,18 @@ struct GrepTreeSource<'a> {
 }
 
 fn grep_tree_source(
+    policy: &sley_remote::RemotePolicy,
     source: GrepTreeSource<'_>,
     prefix: &[u8],
     plan: &GrepPlan<'_>,
     out: &mut impl Write,
 ) -> Result<bool> {
     let mut printed_file = false;
-    grep_tree_level(&source, prefix, plan, out, &mut printed_file)
+    grep_tree_level(policy, &source, prefix, plan, out, &mut printed_file)
 }
 
 fn grep_tree_level(
+    policy: &sley_remote::RemotePolicy,
     source: &GrepTreeSource<'_>,
     prefix: &[u8],
     plan: &GrepPlan<'_>,
@@ -1845,7 +1863,7 @@ fn grep_tree_level(
         }
         eligible_paths.push(eligible);
     }
-    grep_prefetch_promisor_objects(source.db, &candidate_blobs, source.lazy_fetch)?;
+    grep_prefetch_promisor_objects(policy, source.db, &candidate_blobs, source.lazy_fetch)?;
 
     let mut any = false;
     for ((path, (mode, oid)), eligible) in flat.iter().zip(eligible_paths) {
@@ -1867,7 +1885,7 @@ fn grep_tree_level(
                 // omitted by `clone --also-filter-submodules`. Materialize the
                 // promised commit before peeling it; blob reads below retain
                 // their own lazy-fetch boundary.
-                && grep_read_object_maybe_prefetch_promisor(&sub.db, oid, source.lazy_fetch).is_ok()
+                && grep_read_object_maybe_prefetch_promisor(policy, &sub.db, oid, source.lazy_fetch).is_ok()
                 && let Ok(sub_tree) = sley_rev::peel_to_tree(&sub.db, sub.format, oid)
             {
                 let sub_source = GrepTreeSource {
@@ -1882,7 +1900,8 @@ fn grep_tree_level(
                     replace_objects: source.replace_objects,
                 };
                 let sub_prefix = submodule_prefix(prefix, path);
-                let matched = grep_tree_level(&sub_source, &sub_prefix, plan, out, printed_file)?;
+                let matched =
+                    grep_tree_level(policy, &sub_source, &sub_prefix, plan, out, printed_file)?;
                 any = any || matched;
             }
             continue;
@@ -1891,7 +1910,8 @@ fn grep_tree_level(
             continue;
         }
         let display = plan.pathspec.display(&full);
-        let object = grep_read_object_maybe_prefetch_promisor(source.db, oid, source.lazy_fetch)?;
+        let object =
+            grep_read_object_maybe_prefetch_promisor(policy, source.db, oid, source.lazy_fetch)?;
         let driver = grep_userdiff_driver(plan, &full)?;
         let funcname = driver.as_ref().and_then(|driver| driver.funcname.as_ref());
         let matched = grep_buffer(
@@ -1917,6 +1937,7 @@ fn grep_tree_level(
 /// `remote.<name>.uploadpack` commands). That preserves existing behavior while
 /// making the native local/file path both truthful and substantially cheaper.
 fn grep_prefetch_promisor_objects(
+    policy: &sley_remote::RemotePolicy,
     db: &FileObjectDatabase,
     oids: &[ObjectId],
     lazy_fetch: bool,
@@ -1978,6 +1999,7 @@ fn grep_prefetch_promisor_objects(
             .and_then(sley_remote::pack_filter_from_spec)
             .or(Some(sley_odb::PackObjectFilter::BlobNone));
         if sley_remote::install_fetch_pack_via_local_upload_pack(
+            policy,
             &git_dir,
             &remote_git_dir,
             db.object_format(),
@@ -2021,12 +2043,13 @@ fn grep_prefetch_promisor_objects(
 /// command-level lazy-fetch count only when this call actually materialized a
 /// previously missing object.
 fn grep_read_object_maybe_prefetch_promisor(
+    policy: &sley_remote::RemotePolicy,
     db: &FileObjectDatabase,
     oid: &ObjectId,
     lazy_fetch: bool,
 ) -> Result<Arc<EncodedObject>> {
     let was_missing = lazy_fetch && !db.contains(oid)?;
-    let object = read_object_maybe_prefetch_promisor(db, oid, lazy_fetch)?;
+    let object = read_object_maybe_prefetch_promisor(policy, db, oid, lazy_fetch)?;
     if was_missing {
         sley_core::trace2::data("promisor", "fetch_count", 1);
     }
@@ -2689,11 +2712,11 @@ fn buffer_is_binary(content: &[u8]) -> bool {
 }
 
 fn path_to_bytes(path: &Path) -> Vec<u8> {
-    sley::plumbing::sley_core::paths::path_to_bytes(path)
+    sley_core::paths::path_to_bytes(path)
 }
 
 fn bytes_to_path(bytes: &[u8]) -> PathBuf {
-    sley::plumbing::sley_core::paths::bytes_to_os_path(bytes)
+    sley_core::paths::bytes_to_os_path(bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -2719,7 +2742,8 @@ struct GrepPathspec {
 }
 
 impl GrepPathspec {
-    fn new(
+    fn with_precomposed_paths(
+        precompose: sley_core::PrecomposeUnicode,
         worktree_root: Option<&Path>,
         cwd: &Path,
         full_name: bool,
@@ -2759,7 +2783,9 @@ impl GrepPathspec {
             .any(|filter| !filter.element.attr_requirements().is_empty());
         let attributes = if needs_attrs {
             worktree_root
-                .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
+                .map(|root| {
+                    sley_worktree::StandardAttributeMatcher::from_worktree_root(precompose, root)
+                })
                 .transpose()?
         } else {
             None
@@ -2925,7 +2951,7 @@ impl GrepPathspec {
         }
         if unmatched {
             eprintln!("Did you forget to 'git add'?");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         Ok(())
     }

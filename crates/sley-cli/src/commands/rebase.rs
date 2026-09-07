@@ -99,7 +99,7 @@ struct RebaseArgs {
 
 fn rebase_usage_error() -> GitError {
     print_rebase_usage();
-    GitError::Exit(129)
+    crate::cli_exit(129)
 }
 
 fn option_requires_value(name: &str) -> GitError {
@@ -222,7 +222,7 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
                         eprintln!(
                             "fatal: unrecognized empty type '{other}'; valid values are \"drop\", \"keep\", and \"stop\"."
                         );
-                        return Err(GitError::Exit(128));
+                        return Err(crate::cli_exit(128));
                     }
                 };
             }
@@ -314,11 +314,11 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
                 let value = &arg[2..];
                 if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
                     eprintln!("fatal: switch `C' expects a numerical value");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 let Ok(context) = value.parse() else {
                     eprintln!("fatal: switch `C' expects a numerical value");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 };
                 out.context_lines = Some(context);
             }
@@ -329,7 +329,7 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
                     "warn" | "nowarn" | "error" | "error-all" | "fix" | "strip"
                 ) {
                     eprintln!("fatal: Invalid whitespace option: '{value}'");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 out.whitespace = Some(value.to_string());
             }
@@ -348,7 +348,7 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
                     }
                     other => {
                         eprintln!("fatal: Unknown mode: {other}");
-                        return Err(GitError::Exit(128));
+                        return Err(crate::cli_exit(128));
                     }
                 };
             }
@@ -372,11 +372,11 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
             .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | 0x0c | 0x0b))
         {
             eprintln!("error: empty exec command");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         if command.contains('\n') {
             eprintln!("error: exec commands cannot contain newlines");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
     }
     Ok(out)
@@ -412,6 +412,7 @@ fn print_rebase_usage() {
 // ---------------------------------------------------------------------------
 
 struct Ctx {
+    prefetch: RebasePrefetch,
     repository: sley::Repository,
     config: GitConfig,
     refs: FileRefStore,
@@ -449,6 +450,9 @@ impl Ctx {
         let common_refs = FileRefStore::new(&common_git_dir, format);
         let reflog_action = env::var("GIT_REFLOG_ACTION").unwrap_or_else(|_| "rebase".to_string());
         Ok(Ctx {
+            prefetch: RebasePrefetch {
+                policy: cli_session.remote_policy.clone(),
+            },
             repository,
             config,
             refs,
@@ -549,7 +553,9 @@ fn drive_context(ctx: &Ctx) -> rdrive::RebaseContext {
     )
 }
 
-struct RebasePrefetch;
+struct RebasePrefetch {
+    policy: sley_remote::RemotePolicy,
+}
 
 impl sley_sequencer::apply::PromisorObjectFetch for RebasePrefetch {
     fn read_object_maybe_prefetch(
@@ -557,16 +563,23 @@ impl sley_sequencer::apply::PromisorObjectFetch for RebasePrefetch {
         db: &FileObjectDatabase,
         oid: &ObjectId,
     ) -> Result<std::sync::Arc<sley_object::EncodedObject>> {
-        crate::read_object_maybe_prefetch_promisor(db, oid, true)
+        crate::read_object_maybe_prefetch_promisor(&self.policy, db, oid, true)
     }
 }
 
 /// Host services for the merge-backend drive loop: every process-spawning,
 /// renderer, or session-bound operation the engine cannot own. Each closure is
 /// a verbatim relocation of the call site it used to serve in this file.
-fn rebase_hosts(ctx: &Ctx) -> rdrive::RebaseHosts<'_> {
+fn rebase_hosts<'a>(
+    original_cwd: Option<&'a std::path::Path>,
+    precompose: sley_core::PrecomposeUnicode,
+    policy: &'a sley_remote::RemotePolicy,
+    ctx: &'a Ctx,
+) -> rdrive::RebaseHosts<'a> {
     rdrive::RebaseHosts {
-        promisor_fetch: ctx.lazy_fetch.then_some(prefetch_adapter()),
+        promisor_fetch: ctx
+            .lazy_fetch
+            .then_some(&ctx.prefetch as &dyn sley_sequencer::apply::PromisorObjectFetch),
         short_status: Box::new(|| {
             crate::collect_short_status(&ctx.worktree_root, &ctx.git_dir, ctx.format)
         }),
@@ -576,8 +589,9 @@ fn rebase_hosts(ctx: &Ctx) -> rdrive::RebaseHosts<'_> {
                 .flatten()
                 .unwrap_or(ctx.format.hex_len())
         }),
-        reset_submodules: Box::new(|commit| {
+        reset_submodules: Box::new(move |commit| {
             commands::read_tree::reset_index_and_worktree_to_commit(
+                original_cwd,
                 &ctx.worktree_root,
                 &ctx.git_dir,
                 ctx.format,
@@ -637,12 +651,20 @@ fn rebase_hosts(ctx: &Ctx) -> rdrive::RebaseHosts<'_> {
             Ok(())
         }),
         tree_patch: Box::new(|old_tree, new_tree| {
-            render_tree_to_tree_patch(&ctx.db(), ctx.format, old_tree, new_tree, ctx.lazy_fetch)
+            render_tree_to_tree_patch(
+                policy,
+                &ctx.db(),
+                ctx.format,
+                old_tree,
+                new_tree,
+                ctx.lazy_fetch,
+            )
         }),
         print_continue_summary: Box::new(|new_oid, message, old_tree, new_tree| {
             let db = ctx.db();
             print_branch_commit_summary(&db, &ctx.git_dir, ctx.format, new_oid, message)?;
             print_commit_shortstat_between_trees(
+                policy,
                 &db,
                 ctx.format,
                 &old_tree,
@@ -652,6 +674,7 @@ fn rebase_hosts(ctx: &Ctx) -> rdrive::RebaseHosts<'_> {
         }),
         print_diffstat: Box::new(|old_tree, new_tree| {
             print_rebase_diffstat(
+                policy,
                 &ctx.db(),
                 ctx.format,
                 old_tree,
@@ -661,11 +684,18 @@ fn rebase_hosts(ctx: &Ctx) -> rdrive::RebaseHosts<'_> {
                 false,
             )
         }),
-        stash_create: Box::new(|| {
-            commands::stash::create_stash_for_autostash_at(&ctx.git_dir, &ctx.worktree_root)
+        stash_create: Box::new(move || {
+            commands::stash::create_stash_for_autostash_at(
+                original_cwd,
+                precompose,
+                &ctx.git_dir,
+                &ctx.worktree_root,
+            )
         }),
-        stash_apply_quietly: Box::new(|oid| {
+        stash_apply_quietly: Box::new(move |oid| {
             commands::stash::apply_stash_commit_quietly_at(
+                original_cwd,
+                policy,
                 &ctx.git_dir,
                 &ctx.worktree_root,
                 oid,
@@ -727,14 +757,9 @@ fn rebase_hosts(ctx: &Ctx) -> rdrive::RebaseHosts<'_> {
     }
 }
 
-/// Shared promisor hydration adapter (one static per process).
-fn prefetch_adapter() -> &'static RebasePrefetch {
-    static PREFETCH: RebasePrefetch = RebasePrefetch;
-    &PREFETCH
-}
-
-fn am_engine_ctx(ctx: &Ctx) -> sam::AmContext<'static> {
+fn am_engine_ctx(ctx: &Ctx) -> sam::AmContext<'_> {
     commands::am::am_engine_context(
+        &ctx.prefetch,
         &ctx.git_dir,
         &ctx.common_git_dir,
         &ctx.worktree_root,
@@ -744,8 +769,14 @@ fn am_engine_ctx(ctx: &Ctx) -> sam::AmContext<'static> {
     )
 }
 
-fn am_engine_hosts_for(ctx: &Ctx) -> sam::AmHosts<'static> {
+fn am_engine_hosts_for<'a>(
+    original_cwd: Option<&'a std::path::Path>,
+    policy: &'a sley_remote::RemotePolicy,
+    ctx: &Ctx,
+) -> sam::AmHosts<'a> {
     commands::am::am_engine_hosts(
+        original_cwd,
+        policy,
         &ctx.git_dir,
         &ctx.common_git_dir,
         &ctx.worktree_root,
@@ -789,9 +820,17 @@ pub(crate) fn cmd_rebase(cli_session: &crate::session::CliSession, args: &[Strin
     });
     if history_plan == seq::HistoryEditPlan::MissingState {
         eprintln!("fatal: no rebase in progress");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
-    let (rctx, hosts) = (drive_context(&ctx), rebase_hosts(&ctx));
+    let (rctx, hosts) = (
+        drive_context(&ctx),
+        rebase_hosts(
+            cli_session.original_cwd.as_deref(),
+            cli_session.precompose_unicode(),
+            &cli_session.remote_policy,
+            &ctx,
+        ),
+    );
     let apply_in_progress = matches!(
         history_plan,
         seq::HistoryEditPlan::Resume {
@@ -810,8 +849,15 @@ pub(crate) fn cmd_rebase(cli_session: &crate::session::CliSession, args: &[Strin
     if apply_in_progress {
         match parsed.action {
             RebaseAction::Continue => {
-                let result =
-                    sam::rebase_apply_continue(&am_engine_ctx(&ctx), &am_engine_hosts_for(&ctx));
+                let result = sam::rebase_apply_continue(
+                    cli_session.original_cwd.as_deref(),
+                    &am_engine_ctx(&ctx),
+                    &am_engine_hosts_for(
+                        cli_session.original_cwd.as_deref(),
+                        &cli_session.remote_policy,
+                        &ctx,
+                    ),
+                );
                 // Ok iff the whole series completed; restore the autostash then
                 // (a fresh conflict returns Err and keeps it for the next step).
                 if result.is_ok() {
@@ -820,8 +866,15 @@ pub(crate) fn cmd_rebase(cli_session: &crate::session::CliSession, args: &[Strin
                 return result;
             }
             RebaseAction::Skip => {
-                let result =
-                    sam::rebase_apply_skip(&am_engine_ctx(&ctx), &am_engine_hosts_for(&ctx));
+                let result = sam::rebase_apply_skip(
+                    cli_session.original_cwd.as_deref(),
+                    &am_engine_ctx(&ctx),
+                    &am_engine_hosts_for(
+                        cli_session.original_cwd.as_deref(),
+                        &cli_session.remote_policy,
+                        &ctx,
+                    ),
+                );
                 if result.is_ok() {
                     rdrive::finish_apply_autostash(&rctx, &hosts);
                 }
@@ -829,8 +882,15 @@ pub(crate) fn cmd_rebase(cli_session: &crate::session::CliSession, args: &[Strin
             }
             RebaseAction::Abort => {
                 let autostash = rdrive::read_apply_autostash(&ctx.git_dir);
-                let result =
-                    sam::rebase_apply_abort(&am_engine_ctx(&ctx), &am_engine_hosts_for(&ctx));
+                let result = sam::rebase_apply_abort(
+                    cli_session.original_cwd.as_deref(),
+                    &am_engine_ctx(&ctx),
+                    &am_engine_hosts_for(
+                        cli_session.original_cwd.as_deref(),
+                        &cli_session.remote_policy,
+                        &ctx,
+                    ),
+                );
                 // Abort always ends the rebase; restore the autostash on top of
                 // the restored orig_head (git applies it after reset).
                 if result.is_ok() {
@@ -856,25 +916,31 @@ pub(crate) fn cmd_rebase(cli_session: &crate::session::CliSession, args: &[Strin
                     return Ok(());
                 }
                 eprintln!("fatal: there is no current patch");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             RebaseAction::EditTodo => {
                 eprintln!(
                     "error: The --edit-todo action can only be used during interactive rebase."
                 );
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
             RebaseAction::None => {
                 eprintln!("fatal: It looks like 'git am' is in progress. Cannot rebase.");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
     }
 
     match parsed.action {
-        RebaseAction::Continue => return rdrive::rebase_continue(&rctx, &hosts),
-        RebaseAction::Skip => return rdrive::rebase_skip(&rctx, &hosts),
-        RebaseAction::Abort => return rdrive::rebase_abort(&rctx, &hosts),
+        RebaseAction::Continue => {
+            return rdrive::rebase_continue(cli_session.original_cwd.as_deref(), &rctx, &hosts);
+        }
+        RebaseAction::Skip => {
+            return rdrive::rebase_skip(cli_session.original_cwd.as_deref(), &rctx, &hosts);
+        }
+        RebaseAction::Abort => {
+            return rdrive::rebase_abort(cli_session.original_cwd.as_deref(), &rctx, &hosts);
+        }
         RebaseAction::Quit => return rdrive::rebase_quit(&rctx, &hosts),
         RebaseAction::EditTodo => return rdrive::rebase_edit_todo(&rctx, &hosts),
         RebaseAction::ShowCurrentPatch => {
@@ -887,7 +953,7 @@ pub(crate) fn cmd_rebase(cli_session: &crate::session::CliSession, args: &[Strin
                 return Ok(());
             }
             eprintln!("fatal: there is no current patch");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         RebaseAction::None => {}
     }
@@ -897,22 +963,34 @@ pub(crate) fn cmd_rebase(cli_session: &crate::session::CliSession, args: &[Strin
             "fatal: It seems that there is already a rebase-merge directory, and\nI wonder if you are in the middle of another rebase.  If that is the\ncase, please try\n\tgit rebase (--continue | --abort | --skip)\nIf that is not the case, please\n\trm -fr \"{}\"\nand run me again.  I am stopping in case you still have something\nvaluable there.",
             seq::merge_dir(&ctx.git_dir).display()
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
-    start_rebase(&ctx, parsed)
+    start_rebase(
+        cli_session.original_cwd.as_deref(),
+        cli_session.precompose_unicode(),
+        &cli_session.remote_policy,
+        &ctx,
+        parsed,
+    )
 }
 
 // ---------------------------------------------------------------------------
 // Starting a rebase
 // ---------------------------------------------------------------------------
 
-fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
+fn start_rebase(
+    original_cwd: Option<&std::path::Path>,
+    precompose: sley_core::PrecomposeUnicode,
+    policy: &sley_remote::RemotePolicy,
+    ctx: &Ctx,
+    args: RebaseArgs,
+) -> Result<()> {
     let db = ctx.db();
     let refs = ctx.refs();
     // Engine view + host services for the merge backend's tail.
     let rctx = drive_context(ctx);
-    let hosts = rebase_hosts(ctx);
+    let hosts = rebase_hosts(original_cwd, precompose, policy, ctx);
 
     let interactive_explicit = args.interactive;
     let rebase_merges = match args.rebase_merges {
@@ -954,24 +1032,24 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
             eprintln!(
                 "fatal: apply options are incompatible with rebase.rebaseMerges; use --no-rebase-merges"
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if args.update_refs.is_none() && config_update_refs {
             eprintln!(
                 "fatal: apply options are incompatible with rebase.updateRefs; use --no-update-refs"
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         eprintln!("fatal: apply options and merge options cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if args.keep_base && args.onto_name.is_some() {
         eprintln!("fatal: options '--keep-base' and '--onto' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if args.keep_base && args.root {
         eprintln!("fatal: options '--keep-base' and '--root' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let reapply_cherry_picks = args.reapply_cherry_picks.unwrap_or(args.keep_base);
 
@@ -989,7 +1067,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
                 Some(name) => name,
                 None => {
                     print_missing_upstream_advice(ctx, refs);
-                    return Err(GitError::Exit(1));
+                    return Err(crate::cli_exit(1));
                 }
             },
         }
@@ -1008,7 +1086,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
             Ok(oid) => Some(oid),
             Err(_) => {
                 eprintln!("fatal: invalid upstream '{upstream_name}'");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
     };
@@ -1028,7 +1106,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
                 (branch.clone(), None, oid, Some(branch.clone()))
             } else {
                 eprintln!("fatal: no such branch/commit '{branch}'");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
         None => {
@@ -1043,7 +1121,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
                         Some(RefTarget::Direct(oid)) => oid,
                         _ => {
                             eprintln!("fatal: Could not resolve HEAD to a commit");
-                            return Err(GitError::Exit(128));
+                            return Err(crate::cli_exit(128));
                         }
                     };
                     (branch, Some(name), oid, None)
@@ -1051,7 +1129,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
                 Some(RefTarget::Direct(oid)) => ("HEAD".to_string(), None, oid, None),
                 None => {
                     eprintln!("fatal: No such ref: HEAD");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
             }
         }
@@ -1073,7 +1151,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
             "fatal: '{branch_name}' is already used by worktree at '{}'",
             other.display()
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let fork_point = match args.fork_point {
@@ -1102,7 +1180,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         .autostash
         .unwrap_or_else(|| rebase_config_bool(ctx, "rebase", "autostash").unwrap_or(false));
     if autostash {
-        rdrive::create_autostash(&rctx, &hosts, use_apply_backend)?;
+        rdrive::create_autostash(original_cwd, &rctx, &hosts, use_apply_backend)?;
     }
 
     if !args.no_verify {
@@ -1169,7 +1247,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
                         } else {
                             eprintln!("fatal: '{onto_name}': need exactly one merge base");
                         }
-                        return Err(GitError::Exit(128));
+                        return Err(crate::cli_exit(128));
                     }
                 }
             }
@@ -1179,7 +1257,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
                 } else {
                     eprintln!("fatal: '{onto_name}': need exactly one merge base");
                 }
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
     } else {
@@ -1189,7 +1267,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
             Ok(oid) => oid,
             Err(_) => {
                 eprintln!("fatal: Does not point to a valid commit '{onto_name}'");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
     };
@@ -1251,7 +1329,9 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
                     // would be clobbered), restore the autostash and drop all
                     // state so no rebase is left in progress (`rebase --quit`
                     // must then report "no rebase in progress").
-                    if let Err(err) = checkout_up_to_date(ctx, &db, switch_to, &orig_head) {
+                    if let Err(err) =
+                        checkout_up_to_date(original_cwd, ctx, &db, switch_to, &orig_head)
+                    {
                         rdrive::apply_autostash(&rctx, &hosts);
                         seq::remove_merge_state(&ctx.git_dir);
                         return Err(err);
@@ -1261,7 +1341,10 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
                     // still switches to it before reporting up-to-date, so detach
                     // HEAD onto its commit (RESET_HEAD_DETACH path).
                     rdrive::reset_index_and_worktree_to_commit_for_rebase(
-                        &rctx, &hosts, &orig_head,
+                        original_cwd,
+                        &rctx,
+                        &hosts,
+                        &orig_head,
                     )?;
                     let refs = ctx.refs();
                     let old = head_commit_oid(refs)?.unwrap_or_else(|| ObjectId::null(ctx.format));
@@ -1308,6 +1391,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         let new_tree = commit_tree_oid(&db, ctx.format, &onto)?;
         // Start "Changes from … to …" diffstat: includes the summary lines.
         print_rebase_diffstat(
+            policy,
             &db,
             ctx.format,
             &old_tree,
@@ -1321,7 +1405,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
     // The apply backend's explicit fast-forward case.
     if allow_preemptive_ff && !force && branch_base.as_ref() == Some(&orig_head) {
         // onto is a descendant of orig_head: fast-forward.
-        rdrive::reset_index_and_worktree_to_commit_for_rebase(&rctx, &hosts, &onto)?;
+        rdrive::reset_index_and_worktree_to_commit_for_rebase(original_cwd, &rctx, &hosts, &onto)?;
         let committer = committer_identity_for_reflog(&ctx.config)?;
         detach_head_with_reflog(
             ctx,
@@ -1346,6 +1430,9 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
     // honours `git am`-style `--ignore-whitespace` patch fuzzing.
     if use_apply_backend {
         return run_apply_backend(
+            original_cwd,
+            precompose,
+            policy,
             ctx,
             &db,
             &args,
@@ -1381,6 +1468,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
     // Generate the todo list.
     let mut items: Vec<RebaseTodoItem> = if let Some(mode) = rebase_merges {
         make_script_with_merges(
+            policy,
             ctx,
             &db,
             upstream.as_ref(),
@@ -1400,6 +1488,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
             upstream.as_ref()
         };
         let records = make_script_commits(
+            policy,
             ctx,
             &db,
             upstream.as_ref(),
@@ -1466,10 +1555,11 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         rdrive::apply_autostash(&rctx, &hosts);
         seq::remove_merge_state(&ctx.git_dir);
         eprintln!("error: nothing to do");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
 
     rdrive::complete_action(
+        original_cwd,
         &rctx,
         &hosts,
         opts,
@@ -1503,6 +1593,9 @@ fn split_identity(identity: &[u8]) -> Option<(Vec<u8>, Vec<u8>, Option<String>)>
 
 #[allow(clippy::too_many_arguments)]
 fn run_apply_backend(
+    original_cwd: Option<&std::path::Path>,
+    precompose: sley_core::PrecomposeUnicode,
+    policy: &sley_remote::RemotePolicy,
     ctx: &Ctx,
     db: &FileObjectDatabase,
     args: &RebaseArgs,
@@ -1513,7 +1606,7 @@ fn run_apply_backend(
     head_name: Option<&str>,
 ) -> Result<()> {
     let rctx = drive_context(ctx);
-    let hosts = rebase_hosts(ctx);
+    let hosts = rebase_hosts(original_cwd, precompose, policy, ctx);
     // Build the pick series exactly like the merge backend does (skip merges and
     // empty commits unless --keep-empty), then turn each into an apply patch.
     // For `--root --onto <newbase>` there is no upstream to exclude, but commits
@@ -1526,6 +1619,7 @@ fn run_apply_backend(
     };
     let reapply_cherry_picks = args.reapply_cherry_picks.unwrap_or(args.keep_base);
     let records = make_script_commits(
+        policy,
         ctx,
         db,
         upstream,
@@ -1540,7 +1634,16 @@ fn run_apply_backend(
     if records.is_empty() {
         // Nothing to replay: detach onto the new base and finish (matches git's
         // "noop" apply-backend run, which still moves the branch to onto).
-        checkout_onto_for_apply(ctx, &rctx, &hosts, db, onto, onto_name, orig_head)?;
+        checkout_onto_for_apply(
+            original_cwd,
+            ctx,
+            &rctx,
+            &hosts,
+            db,
+            onto,
+            onto_name,
+            orig_head,
+        )?;
         if let Some(head_name) = head_name
             && head_name.starts_with("refs/heads/")
         {
@@ -1568,6 +1671,7 @@ fn run_apply_backend(
             None => ObjectId::empty_tree(ctx.format),
         };
         let diff = render_tree_to_tree_patch(
+            policy,
             db,
             ctx.format,
             &parent_tree,
@@ -1603,7 +1707,16 @@ fn run_apply_backend(
     // checkout is refused (untracked-file clobber), the rebase never starts:
     // restore the autostash and drop all state so no rebase is left in progress
     // (t3420 #5 — `rebase --quit` must then report "no rebase in progress").
-    if let Err(err) = checkout_onto_for_apply(ctx, &rctx, &hosts, db, onto, onto_name, orig_head) {
+    if let Err(err) = checkout_onto_for_apply(
+        original_cwd,
+        ctx,
+        &rctx,
+        &hosts,
+        db,
+        onto,
+        onto_name,
+        orig_head,
+    ) {
         rdrive::apply_autostash(&rctx, &hosts);
         seq::remove_merge_state(&ctx.git_dir);
         let _ = fs::remove_dir_all(ctx.git_dir.join("rebase-apply"));
@@ -1611,8 +1724,9 @@ fn run_apply_backend(
     }
 
     let result = sam::start_rebase_apply(
+        original_cwd,
         &am_engine_ctx(ctx),
-        &am_engine_hosts_for(ctx),
+        &am_engine_hosts_for(original_cwd, policy, ctx),
         sam::RebaseApplyParams {
             commits,
             quiet: args.quiet,
@@ -1639,6 +1753,7 @@ fn run_apply_backend(
 /// Detach HEAD onto `base` for the apply backend, refusing if the checkout would
 /// clobber untracked files (mirrors the merge backend's `checkout_onto_base`).
 fn checkout_onto_for_apply(
+    original_cwd: Option<&std::path::Path>,
     ctx: &Ctx,
     rctx: &rdrive::RebaseContext,
     hosts: &rdrive::RebaseHosts<'_>,
@@ -1667,9 +1782,9 @@ fn checkout_onto_for_apply(
         eprintln!("Please move or remove them before you switch branches.");
         eprintln!("Aborting");
         eprintln!("error: could not detach HEAD");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
-    rdrive::reset_index_and_worktree_to_commit_for_rebase(rctx, hosts, base)?;
+    rdrive::reset_index_and_worktree_to_commit_for_rebase(original_cwd, rctx, hosts, base)?;
     let committer = committer_identity_for_reflog(&ctx.config)?;
     detach_head_with_reflog(
         ctx,
@@ -1757,7 +1872,7 @@ fn require_clean_work_tree(ctx: &Ctx, action: &str, with_hint: bool) -> Result<(
     if with_hint {
         eprintln!("error: Please commit or stash them.");
     }
-    Err(GitError::Exit(1))
+    Err(crate::cli_exit(1))
 }
 
 fn rebase_status_is_submodule(entry: &sley_worktree::ShortStatusEntry) -> bool {
@@ -1790,6 +1905,7 @@ fn is_linear_history(
 }
 
 fn checkout_up_to_date(
+    original_cwd: Option<&std::path::Path>,
     ctx: &Ctx,
     db: &FileObjectDatabase,
     branch: &str,
@@ -1813,9 +1929,10 @@ fn checkout_up_to_date(
         eprintln!("Please move or remove them before you switch branches.");
         eprintln!("Aborting");
         eprintln!("error: could not switch to branch '{branch}'");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     sley_worktree::reset_index_and_worktree_to_commit_with_process_filter_metadata(
+        original_cwd,
         &ctx.worktree_root,
         &ctx.git_dir,
         ctx.format,
@@ -1879,6 +1996,7 @@ fn move_to_original_branch(
 }
 
 fn print_rebase_diffstat(
+    policy: &sley_remote::RemotePolicy,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     old_tree: &ObjectId,
@@ -1901,12 +2019,13 @@ fn print_rebase_diffstat(
         return Ok(());
     }
     let mut stdout = io::stdout();
+    let lazy_fetch_adapter_1 = crate::diff_lazy_fetch(policy, lazy_fetch);
     let stat_entries = collect_diff_stat_entries(
         entries.as_slice(),
         db,
         None,
         false,
-        crate::diff_lazy_fetch(lazy_fetch),
+        lazy_fetch_adapter_1.as_option(),
     )?;
     // The diffstat rows + the "N file changed …" trailer (already emitted by
     // `write_diff_stat`). It is NOT followed by a separate shortstat — emitting
@@ -1970,6 +2089,7 @@ fn find_unique_abbrev_hex(ctx: &Ctx, db: &FileObjectDatabase, oid: &ObjectId) ->
 }
 
 fn make_script_commits(
+    policy: &sley_remote::RemotePolicy,
     ctx: &Ctx,
     db: &FileObjectDatabase,
     upstream: Option<&ObjectId>,
@@ -2041,7 +2161,7 @@ fn make_script_commits(
             if record.parents.len() > 1 {
                 continue; // merges carry no single-parent patch-id
             }
-            if let Some(id) = commit_patch_id(db, ctx.format, &record, ctx.lazy_fetch)? {
+            if let Some(id) = commit_patch_id(policy, db, ctx.format, &record, ctx.lazy_fetch)? {
                 ids.insert(id);
             }
         }
@@ -2124,7 +2244,7 @@ fn make_script_commits(
         // are eligible — matching `!is_empty && (flags & PATCHSAME)`.
         if !upstream_patch_ids.is_empty()
             && record.commit.tree != parent_tree
-            && let Some(id) = commit_patch_id(db, ctx.format, &record, ctx.lazy_fetch)?
+            && let Some(id) = commit_patch_id(policy, db, ctx.format, &record, ctx.lazy_fetch)?
             && upstream_patch_ids.contains(&id)
         {
             continue;
@@ -2135,6 +2255,7 @@ fn make_script_commits(
 }
 
 fn make_script_with_merges(
+    policy: &sley_remote::RemotePolicy,
     ctx: &Ctx,
     db: &FileObjectDatabase,
     upstream: Option<&ObjectId>,
@@ -2181,7 +2302,7 @@ fn make_script_with_merges(
             if record.parents.len() > 1 {
                 continue;
             }
-            if let Some(id) = commit_patch_id(db, ctx.format, &record, ctx.lazy_fetch)? {
+            if let Some(id) = commit_patch_id(policy, db, ctx.format, &record, ctx.lazy_fetch)? {
                 ids.insert(id);
             }
         }
@@ -2270,7 +2391,7 @@ fn make_script_with_merges(
         if record.parents.len() <= 1
             && !upstream_patch_ids.is_empty()
             && !is_empty
-            && let Some(id) = commit_patch_id(db, ctx.format, record, ctx.lazy_fetch)?
+            && let Some(id) = commit_patch_id(policy, db, ctx.format, record, ctx.lazy_fetch)?
             && upstream_patch_ids.contains(&id)
         {
             continue;
@@ -2636,6 +2757,7 @@ fn merge_label_from_message(message: &[u8]) -> String {
 /// Patch-id of a single (non-merge) commit's diff against its first parent, for
 /// `--cherry-mark` duplicate detection. `None` when the diff is empty.
 fn commit_patch_id(
+    policy: &sley_remote::RemotePolicy,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     record: &sley_rev::CommitRecord,
@@ -2648,8 +2770,15 @@ fn commit_patch_id(
         Some(parent) => commit_tree_oid(db, format, parent)?,
         None => ObjectId::empty_tree(format),
     };
-    let diff = render_tree_to_tree_patch(db, format, &parent_tree, &record.commit.tree, lazy_fetch)
-        .unwrap_or_default();
+    let diff = render_tree_to_tree_patch(
+        policy,
+        db,
+        format,
+        &parent_tree,
+        &record.commit.tree,
+        lazy_fetch,
+    )
+    .unwrap_or_default();
     Ok(commands::patch_id::patch_id_for_diff(&diff, format))
 }
 
@@ -2955,7 +3084,7 @@ fn launch_sequence_editor(ctx: &Ctx, path: &Path) -> Result<()> {
         .status()?;
     if !status.success() {
         eprintln!("error: there was a problem with the editor '{editor}'");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }

@@ -221,7 +221,7 @@ fn rewrite_credential_file(
     match_password: bool,
 ) -> Result<()> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent).map_err(|err| GitError::Io(err.to_string()))?;
+        fs::create_dir_all(parent).map_err(GitError::from)?;
     }
     let mut out = Vec::new();
     if let Some(extra) = extra {
@@ -234,7 +234,7 @@ fn rewrite_credential_file(
         Ok(())
     };
     parse_credential_file(path, credential, false, Some(&mut sink), match_password)?;
-    fs::write(path, out).map_err(|err| GitError::Io(err.to_string()))?;
+    fs::write(path, out).map_err(GitError::from)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

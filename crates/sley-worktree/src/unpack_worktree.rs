@@ -50,6 +50,8 @@ pub struct SubmoduleHooks<'a> {
 /// clobber an untracked file, and how to write/remove worktree files when `-u`
 /// applies the result.
 pub struct ReadTreeWorktree<'a> {
+    /// Directory the caller needs preserved while this operation mutates paths.
+    pub original_cwd: Option<PathBuf>,
     pub worktree_root: PathBuf,
     pub git_dir: PathBuf,
     pub db: &'a FileObjectDatabase,
@@ -127,7 +129,10 @@ impl sley_unpack_trees::WorktreeProbe for ReadTreeWorktree<'_> {
         // `--reset` (OverwriteUntracked) authorizes clobbering anything in the
         // way (git's `o->reset == UNPACK_RESET_OVERWRITE_UNTRACKED` early return).
         if matches!(reset, sley_unpack_trees::ResetType::OverwriteUntracked) {
-            if original_cwd_relative_to(&self.worktree_root).as_deref() == Some(path) {
+            if original_cwd_relative_to(self.original_cwd.as_deref(), &self.worktree_root)
+                .as_deref()
+                == Some(path)
+            {
                 return refuse_remove_current_working_directory(path);
             }
             return Ok(());
@@ -153,7 +158,12 @@ impl sley_unpack_trees::WorktreeProbe for ReadTreeWorktree<'_> {
         let Ok(metadata) = fs::symlink_metadata(&file_path) else {
             return Ok(());
         };
-        if path_matches_standard_ignore(&self.worktree_root, path, metadata.is_dir())? {
+        if path_matches_standard_ignore(
+            self.repo_config.precompose_unicode(),
+            &self.worktree_root,
+            path,
+            metadata.is_dir(),
+        )? {
             return Ok(());
         }
         // git's `check_ok_to_remove`: a directory in the way (the D/F dir→file
@@ -205,6 +215,7 @@ impl sley_unpack_trees::WorktreeProbe for ReadTreeWorktree<'_> {
             return Ok(false);
         };
         Ok(!path_matches_standard_ignore(
+            self.repo_config.precompose_unicode(),
             &self.worktree_root,
             path,
             metadata.is_dir(),
@@ -282,13 +293,16 @@ impl ReadTreeWorktree<'_> {
     /// file is written; on an unclean one this rejects with git's
     /// `ERROR_NOT_UPTODATE_DIR` exit so no untracked work is silently destroyed.
     fn verify_clean_subdirectory(&self, dir_git_path: &[u8], dir_fs_path: &Path) -> Result<()> {
-        if original_cwd_relative_to(&self.worktree_root).as_deref() == Some(dir_git_path) {
+        if original_cwd_relative_to(self.original_cwd.as_deref(), &self.worktree_root).as_deref()
+            == Some(dir_git_path)
+        {
             return refuse_remove_current_working_directory(dir_git_path);
         }
         // One matcher for the whole walk: git builds a single `dir_struct` per
         // call too (`read_directory`), sharing the exclude-per-directory stack.
         let common_git_dir = common_git_dir_for_git_dir(&self.git_dir)?;
         let ignores = crate::ignore::IgnoreMatcher::from_worktree_root_and_git_dir(
+            crate::precompose_for_git_dir(&self.git_dir),
             &self.worktree_root,
             &common_git_dir,
         )?;
@@ -325,7 +339,9 @@ impl ReadTreeWorktree<'_> {
                         // read-tree keeps its historic per-path wording and dies.
                         UnpackPorcelain::ReadTree => {
                             let display = String::from_utf8_lossy(dir_git_path);
-                            eprintln!(
+                            sley_core::diagnostic!(
+                                Stderr,
+                                true,
                                 "error: Updating '{display}' would lose untracked files in it"
                             );
                         }
@@ -333,15 +349,17 @@ impl ReadTreeWorktree<'_> {
                         // block from setup_unpack_trees_porcelain and exits 1.
                         UnpackPorcelain::Checkout => {
                             let display = String::from_utf8_lossy(dir_git_path);
-                            eprintln!(
+                            sley_core::diagnostic!(
+                                Stderr,
+                                true,
                                 "error: Updating the following directories would lose untracked files in them:"
                             );
-                            eprintln!("\t{display}");
-                            eprintln!();
-                            eprintln!("Aborting");
+                            sley_core::diagnostic!(Stderr, true, "\t{display}");
+                            sley_core::diagnostic!(Stderr, true, "");
+                            sley_core::diagnostic!(Stderr, true, "Aborting");
                         }
                     }
-                    return Err(GitError::Exit(unpack_rejection_exit(self.porcelain)));
+                    return Err(GitError::Rejected(unpack_rejection_kind(self.porcelain)));
                 }
             }
         }
@@ -359,8 +377,8 @@ fn move_head_verdict_to_result(
     match verdict {
         sley_submodule::MoveHeadVerdict::Ok => Ok(()),
         sley_submodule::MoveHeadVerdict::WouldLose => {
-            eprintln!("error: Cannot update submodule:\n{path_str}");
-            Err(GitError::Exit(128))
+            sley_core::diagnostic!(Stderr, true, "error: Cannot update submodule:\n{path_str}");
+            Err(GitError::Rejected(sley_core::RejectionKind::Refused))
         }
     }
 }
@@ -373,6 +391,7 @@ impl sley_unpack_trees::WorktreeWriter for ReadTreeWorktree<'_> {
         oid: &ObjectId,
     ) -> Result<Option<sley_unpack_trees::StatInfo>> {
         write_tree_entry_to_worktree_with_hooks(
+            self.original_cwd.as_deref(),
             &self.worktree_root,
             &self.git_dir,
             self.format,
@@ -401,6 +420,7 @@ impl sley_unpack_trees::WorktreeWriter for ReadTreeWorktree<'_> {
             })
             .collect::<Vec<_>>();
         let mut ordinary_stats = materialize_checkout_entries_with_database(
+            self.original_cwd.as_deref(),
             &self.worktree_root,
             &self.git_dir,
             self.format,
@@ -432,7 +452,7 @@ impl sley_unpack_trees::WorktreeWriter for ReadTreeWorktree<'_> {
                 return remove_worktree(&self.worktree_root, &self.git_dir, path);
             }
         }
-        remove_worktree_path(&self.worktree_root, path)
+        remove_worktree_path(self.original_cwd.as_deref(), &self.worktree_root, path)
     }
 }
 
@@ -482,6 +502,7 @@ impl ReadTreeWorktree<'_> {
 /// per-path `Entry '...' not uptodate. Cannot merge.` message its test asserts).
 #[allow(clippy::too_many_arguments)]
 pub fn checkout_two_way_engine(
+    original_cwd: Option<&std::path::Path>,
     git_dir: &Path,
     worktree_root: &Path,
     format: ObjectFormat,
@@ -513,6 +534,7 @@ pub fn checkout_two_way_engine(
 
     let tree_attributes = TreeAttributes::from_tree(worktree_root, git_dir, db, format, new_tree)?;
     let mut wt = ReadTreeWorktree {
+        original_cwd: original_cwd.map(Path::to_path_buf),
         submodules: load_superproject_submodules(worktree_root),
         repo_config: repo_config.clone(),
         tree_attributes: Some(tree_attributes),
@@ -538,17 +560,21 @@ pub fn checkout_two_way_engine(
     options.apply_sparse_checkout = apply_sparse_checkout;
     let plan =
         sley_unpack_trees::plan_checkout_transition(&index, old_leaves, new_leaves, options, &wt)?;
-    refuse_if_unpack_result_removes_current_directory(worktree_root, plan.result())?;
+    refuse_if_unpack_result_removes_current_directory(original_cwd, worktree_root, plan.result())?;
     let result = plan.apply(&mut wt)?;
     if !result.sparse_checkout_present_paths.is_empty() {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "warning: The following paths were already present and thus not updated despite sparse patterns:"
         );
         for path in &result.sparse_checkout_present_paths {
-            eprintln!("\t{}", String::from_utf8_lossy(path));
+            sley_core::diagnostic!(Stderr, true, "\t{}", String::from_utf8_lossy(path));
         }
-        eprintln!();
-        eprintln!(
+        sley_core::diagnostic!(Stderr, true, "");
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "After fixing the above paths, you may want to run `git sparse-checkout reapply`."
         );
     }
@@ -725,20 +751,30 @@ pub fn verify_uptodate_path(
         match porcelain {
             UnpackPorcelain::ReadTree => {
                 let display = String::from_utf8_lossy(path);
-                eprintln!("error: Entry '{display}' not uptodate. Cannot merge.");
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "error: Entry '{display}' not uptodate. Cannot merge."
+                );
             }
             UnpackPorcelain::Checkout => {
                 // git's ERROR_NOT_UPTODATE_FILE under the "checkout" porcelain:
                 // the collected-path "local changes would be overwritten" block.
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "error: Your local changes to the following files would be overwritten by checkout:"
                 );
-                eprintln!("\t{}", String::from_utf8_lossy(path));
-                eprintln!("Please commit your changes or stash them before you switch branches.");
-                eprintln!("Aborting");
+                sley_core::diagnostic!(Stderr, true, "\t{}", String::from_utf8_lossy(path));
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "Please commit your changes or stash them before you switch branches."
+                );
+                sley_core::diagnostic!(Stderr, true, "Aborting");
             }
         }
-        return Err(GitError::Exit(128));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     Ok(())
 }
@@ -785,6 +821,7 @@ pub fn safe_worktree_path(root: &Path, path: &[u8]) -> Option<PathBuf> {
 ///   freshly-checked-out file reported clean.
 #[allow(clippy::too_many_arguments)]
 fn write_blob_to_worktree(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -807,9 +844,9 @@ fn write_blob_to_worktree(
     // already-populated submodule is left untouched) and record a zeroed stat,
     // exactly as git's `write_entry` S_IFGITLINK arm and `materialize_tree_entry`.
     if sley_index::is_gitlink(mode) {
-        create_leading_directories(worktree_root, &file_path)?;
+        create_leading_directories(original_cwd, worktree_root, &file_path)?;
         if fs::symlink_metadata(&file_path).is_ok_and(|md| !md.is_dir()) {
-            remove_path_in_the_way(&file_path)?;
+            remove_path_in_the_way(original_cwd, &file_path)?;
         }
         fs::create_dir_all(&file_path)?;
         return Ok(None);
@@ -828,11 +865,11 @@ fn write_blob_to_worktree(
     // a tracked file `p` being replaced by `p/child` must first become a dir).
     // This must precede the final-path probe below, which would otherwise see
     // ENOTDIR trying to stat `p/child` under a file `p`.
-    create_leading_directories(worktree_root, &file_path)?;
+    create_leading_directories(original_cwd, worktree_root, &file_path)?;
     // Then remove whatever currently occupies the final path: a directory
     // subtree (the D/F dir→file transition, git's `remove_subtree`) or any
     // file/symlink. `force` is always set here.
-    remove_path_in_the_way(&file_path)?;
+    remove_path_in_the_way(original_cwd, &file_path)?;
 
     if (mode & 0o170000) == 0o120000 {
         // Symlink: the blob bytes are the link target, opaque to clean/smudge.
@@ -878,6 +915,7 @@ fn write_blob_to_worktree(
 
 #[allow(clippy::too_many_arguments)]
 pub fn write_tree_entry_to_worktree(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -890,6 +928,7 @@ pub fn write_tree_entry_to_worktree(
     recurse_submodules: bool,
 ) -> Result<Option<sley_unpack_trees::StatInfo>> {
     write_tree_entry_to_worktree_with_hooks(
+        original_cwd,
         worktree_root,
         git_dir,
         format,
@@ -906,6 +945,7 @@ pub fn write_tree_entry_to_worktree(
 
 #[allow(clippy::too_many_arguments)]
 pub fn write_tree_entry_to_worktree_with_hooks(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -928,6 +968,7 @@ pub fn write_tree_entry_to_worktree_with_hooks(
         }
     }
     write_blob_to_worktree(
+        original_cwd,
         worktree_root,
         git_dir,
         format,
@@ -1003,10 +1044,10 @@ fn leading_nondir_component(worktree_root: &Path, git_path: &[u8]) -> Result<Opt
 /// Process exit status for an unpack-trees rejection. Upstream dies with 128
 /// from the read-tree plumbing, but the checkout/switch porcelain reports the
 /// collected "Aborting" block through its normal error return (exit 1).
-fn unpack_rejection_exit(porcelain: UnpackPorcelain) -> i32 {
+fn unpack_rejection_kind(porcelain: UnpackPorcelain) -> sley_core::RejectionKind {
     match porcelain {
-        UnpackPorcelain::ReadTree => 128,
-        UnpackPorcelain::Checkout => 1,
+        UnpackPorcelain::ReadTree => sley_core::RejectionKind::Refused,
+        UnpackPorcelain::Checkout => sley_core::RejectionKind::Incomplete,
     }
 }
 
@@ -1014,30 +1055,41 @@ fn reject_untracked_would_be_overwritten(porcelain: UnpackPorcelain, path: &[u8]
     match porcelain {
         UnpackPorcelain::ReadTree => {
             let display = String::from_utf8_lossy(path);
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "error: Untracked working tree file '{display}' would be overwritten by merge."
             );
         }
         UnpackPorcelain::Checkout => {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "error: The following untracked working tree files would be overwritten by checkout:"
             );
-            eprintln!("\t{}", String::from_utf8_lossy(path));
-            eprintln!("Please move or remove them before you switch branches.");
-            eprintln!("Aborting");
+            sley_core::diagnostic!(Stderr, true, "\t{}", String::from_utf8_lossy(path));
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "Please move or remove them before you switch branches."
+            );
+            sley_core::diagnostic!(Stderr, true, "Aborting");
         }
     }
-    Err(GitError::Exit(unpack_rejection_exit(porcelain)))
+    Err(GitError::Rejected(unpack_rejection_kind(porcelain)))
 }
 
 /// git's `write_entry` D/F-removal preamble: remove whatever currently occupies
 /// `file_path` so a write can proceed. A directory is removed recursively (the
 /// dir→file transition, git's `remove_subtree`); a file or symlink is unlinked.
 /// An absent path is a no-op.
-pub fn remove_path_in_the_way(file_path: &Path) -> Result<()> {
+pub fn remove_path_in_the_way(
+    original_cwd: Option<&std::path::Path>,
+    file_path: &Path,
+) -> Result<()> {
     match fs::symlink_metadata(file_path) {
         Ok(md) if md.is_dir() => {
-            if path_is_original_cwd(file_path) {
+            if path_is_original_cwd(original_cwd, file_path) {
                 return refuse_remove_current_working_directory_absolute(file_path);
             }
             fs::remove_dir_all(file_path)?;
@@ -1062,7 +1114,11 @@ pub fn remove_path_in_the_way(file_path: &Path) -> Result<()> {
 /// of a needed component (the file→dir transition). `fs::create_dir_all` handles
 /// the common all-missing case; the per-component fallback handles a regular
 /// file or symlink sitting where a directory must be.
-fn create_leading_directories(worktree_root: &Path, file_path: &Path) -> Result<()> {
+fn create_leading_directories(
+    original_cwd: Option<&std::path::Path>,
+    worktree_root: &Path,
+    file_path: &Path,
+) -> Result<()> {
     let Some(parent) = file_path.parent() else {
         return Ok(());
     };
@@ -1082,7 +1138,7 @@ fn create_leading_directories(worktree_root: &Path, file_path: &Path) -> Result<
         match fs::symlink_metadata(&cur) {
             Ok(md) if md.is_dir() => {}
             Ok(_) => {
-                if path_is_original_cwd(&cur) {
+                if path_is_original_cwd(original_cwd, &cur) {
                     return refuse_remove_current_working_directory_absolute(&cur);
                 }
                 fs::remove_file(&cur)?;
@@ -1105,7 +1161,11 @@ fn create_leading_directories(worktree_root: &Path, file_path: &Path) -> Result<
 /// path (a leftover from a prior file→dir transition, or a populated gitlink
 /// being removed) is removed recursively — git's `remove_or_warn` honours the
 /// directory mode.
-pub fn remove_worktree_path(worktree_root: &Path, path: &[u8]) -> Result<()> {
+pub fn remove_worktree_path(
+    original_cwd: Option<&std::path::Path>,
+    worktree_root: &Path,
+    path: &[u8],
+) -> Result<()> {
     let Some(file_path) = safe_worktree_path(worktree_root, path) else {
         return Ok(());
     };
@@ -1124,7 +1184,9 @@ pub fn remove_worktree_path(worktree_root: &Path, path: &[u8]) -> Result<()> {
                 if err.kind() == io::ErrorKind::DirectoryNotEmpty
                     || err.raw_os_error() == Some(39) =>
             {
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "warning: unable to rmdir '{}': Directory not empty",
                     String::from_utf8_lossy(path)
                 );
@@ -1136,16 +1198,20 @@ pub fn remove_worktree_path(worktree_root: &Path, path: &[u8]) -> Result<()> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err.into()),
     }
-    prune_empty_dirs(worktree_root, file_path.parent());
+    prune_empty_dirs(original_cwd, worktree_root, file_path.parent());
     Ok(())
 }
 
 /// Remove now-empty parent directories up to (but not including) the worktree
 /// root. Errors are swallowed: a non-empty or vanished directory simply stops
 /// the walk.
-pub fn prune_empty_dirs(root: &Path, mut dir: Option<&Path>) {
+pub fn prune_empty_dirs(
+    original_cwd: Option<&std::path::Path>,
+    root: &Path,
+    mut dir: Option<&Path>,
+) {
     while let Some(path) = dir {
-        if path == root || path_is_original_cwd(path) {
+        if path == root || path_is_original_cwd(original_cwd, path) {
             break;
         }
         if fs::remove_dir(path).is_err() {
@@ -1155,9 +1221,12 @@ pub fn prune_empty_dirs(root: &Path, mut dir: Option<&Path>) {
     }
 }
 
-fn original_cwd_relative_to(worktree_root: &Path) -> Option<Vec<u8>> {
+fn original_cwd_relative_to(
+    original_cwd: Option<&std::path::Path>,
+    worktree_root: &Path,
+) -> Option<Vec<u8>> {
     let root = fs::canonicalize(worktree_root).unwrap_or_else(|_| worktree_root.to_path_buf());
-    let cwd = original_cwd_absolute()?;
+    let cwd = original_cwd_absolute(original_cwd)?;
     if cwd == root {
         return None;
     }
@@ -1166,19 +1235,23 @@ fn original_cwd_relative_to(worktree_root: &Path) -> Option<Vec<u8>> {
 }
 
 fn refuse_remove_current_working_directory(path: &[u8]) -> Result<()> {
-    eprintln!(
+    sley_core::diagnostic!(
+        Stderr,
+        true,
         "error: Refusing to remove the current working directory:\n{}",
         String::from_utf8_lossy(path)
     );
-    Err(GitError::Exit(128))
+    Err(GitError::Rejected(sley_core::RejectionKind::Refused))
 }
 
 fn refuse_remove_current_working_directory_absolute(path: &Path) -> Result<()> {
-    eprintln!(
+    sley_core::diagnostic!(
+        Stderr,
+        true,
         "error: Refusing to remove the current working directory:\n{}",
         path.display()
     );
-    Err(GitError::Exit(128))
+    Err(GitError::Rejected(sley_core::RejectionKind::Refused))
 }
 
 fn path_to_git_bytes_lossy(path: &Path) -> Vec<u8> {
@@ -1196,10 +1269,11 @@ fn path_to_git_bytes_lossy(path: &Path) -> Vec<u8> {
 /// working directory into a regular file (git's CWD D/F guard for the
 /// `--reset -u` entry application path).
 pub fn refuse_if_unpack_entries_turn_cwd_into_file(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
     entries: &[(Vec<u8>, ReadTreeEntry)],
 ) -> Result<()> {
-    let Some(cwd) = original_cwd_relative_to(worktree_root) else {
+    let Some(cwd) = original_cwd_relative_to(original_cwd, worktree_root) else {
         return Ok(());
     };
     if entries.iter().any(|(path, entry)| {
@@ -1216,10 +1290,11 @@ pub fn refuse_if_unpack_entries_turn_cwd_into_file(
 /// in and replace it with a regular file (git's "Refusing to remove current
 /// working directory" guard for the D/F transition under the CWD).
 pub fn refuse_if_unpack_result_removes_current_directory(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
     result: &sley_unpack_trees::UnpackTreesResult,
 ) -> Result<()> {
-    let Some(cwd) = original_cwd_relative_to(worktree_root) else {
+    let Some(cwd) = original_cwd_relative_to(original_cwd, worktree_root) else {
         return Ok(());
     };
     let cwd_slash = {
@@ -1307,7 +1382,10 @@ mod tests {
     fn would_lose_maps_to_exit_128() {
         let err = move_head_verdict_to_result(MoveHeadVerdict::WouldLose, "sub1")
             .expect_err("WouldLose must be an error");
-        assert!(matches!(err, GitError::Exit(128)));
+        assert!(matches!(
+            err,
+            GitError::Rejected(sley_core::RejectionKind::Refused)
+        ));
     }
 
     #[test]
@@ -1438,7 +1516,7 @@ mod tests {
         assert_eq!(verdict, MoveHeadVerdict::WouldLose);
         assert!(matches!(
             move_head_verdict_to_result(verdict, "sub1"),
-            Err(GitError::Exit(128))
+            Err(GitError::Rejected(sley_core::RejectionKind::Refused))
         ));
     }
 

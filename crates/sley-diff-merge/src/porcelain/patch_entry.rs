@@ -368,11 +368,13 @@ pub fn write_diff_patch_entry(
                 .map(|spec| {
                     sley_grep::Regex::compile_bytes(&spec, sley_grep::RegexMode::Ere, false, false)
                         .map_err(|_| {
-                            eprintln!(
+                            sley_core::diagnostic!(
+                                Stderr,
+                                true,
                                 "fatal: invalid regular expression: {}",
                                 String::from_utf8_lossy(&spec)
                             );
-                            GitError::Exit(128)
+                            GitError::Rejected(sley_core::RejectionKind::Refused)
                         })
                 })
                 .transpose()?;

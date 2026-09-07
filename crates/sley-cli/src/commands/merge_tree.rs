@@ -21,7 +21,6 @@
 //! private ones), so every helper, type, and re-export visible at the crate root
 //! is in scope here without re-listing it.
 use crate::*;
-use sley::plumbing::{sley_config, sley_core, sley_rev, sley_worktree};
 
 /// Which top-level mode `git merge-tree` runs in. Selected explicitly via
 /// `--write-tree` / `--trivial-merge`, otherwise inferred from the positional
@@ -112,7 +111,7 @@ usage: git merge-tree [--write-tree] [<options>] <branch1> <branch2>
 /// argument parser in upstream `git`.
 fn usage_error() -> GitError {
     eprint!("{MERGE_TREE_USAGE}");
-    GitError::Exit(129)
+    crate::cli_exit(129)
 }
 
 /// `git merge-tree` entry point.
@@ -136,7 +135,7 @@ pub(crate) fn cmd_merge_tree(
 fn reject_trivial_incompatible_options(options: &MergeTreeOptions) -> Result<()> {
     if options.mode == MergeTreeMode::TrivialMerge && options.trivial_incompatible_option {
         eprintln!("fatal: --trivial-merge is incompatible with all other options");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(())
 }
@@ -353,7 +352,7 @@ fn run_real_merge(
         return if outcome.clean {
             Ok(())
         } else {
-            Err(GitError::Exit(1))
+            Err(crate::cli_exit(1))
         };
     }
 
@@ -361,7 +360,7 @@ fn run_real_merge(
     if outcome.clean {
         Ok(())
     } else {
-        Err(GitError::Exit(1))
+        Err(crate::cli_exit(1))
     }
 }
 
@@ -460,7 +459,7 @@ fn compute_real_merge(
                     if !options.allow_unrelated_histories {
                         // This hard error is printed even under --quiet.
                         eprintln!("fatal: refusing to merge unrelated histories");
-                        return Err(GitError::Exit(128));
+                        return Err(crate::cli_exit(128));
                     }
                     None
                 }
@@ -483,9 +482,13 @@ fn compute_real_merge(
         .map(|source| resolve_tree_ish(&git_dir, &db, format, source))
         .transpose()?;
     let worktree_attributes = if attr_source_tree.is_none() {
-        worktree_root
-            .as_ref()
-            .and_then(|root| sley_worktree::StandardAttributeMatcher::from_worktree_root(root).ok())
+        worktree_root.as_ref().and_then(|root| {
+            sley_worktree::StandardAttributeMatcher::from_worktree_root(
+                cli_session.precompose_unicode(),
+                root,
+            )
+            .ok()
+        })
     } else {
         None
     };
@@ -591,7 +594,7 @@ fn ensure_merge_tree_inputs_readable(
                     "error: collecting merge info failed for trees {base}, {ours_tree}, {theirs_tree}"
                 );
                 eprintln!("fatal: failure to merge");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             return Err(err);
         }
@@ -602,7 +605,7 @@ fn ensure_merge_tree_inputs_readable(
 fn merge_tree_merge_error(err: GitError) -> GitError {
     if let Some(oid) = merge_tree_missing_oid(&err) {
         eprintln!("error: unable to read blob object {oid}");
-        return GitError::Exit(128);
+        return crate::cli_exit(128);
     }
     err
 }
@@ -628,7 +631,7 @@ fn run_stdin_merges(
 ) -> Result<()> {
     if options.merge_base.is_some() {
         eprintln!("fatal: --merge-base and --stdin cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if !options.positionals.is_empty() {
         return Err(usage_error());
@@ -705,7 +708,7 @@ fn stdin_record_options(
                 "fatal: malformed input line: {}",
                 String::from_utf8_lossy(record)
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     Ok(Some(batch))
@@ -715,7 +718,7 @@ fn stdin_record_options(
 /// favouring options affect merge-tree output; everything else is ignored, as
 /// upstream tolerates (and largely ignores) most strategy options here.
 fn parse_strategy_favor(options: &[String]) -> Result<sley_diff_merge::MergeFavor> {
-    use sley::plumbing::sley_diff_merge::MergeFavor;
+    use sley_diff_merge::MergeFavor;
     let mut favor = MergeFavor::None;
     for option in options {
         match option.as_str() {
@@ -802,7 +805,7 @@ fn dereferenced_type(db: &FileObjectDatabase, oid: &ObjectId) -> &'static str {
 /// sentinel.
 fn not_something_we_can_merge(rev: &str) -> GitError {
     eprintln!("merge-tree: {rev} - not something we can merge");
-    GitError::Exit(1)
+    crate::cli_exit(1)
 }
 
 /// Render a [`sley_diff_merge::MergeTreesResult`] into the `merge-tree
@@ -1313,6 +1316,7 @@ fn run_trivial_merge(
         }
 
         emit_trivial_path(
+            &cli_session.remote_policy,
             &mut out,
             &db,
             &path,
@@ -1353,6 +1357,7 @@ struct TrivialStageLine {
 /// Emit one path's trivial-merge record: a section header, the relevant stage
 /// lines, and a unified diff of ours -> the merged result.
 fn emit_trivial_path(
+    policy: &sley_remote::RemotePolicy,
     out: &mut impl Write,
     db: &FileObjectDatabase,
     path: &[u8],
@@ -1361,7 +1366,8 @@ fn emit_trivial_path(
     theirs: &TrivialEntry,
     lazy_fetch: bool,
 ) -> Result<()> {
-    let (header, lines, result_bytes) = trivial_resolution(db, base, ours, theirs, lazy_fetch)?;
+    let (header, lines, result_bytes) =
+        trivial_resolution(policy, db, base, ours, theirs, lazy_fetch)?;
 
     writeln!(out, "{header}")?;
     for line in &lines {
@@ -1377,7 +1383,7 @@ fn emit_trivial_path(
 
     // The diff is from ours (branch1) to the merged result.
     if let Some(result_bytes) = result_bytes {
-        let ours_bytes = blob_bytes(db, ours, lazy_fetch)?;
+        let ours_bytes = blob_bytes(policy, db, ours, lazy_fetch)?;
         write_unified_hunks(out, &ours_bytes, &result_bytes)?;
     }
     Ok(())
@@ -1388,6 +1394,7 @@ fn emit_trivial_path(
 /// mirrors `git merge-tree`'s deprecated trivial resolver, which only reports
 /// paths whose result differs from `ours`.
 fn trivial_resolution(
+    policy: &sley_remote::RemotePolicy,
     db: &FileObjectDatabase,
     base: &TrivialEntry,
     ours: &TrivialEntry,
@@ -1418,13 +1425,13 @@ fn trivial_resolution(
             Ok((
                 "added in remote",
                 lines,
-                Some(merge_read_blob(db, their_oid, lazy_fetch)?),
+                Some(merge_read_blob(policy, db, their_oid, lazy_fetch)?),
             ))
         }
         // Both sides added the file (with differing content): a content merge with
         // `.our` / `.their` markers.
         (None, Some(_), Some(_)) => {
-            let result = trivial_content_merge(db, &Vec::new(), ours, theirs, lazy_fetch)?;
+            let result = trivial_content_merge(policy, db, &Vec::new(), ours, theirs, lazy_fetch)?;
             let lines = [line("our", ours), line("their", theirs)]
                 .into_iter()
                 .flatten()
@@ -1432,12 +1439,12 @@ fn trivial_resolution(
             Ok(("added in both", lines, Some(result)))
         }
         (Some((_, base_oid)), our_entry, their_entry) => {
-            let base_bytes = merge_read_blob(db, base_oid, lazy_fetch)?;
+            let base_bytes = merge_read_blob(policy, db, base_oid, lazy_fetch)?;
             match (our_entry, their_entry) {
                 // Changed only on the remote side: auto-resolves to their version,
                 // reported as a clean `merged` with a `result` line.
                 (Some((our_mode, _)), Some((_, their_oid))) if ours == base => {
-                    let their_bytes = merge_read_blob(db, their_oid, lazy_fetch)?;
+                    let their_bytes = merge_read_blob(policy, db, their_oid, lazy_fetch)?;
                     let lines = vec![
                         TrivialStageLine {
                             label: "result",
@@ -1454,7 +1461,8 @@ fn trivial_resolution(
                 }
                 // Changed on both sides: a content merge with `.our` / `.their`.
                 (Some(_), Some(_)) => {
-                    let result = trivial_content_merge(db, &base_bytes, ours, theirs, lazy_fetch)?;
+                    let result =
+                        trivial_content_merge(policy, db, &base_bytes, ours, theirs, lazy_fetch)?;
                     let lines = [line("base", base), line("our", ours), line("their", theirs)]
                         .into_iter()
                         .flatten()
@@ -1474,7 +1482,7 @@ fn trivial_resolution(
                 _ => Ok((
                     "merged",
                     Vec::new(),
-                    Some(blob_bytes(db, ours, lazy_fetch)?),
+                    Some(blob_bytes(policy, db, ours, lazy_fetch)?),
                 )),
             }
         }
@@ -1483,7 +1491,7 @@ fn trivial_resolution(
         _ => Ok((
             "merged",
             Vec::new(),
-            Some(blob_bytes(db, ours, lazy_fetch)?),
+            Some(blob_bytes(policy, db, ours, lazy_fetch)?),
         )),
     }
 }
@@ -1491,14 +1499,15 @@ fn trivial_resolution(
 /// Run a 3-way content merge for the trivial mode, using git's `.our` / `.their`
 /// conflict-marker labels.
 fn trivial_content_merge(
+    policy: &sley_remote::RemotePolicy,
     db: &FileObjectDatabase,
     base_bytes: &[u8],
     ours: &TrivialEntry,
     theirs: &TrivialEntry,
     lazy_fetch: bool,
 ) -> Result<Vec<u8>> {
-    let ours_bytes = blob_bytes(db, ours, lazy_fetch)?;
-    let theirs_bytes = blob_bytes(db, theirs, lazy_fetch)?;
+    let ours_bytes = blob_bytes(policy, db, ours, lazy_fetch)?;
+    let theirs_bytes = blob_bytes(policy, db, theirs, lazy_fetch)?;
     let result = sley_diff_merge::merge_blobs(
         base_bytes,
         &ours_bytes,
@@ -1517,9 +1526,14 @@ fn trivial_content_merge(
 }
 
 /// Read the blob bytes for a present entry, or the empty slice for an absent one.
-fn blob_bytes(db: &FileObjectDatabase, entry: &TrivialEntry, lazy_fetch: bool) -> Result<Vec<u8>> {
+fn blob_bytes(
+    policy: &sley_remote::RemotePolicy,
+    db: &FileObjectDatabase,
+    entry: &TrivialEntry,
+    lazy_fetch: bool,
+) -> Result<Vec<u8>> {
     match entry {
-        Some((_, oid)) => merge_read_blob(db, oid, lazy_fetch),
+        Some((_, oid)) => merge_read_blob(policy, db, oid, lazy_fetch),
         None => Ok(Vec::new()),
     }
 }

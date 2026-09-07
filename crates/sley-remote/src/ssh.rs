@@ -160,12 +160,12 @@ struct StderrDrain {
 impl StderrDrain {
     fn start(stderr: ChildStderr) -> Self {
         Self {
-            handle: std::thread::spawn(move || {
+            handle: std::thread::spawn(sley_core::diagnostics::inherit(move || {
                 let mut sink = Vec::new();
                 let mut stderr = stderr;
                 let _ = stderr.read_to_end(&mut sink);
                 sink
-            }),
+            })),
         }
     }
 
@@ -197,7 +197,7 @@ fn with_ssh_child_cancel_watch<T>(
         let watch_child = Arc::clone(child);
         let watch_cancel = cancel;
         let watch_stop = &stop;
-        scope.spawn(move || {
+        scope.spawn(sley_core::diagnostics::inherit(move || {
             while !watch_stop.load(Ordering::Relaxed) {
                 if watch_cancel.is_cancelled() {
                     if let Ok(mut guard) = watch_child.lock() {
@@ -207,7 +207,7 @@ fn with_ssh_child_cancel_watch<T>(
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
-        });
+        }));
         // Ensure the watcher always observes stop, even if `body` panics.
         let _stop_guard = StopOnDrop(&stop);
         body()
@@ -1006,6 +1006,7 @@ pub struct SshFetchPackRequest<'a> {
 }
 
 pub fn install_fetch_pack_via_ssh_upload_pack(
+    policy: &crate::RemotePolicy,
     request: SshFetchPackRequest<'_>,
     progress: &mut dyn ProgressSink,
     cancel: CancelFlag<'_>,
@@ -1027,11 +1028,9 @@ pub fn install_fetch_pack_via_ssh_upload_pack(
         deepen: request.deepen,
         ..UploadPackRequest::default()
     };
-    let haves = request
-        .haves
-        .clone()
-        .map(Ok)
-        .unwrap_or_else(|| crate::local::local_have_oids(request.git_dir, request.format))?;
+    let haves = request.haves.clone().map(Ok).unwrap_or_else(|| {
+        crate::local::local_have_oids(policy, request.git_dir, request.format)
+    })?;
     let (child, stdin, mut stdout, stderr_drain) = spawn_service_process(
         request.remote,
         GitService::UploadPack,

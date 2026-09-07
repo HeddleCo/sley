@@ -201,7 +201,7 @@ pub fn run_proc_receive_hook(input: ProcReceiveHookInput<'_>) -> Result<ProcRece
                 .remote_stderr
                 .extend_from_slice(b"error: cannot find hook 'proc-receive'\n");
         } else {
-            eprintln!("error: cannot find hook 'proc-receive'");
+            sley_core::diagnostic!(Stderr, true, "error: cannot find hook 'proc-receive'");
         }
         let mut commands = input.commands.to_vec();
         for state in &mut commands {
@@ -239,9 +239,10 @@ pub fn run_proc_receive_hook(input: ProcReceiveHookInput<'_>) -> Result<ProcRece
         child.env(format!("GIT_PUSH_OPTION_{index}"), option);
     }
 
-    let mut child = child
-        .spawn()
-        .map_err(|err| GitError::Io(format!("cannot spawn proc-receive hook: {err}")))?;
+    let mut child = child.spawn().map_err(|err| GitError::IoKind {
+        kind: std::io::ErrorKind::Other,
+        message: format!("cannot spawn proc-receive hook: {err}"),
+    })?;
 
     // Drain the hook's stderr while its pkt-line protocol is in flight.  A hook
     // may emit more than a pipe buffer before exiting, so waiting first can
@@ -253,24 +254,24 @@ pub fn run_proc_receive_hook(input: ProcReceiveHookInput<'_>) -> Result<ProcRece
     // requires an explicit diagnostic truncation/error policy.
     let hook_stderr = if capture_stderr {
         child.stderr.take().map(|mut stderr| {
-            thread::spawn(move || {
+            thread::spawn(sley_core::diagnostics::inherit(move || {
                 let mut output = Vec::new();
                 let _ = stderr.read_to_end(&mut output);
                 output
-            })
+            }))
         })
     } else {
         None
     };
 
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| GitError::Io("proc-receive hook stdin unavailable".into()))?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| GitError::Io("proc-receive hook stdout unavailable".into()))?;
+    let mut stdin = child.stdin.take().ok_or_else(|| GitError::IoKind {
+        kind: std::io::ErrorKind::Other,
+        message: "proc-receive hook stdin unavailable".into(),
+    })?;
+    let mut stdout = child.stdout.take().ok_or_else(|| GitError::IoKind {
+        kind: std::io::ErrorKind::Other,
+        message: "proc-receive hook stdout unavailable".into(),
+    })?;
 
     let mut hook_failed = false;
     let mut protocol_messages = Vec::new();
@@ -295,9 +296,7 @@ pub fn run_proc_receive_hook(input: ProcReceiveHookInput<'_>) -> Result<ProcRece
             }
         }
         if !hook_failed {
-            stdin
-                .write_all(b"0000")
-                .map_err(|err| GitError::Io(err.to_string()))?;
+            stdin.write_all(b"0000").map_err(GitError::from)?;
         }
     }
 
@@ -322,9 +321,7 @@ pub fn run_proc_receive_hook(input: ProcReceiveHookInput<'_>) -> Result<ProcRece
                 }
             }
             if !hook_failed {
-                stdin
-                    .write_all(b"0000")
-                    .map_err(|err| GitError::Io(err.to_string()))?;
+                stdin.write_all(b"0000").map_err(GitError::from)?;
             }
         }
     }
@@ -346,11 +343,12 @@ pub fn run_proc_receive_hook(input: ProcReceiveHookInput<'_>) -> Result<ProcRece
         }
     }
 
-    let status = child.wait().map_err(|err| GitError::Io(err.to_string()))?;
+    let status = child.wait().map_err(GitError::from)?;
     if let Some(hook_stderr) = hook_stderr {
-        let hook_stderr = hook_stderr
-            .join()
-            .map_err(|_| GitError::Io("proc-receive stderr reader panicked".into()))?;
+        let hook_stderr = hook_stderr.join().map_err(|_| GitError::IoKind {
+            kind: std::io::ErrorKind::Other,
+            message: "proc-receive stderr reader panicked".into(),
+        })?;
         input.remote_stderr.extend_from_slice(&hook_stderr);
     }
     for message in protocol_messages {
@@ -359,7 +357,7 @@ pub fn run_proc_receive_hook(input: ProcReceiveHookInput<'_>) -> Result<ProcRece
                 .remote_stderr
                 .extend_from_slice(format!("error: {message}\n").as_bytes());
         } else {
-            eprintln!("error: {message}");
+            sley_core::diagnostic!(Stderr, true, "error: {message}");
         }
     }
     if !status.success() {

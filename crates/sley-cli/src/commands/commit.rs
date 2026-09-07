@@ -1,7 +1,6 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 #![allow(clippy::expect_used)]
 
-use sley::plumbing::{sley_diff_merge, sley_object, sley_worktree};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use super::status::{
@@ -52,9 +51,10 @@ pub(crate) fn run_prepare_commit_msg_hook(
             ..commands::hooks::HookRun::default()
         },
     ) {
-        Err(GitError::Exit(code)) => {
+        Err(error) if crate::cli_reported_status(&error).is_some() => {
+            let code = crate::cli_exit_code(&error);
             eprintln!("error: prepare-commit-msg hook failed");
-            Err(GitError::Exit(code))
+            Err(crate::cli_exit(code))
         }
         result => result,
     }
@@ -800,17 +800,17 @@ pub(crate) fn cmd_commit(
     if reuse_message.is_some() && !message_chunks.is_empty() {
         let option = if reedit_message { "-c" } else { "-C" };
         eprintln!("fatal: options '-m' and '{option}' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if reuse_message.is_some() && file_message.is_some() {
         let option = if reedit_message { "-c" } else { "-C" };
         eprintln!("fatal: options '{option}' and '-F' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if fixup_commit.is_some() && reuse_message.is_some() {
         let option = if reedit_message { "-c" } else { "-C" };
         eprintln!("fatal: options '{option}' and '--fixup' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if let Some(fixup) = &fixup_commit
         && fixup.is_amend_style()
@@ -822,11 +822,11 @@ pub(crate) fn cmd_commit(
             "--fixup:amend"
         };
         eprintln!("fatal: options '-m' and '{option}' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if squash_commit.is_some() && fixup_commit.is_some() {
         eprintln!("fatal: options '--squash' and '--fixup' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if let Some(fixup) = &fixup_commit
         && fixup.is_reword()
@@ -836,45 +836,45 @@ pub(crate) fn cmd_commit(
                 "fatal: reword option of '--fixup' and path '{}' cannot be used together",
                 pathspec_args[0]
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if all || include_without_paths || only_without_paths || interactive || patch {
             eprintln!(
                 "fatal: reword option of '--fixup' and '--patch/--interactive/--all/--include/--only' cannot be used together"
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     if fixup_commit.is_some() && file_message.is_some() {
         eprintln!("fatal: options '-F' and '--fixup' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if file_message.is_some() && !message_chunks.is_empty() {
         eprintln!("fatal: options '-m' and '-F' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if pathspec_from_file_active && (interactive || patch) {
         eprintln!(
             "fatal: options '--pathspec-from-file' and '--interactive/--patch' cannot be used together"
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if pathspec_from_file_active && all {
         eprintln!("fatal: options '--pathspec-from-file' and '-a' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     // git's die_for_incompatible_opt4(also, only, all, interactive).
     if include_without_paths && only_without_paths {
         eprintln!("fatal: options '-i/--include' and '-o/--only' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if include_without_paths && all {
         eprintln!("fatal: options '-i/--include' and '-a/--all' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if only_without_paths && all {
         eprintln!("fatal: options '-o/--only' and '-a/--all' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if (include_without_paths || only_without_paths || all) && (interactive || patch) {
         let other = if include_without_paths {
@@ -887,7 +887,7 @@ pub(crate) fn cmd_commit(
         eprintln!(
             "fatal: options '{other}' and '--interactive/-p/--patch' cannot be used together"
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     // git: die only when no paths and (--include, or --only without --amend and
     // without --allow-empty). `git commit --allow-empty --only` is valid.
@@ -900,11 +900,11 @@ pub(crate) fn cmd_commit(
         && (include_without_paths || (only_without_paths && !amend_style && !allow_empty))
     {
         eprintln!("fatal: No paths with --include/--only does not make sense.");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if pathspec_file_nul && pathspec_from_file.is_none() {
         eprintln!("fatal: the option '--pathspec-file-nul' requires '--pathspec-from-file'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if let Some(pathspec_file) = pathspec_from_file.as_deref() {
         let pathspecs =
@@ -922,22 +922,22 @@ pub(crate) fn cmd_commit(
         && (include_without_paths || only_without_paths)
     {
         eprintln!("fatal: No paths with --include/--only does not make sense.");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if !pathspec_args.is_empty() && all {
         eprintln!(
             "fatal: paths '{} ...' with -a does not make sense",
             pathspec_args[0]
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if unified_context.is_some() && !interactive && !patch {
         eprintln!("fatal: the option '--unified' requires '--interactive/--patch'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if inter_hunk_context.is_some() && !interactive && !patch {
         eprintln!("fatal: the option '--inter-hunk-context' requires '--interactive/--patch'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if status_mode != CommitStatusMode::Normal || dry_run {
         // Status / dry-run previews honour `-a` (and the resulting "would be
@@ -1048,34 +1048,34 @@ pub(crate) fn cmd_commit(
     let in_rebase = rebase_in_progress(&git_dir);
     if reset_author && reuse_message.is_none() && !amend && !in_cherry_pick && !in_rebase {
         eprintln!("fatal: --reset-author can be used only with -C, -c or --amend.");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if !pathspec_args.is_empty() {
         if in_rebase {
             eprintln!("fatal: cannot do a partial commit during a rebase.");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if in_merge {
             eprintln!("fatal: cannot do a partial commit during a merge.");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if in_cherry_pick || in_revert {
             eprintln!("fatal: cannot do a partial commit during a cherry-pick.");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     if amend {
         if in_rebase {
             eprintln!("fatal: You are in the middle of a rebase -- cannot amend.");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if in_merge {
             eprintln!("fatal: You are in the middle of a merge -- cannot amend.");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if in_cherry_pick || in_revert {
             eprintln!("fatal: You are in the middle of a cherry-pick -- cannot amend.");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     // `i18n.commitEncoding` is recorded as the commit's `encoding` header so that
@@ -1134,7 +1134,7 @@ pub(crate) fn cmd_commit(
                     .is_some_and(CommitFixup::is_amend_style) =>
             {
                 eprintln!("fatal: You have nothing to amend.");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             None => Some(ObjectId::empty_tree(format)),
         }
@@ -1496,7 +1496,7 @@ pub(crate) fn cmd_commit(
     {
         eprintln!("error: {err}");
         eprintln!("Please supply the message using either -m or -F option.");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     if !no_verify {
         commands::hooks::run_hook_at(
@@ -1518,7 +1518,7 @@ pub(crate) fn cmd_commit(
     {
         let _ = restore_taken_index_snapshot(&git_dir, &all_index_snapshot);
         eprintln!("Aborting commit due to empty commit message.");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     // `git commit` invoked manually during a conflicted rebase concludes the
     // current rebase step (builtin: the sequencer's `do_commit` path). `--amend`
@@ -1531,6 +1531,7 @@ pub(crate) fn cmd_commit(
     // exits 1 (t3436 date tests: amend after a leftover rebase dir).
     if in_rebase && !amend {
         return conclude_rebase_step_via_commit(
+            &cli_session.remote_policy,
             &git_dir,
             format,
             author,
@@ -1544,6 +1545,8 @@ pub(crate) fn cmd_commit(
     }
     if in_merge {
         return conclude_in_progress_merge(
+            cli_session.original_cwd.as_deref(),
+            &cli_session.remote_policy,
             &git_dir,
             &worktree_root_for_git_dir(cli_session, &git_dir)?,
             format,
@@ -1556,6 +1559,8 @@ pub(crate) fn cmd_commit(
     }
     if in_cherry_pick || in_revert {
         return conclude_replay_via_commit(
+            cli_session.original_cwd.as_deref(),
+            &cli_session.remote_policy,
             &git_dir,
             &worktree_root_for_git_dir(cli_session, &git_dir)?,
             format,
@@ -1579,7 +1584,7 @@ pub(crate) fn cmd_commit(
     {
         let _ = restore_taken_index_snapshot(&git_dir, &all_index_snapshot);
         eprintln!("Aborting commit due to empty commit message.");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     if !allow_empty_message
         && (commit_message_is_empty_for_cleanup(&message, cleanup_mode)
@@ -1589,7 +1594,7 @@ pub(crate) fn cmd_commit(
     {
         let _ = restore_taken_index_snapshot(&git_dir, &all_index_snapshot);
         eprintln!("Aborting commit due to empty commit message.");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     if fixup_commit
         .as_ref()
@@ -1600,12 +1605,12 @@ pub(crate) fn cmd_commit(
     {
         let _ = restore_taken_index_snapshot(&git_dir, &all_index_snapshot);
         eprintln!("Aborting commit due to empty commit message body.");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     if commit_message_has_nul(&message) {
         let _ = restore_taken_index_snapshot(&git_dir, &all_index_snapshot);
         eprintln!("error: a NUL byte in commit log message not allowed.");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     if encoding_is_utf8(&commit_encoding) && commit_message_has_invalid_utf8(&message) {
         eprintln!("Warning: commit message did not conform to UTF-8.");
@@ -1624,7 +1629,7 @@ pub(crate) fn cmd_commit(
     {
         let _ = restore_taken_index_snapshot(&git_dir, &all_index_snapshot);
         eprintln!("Aborting commit; you did not edit the message.");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     if !pathspec_args.is_empty() {
         let (head, tree_map) = partial_head_tree.expect("partial commit precomputed HEAD tree");
@@ -1664,7 +1669,7 @@ pub(crate) fn cmd_commit(
             Some(tree) => Some(tree),
             None => {
                 print_clean_commit_status(cli_session, &git_dir, format)?;
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
         }
     } else {
@@ -1745,6 +1750,8 @@ pub(crate) fn cmd_commit(
         format,
     )?;
     remove_commit_state_files(
+        cli_session.original_cwd.as_deref(),
+        &cli_session.remote_policy,
         &git_dir,
         &worktree_root_for_git_dir(cli_session, &git_dir)?,
         cli_session.lazy_fetch(),
@@ -1755,6 +1762,7 @@ pub(crate) fn cmd_commit(
         // (reuse from -C/-c/amend). Shows the `Date:` line in the summary.
         let show_author_date = author_date.is_some() || reuse_message.is_some() || amend;
         print_commit_summary(
+            &cli_session.remote_policy,
             &git_dir,
             format,
             &commit_odb,
@@ -1842,6 +1850,7 @@ fn run_auto_maintenance_after_commit(
 /// summary reuses any hot pack/MIDX state from the commit path instead of
 /// opening a second database for the same repository.
 fn print_commit_summary(
+    policy: &sley_remote::RemotePolicy,
     git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
@@ -1899,13 +1908,9 @@ fn print_commit_summary(
         sley_diff_merge::DiffNameStatusOptions::default(),
     )?;
     if !entries.is_empty() {
-        let stat_entries = collect_diff_stat_entries(
-            &entries,
-            db,
-            None,
-            false,
-            crate::diff_lazy_fetch(lazy_fetch),
-        )?;
+        let lazy_fetch_adapter_1 = crate::diff_lazy_fetch(policy, lazy_fetch);
+        let stat_entries =
+            collect_diff_stat_entries(&entries, db, None, false, lazy_fetch_adapter_1.as_option())?;
         write_diff_shortstat_materialized(&mut out, &stat_entries)?;
         for entry in &entries {
             write_commit_summary_entry(&mut out, entry)?;
@@ -2017,6 +2022,8 @@ fn commit_message_with_trailers<'a>(
 /// the last-pick sequencer-state teardown).
 #[allow(clippy::too_many_arguments)]
 fn conclude_replay_via_commit(
+    original_cwd: Option<&std::path::Path>,
+    policy: &sley_remote::RemotePolicy,
     git_dir: &Path,
     worktree_root: &Path,
     format: ObjectFormat,
@@ -2049,7 +2056,7 @@ fn conclude_replay_via_commit(
             eprintln!("hint: Fix them up in the work tree, and then use 'git add/rm <file>'");
             eprintln!("hint: as appropriate to mark resolution and make a commit.");
             eprintln!("fatal: Exiting because of an unresolved conflict.");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     let head_tree = match &head {
@@ -2070,11 +2077,11 @@ fn conclude_replay_via_commit(
         eprintln!("    git commit --allow-empty");
         eprintln!();
         eprintln!("Otherwise, please use 'git {action} --skip'");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     if !allow_empty_message && commit_message_is_empty(&message) {
         eprintln!("Aborting commit due to empty commit message.");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     let author = if use_pick_author && cherry_pick_head.is_file() {
         let text = fs::read_to_string(&cherry_pick_head)?;
@@ -2119,7 +2126,7 @@ fn conclude_replay_via_commit(
     });
     tx.commit()?;
     sley_sequencer::replay::post_commit_cleanup(git_dir);
-    remove_commit_state_files(git_dir, worktree_root, lazy_fetch);
+    remove_commit_state_files(original_cwd, policy, git_dir, worktree_root, lazy_fetch);
     commands::hooks::run_post_index_change_hook_at(git_dir, false, false)?;
     if !quiet {
         println!("{new_oid}");
@@ -2207,6 +2214,8 @@ fn commit_partial_paths(
     sley_worktree::refresh_repository_cache_tree(git_dir, format, &db)?;
     sley_sequencer::replay::post_commit_cleanup(git_dir);
     remove_commit_state_files(
+        cli_session.original_cwd.as_deref(),
+        &cli_session.remote_policy,
         git_dir,
         &worktree_root_for_git_dir(cli_session, git_dir)?,
         cli_session.lazy_fetch(),
@@ -2303,7 +2312,7 @@ fn stage_partial_commit_paths(
     for (path, element, matched) in &pathspecs {
         if !element.is_exclude() && !matched {
             eprintln!("error: pathspec '{path}' did not match any file(s) known to git");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
 
@@ -2565,10 +2574,23 @@ fn restore_taken_index_snapshot(git_dir: &Path, snapshot: &Option<Option<Vec<u8>
     Ok(())
 }
 
-fn remove_commit_state_files(git_dir: &Path, worktree_root: &Path, lazy_fetch: bool) {
+fn remove_commit_state_files(
+    original_cwd: Option<&std::path::Path>,
+    policy: &sley_remote::RemotePolicy,
+    git_dir: &Path,
+    worktree_root: &Path,
+    lazy_fetch: bool,
+) {
     let format = repository_object_format(git_dir).ok();
     if let Some(format) = format {
-        commands::merge_rebase::apply_merge_autostash(git_dir, worktree_root, format, lazy_fetch);
+        commands::merge_rebase::apply_merge_autostash(
+            original_cwd,
+            policy,
+            git_dir,
+            worktree_root,
+            format,
+            lazy_fetch,
+        );
     }
     for name in [
         "MERGE_HEAD",
@@ -2747,7 +2769,7 @@ fn cmd_commit_status_preview(
     if committable {
         Ok(())
     } else {
-        Err(GitError::Exit(1))
+        Err(crate::cli_exit(1))
     }
 }
 
@@ -2827,7 +2849,7 @@ fn cmd_commit_long_status_preview(
     if committable {
         Ok(())
     } else {
-        Err(GitError::Exit(1))
+        Err(crate::cli_exit(1))
     }
 }
 
@@ -2849,7 +2871,7 @@ impl CommitFixup {
                 .is_some_and(|(mode, _)| !mode.is_empty())
         {
             eprintln!("fatal: unknown option: --fixup={value}");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         } else {
             Ok(Self::Plain(value.to_string()))
         }
@@ -2882,32 +2904,32 @@ fn commit_usage() -> Result<()> {
     eprintln!("                  [-F <file> | -m <msg>] [--reset-author] [--allow-empty]");
     eprintln!("                  [--no-verify] [-e] [--author=<author>] [--date=<date>]");
     eprintln!("                  [--cleanup=<mode>] [--[no-]status] [-i | -o] [pathspec...]");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn commit_author_requires_value_error() -> Result<()> {
     eprintln!("error: option `author' requires a value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn commit_date_requires_value_error() -> Result<()> {
     eprintln!("error: option `date' requires a value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn commit_cleanup_requires_value_error() -> Result<()> {
     eprintln!("error: option `cleanup' requires a value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn commit_template_requires_value_error() -> Result<()> {
     eprintln!("error: option `template' requires a value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn commit_template_short_requires_value_error() -> Result<()> {
     eprintln!("error: switch `t' requires a value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn commit_reuse_message_requires_value_error(short: bool, reedit: bool) -> Result<()> {
@@ -2922,42 +2944,42 @@ fn commit_reuse_message_requires_value_error(short: bool, reedit: bool) -> Resul
         };
         eprintln!("error: option `{option}' requires a value");
     }
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn commit_fixup_requires_value_error() -> Result<()> {
     eprintln!("error: option `fixup' requires a value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn commit_squash_requires_value_error() -> Result<()> {
     eprintln!("error: option `squash' requires a value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn commit_trailer_requires_value_error() -> Result<()> {
     eprintln!("error: option `trailer' requires a value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn commit_pathspec_from_file_requires_value_error() -> Result<()> {
     eprintln!("error: option `pathspec-from-file' requires a value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn commit_pathspec_from_file_with_inline_pathspec_error() -> Result<()> {
     eprintln!("fatal: '--pathspec-from-file' and pathspec arguments cannot be used together");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn commit_option_takes_no_value_error(option: &str) -> Result<()> {
     eprintln!("error: option `{option}' takes no value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn commit_invalid_untracked_files_mode_error(mode: &str) -> Result<()> {
     eprintln!("fatal: Invalid untracked files mode '{mode}'");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn commit_message_arg_chunk(message: &str) -> Vec<u8> {
@@ -3058,7 +3080,7 @@ fn validate_commit_cleanup_mode(value: &str) -> Result<()> {
         "strip" | "whitespace" | "scissors" | "default" | "verbatim" => Ok(()),
         _ => {
             eprintln!("fatal: Invalid cleanup mode {value}");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -3232,7 +3254,7 @@ fn read_amended_commit(git_dir: &Path, format: ObjectFormat) -> Result<Commit> {
         Some(commit) => Ok(commit),
         None => {
             eprintln!("fatal: You have nothing to amend.");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -3283,7 +3305,7 @@ fn build_reused_commit_author_identity(
     let date = match date {
         Some(date) => try_canonicalize_commit_date(date).ok_or_else(|| {
             eprintln!("fatal: invalid date format: {date}");
-            GitError::Exit(128)
+            crate::cli_exit(128)
         })?,
         None => reused_date,
     };
@@ -3295,7 +3317,7 @@ fn validate_reused_commit_author_identity(identity: &[u8]) -> Result<()> {
         return Ok(());
     }
     eprintln!("fatal: empty ident name (for <>) not allowed");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn commit_author_hook_env(author: &[u8]) -> Result<Vec<(String, String)>> {
@@ -3458,7 +3480,7 @@ fn read_commit_template_file(path: &str) -> Result<Option<Vec<u8>>> {
         Err(err) if optional && err.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(err) => {
             eprintln!("fatal: could not read '{path}': {err}");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -3614,7 +3636,8 @@ fn append_commit_diff_index_patch(
                 anchors: &[],
                 allow_textconv: true,
                 db: &db,
-                lazy_fetch: crate::diff_lazy_fetch(lazy_fetch),
+                lazy_fetch: crate::diff_lazy_fetch(&cli_session.remote_policy, lazy_fetch)
+                    .as_option(),
                 worktree_root: worktree.then_some(worktree_root.as_path()),
                 use_worktree_new: worktree,
                 format,
@@ -3975,7 +3998,7 @@ fn build_commit_author_identity(
         // Explicit `--date=` must parse (git's `parse_force_date`).
         try_canonicalize_commit_date(date).ok_or_else(|| {
             eprintln!("fatal: invalid date format: {date}");
-            GitError::Exit(128)
+            crate::cli_exit(128)
         })?
     } else {
         let raw = env::var("GIT_AUTHOR_DATE").unwrap_or_else(|_| "@0 +0000".into());
@@ -4010,7 +4033,7 @@ fn resolve_commit_author_nickname(
         .build()
         .map_err(|error| {
             eprintln!("fatal: invalid --author pattern '{author}': {error}");
-            GitError::Exit(128)
+            crate::cli_exit(128)
         })?;
     let mut tips = Vec::new();
     let head_oid = match refs.read_ref("HEAD")? {
@@ -4086,13 +4109,13 @@ fn parse_commit_author_bytes(author: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
 
 fn commit_invalid_author_error(author: &str) -> Result<(String, String)> {
     eprintln!("fatal: --author '{author}' is not 'Name <email>' and matches no existing author");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn commit_invalid_author_bytes_error<T>(author: &[u8]) -> Result<T> {
     let author = String::from_utf8_lossy(author);
     eprintln!("fatal: --author '{author}' is not 'Name <email>' and matches no existing author");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 #[cfg(test)]

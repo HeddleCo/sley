@@ -5,8 +5,8 @@ use std::fs;
 use std::io::{self};
 use std::path::{Path, PathBuf};
 
-use sley::plumbing::sley_config;
-use sley::{GitError, Result};
+use sley::Result;
+
 use sley_transport::{
     CredentialOpType, GitCredential, cmd_credential_cache as transport_cmd_credential_cache,
     cmd_credential_cache_daemon as transport_cmd_credential_cache_daemon,
@@ -24,7 +24,7 @@ pub(crate) fn cmd_credential(
 ) -> Result<()> {
     if args.len() != 1 {
         eprintln!("usage: git credential (fill|approve|reject)");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     let op = &args[0];
     if op == "capability" {
@@ -60,7 +60,7 @@ pub(crate) fn cmd_credential(
         }
         _ => {
             eprintln!("usage: git credential (fill|approve|reject)");
-            return Err(GitError::Exit(129));
+            return Err(crate::cli_exit(129));
         }
     }
     Ok(())

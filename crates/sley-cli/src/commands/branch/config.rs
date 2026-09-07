@@ -1,7 +1,6 @@
 //! Branch-related repository config read/write helpers.
 
 use crate::*;
-use sley::plumbing::sley_config;
 
 pub(super) fn rename_branch_config(
     git_dir: &Path,
@@ -159,9 +158,9 @@ pub(super) fn write_raw_repo_config(git_dir: &Path, bytes: Vec<u8>) -> Result<()
                 "error: could not lock config file {}: File exists",
                 branch_config_display_path(git_dir)
             );
-            Err(GitError::Exit(255))
+            Err(crate::cli_exit(255))
         }
-        Err(err) => Err(GitError::Io(err.to_string())),
+        Err(err) => Err(GitError::from(err)),
     }
 }
 
@@ -171,7 +170,7 @@ pub(super) fn write_branch_repo_config(git_dir: &Path, config: &GitConfig) -> Re
             "error: could not lock config file {}: File exists",
             branch_config_display_path(git_dir)
         );
-        return Err(GitError::Exit(255));
+        return Err(crate::cli_exit(255));
     }
     fs::write(git_dir.join("config"), config.to_canonical_bytes())?;
     Ok(())
@@ -209,7 +208,7 @@ pub(super) fn validate_autosetuprebase(config: &GitConfig) -> Result<AutoRebase>
         None => Ok(AutoRebase::Never),
         Some(None) => {
             eprintln!("error: missing value for 'branch.autosetuprebase'");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
         Some(Some("never")) => Ok(AutoRebase::Never),
         Some(Some("local")) => Ok(AutoRebase::Local),
@@ -217,7 +216,7 @@ pub(super) fn validate_autosetuprebase(config: &GitConfig) -> Result<AutoRebase>
         Some(Some("always")) => Ok(AutoRebase::Always),
         Some(Some(other)) => {
             eprintln!("error: malformed value for 'branch.autosetuprebase': {other}");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }

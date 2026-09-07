@@ -1,5 +1,4 @@
 use super::*;
-use sley::plumbing::{sley_diff_merge, sley_object, sley_rev};
 
 pub(super) enum PickaxeSpec {
     /// `-S<string>`: count occurrences of the needle in the old vs new blob; a
@@ -81,7 +80,7 @@ pub(super) fn parse_diff_filter_arg(
         let bit = diff_filter_letter_bit(upper);
         if bit == 0 {
             eprintln!("fatal: unknown change class '{ch}' in --diff-filter={arg}");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if negate {
             *filter_not |= bit;
@@ -574,7 +573,7 @@ pub(super) fn compile_pickaxe_regex(pattern: &str, ignore_case: bool) -> Result<
     sley_grep::Regex::compile(pattern, sley_grep::RegexMode::Ere, ignore_case, false).map_err(
         |_| {
             eprintln!("fatal: invalid regex: {pattern}");
-            GitError::Exit(128)
+            crate::cli_exit(128)
         },
     )
 }

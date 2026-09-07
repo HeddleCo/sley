@@ -2,7 +2,6 @@
 #![allow(clippy::expect_used)]
 
 use crate::*;
-use sley::plumbing::{sley_refs, sley_rev, sley_worktree};
 
 use super::commit_graph::commit_graph_commit_time_from_committer;
 
@@ -151,7 +150,7 @@ pub(crate) fn cmd_archive(cli_session: &crate::session::CliSession, args: &[Stri
     if list {
         // `--list` takes no tree-ish or pathspecs.
         if treeish.is_some() || !pathspecs.is_empty() {
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         let config = archive_config_for_list(
             remote.as_deref(),
@@ -210,7 +209,7 @@ pub(crate) fn cmd_archive(cli_session: &crate::session::CliSession, args: &[Stri
             if message.contains("outside the current directory") =>
         {
             eprintln!("fatal: {message}");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         Err(err) => return Err(err),
     };
@@ -219,7 +218,7 @@ pub(crate) fn cmd_archive(cli_session: &crate::session::CliSession, args: &[Stri
     if remote.is_some()
         && !archive_remote_object_allowed(&git_dir, &db, format, &oid, &treeish, &config)?
     {
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let object = db.read_object(&oid)?;
     let (tree_oid, default_mtime, commit_id, commit_record) = match object.object_type {
@@ -299,7 +298,11 @@ pub(crate) fn cmd_archive(cli_session: &crate::session::CliSession, args: &[Stri
     };
     let mut convert = if worktree_attributes {
         if let Some(worktree_root) = &worktree_root {
-            sley_archive::ArchiveConvert::from_worktree(worktree_root, &config)?
+            sley_archive::ArchiveConvert::from_worktree(
+                cli_session.precompose_unicode(),
+                worktree_root,
+                &config,
+            )?
         } else if let Some(attr_tree_oid) = &archive_attr_tree_oid {
             sley_archive::ArchiveConvert::from_tree(
                 &attr_root,
@@ -344,6 +347,7 @@ pub(crate) fn cmd_archive(cli_session: &crate::session::CliSession, args: &[Stri
     // `UserdiffResolver` resolves `diff=<name>` ⇒ `diff.<name>.binary` config and
     // builtin driver flags.
     let diff_attributes = archive_diff_attributes(
+        cli_session.precompose_unicode(),
         &attr_root,
         &git_dir,
         &db,
@@ -490,6 +494,7 @@ enum ArchiveDiffAttributes {
 }
 
 fn archive_diff_attributes(
+    precompose: sley_core::PrecomposeUnicode,
     attr_root: &Path,
     git_dir: &Path,
     db: &FileObjectDatabase,
@@ -500,7 +505,7 @@ fn archive_diff_attributes(
 ) -> Result<ArchiveDiffAttributes> {
     if let Some(worktree_root) = worktree_root {
         return Ok(ArchiveDiffAttributes::Worktree(
-            sley_worktree::StandardAttributeMatcher::from_worktree_root(worktree_root)?,
+            sley_worktree::StandardAttributeMatcher::from_worktree_root(precompose, worktree_root)?,
         ));
     }
     Ok(ArchiveDiffAttributes::Tree(
@@ -696,7 +701,7 @@ fn archive_filter_command(
                 .unwrap_or(false),
         };
         if !remote_allowed {
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     let Some(command) = config.get("tar", Some(format_name), "command") else {
@@ -704,7 +709,7 @@ fn archive_filter_command(
     };
     if command.is_empty() {
         eprintln!("fatal: empty tar filter command for '{format_name}'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(Some(command.to_string()))
 }
@@ -726,13 +731,11 @@ fn run_archive_filter(command: &str, input: &[u8]) -> Result<Vec<u8>> {
         .stdin(std::process::Stdio::from(input_file))
         .stdout(std::process::Stdio::piped())
         .spawn()
-        .map_err(|err| GitError::Io(err.to_string()))?;
-    let output = child
-        .wait_with_output()
-        .map_err(|err| GitError::Io(err.to_string()))?;
+        .map_err(GitError::from)?;
+    let output = child.wait_with_output().map_err(GitError::from)?;
     let _ = fs::remove_file(&input_path);
     if !output.status.success() {
-        return Err(GitError::Exit(output.status.code().unwrap_or(128)));
+        return Err(crate::cli_exit(output.status.code().unwrap_or(128)));
     }
     Ok(output.stdout)
 }
@@ -950,13 +953,13 @@ fn handle_archive_result(result: Result<()>) -> Result<()> {
         Ok(()) => Ok(()),
         Err(GitError::InvalidPath(message)) if message.starts_with("pathspec ") => {
             eprintln!("fatal: {message}");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
         Err(GitError::InvalidPath(message))
             if message.contains("outside the current directory") =>
         {
             eprintln!("fatal: {message}");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
         Err(err) => Err(err),
     }

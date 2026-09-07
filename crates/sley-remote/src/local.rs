@@ -84,14 +84,20 @@ fn resolve_for_each_ref_target(
 
 /// The upload-pack capabilities advertised for the repository at `git_dir`:
 /// the object format, side-band-64k, and a `HEAD` symref hint if present.
-pub fn upload_pack_features(git_dir: &Path, format: ObjectFormat) -> Result<UploadPackFeatures> {
+pub fn upload_pack_features(
+    policy: &crate::RemotePolicy,
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<UploadPackFeatures> {
     let store = FileRefStore::new(git_dir, format);
     let mut symrefs = Vec::new();
-    let head_name = sley_core::expand_namespace("HEAD");
+    let head_name = policy.namespace.expand("HEAD");
     if let Some(RefTarget::Symbolic(target)) = store.read_ref(&head_name)? {
         // Advertise the logical (namespace-stripped) target so clients see the
         // same names they will later request.
-        let logical_target = sley_core::strip_namespace(&target)
+        let logical_target = policy
+            .namespace
+            .strip(&target)
             .unwrap_or(target.as_str())
             .to_string();
         symrefs.push(format!("HEAD:{logical_target}"));
@@ -265,6 +271,7 @@ pub fn attach_receive_pack_capabilities(
 /// incoming packfile and execute the ref creations/updates/deletions, returning
 /// the report-status describing what happened.
 pub fn receive_pack_into_local_repository(
+    original_cwd: Option<&std::path::Path>,
     remote_git_dir: &Path,
     format: ObjectFormat,
     request: &ReceivePackPushRequest,
@@ -288,6 +295,7 @@ pub fn receive_pack_into_local_repository(
         |oid| remote_db.contains(oid),
         |commands| {
             let applied = apply_receive_pack_ref_transaction(
+                original_cwd,
                 remote_git_dir,
                 format,
                 &remote_store,
@@ -321,6 +329,7 @@ pub fn receive_pack_into_local_repository(
 /// [`receive_pack_into_local_repository`] but avoids materializing the pack as a
 /// `Vec<u8>` in stdio/SSH server paths.
 pub fn receive_pack_stream_into_local_repository<R: Read>(
+    original_cwd: Option<&std::path::Path>,
     remote_git_dir: &Path,
     format: ObjectFormat,
     header: &ReceivePackPushRequestHeader,
@@ -381,6 +390,7 @@ pub fn receive_pack_stream_into_local_repository<R: Read>(
             }
         }
         let applied = apply_receive_pack_ref_transaction(
+            original_cwd,
             remote_git_dir,
             format,
             &remote_store,
@@ -512,6 +522,7 @@ fn receive_pack_reflog_committer() -> Vec<u8> {
 /// avoiding a raw-pack round trip: the install closure builds the reachable
 /// pack and installs the generated pack/index directly.
 pub fn receive_pack_reachable_pack_into_local_repository(
+    original_cwd: Option<&std::path::Path>,
     remote_git_dir: &Path,
     format: ObjectFormat,
     request: &ReceivePackPushRequest,
@@ -550,6 +561,7 @@ pub fn receive_pack_reachable_pack_into_local_repository(
         |oid| remote_db.contains(oid),
         |commands| {
             let applied = apply_receive_pack_ref_transaction(
+                original_cwd,
                 remote_git_dir,
                 format,
                 &remote_store,
@@ -579,6 +591,7 @@ pub fn receive_pack_reachable_pack_into_local_repository(
 }
 
 pub(crate) fn apply_receive_pack_ref_transaction(
+    original_cwd: Option<&std::path::Path>,
     remote_git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
@@ -592,7 +605,13 @@ pub(crate) fn apply_receive_pack_ref_transaction(
         .collect::<Vec<_>>();
     // receive.denyCurrentBranch=updateInstead: update the checked-out worktree
     // before rewriting the branch tip (git update_worktree before ref update).
-    maybe_update_worktrees_for_update_instead(remote_git_dir, format, store, &updates)?;
+    maybe_update_worktrees_for_update_instead(
+        original_cwd,
+        remote_git_dir,
+        format,
+        store,
+        &updates,
+    )?;
     // Git's non-atomic receive-pack applies deletes and other updates in two
     // separate transactions (PHASE_DELETIONS then PHASE_OTHERS). A single
     // transaction would treat F/D pairs like delete `branch/conflict` + create
@@ -648,6 +667,7 @@ pub(crate) fn apply_receive_pack_ref_transaction(
 /// For each update that targets a worktree HEAD under
 /// `receive.denyCurrentBranch=updateInstead`, run push-to-checkout / push_to_deploy.
 fn maybe_update_worktrees_for_update_instead(
+    original_cwd: Option<&std::path::Path>,
     remote_git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
@@ -688,6 +708,7 @@ fn maybe_update_worktrees_for_update_instead(
                 continue;
             }
             crate::receive_hooks::update_worktree_for_update_instead(
+                original_cwd,
                 wt_git_dir,
                 format,
                 &command.new_id,
@@ -729,6 +750,7 @@ fn canonical_receive_pack_update_commands(
 /// `ref-prefix` filtering. Writes the client command and server response to the
 /// packet trace so tests can observe filtered ads (t5702).
 pub fn local_protocol_v2_ls_refs_advertisements(
+    policy: &crate::RemotePolicy,
     git_dir: &Path,
     format: ObjectFormat,
     ref_prefixes: &[String],
@@ -751,7 +773,7 @@ pub fn local_protocol_v2_ls_refs_advertisements(
     }
     let mut request_bytes = Vec::new();
     write_protocol_v2_command_request(&mut request_bytes, &command)?;
-    let records = local_ls_refs_v2_records(git_dir, format, &request, &config)?;
+    let records = local_ls_refs_v2_records(policy, git_dir, format, &request, &config)?;
     let mut response_bytes = Vec::new();
     write_protocol_v2_ls_refs_response(&mut response_bytes, &records)?;
     let set = protocol_v2_ls_refs_records_to_ref_advertisement_set(&records)?;
@@ -766,18 +788,19 @@ pub fn local_protocol_v2_ls_refs_advertisements(
 /// (`transfer.hideRefs` / `uploadpack.hideRefs`) are omitted using git's
 /// stripped-vs-full matching rules.
 pub fn local_fetch_advertisements(
+    policy: &crate::RemotePolicy,
     git_dir: &Path,
     format: ObjectFormat,
 ) -> Result<Vec<RefAdvertisement>> {
     let store = FileRefStore::new_without_reference_backend_env(git_dir, format);
-    let namespace = sley_core::get_git_namespace();
+    let namespace_prefix = policy.namespace.prefix().to_owned();
     let hidden = transfer_upload_hidden_ref_patterns(git_dir);
     let mut advertisements = Vec::new();
 
-    let head_name = if namespace.is_empty() {
+    let head_name = if namespace_prefix.is_empty() {
         "HEAD".to_string()
     } else {
-        format!("{namespace}HEAD")
+        format!("{namespace_prefix}HEAD")
     };
     if let Some(target) = store.read_ref(&head_name)? {
         let reference = Ref {
@@ -797,10 +820,10 @@ pub fn local_fetch_advertisements(
     }
     for reference in store.list_refs()? {
         let physical = reference.name.clone();
-        let logical = if namespace.is_empty() {
+        let logical = if namespace_prefix.is_empty() {
             Some(physical.as_str())
         } else {
-            physical.strip_prefix(namespace.as_str())
+            physical.strip_prefix(namespace_prefix.as_str())
         };
         let Some(logical) = logical else {
             continue;
@@ -880,12 +903,16 @@ pub(crate) fn transfer_receive_hidden_ref_patterns(config: &GitConfig) -> Vec<St
 /// Tips whose objects are missing (e.g. a partial client whose packs were
 /// deleted, t5616 "fetch does not lazy-fetch missing targets of its refs") are
 /// skipped: a have must name an object the client can actually prove.
-pub fn local_have_oids(git_dir: &Path, format: ObjectFormat) -> Result<Vec<ObjectId>> {
+pub fn local_have_oids(
+    policy: &crate::RemotePolicy,
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Vec<ObjectId>> {
     let mut seen = HashSet::new();
     let mut haves = Vec::new();
     let db = FileObjectDatabase::from_git_dir(git_dir, format)
         .with_promisor_remote_present(repo_has_promisor_remote(git_dir));
-    for advertisement in local_fetch_advertisements(git_dir, format)? {
+    for advertisement in local_fetch_advertisements(policy, git_dir, format)? {
         if seen.insert(advertisement.oid) && db.contains(&advertisement.oid)? {
             haves.push(advertisement.oid);
         }
@@ -905,10 +932,11 @@ pub fn local_have_oids(git_dir: &Path, format: ObjectFormat) -> Result<Vec<Objec
 /// tip from a common ancestor reached only in a later round.
 #[cfg(feature = "http")]
 pub(crate) fn local_negotiation_have_oids(
+    policy: &crate::RemotePolicy,
     git_dir: &Path,
     format: ObjectFormat,
 ) -> Result<Vec<ObjectId>> {
-    local_negotiation_have_oids_stopping_at(git_dir, format, &HashSet::new())
+    local_negotiation_have_oids_stopping_at(policy, git_dir, format, &HashSet::new())
 }
 
 /// Commit haves ordered like [`local_negotiation_have_oids`], but stop walking
@@ -917,6 +945,7 @@ pub(crate) fn local_negotiation_have_oids(
 /// sending ancestors of that tip only wastes negotiation lines. This mirrors
 /// fetch-pack's `mark_tips()` boundary for the default/consecutive negotiator.
 fn local_negotiation_have_oids_pruned_by_remote_tips(
+    policy: &crate::RemotePolicy,
     git_dir: &Path,
     remote_git_dir: &Path,
     format: ObjectFormat,
@@ -924,7 +953,7 @@ fn local_negotiation_have_oids_pruned_by_remote_tips(
     let remote_db = FileObjectDatabase::from_git_dir(remote_git_dir, format)
         .with_promisor_remote_present(repo_has_promisor_remote(remote_git_dir));
     let mut advertised_commits = HashSet::new();
-    for advertisement in local_fetch_advertisements(remote_git_dir, format)? {
+    for advertisement in local_fetch_advertisements(policy, remote_git_dir, format)? {
         // A corrupt advertisement is diagnosed later when its ref is wanted.
         // It cannot establish a negotiation frontier because the server does
         // not actually own the advertised object.
@@ -937,10 +966,11 @@ fn local_negotiation_have_oids_pruned_by_remote_tips(
             advertised_commits.insert(commit);
         }
     }
-    local_negotiation_have_oids_stopping_at(git_dir, format, &advertised_commits)
+    local_negotiation_have_oids_stopping_at(policy, git_dir, format, &advertised_commits)
 }
 
 fn local_negotiation_have_oids_stopping_at(
+    policy: &crate::RemotePolicy,
     git_dir: &Path,
     format: ObjectFormat,
     stop_commits: &HashSet<ObjectId>,
@@ -957,7 +987,7 @@ fn local_negotiation_have_oids_stopping_at(
             .unwrap_or(0))
     };
     // mark_complete runs once at fetch entry; have-building still peels tips.
-    for advertisement in local_fetch_advertisements(git_dir, format)? {
+    for advertisement in local_fetch_advertisements(policy, git_dir, format)? {
         if let Some(commit) = peel_to_commit_for_negotiation(&db, format, &advertisement.oid)?
             && seen.insert(commit)
         {
@@ -1065,10 +1095,14 @@ fn peel_to_commit_for_negotiation<R: ObjectReader>(
 /// Git's `mark_complete` over every local ref: a tip present only in the
 /// commit-graph (not the ODB) is fatal. Exact-OID wants skip negotiation, so
 /// this must run independently of have-building (t5330 #4).
-pub fn mark_complete_local_refs(git_dir: &Path, format: ObjectFormat) -> Result<()> {
+pub fn mark_complete_local_refs(
+    policy: &crate::RemotePolicy,
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<()> {
     let db = FileObjectDatabase::from_git_dir(git_dir, format)
         .with_promisor_remote_present(repo_has_promisor_remote(git_dir));
-    for advertisement in local_fetch_advertisements(git_dir, format)? {
+    for advertisement in local_fetch_advertisements(policy, git_dir, format)? {
         die_if_commit_graph_only_missing(git_dir, &db, format, &advertisement.oid)?;
     }
     Ok(())
@@ -1089,12 +1123,14 @@ fn die_if_commit_graph_only_missing(
     let in_graph = sley_rev::commit_graph_tree_oid(git_dir, format, oid)?.is_some();
     let in_odb = db.contains(oid)?;
     if in_graph && !in_odb {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "fatal: You are attempting to fetch {oid}, which is in the commit graph file but not in the object database.\n\
 This is probably due to repo corruption.\n\
 If you are attempting to repair this repo corruption by refetching the missing object, use 'git fetch --refetch' with the missing object."
         );
-        return Err(GitError::Exit(128));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     Ok(())
 }
@@ -1564,6 +1600,7 @@ fn common_covers_wanted_commits(
 /// [`crate::apply_shallow_info`]). Empty for a full fetch.
 #[allow(clippy::too_many_arguments)]
 pub fn install_fetch_pack_via_local_upload_pack(
+    policy: &crate::RemotePolicy,
     git_dir: &Path,
     remote_git_dir: &Path,
     format: ObjectFormat,
@@ -1577,6 +1614,7 @@ pub fn install_fetch_pack_via_local_upload_pack(
     unpack_limit: Option<usize>,
 ) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
     install_fetch_pack_via_local_upload_pack_with_promisor_decision(
+        policy,
         git_dir,
         remote_git_dir,
         format,
@@ -1598,6 +1636,7 @@ pub fn install_fetch_pack_via_local_upload_pack(
 /// local/file promisors before constructing the transfer pack.
 #[allow(clippy::too_many_arguments)]
 pub fn install_fetch_pack_via_local_upload_pack_with_promisor_decision(
+    policy: &crate::RemotePolicy,
     git_dir: &Path,
     remote_git_dir: &Path,
     format: ObjectFormat,
@@ -1612,6 +1651,7 @@ pub fn install_fetch_pack_via_local_upload_pack_with_promisor_decision(
     promisor_decision: &crate::PromisorRemoteDecision,
 ) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
     install_fetch_pack_via_local_upload_pack_with_promisor_decision_into(
+        policy,
         git_dir,
         git_dir,
         remote_git_dir,
@@ -1649,6 +1689,7 @@ pub(crate) enum LocalFetchPackRequestMode {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn install_fetch_pack_via_local_upload_pack_with_promisor_decision_into(
+    policy: &crate::RemotePolicy,
     git_dir: &Path,
     destination_git_dir: &Path,
     remote_git_dir: &Path,
@@ -1735,7 +1776,7 @@ pub(crate) fn install_fetch_pack_via_local_upload_pack_with_promisor_decision_in
     } else if let Some(haves) = custom_haves {
         haves
     } else {
-        local_negotiation_have_oids_pruned_by_remote_tips(git_dir, remote_git_dir, format)?
+        local_negotiation_have_oids_pruned_by_remote_tips(policy, git_dir, remote_git_dir, format)?
     };
     let remote_has_promisor = repo_has_promisor_remote(remote_git_dir);
     let remote_db = FileObjectDatabase::from_git_dir(remote_git_dir, format)
@@ -1752,7 +1793,7 @@ pub(crate) fn install_fetch_pack_via_local_upload_pack_with_promisor_decision_in
         // for fetching from an intentionally incomplete local repository when
         // the destination already owns its missing delta/base objects.
         let mut seen = known_haves.iter().copied().collect::<HashSet<_>>();
-        for oid in local_have_oids(git_dir, format)? {
+        for oid in local_have_oids(policy, git_dir, format)? {
             if seen.insert(oid) && remote_db.contains(&oid)? {
                 known_haves.push(oid);
             }
@@ -1828,7 +1869,14 @@ pub(crate) fn install_fetch_pack_via_local_upload_pack_with_promisor_decision_in
         starts.extend(plan.extra_wants.iter().copied());
     }
     if remote_has_promisor && promisor_decision.accepted.is_empty() {
-        hydrate_reachable_promised_objects(remote_git_dir, &remote_db, format, &starts, &excluded)?;
+        hydrate_reachable_promised_objects(
+            policy,
+            remote_git_dir,
+            &remote_db,
+            format,
+            &starts,
+            &excluded,
+        )?;
     }
     for want in &starts {
         if !remote_db.contains(want)?
@@ -1900,6 +1948,7 @@ pub(crate) fn install_fetch_pack_via_local_upload_pack_with_promisor_decision_in
 /// source that cannot provide an object is skipped so the next promisor can be
 /// tried; non-local transports remain the caller's responsibility.
 pub fn hydrate_objects_from_local_promisor_remotes(
+    policy: &crate::RemotePolicy,
     git_dir: &Path,
     format: ObjectFormat,
     objects: &[ObjectId],
@@ -1945,6 +1994,7 @@ pub fn hydrate_objects_from_local_promisor_remotes(
             // swallow install failures — a silent miss leaves the caller with
             // a NotFound that is harder to diagnose (t5616 .gitmodules).
             if let Err(err) = install_fetch_pack_via_local_upload_pack(
+                policy,
                 git_dir,
                 &promisor_git_dir,
                 format,
@@ -1983,16 +2033,25 @@ pub fn hydrate_objects_from_local_promisor_remotes(
 /// sidecars were deliberately removed: repository configuration still proves
 /// the remote is a promisor even though no local sidecar can classify the gap.
 pub fn hydrate_reachable_from_local_promisor_remotes(
+    policy: &crate::RemotePolicy,
     remote_git_dir: &Path,
     format: ObjectFormat,
     starts: &[ObjectId],
 ) -> Result<()> {
     let remote_db =
         FileObjectDatabase::from_git_dir(remote_git_dir, format).with_promisor_remote_present(true);
-    hydrate_reachable_promised_objects(remote_git_dir, &remote_db, format, starts, &HashSet::new())
+    hydrate_reachable_promised_objects(
+        policy,
+        remote_git_dir,
+        &remote_db,
+        format,
+        starts,
+        &HashSet::new(),
+    )
 }
 
 fn hydrate_reachable_promised_objects(
+    policy: &crate::RemotePolicy,
     remote_git_dir: &Path,
     remote_db: &FileObjectDatabase,
     format: ObjectFormat,
@@ -2058,6 +2117,7 @@ fn hydrate_reachable_promised_objects(
             let remote_before = missing.len();
             for oid in missing.iter().copied() {
                 let _ = install_fetch_pack_via_local_upload_pack(
+                    policy,
                     remote_git_dir,
                     &promisor_git_dir,
                     format,
@@ -2101,6 +2161,7 @@ fn hydrate_reachable_promised_objects(
 
 /// Inputs for one in-process protocol-v2 fetch using `want-ref`.
 pub(crate) struct LocalProtocolV2FetchRequest<'a> {
+    pub policy: &'a crate::RemotePolicy,
     pub git_dir: &'a Path,
     pub destination_git_dir: &'a Path,
     pub remote_git_dir: &'a Path,
@@ -2139,7 +2200,7 @@ pub(crate) fn install_fetch_pack_via_local_protocol_v2(
     let haves = input
         .haves
         .map(Ok)
-        .unwrap_or_else(|| local_have_oids(input.git_dir, input.format))?;
+        .unwrap_or_else(|| local_have_oids(input.policy, input.git_dir, input.format))?;
     let local_db = FileObjectDatabase::from_git_dir(input.git_dir, input.format);
     let destination_db = FileObjectDatabase::from_git_dir(input.destination_git_dir, input.format);
     let remote_db = FileObjectDatabase::from_git_dir(input.remote_git_dir, input.format);
@@ -2171,7 +2232,8 @@ pub(crate) fn install_fetch_pack_via_local_protocol_v2(
         }
     };
 
-    let mut sections = local_fetch_v2_sections(input.remote_git_dir, input.format, &decoded)?;
+    let mut sections =
+        local_fetch_v2_sections(input.policy, input.remote_git_dir, input.format, &decoded)?;
     // If every resolved want is already local, the pack builder has nothing to
     // send. Keep the wanted-refs mapping but omit an empty packfile section.
     sections.retain(|section| {
@@ -2540,11 +2602,16 @@ fn upload_pack_v2_capabilities(
 /// indirection. Returns `None` for a detached or missing `HEAD`. When a
 /// namespace is active the on-disk namespaced HEAD is read and the target is
 /// returned in its logical (stripped) form.
-fn head_symref_target(store: &FileRefStore) -> Result<Option<String>> {
-    let head_name = sley_core::expand_namespace("HEAD");
+fn head_symref_target(
+    policy: &crate::RemotePolicy,
+    store: &FileRefStore,
+) -> Result<Option<String>> {
+    let head_name = policy.namespace.expand("HEAD");
     match store.read_ref(&head_name)? {
         Some(RefTarget::Symbolic(name)) => {
-            let logical = sley_core::strip_namespace(&name)
+            let logical = policy
+                .namespace
+                .strip(&name)
                 .unwrap_or(name.as_str())
                 .to_string();
             Ok(Some(logical))
@@ -2557,6 +2624,7 @@ fn head_symref_target(store: &FileRefStore) -> Result<Option<String>> {
 /// honoring the request's `ref-prefix`, `peel`, `symrefs`, and `unborn`
 /// arguments. Mirrors `ls-refs.c::ls_refs`.
 fn local_ls_refs_v2_records(
+    policy: &crate::RemotePolicy,
     git_dir: &Path,
     format: ObjectFormat,
     request: &ProtocolV2LsRefsRequest,
@@ -2564,18 +2632,18 @@ fn local_ls_refs_v2_records(
 ) -> Result<Vec<ProtocolV2LsRefsRecord>> {
     let store = FileRefStore::new(git_dir, format);
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let namespace = sley_core::get_git_namespace();
+    let namespace_prefix = policy.namespace.prefix().to_owned();
     let hidden = transfer_upload_hidden_ref_patterns(git_dir);
-    let head_symref = head_symref_target(&store)?;
+    let head_symref = head_symref_target(policy, &store)?;
 
     // Build the (name -> oid, symref) list in git's advertisement order: HEAD
     // first (when present), then the sorted ref list from `for-each-ref`.
-    // Names are always the logical (namespace-stripped) form clients expect.
+    // Names are always the logical (namespace_prefix-stripped) form clients expect.
     let mut entries: Vec<(String, ObjectId, Option<String>)> = Vec::new();
-    let head_physical = if namespace.is_empty() {
+    let head_physical = if namespace_prefix.is_empty() {
         "HEAD".to_string()
     } else {
-        format!("{namespace}HEAD")
+        format!("{namespace_prefix}HEAD")
     };
     if let Some(target) = store.read_ref(&head_physical)? {
         let reference = Ref {
@@ -2594,10 +2662,10 @@ fn local_ls_refs_v2_records(
     }
     for reference in store.list_refs()? {
         let physical = reference.name.clone();
-        let logical = if namespace.is_empty() {
+        let logical = if namespace_prefix.is_empty() {
             Some(physical.as_str())
         } else {
-            physical.strip_prefix(namespace.as_str())
+            physical.strip_prefix(namespace_prefix.as_str())
         };
         let Some(logical) = logical else {
             continue;
@@ -2612,11 +2680,8 @@ fn local_ls_refs_v2_records(
         let Some((oid, symref)) = resolve_for_each_ref_target(&store, &reference)? else {
             continue;
         };
-        let logical_symref = symref.map(|s| {
-            sley_core::strip_namespace(&s)
-                .unwrap_or(s.as_str())
-                .to_string()
-        });
+        let logical_symref =
+            symref.map(|s| policy.namespace.strip(&s).unwrap_or(s.as_str()).to_string());
         entries.push((logical.to_string(), oid, logical_symref));
     }
 
@@ -2701,6 +2766,7 @@ fn upload_pack_protocol_error_message(err: &GitError) -> Option<&str> {
 /// the logical name → oid mapping. Unknown or hidden refs produce the same
 /// `unknown ref <name>` protocol error as git's `parse_want_ref`.
 fn resolve_upload_pack_want_refs(
+    policy: &crate::RemotePolicy,
     git_dir: &Path,
     format: ObjectFormat,
     want_refs: &[String],
@@ -2715,7 +2781,7 @@ fn resolve_upload_pack_want_refs(
                 "duplicate want-ref {name}"
             )));
         }
-        let physical = sley_core::expand_namespace(name);
+        let physical = policy.namespace.expand(name);
         if sley_core::ref_is_hidden(Some(name.as_str()), &physical, &hidden) {
             return Err(upload_pack_protocol_error(format!("unknown ref {name}")));
         }
@@ -2753,6 +2819,7 @@ struct LocalFetchV2Plan {
 /// fetch. Keeping the pack as a plan lets the stdio server write it directly to
 /// sideband while in-process callers can retain their materialized response API.
 fn local_fetch_v2_plan(
+    policy: &crate::RemotePolicy,
     git_dir: &Path,
     format: ObjectFormat,
     request: &ProtocolV2FetchRequest,
@@ -2772,7 +2839,7 @@ fn local_fetch_v2_plan(
     let resolved_want_refs = if request.want_refs.is_empty() {
         Vec::new()
     } else {
-        resolve_upload_pack_want_refs(git_dir, format, &request.want_refs)?
+        resolve_upload_pack_want_refs(policy, git_dir, format, &request.want_refs)?
     };
 
     let mut sections = Vec::new();
@@ -2840,7 +2907,7 @@ fn local_fetch_v2_plan(
     // `deepen-since` selection and cutting the pack at the computed boundary
     // must happen here rather than in a transport-specific client.
     let deepen_plan = if request.deepen_since.is_some() || !request.deepen_not.is_empty() {
-        let advertisements = local_fetch_advertisements(git_dir, format)?;
+        let advertisements = local_fetch_advertisements(policy, git_dir, format)?;
         let mut deepen_not = Vec::with_capacity(request.deepen_not.len());
         for name in &request.deepen_not {
             let advertisement = advertisements
@@ -2951,11 +3018,13 @@ fn local_fetch_v2_plan(
 /// The stdio upload-pack server uses [`write_local_fetch_v2_response`] instead
 /// so the pack never becomes a second sideband-framing buffer.
 fn local_fetch_v2_sections(
+    policy: &crate::RemotePolicy,
     git_dir: &Path,
     format: ObjectFormat,
     request: &ProtocolV2FetchRequest,
 ) -> Result<Vec<ProtocolV2FetchResponseSection>> {
-    let LocalFetchV2Plan { mut sections, pack } = local_fetch_v2_plan(git_dir, format, request)?;
+    let LocalFetchV2Plan { mut sections, pack } =
+        local_fetch_v2_plan(policy, git_dir, format, request)?;
     let Some(pack) = pack else {
         return Ok(sections);
     };
@@ -2979,12 +3048,14 @@ fn local_fetch_v2_sections(
 }
 
 fn write_local_fetch_v2_response(
+    policy: &crate::RemotePolicy,
     git_dir: &Path,
     format: ObjectFormat,
     request: &ProtocolV2FetchRequest,
     writer: &mut impl std::io::Write,
 ) -> Result<()> {
-    let LocalFetchV2Plan { sections, pack } = local_fetch_v2_plan(git_dir, format, request)?;
+    let LocalFetchV2Plan { sections, pack } =
+        local_fetch_v2_plan(policy, git_dir, format, request)?;
     let Some(pack) = pack else {
         if !sections.is_empty() {
             write_protocol_v2_fetch_response(writer, &sections)?;
@@ -3057,23 +3128,25 @@ fn write_bundle_uri_command_response(
 }
 
 pub fn serve_upload_pack_v2(
+    policy: &crate::RemotePolicy,
     git_dir: &Path,
     format: ObjectFormat,
     reader: &mut impl std::io::Read,
     writer: &mut impl std::io::Write,
 ) -> Result<()> {
     let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
-    serve_upload_pack_v2_with_config(git_dir, format, &config, reader, writer)
+    serve_upload_pack_v2_with_config(policy, git_dir, format, &config, reader, writer)
 }
 
 pub fn serve_upload_pack_v2_with_config(
+    policy: &crate::RemotePolicy,
     git_dir: &Path,
     format: ObjectFormat,
     config: &GitConfig,
     reader: &mut impl std::io::Read,
     writer: &mut impl std::io::Write,
 ) -> Result<()> {
-    serve_upload_pack_v2_inner(git_dir, format, config, reader, writer, true)
+    serve_upload_pack_v2_inner(policy, git_dir, format, config, reader, writer, true)
 }
 
 /// Serve a protocol-v2 stateless RPC request without re-advertising
@@ -3081,16 +3154,18 @@ pub fn serve_upload_pack_v2_with_config(
 /// `info/refs` GET, so each upload-pack POST begins directly with the command
 /// response, matching `git upload-pack --stateless-rpc`.
 pub fn serve_upload_pack_v2_stateless_with_config(
+    policy: &crate::RemotePolicy,
     git_dir: &Path,
     format: ObjectFormat,
     config: &GitConfig,
     reader: &mut impl std::io::Read,
     writer: &mut impl std::io::Write,
 ) -> Result<()> {
-    serve_upload_pack_v2_inner(git_dir, format, config, reader, writer, false)
+    serve_upload_pack_v2_inner(policy, git_dir, format, config, reader, writer, false)
 }
 
 fn serve_upload_pack_v2_inner(
+    policy: &crate::RemotePolicy,
     git_dir: &Path,
     format: ObjectFormat,
     config: &GitConfig,
@@ -3132,12 +3207,12 @@ fn serve_upload_pack_v2_inner(
         }
         match classify_protocol_v2_command_request(&handshake, format, &request)? {
             sley_protocol::ProtocolV2Command::LsRefs(ls_refs) => {
-                let records = local_ls_refs_v2_records(git_dir, format, &ls_refs, config)?;
+                let records = local_ls_refs_v2_records(policy, git_dir, format, &ls_refs, config)?;
                 write_protocol_v2_ls_refs_response(writer, &records)?;
                 writer.flush()?;
             }
             sley_protocol::ProtocolV2Command::Fetch(fetch) => {
-                match write_local_fetch_v2_response(git_dir, format, &fetch, writer) {
+                match write_local_fetch_v2_response(policy, git_dir, format, &fetch, writer) {
                     Ok(()) => writer.flush()?,
                     Err(err) => {
                         // Mirror git's packet_writer_error + die: emit ERR so the
@@ -3194,6 +3269,7 @@ mod tests {
             let commit = write_test_object(&remote_db, &test_commit(tree, &[], b"tip\n"));
 
             install_fetch_pack_via_local_upload_pack_with_promisor_decision_into(
+                &crate::RemotePolicy::default(),
                 &client_git,
                 &client_git,
                 &remote_git,
@@ -3216,6 +3292,7 @@ mod tests {
             assert!(!client_db.contains(&blob).expect("check filtered blob"));
 
             install_fetch_pack_via_local_upload_pack(
+                &crate::RemotePolicy::default(),
                 &client_git,
                 &remote_git,
                 format,
@@ -3349,9 +3426,13 @@ mod tests {
         )
         .expect("remote common tag");
 
-        let haves =
-            local_negotiation_have_oids_pruned_by_remote_tips(&client_git, &remote_git, format)
-                .expect("plan negotiation haves");
+        let haves = local_negotiation_have_oids_pruned_by_remote_tips(
+            &crate::RemotePolicy::default(),
+            &client_git,
+            &remote_git,
+            format,
+        )
+        .expect("plan negotiation haves");
         assert!(haves.contains(&client_oid));
         assert!(haves.contains(&common_oid));
         assert!(!haves.contains(&root_oid));
@@ -3471,6 +3552,7 @@ mod tests {
             assert!(client_db.is_promised_object(&promised_blob));
 
             install_fetch_pack_via_local_upload_pack(
+                &crate::RemotePolicy::default(),
                 &client_git,
                 &remote_git,
                 format,
@@ -3541,6 +3623,7 @@ mod tests {
 
         let outcome = install_fetch_pack_via_local_protocol_v2(
             LocalProtocolV2FetchRequest {
+                policy: &Default::default(),
                 git_dir: &client_git,
                 destination_git_dir: &client_git,
                 remote_git_dir: &remote_git,
@@ -3576,6 +3659,7 @@ mod tests {
         let tree_oid = write_test_object(&db, &test_tree(&[]));
         let commit_oid = write_test_object(&db, &test_commit(tree_oid, &[], b"tip\n"));
         let error = local_fetch_v2_sections(
+            &crate::RemotePolicy::default(),
             &git_dir,
             format,
             &ProtocolV2FetchRequest {
@@ -3607,6 +3691,7 @@ mod tests {
         let base = write_test_object(&db, &test_commit(tree_oid, &[], b"base\n"));
         let tip = write_test_object(&db, &test_commit(tree_oid, &[base], b"tip\n"));
         let sections = local_fetch_v2_sections(
+            &crate::RemotePolicy::default(),
             &git_dir,
             format,
             &ProtocolV2FetchRequest {
@@ -3632,6 +3717,7 @@ mod tests {
         let unknown = ObjectId::from_hex(format, "1111111111111111111111111111111111111111")
             .expect("test object id");
         let sections = local_fetch_v2_sections(
+            &crate::RemotePolicy::default(),
             &git_dir,
             format,
             &ProtocolV2FetchRequest {
@@ -3659,6 +3745,7 @@ mod tests {
         fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").expect("test repository HEAD");
 
         let sections = local_fetch_v2_sections(
+            &crate::RemotePolicy::default(),
             &git_dir,
             ObjectFormat::Sha1,
             &ProtocolV2FetchRequest {
@@ -3683,6 +3770,7 @@ mod tests {
 
         let mut stateless_response = Vec::new();
         serve_upload_pack_v2_stateless_with_config(
+            &crate::RemotePolicy::default(),
             &git_dir,
             ObjectFormat::Sha1,
             &config,
@@ -3694,6 +3782,7 @@ mod tests {
 
         let mut long_lived_response = Vec::new();
         serve_upload_pack_v2_with_config(
+            &crate::RemotePolicy::default(),
             &git_dir,
             ObjectFormat::Sha1,
             &config,
@@ -3735,6 +3824,7 @@ mod tests {
         .expect("encode fetch request");
         let mut response = Vec::new();
         serve_upload_pack_v2_stateless_with_config(
+            &crate::RemotePolicy::default(),
             &git_dir,
             format,
             &GitConfig::default(),
@@ -3814,6 +3904,7 @@ mod tests {
         );
 
         install_fetch_pack_via_local_upload_pack(
+            &crate::RemotePolicy::default(),
             &user_git,
             &base_git,
             format,
@@ -3835,6 +3926,7 @@ mod tests {
         );
 
         install_fetch_pack_via_local_upload_pack(
+            &crate::RemotePolicy::default(),
             &user_git,
             &patch_git,
             format,
@@ -3855,6 +3947,7 @@ mod tests {
         );
 
         let direct = install_fetch_pack_via_local_upload_pack(
+            &crate::RemotePolicy::default(),
             &direct_git,
             &patch_git,
             format,
@@ -3907,6 +4000,7 @@ mod tests {
         );
 
         install_fetch_pack_via_local_upload_pack(
+            &crate::RemotePolicy::default(),
             &client_git,
             &remote_git,
             format,
@@ -3966,9 +4060,13 @@ mod tests {
         let blob = EncodedObject::new(ObjectType::Blob, b"lazy payload\n".to_vec());
         let blob_oid =
             write_test_object(&FileObjectDatabase::from_git_dir(&lop_git, format), &blob);
-        let hydrated =
-            hydrate_objects_from_local_promisor_remotes(&client_git, format, &[blob_oid])
-                .expect("hydrate exact object");
+        let hydrated = hydrate_objects_from_local_promisor_remotes(
+            &crate::RemotePolicy::default(),
+            &client_git,
+            format,
+            &[blob_oid],
+        )
+        .expect("hydrate exact object");
         assert_eq!(hydrated, vec![blob_oid]);
         assert!(
             FileObjectDatabase::from_git_dir(&client_git, format)
@@ -4040,6 +4138,7 @@ mod tests {
             token: None,
         };
         install_fetch_pack_via_local_upload_pack_with_promisor_decision(
+            &crate::RemotePolicy::default(),
             &accepted_git,
             &server_git,
             format,
@@ -4062,6 +4161,7 @@ mod tests {
         assert!(!server_db.contains(&blob_oid).expect("server object lookup"));
 
         install_fetch_pack_via_local_upload_pack(
+            &crate::RemotePolicy::default(),
             &rejected_git,
             &server_git,
             format,
@@ -4142,8 +4242,13 @@ mod tests {
                 .contains(&blob_oid)
                 .expect("missing before hydrate")
         );
-        hydrate_reachable_from_local_promisor_remotes(&server_git, format, &[commit_oid])
-            .expect("hydrate configured promisor gap");
+        hydrate_reachable_from_local_promisor_remotes(
+            &crate::RemotePolicy::default(),
+            &server_git,
+            format,
+            &[commit_oid],
+        )
+        .expect("hydrate configured promisor gap");
         server_db.refresh_read_cache();
         assert!(server_db.contains(&blob_oid).expect("hydrated blob lookup"));
 
@@ -4208,6 +4313,7 @@ mod tests {
         let server_db = FileObjectDatabase::from_git_dir(&server_git, format)
             .with_promisor_remote_present(true);
         hydrate_reachable_promised_objects(
+            &crate::RemotePolicy::default(),
             &server_git,
             &server_db,
             format,
@@ -4273,6 +4379,7 @@ mod tests {
 }
 
 pub fn negotiate_only_local(
+    policy: &crate::RemotePolicy,
     local_git_dir: &Path,
     remote_git_dir: &Path,
     format: ObjectFormat,
@@ -4313,7 +4420,7 @@ pub fn negotiate_only_local(
         ofs_delta: true,
         ..ProtocolV2FetchRequest::default()
     };
-    let sections = local_fetch_v2_sections(remote_git_dir, format, &request)?;
+    let sections = local_fetch_v2_sections(policy, remote_git_dir, format, &request)?;
     let mut acked = Vec::new();
     for section in sections {
         if let ProtocolV2FetchResponseSection::Acknowledgments(acks) = section {

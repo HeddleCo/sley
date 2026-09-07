@@ -2,7 +2,7 @@
 
 // Glob the crate root for shared plumbing; see commands::stash for rationale.
 use crate::*;
-use sley::plumbing::sley_diff_merge::{ConflictStyle, MergeBlobOptions, merge_blobs};
+use sley_diff_merge::{ConflictStyle, MergeBlobOptions, merge_blobs};
 use sley_notes::{
     NotesCommitIdentity, NotesMergeConflict, NotesMergeOutcome, NotesMergeStrategy, NotesRef,
     UpsertNoteOptions, finalize_notes_merge, list_notes, merge_notes, notes_ref_expected,
@@ -75,7 +75,7 @@ pub(crate) fn cmd_notes(cli_session: &crate::session::CliSession, args: &[String
             eprintln!(
                 "fatal: refusing to {verb} notes in {raw_write_ref} (outside of refs/notes/)"
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         Ok(())
     };
@@ -246,14 +246,14 @@ fn guard_writable_notes_ref(
             Ok(Some(_)) => Ok(()),
             _ => {
                 eprintln!("fatal: Cannot use notes ref {notes_ref}");
-                Err(GitError::Exit(128))
+                Err(crate::cli_exit(128))
             }
         },
         // A reflog selector that fails to resolve (out of range / absent reflog)
         // is a hard error in git, carrying its own message; surface it verbatim.
         Err(GitError::NotFound(kind)) if notes_ref.contains("@{") => {
             eprintln!("fatal: {kind}");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
         // Any other failure to resolve the ref as a tree-ish means it does not
         // exist yet; git treats this as an empty notes tree and allows creation.
@@ -336,12 +336,12 @@ fn launch_note_editor(
     let Some(editor) = note_editor_command(config) else {
         let _ = fs::remove_file(&edit_path);
         eprintln!("fatal: please supply the note contents using either -m or -F option");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
     if editor == "false" || editor == ":" {
         let _ = fs::remove_file(&edit_path);
         eprintln!("fatal: please supply the note contents using either -m or -F option");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     // git runs the editor via the shell as `<editor> <path>`.
@@ -355,7 +355,7 @@ fn launch_note_editor(
     if !ok {
         let _ = fs::remove_file(&edit_path);
         eprintln!("fatal: please supply the note contents using either -m or -F option");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let edited = fs::read(&edit_path).unwrap_or_default();
@@ -474,7 +474,7 @@ fn read_note_blob_content(
     let object = db.read_object(&oid)?;
     if object.object_type != ObjectType::Blob {
         eprintln!("fatal: cannot read note data from non-blob object '{spec}'.");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(object.body.clone())
 }
@@ -680,7 +680,7 @@ fn notes_list(
             }
             None => {
                 eprintln!("error: no note found for object {}.", target.to_hex());
-                Err(GitError::Exit(1))
+                Err(crate::cli_exit(1))
             }
         }
     } else {
@@ -719,7 +719,7 @@ fn notes_show(
     };
     let Some(blob) = blob else {
         eprintln!("error: no note found for object {}.", target.to_hex());
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     };
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let object = db.read_object(&blob)?;
@@ -782,7 +782,7 @@ fn notes_add(
                 "error: Cannot add notes. Found existing notes for object {}. Use '-f' to overwrite existing notes",
                 target.to_hex()
             );
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         // No -m/-F/-c/-C and no -f: git redirects to the `edit` subcommand.
         return notes_edit(git_dir, format, notes_ref, args, config, replace_objects);
@@ -1068,7 +1068,7 @@ fn notes_remove(
     // but only commits when none were missing (retval == 0). A missing object
     // therefore leaves the notes ref untouched.
     if any_missing {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     if removed_any {
         write_notes(
@@ -1122,7 +1122,7 @@ fn notes_prune(
         // git: `prune` takes no positional arguments — any extra is a usage error.
         eprintln!("error: too many arguments");
         print_notes_usage(NotesUsage::Prune);
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
 
     let store = FileRefStore::new(git_dir, format);
@@ -1200,7 +1200,7 @@ fn notes_copy(
             "--for-rewrite" => {
                 let Some(value) = iter.next() else {
                     eprintln!("error: option `for-rewrite' requires a value");
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 };
                 rewrite_cmd = Some(value.clone());
             }
@@ -1239,7 +1239,7 @@ fn notes_copy(
         [] => {
             eprintln!("error: too few arguments");
             print_notes_usage(NotesUsage::Copy);
-            return Err(GitError::Exit(129));
+            return Err(crate::cli_exit(129));
         }
         _ => return Err(notes_too_many_arguments(NotesUsage::Copy)),
     };
@@ -1261,7 +1261,7 @@ fn notes_copy(
             "error: Cannot copy notes. Found existing notes for object {}. Use '-f' to overwrite existing notes",
             to.to_hex()
         );
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     let Some(source_blob) =
         read_note(git_dir, format, &store, &notes_ref_handle(notes_ref), &from)?
@@ -1270,7 +1270,7 @@ fn notes_copy(
             "error: missing notes on source object {}. Cannot copy.",
             from.to_hex()
         );
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     };
     if existing.is_some() && force {
         eprintln!("Overwriting existing notes for object {}", to.to_hex());
@@ -1468,7 +1468,7 @@ fn notes_copy_from_stdin(
                     continue;
                 }
                 eprintln!("fatal: malformed input line: '{line}'.");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             };
             let from = resolve_note_object(git_dir, format, from_spec, replace_objects)?;
             let to = resolve_note_object(git_dir, format, to_spec, replace_objects)?;
@@ -1550,12 +1550,12 @@ fn notes_merge_cmd(
     if modes != 1 {
         eprintln!("error: cannot mix --commit, --abort or -s/--strategy");
         print_notes_usage(NotesUsage::Merge);
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     if do_merge && parsed.remote.is_none() {
         eprintln!("error: must specify a notes ref to merge");
         print_notes_usage(NotesUsage::Merge);
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     if !do_merge && parsed.remote.is_some() {
         return Err(notes_too_many_arguments(NotesUsage::Merge));
@@ -1620,7 +1620,7 @@ fn notes_merge_cmd(
                 "Automatic notes merge failed. Fix conflicts in {} and commit the result with 'git notes merge --commit', or abort the merge with 'git notes merge --abort'.",
                 git_dir.join("NOTES_MERGE_WORKTREE").display()
             );
-            Err(GitError::Exit(1))
+            Err(crate::cli_exit(1))
         }
     }
 }
@@ -1660,7 +1660,7 @@ fn parse_notes_merge_args(args: &[String]) -> Result<NotesMergeArgs> {
             "-s" | "--strategy" => {
                 let Some(value) = iter.next() else {
                     eprintln!("error: option `strategy' requires a value");
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 };
                 parsed.strategy = Some(value.clone());
             }
@@ -1706,7 +1706,7 @@ fn parse_notes_merge_strategy_option(value: &str) -> Result<NotesMergeStrategy> 
     parse_notes_merge_strategy(value).ok_or_else(|| {
         eprintln!("error: unknown -s/--strategy: {value}");
         print_notes_usage(NotesUsage::Merge);
-        GitError::Exit(129)
+        crate::cli_exit(129)
     })
 }
 
@@ -1714,7 +1714,7 @@ fn parse_notes_merge_strategy_config(key: &str, value: &str) -> Result<NotesMerg
     parse_notes_merge_strategy(value).ok_or_else(|| {
         eprintln!("error: unknown notes merge strategy {value}");
         eprintln!("fatal: unable to parse '{key}' from command-line config");
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })
 }
 
@@ -1743,7 +1743,7 @@ fn write_notes_merge_conflicts(
             "fatal: You have not concluded your previous notes merge ({} exists).",
             git_dir.join("NOTES_MERGE_*").display()
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     fs::create_dir_all(&worktree)?;
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
@@ -1837,7 +1837,7 @@ fn ensure_no_shared_notes_merge(
             "fatal: a notes merge into {notes_ref} is already in-progress at {}",
             path.display()
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(())
 }
@@ -1942,15 +1942,15 @@ fn write_notes_merge_state(git_dir: &Path, partial: ObjectId, notes_ref: &str) -
 fn read_notes_merge_state(git_dir: &Path, format: ObjectFormat) -> Result<(ObjectId, NotesRef)> {
     let partial_text = fs::read_to_string(git_dir.join("NOTES_MERGE_PARTIAL")).map_err(|_| {
         eprintln!("fatal: failed to read ref NOTES_MERGE_PARTIAL");
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })?;
     let partial = ObjectId::from_hex(format, partial_text.trim()).map_err(|_| {
         eprintln!("fatal: failed to read ref NOTES_MERGE_PARTIAL");
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })?;
     let ref_text = fs::read_to_string(git_dir.join("NOTES_MERGE_REF")).map_err(|_| {
         eprintln!("fatal: failed to resolve NOTES_MERGE_REF");
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })?;
     let target = ref_text
         .trim()
@@ -1990,7 +1990,7 @@ fn commit_notes_merge_state(
             show(current),
             show(expected)
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let worktree = git_dir.join("NOTES_MERGE_WORKTREE");
@@ -2101,7 +2101,7 @@ fn resolve_note_object(
             | GitError::InvalidObjectId(_),
         ) => {
             eprintln!("fatal: failed to resolve '{spec}' as a valid ref.");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
         Err(err) => Err(err),
     }
@@ -2132,7 +2132,7 @@ enum NotesUsage {
 fn notes_unknown_subcommand_error(subcommand: &str) -> Result<()> {
     eprintln!("error: unknown subcommand: `{subcommand}'");
     print_notes_usage(NotesUsage::TopLevel);
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 /// Build the error for an unrecognized option, distinguishing a long `--opt`
@@ -2151,12 +2151,12 @@ fn notes_unknown_option(option: &str, usage: NotesUsage) -> GitError {
         eprintln!("error: unknown option `{option}'");
     }
     print_notes_usage(usage);
-    GitError::Exit(129)
+    crate::cli_exit(129)
 }
 
 fn notes_option_requires_value_error(option: &str) -> Result<()> {
     eprintln!("error: option `{option}' requires a value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn notes_message_requires_value_error(flag: &str) -> Result<EditOptions> {
@@ -2168,7 +2168,7 @@ fn notes_message_requires_value_error(flag: &str) -> Result<EditOptions> {
             flag.trim_start_matches('-')
         );
     }
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 /// `error: too many arguments` followed by the subcommand usage (exit 129),
@@ -2177,7 +2177,7 @@ fn notes_message_requires_value_error(flag: &str) -> Result<EditOptions> {
 fn notes_too_many_arguments(usage: NotesUsage) -> GitError {
     eprintln!("error: too many arguments");
     print_notes_usage(usage);
-    GitError::Exit(129)
+    crate::cli_exit(129)
 }
 
 fn print_notes_usage(usage: NotesUsage) {

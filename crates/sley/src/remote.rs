@@ -36,10 +36,11 @@ pub const INTEGRATION_API_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// For repository-bound fetch/push after open, use [`Repository::fetch`] /
 /// [`Repository::push`] (and their `*_with_cancel` variants).
 pub fn clone_repository(
+    original_cwd: Option<&std::path::Path>,
     request: CloneRequest<'_>,
     services: CloneServices<'_>,
 ) -> Result<CloneOutcome> {
-    clone(request, services)
+    clone(original_cwd, request, services)
 }
 
 /// A repository-bound remote: resolves URLs and transport sources from config.
@@ -68,11 +69,6 @@ impl RemoteContext {
     /// Effective configuration used for URL rewriting and fetch/push options.
     pub fn config(&self) -> &GitConfig {
         &self.config
-    }
-
-    /// Transport capabilities of the linked `sley-remote` build.
-    pub fn transport_capabilities(&self) -> sley_remote::TransportCapabilities {
-        sley_remote::TransportCapabilities::current()
     }
 
     /// Rewritten fetch URL (`remote.<name>.url` + `url.*.insteadOf`).
@@ -228,6 +224,7 @@ impl Repository {
     /// Push `refspecs` to `remote` (name or URL).
     pub fn push(
         &self,
+        original_cwd: Option<&Path>,
         remote: impl Into<String>,
         refspecs: &[String],
         options: PushOptions,
@@ -235,6 +232,7 @@ impl Repository {
         progress: &mut dyn ProgressSink,
     ) -> Result<PushOutcome> {
         self.push_with_cancel(
+            original_cwd,
             remote,
             refspecs,
             options,
@@ -249,8 +247,10 @@ impl Repository {
     /// Pass `CancelFlag::new(&atomic)` (or any `DynCancelFlag`) so a UI stop or
     /// SIGINT handler can trip [`sley_core::GitError::Cancelled`] while building
     /// the push packfile.
+    #[allow(clippy::too_many_arguments)] // Caller-owned CWD protection is independent of transport services.
     pub fn push_with_cancel(
         &self,
+        original_cwd: Option<&Path>,
         remote: impl Into<String>,
         refspecs: &[String],
         options: PushOptions,
@@ -261,6 +261,7 @@ impl Repository {
         let ctx = self.remote(remote)?;
         let destination = ctx.push_destination(self)?;
         push(
+            original_cwd,
             PushRequest {
                 git_dir: self.git_dir(),
                 common_git_dir: self.common_dir(),
@@ -282,12 +283,14 @@ impl Repository {
     /// Push a caller-authored exact old/new/delete plan to `remote`.
     pub fn push_actions(
         &self,
+        original_cwd: Option<&Path>,
         remote: impl Into<String>,
         plan: PushActionPlan,
         credentials: &mut dyn CredentialProvider,
         progress: &mut dyn ProgressSink,
     ) -> Result<PushOutcome> {
         self.push_actions_with_cancel(
+            original_cwd,
             remote,
             plan,
             credentials,
@@ -299,6 +302,7 @@ impl Repository {
     /// [`Self::push_actions`] with cooperative cancellation of pack generation.
     pub fn push_actions_with_cancel(
         &self,
+        original_cwd: Option<&Path>,
         remote: impl Into<String>,
         plan: PushActionPlan,
         credentials: &mut dyn CredentialProvider,
@@ -306,6 +310,7 @@ impl Repository {
         cancel: sley_core::DynCancelFlag<'_>,
     ) -> Result<PushOutcome> {
         self.push_actions_with_http_client_and_cancel(
+            original_cwd,
             remote,
             plan,
             credentials,
@@ -318,6 +323,7 @@ impl Repository {
     /// Like [`Repository::push_actions`], with a caller-provided smart-HTTP client.
     pub fn push_actions_with_http_client(
         &self,
+        original_cwd: Option<&Path>,
         remote: impl Into<String>,
         plan: PushActionPlan,
         credentials: &mut dyn CredentialProvider,
@@ -325,6 +331,7 @@ impl Repository {
         http_client: Option<&dyn HttpClient>,
     ) -> Result<PushOutcome> {
         self.push_actions_with_http_client_and_cancel(
+            original_cwd,
             remote,
             plan,
             credentials,
@@ -338,6 +345,7 @@ impl Repository {
     #[allow(clippy::too_many_arguments)]
     pub fn push_actions_with_http_client_and_cancel(
         &self,
+        original_cwd: Option<&Path>,
         remote: impl Into<String>,
         plan: PushActionPlan,
         credentials: &mut dyn CredentialProvider,
@@ -348,6 +356,7 @@ impl Repository {
         let ctx = self.remote(remote)?;
         let destination = ctx.push_destination(self)?;
         push_actions_with_http_client(
+            original_cwd,
             PushActionRequest {
                 git_dir: self.git_dir(),
                 common_git_dir: self.common_dir(),
@@ -369,17 +378,19 @@ impl Repository {
     /// List refs advertised by `remote` (name or URL).
     pub fn ls_remote(
         &self,
+        policy: &RemotePolicy,
         remote: impl Into<String>,
         filter: LsRemoteFilter,
         matches: &dyn Fn(&str) -> bool,
         credentials: &mut dyn CredentialProvider,
     ) -> Result<Vec<LsRemoteRecord>> {
-        self.ls_remote_with_http_client(remote, filter, matches, credentials, None)
+        self.ls_remote_with_http_client(policy, remote, filter, matches, credentials, None)
     }
 
     /// Like [`Repository::ls_remote`], with a caller-provided smart-HTTP client.
     pub fn ls_remote_with_http_client(
         &self,
+        policy: &RemotePolicy,
         remote: impl Into<String>,
         filter: LsRemoteFilter,
         matches: &dyn Fn(&str) -> bool,
@@ -396,6 +407,7 @@ impl Repository {
         };
         Ok(ls_remote_with_http_client(
             LsRemoteRequest {
+                policy,
                 source: &ls_source,
                 format: self.object_format(),
                 filter: &filter,
@@ -468,8 +480,5 @@ mod tests {
             ctx.fetch_transport_kind().expect("kind"),
             Some(sley_remote::RemoteTransportKind::Http)
         );
-        assert!(ctx.transport_capabilities().http_protocol_v2_fetch);
-        assert!(ctx.transport_capabilities().ssh_fetch);
-        assert!(ctx.transport_capabilities().thin_pack_push);
     }
 }

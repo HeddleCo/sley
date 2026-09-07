@@ -117,8 +117,8 @@ fn read_effective_config_value_at_git_dir(
 }
 
 pub(crate) fn fatal_failed(action: ReplayAction) -> GitError {
-    eprintln!("fatal: {} failed", action.name());
-    GitError::Exit(128)
+    sley_core::diagnostic!(Stderr, true, "fatal: {} failed", action.name());
+    GitError::Rejected(sley_core::RejectionKind::Refused)
 }
 
 // ---------------------------------------------------------------------------
@@ -230,8 +230,8 @@ fn select_revisions(
     let mut options = setup.options;
     if !options.has_revisions() && options.max_count.is_some() {
         let oid = resolve_revision(ctx, "HEAD").map_err(|_| {
-            eprintln!("fatal: bad revision 'HEAD'");
-            GitError::Exit(128)
+            sley_core::diagnostic!(Stderr, true, "fatal: bad revision 'HEAD'");
+            GitError::Rejected(sley_core::RejectionKind::Refused)
         })?;
         options.positives.push(sley_rev::RevisionTip {
             oid,
@@ -261,7 +261,12 @@ fn select_revisions(
             .iter()
             .map(|tip| {
                 sley_rev::peel_to_commit(db, ctx.format, &tip.oid).map_err(|_| {
-                    eprintln!("error: {}: can't cherry-pick that object", tip.rev);
+                    sley_core::diagnostic!(
+                        Stderr,
+                        true,
+                        "error: {}: can't cherry-pick that object",
+                        tip.rev
+                    );
                     fatal_failed(action)
                 })
             })
@@ -297,7 +302,12 @@ fn select_revisions(
     } else {
         for tip in &options.positives {
             let commit_oid = sley_rev::peel_to_commit(db, ctx.format, &tip.oid).map_err(|_| {
-                eprintln!("error: {}: can't cherry-pick that object", tip.rev);
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "error: {}: can't cherry-pick that object",
+                    tip.rev
+                );
                 fatal_failed(action)
             })?;
             commits.push(commit_oid);
@@ -416,6 +426,7 @@ pub fn make_todo_item(
 /// The initial `git cherry-pick` / `git revert` run (option parsing and
 /// opts-normalization stay with the CLI).
 pub fn pick_revisions(
+    original_cwd: Option<&std::path::Path>,
     ctx: &PickContext,
     hosts: &mut PickHosts<'_>,
     opts: &ReplayOpts,
@@ -423,16 +434,18 @@ pub fn pick_revisions(
 ) -> Result<()> {
     let selection = select_revisions(ctx, hosts, ctx.action, rev_args)?;
     if selection.commits.is_empty() {
-        eprintln!("error: empty commit set passed");
+        sley_core::diagnostic!(Stderr, true, "error: empty commit set passed");
         return Err(fatal_failed(ctx.action));
     }
     if selection.single {
         // Single plain rev: replay it without touching the sequencer dir.
         let item = make_todo_item(&ctx.db, ctx.format, ctx.action, &selection.commits[0])?;
-        return match do_pick_commit(ctx, hosts, opts, &item, true) {
+        return match do_pick_commit(original_cwd, ctx, hosts, opts, &item, true) {
             Ok(PickFlow::Done | PickFlow::Dropped) => Ok(()),
-            Ok(PickFlow::Conflict) => Err(GitError::Exit(1)),
-            Ok(PickFlow::HaltEmpty) => Err(GitError::Exit(1)),
+            Ok(PickFlow::Conflict) => Err(GitError::Rejected(sley_core::RejectionKind::Incomplete)),
+            Ok(PickFlow::HaltEmpty) => {
+                Err(GitError::Rejected(sley_core::RejectionKind::Incomplete))
+            }
             Err(halt) => Err(finish_halt(ctx, halt)),
         };
     }
@@ -444,21 +457,21 @@ pub fn pick_revisions(
     let advise_skip =
         ctx.git_dir.join("CHERRY_PICK_HEAD").exists() || ctx.git_dir.join("REVERT_HEAD").exists();
     if let Some(in_progress) = replay::in_progress_error(&ctx.git_dir, advise_skip) {
-        eprintln!("error: {}", in_progress.error);
+        sley_core::diagnostic!(Stderr, true, "error: {}", in_progress.error);
         if config_bool(&ctx.config, "advice", "sequencerInUse").unwrap_or(true) {
             for line in in_progress.hint.lines() {
-                eprintln!("hint: {line}");
+                sley_core::diagnostic!(Stderr, true, "hint: {line}");
             }
         }
         return Err(fatal_failed(ctx.action));
     }
     replay::create_seq_dir(&ctx.git_dir).map_err(|err| {
-        eprintln!("error: {err}");
+        sley_core::diagnostic!(Stderr, true, "error: {err}");
         fatal_failed(ctx.action)
     })?;
     let head = ctx.head_oid();
     if head.is_none() && ctx.action == ReplayAction::Revert {
-        eprintln!("error: can't revert as initial commit");
+        sley_core::diagnostic!(Stderr, true, "error: can't revert as initial commit");
         return Err(fatal_failed(ctx.action));
     }
     let head_text = match &head {
@@ -468,7 +481,7 @@ pub fn pick_revisions(
     replay::save_head(&ctx.git_dir, &head_text)?;
     replay::save_opts(&ctx.git_dir, opts)?;
     replay::update_abort_safety(&ctx.git_dir, head.as_ref());
-    pick_commits(ctx, hosts, opts, &items)
+    pick_commits(original_cwd, ctx, hosts, opts, &items)
 }
 
 /// Failure routing for the pick engine: `Fatal` is the `res < 0` path (the
@@ -476,13 +489,13 @@ pub fn pick_revisions(
 /// child-status exit (no fatal line).
 enum ReplayHalt {
     Fatal,
-    Code(i32),
+    Failure(GitError),
 }
 
 fn finish_halt(ctx: &PickContext, halt: ReplayHalt) -> GitError {
     match halt {
         ReplayHalt::Fatal => fatal_failed(ctx.action),
-        ReplayHalt::Code(code) => GitError::Exit(code),
+        ReplayHalt::Failure(error) => error,
     }
 }
 
@@ -517,9 +530,21 @@ fn check_no_unmerged(ctx: &PickContext) -> std::result::Result<(), ReplayHalt> {
             ReplayAction::Pick => "Cherry-picking",
             ReplayAction::Revert => "Reverting",
         };
-        eprintln!("error: {verb} is not possible because you have unmerged files.");
-        eprintln!("hint: Fix them up in the work tree, and then use 'git add/rm <file>'");
-        eprintln!("hint: as appropriate to mark resolution and make a commit.");
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "error: {verb} is not possible because you have unmerged files."
+        );
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "hint: Fix them up in the work tree, and then use 'git add/rm <file>'"
+        );
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "hint: as appropriate to mark resolution and make a commit."
+        );
         return Err(ReplayHalt::Fatal);
     }
     Ok(())
@@ -528,6 +553,7 @@ fn check_no_unmerged(ctx: &PickContext) -> std::result::Result<(), ReplayHalt> {
 /// The pick loop (`pick_commits`): replay every remaining todo item, saving
 /// the sheet before each step, and tear the state down on success.
 fn pick_commits(
+    original_cwd: Option<&std::path::Path>,
     ctx: &PickContext,
     hosts: &mut PickHosts<'_>,
     opts: &ReplayOpts,
@@ -535,10 +561,14 @@ fn pick_commits(
 ) -> Result<()> {
     for (index, item) in items.iter().enumerate() {
         replay::save_todo(&ctx.git_dir, &items[index..])?;
-        match do_pick_commit(ctx, hosts, opts, item, false) {
+        match do_pick_commit(original_cwd, ctx, hosts, opts, item, false) {
             Ok(PickFlow::Done | PickFlow::Dropped) => {}
-            Ok(PickFlow::Conflict) => return Err(GitError::Exit(1)),
-            Ok(PickFlow::HaltEmpty) => return Err(GitError::Exit(1)),
+            Ok(PickFlow::Conflict) => {
+                return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
+            }
+            Ok(PickFlow::HaltEmpty) => {
+                return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
+            }
             Err(halt) => return Err(finish_halt(ctx, halt)),
         }
     }
@@ -547,7 +577,7 @@ fn pick_commits(
 }
 
 fn print_fatal_error(err: GitError) -> ReplayHalt {
-    eprintln!("error: {err}");
+    sley_core::diagnostic!(Stderr, true, "error: {err}");
     ReplayHalt::Fatal
 }
 
@@ -581,6 +611,7 @@ fn original_commit_empty(
 
 #[allow(clippy::too_many_lines)]
 fn do_pick_commit(
+    original_cwd: Option<&std::path::Path>,
     ctx: &PickContext,
     hosts: &mut PickHosts<'_>,
     opts: &ReplayOpts,
@@ -604,12 +635,18 @@ fn do_pick_commit(
     };
     let index_tree = index_tree_oid(ctx).map_err(print_fatal_error)?;
     if !opts.no_commit && index_tree != head_tree {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "error: your local changes would be overwritten by {}.",
             action.name()
         );
         if config_bool(&ctx.config, "advice", "commitBeforeMerge").unwrap_or(true) {
-            eprintln!("hint: commit your changes or stash them to proceed.");
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "hint: commit your changes or stash them to proceed."
+            );
         }
         return Err(ReplayHalt::Fatal);
     }
@@ -619,7 +656,9 @@ fn do_pick_commit(
         None
     } else if commit.parents.len() > 1 {
         if opts.mainline == 0 {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "error: commit {} is a merge but no -m option was given.",
                 item.oid
             );
@@ -628,17 +667,23 @@ fn do_pick_commit(
         match commit.parents.get(opts.mainline as usize - 1) {
             Some(parent) => Some(*parent),
             None => {
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "error: commit {} does not have parent {}",
-                    item.oid, opts.mainline
+                    item.oid,
+                    opts.mainline
                 );
                 return Err(ReplayHalt::Fatal);
             }
         }
     } else if opts.mainline > 1 {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "error: commit {} does not have parent {}",
-            item.oid, opts.mainline
+            item.oid,
+            opts.mainline
         );
         return Err(ReplayHalt::Fatal);
     } else {
@@ -654,7 +699,7 @@ fn do_pick_commit(
     if opts.allow_ff
         && ((parent.is_some() && parent.as_ref() == head.as_ref()) || (parent.is_none() && unborn))
     {
-        fast_forward_to(ctx, &item.oid, head.as_ref()).map_err(print_fatal_error)?;
+        fast_forward_to(original_cwd, ctx, &item.oid, head.as_ref()).map_err(print_fatal_error)?;
         return Ok(PickFlow::Done);
     }
 
@@ -743,11 +788,15 @@ fn do_pick_commit(
 
     // Pre-flight worktree clobber checks (unpack_trees' verify steps).
     let target_map = merge_results_to_tree_map(&results);
-    if let Err(err) =
-        merge_refuse_if_current_working_directory_becomes_file(&ctx.worktree_root, &target_map)
-    {
+    if let Err(err) = merge_refuse_if_current_working_directory_becomes_file(
+        original_cwd,
+        &ctx.worktree_root,
+        &target_map,
+    ) {
         return match err {
-            GitError::Exit(code) => Err(ReplayHalt::Code(code)),
+            error @ (GitError::Rejected(_)
+            | GitError::Callback(_)
+            | GitError::ChildProcessFailed { .. }) => Err(ReplayHalt::Failure(error)),
             other => Err(print_fatal_error(other)),
         };
     }
@@ -759,7 +808,7 @@ fn do_pick_commit(
         .or_else(|| config_value(&ctx.config, "commit", "cleanup"));
 
     if !conflicts.is_empty() {
-        apply_merge_results_to_index_and_worktree(ctx, hosts, &ours_map, &results)
+        apply_merge_results_to_index_and_worktree(original_cwd, ctx, hosts, &ours_map, &results)
             .map_err(print_fatal_error)?;
         // State files for the resolution flow.
         let help_msg = std::env::var("GIT_CHERRY_PICK_HELP").ok();
@@ -790,22 +839,26 @@ fn do_pick_commit(
                 && ours.is_some()
                 && theirs.is_some()
             {
-                println!("Auto-merging {display}");
+                sley_core::diagnostic!(Stdout, true, "Auto-merging {display}");
             }
-            println!("CONFLICT (content): Merge conflict in {display}");
+            sley_core::diagnostic!(
+                Stdout,
+                true,
+                "CONFLICT (content): Merge conflict in {display}"
+            );
         }
         let verb = match action {
             ReplayAction::Pick => "apply",
             ReplayAction::Revert => "revert",
         };
-        eprintln!("error: could not {verb} {short}... {subject}");
+        sley_core::diagnostic!(Stderr, true, "error: could not {verb} {short}... {subject}");
         print_conflict_advice(ctx, opts, help_msg.as_deref());
         replay::update_abort_safety(&ctx.git_dir, head.as_ref());
         return Ok(PickFlow::Conflict);
     }
 
     // Clean merge: stage the result.
-    apply_merge_results_to_index_and_worktree(ctx, hosts, &ours_map, &results)
+    apply_merge_results_to_index_and_worktree(original_cwd, ctx, hosts, &ours_map, &results)
         .map_err(print_fatal_error)?;
     let new_tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)
         .map_err(print_fatal_error)?;
@@ -855,9 +908,12 @@ fn do_pick_commit(
             2 => {
                 let _ = std::fs::remove_file(ctx.git_dir.join("CHERRY_PICK_HEAD"));
                 let _ = std::fs::remove_file(ctx.git_dir.join("MERGE_MSG"));
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "dropping {} {} -- patch contents already upstream",
-                    item.oid, subject
+                    item.oid,
+                    subject
                 );
                 replay::update_abort_safety(&ctx.git_dir, head.as_ref());
                 return Ok(PickFlow::Dropped);
@@ -872,10 +928,13 @@ fn do_pick_commit(
     message = (hosts.prepare_commit_message)(&ctx.git_dir, message.clone(), source_is_merge, edit)
         .map_err(|err| {
             // Editor / hook failure cancels the commit but keeps the state files.
-            if !matches!(err, GitError::Exit(_)) {
-                eprintln!("error: {err}");
+            if !matches!(
+                err,
+                GitError::Rejected(_) | GitError::Callback(_) | GitError::ChildProcessFailed { .. }
+            ) {
+                sley_core::diagnostic!(Stderr, true, "error: {err}");
             }
-            ReplayHalt::Code(1)
+            ReplayHalt::Failure(GitError::Rejected(sley_core::RejectionKind::Incomplete))
         })?;
 
     // Create the commit and advance HEAD.
@@ -915,14 +974,16 @@ fn read_object_or_fatal(
     match ctx.db.read_object(oid) {
         Ok(object) if object.object_type == ObjectType::Commit => Ok(object),
         Ok(object) => {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "error: expected commit {oid}, found {}",
                 object.object_type.as_str()
             );
             Err(ReplayHalt::Fatal)
         }
         Err(err) => {
-            eprintln!("error: {err}");
+            sley_core::diagnostic!(Stderr, true, "error: {err}");
             Err(ReplayHalt::Fatal)
         }
     }
@@ -1051,25 +1112,33 @@ fn verify_worktree_safe(
         }
     }
     if !local_changes.is_empty() {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "error: Your local changes to the following files would be overwritten by merge:"
         );
         for path in &local_changes {
-            eprintln!("\t{}", String::from_utf8_lossy(path));
+            sley_core::diagnostic!(Stderr, true, "\t{}", String::from_utf8_lossy(path));
         }
-        eprintln!("Please commit your changes or stash them before you merge.");
-        eprintln!("Aborting");
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "Please commit your changes or stash them before you merge."
+        );
+        sley_core::diagnostic!(Stderr, true, "Aborting");
         return Err(ReplayHalt::Fatal);
     }
     if !untracked.is_empty() {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "error: The following untracked working tree files would be overwritten by merge:"
         );
         for path in &untracked {
-            eprintln!("\t{}", String::from_utf8_lossy(path));
+            sley_core::diagnostic!(Stderr, true, "\t{}", String::from_utf8_lossy(path));
         }
-        eprintln!("Please move or remove them before you merge.");
-        eprintln!("Aborting");
+        sley_core::diagnostic!(Stderr, true, "Please move or remove them before you merge.");
+        sley_core::diagnostic!(Stderr, true, "Aborting");
         return Err(ReplayHalt::Fatal);
     }
     Ok(())
@@ -1078,6 +1147,7 @@ fn verify_worktree_safe(
 /// Apply merge results: update the index (preserving cached stat data for
 /// unchanged entries) and the worktree files that changed.
 fn apply_merge_results_to_index_and_worktree(
+    original_cwd: Option<&std::path::Path>,
     ctx: &PickContext,
     hosts: &PickHosts<'_>,
     ours_map: &MergeTreeMap,
@@ -1170,7 +1240,7 @@ fn apply_merge_results_to_index_and_worktree(
             _ => false,
         };
         if remove {
-            merge_remove_worktree_file(&ctx.worktree_root, path)?;
+            merge_remove_worktree_file(original_cwd, &ctx.worktree_root, path)?;
         }
     }
     for (path, result) in results {
@@ -1189,13 +1259,25 @@ fn apply_merge_results_to_index_and_worktree(
                     } else {
                         merge_read_blob_with_fetch(&ctx.db, oid, hosts.promisor_fetch)?
                     };
-                    merge_write_worktree_file(&ctx.worktree_root, path, &content, *mode)?;
+                    merge_write_worktree_file(
+                        original_cwd,
+                        &ctx.worktree_root,
+                        path,
+                        &content,
+                        *mode,
+                    )?;
                 }
             }
             MergePathResult::Resolved(None) => {}
             MergePathResult::Conflict { worktree, .. } => {
                 if let Some((mode, content)) = worktree {
-                    merge_write_worktree_file(&ctx.worktree_root, path, content, *mode)?;
+                    merge_write_worktree_file(
+                        original_cwd,
+                        &ctx.worktree_root,
+                        path,
+                        content,
+                        *mode,
+                    )?;
                 }
             }
         }
@@ -1342,22 +1424,30 @@ fn print_conflict_advice(ctx: &PickContext, opts: &ReplayOpts, help_msg: Option<
         ]
     };
     for line in lines {
-        eprintln!("hint: {line}");
+        sley_core::diagnostic!(Stderr, true, "hint: {line}");
     }
-    eprintln!("hint: Disable this message with \"git config set advice.mergeConflict false\"");
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "hint: Disable this message with \"git config set advice.mergeConflict false\""
+    );
 }
 
 /// stderr block `git commit` prints when a pick resolves to nil (the
 /// `empty_cherry_pick_advice` + single-pick variant; the whence probe in git
 /// always reports the single variant for non-rebase picks).
 fn print_empty_halt_advice(ctx: &PickContext) {
-    eprintln!("The previous cherry-pick is now empty, possibly due to conflict resolution.");
-    eprintln!("If you wish to commit it anyway, use:");
-    eprintln!();
-    eprintln!("    git commit --allow-empty");
-    eprintln!();
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "The previous cherry-pick is now empty, possibly due to conflict resolution."
+    );
+    sley_core::diagnostic!(Stderr, true, "If you wish to commit it anyway, use:");
+    sley_core::diagnostic!(Stderr, true, "");
+    sley_core::diagnostic!(Stderr, true, "    git commit --allow-empty");
+    sley_core::diagnostic!(Stderr, true, "");
     let me = ctx.action.name();
-    eprintln!("Otherwise, please use 'git {me} --skip'");
+    sley_core::diagnostic!(Stderr, true, "Otherwise, please use 'git {me} --skip'");
 }
 
 pub fn merge_results_to_tree_map(results: &BTreeMap<Vec<u8>, MergePathResult>) -> MergeTreeMap {
@@ -1379,7 +1469,12 @@ fn should_edit(action: ReplayAction, opts: &ReplayOpts) -> bool {
     }
 }
 
-fn fast_forward_to(ctx: &PickContext, target: &ObjectId, head: Option<&ObjectId>) -> Result<()> {
+fn fast_forward_to(
+    original_cwd: Option<&std::path::Path>,
+    ctx: &PickContext,
+    target: &ObjectId,
+    head: Option<&ObjectId>,
+) -> Result<()> {
     let refs = ctx.refs();
     let target_ref = match refs.read_ref("HEAD")? {
         Some(RefTarget::Symbolic(branch)) => branch,
@@ -1401,6 +1496,7 @@ fn fast_forward_to(ctx: &PickContext, target: &ObjectId, head: Option<&ObjectId>
     });
     tx.commit()?;
     sley_worktree::reset_index_and_worktree_to_commit(
+        original_cwd,
         &ctx.worktree_root,
         &ctx.git_dir,
         ctx.format,
@@ -1465,7 +1561,12 @@ fn print_commit_summary_line(ctx: &PickContext, oid: &ObjectId, message: &[u8]) 
         _ => "detached HEAD".to_string(),
     };
     let subject = commit_subject(message);
-    println!("[{location} {}] {subject}", format_log_abbrev_oid(oid));
+    sley_core::diagnostic!(
+        Stdout,
+        true,
+        "[{location} {}] {subject}",
+        format_log_abbrev_oid(oid)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1473,9 +1574,13 @@ fn print_commit_summary_line(ctx: &PickContext, oid: &ObjectId, message: &[u8]) 
 // ---------------------------------------------------------------------------
 
 /// `--continue`.
-pub fn continue_sequence(ctx: &PickContext, hosts: &mut PickHosts<'_>) -> Result<()> {
+pub fn continue_sequence(
+    original_cwd: Option<&std::path::Path>,
+    ctx: &PickContext,
+    hosts: &mut PickHosts<'_>,
+) -> Result<()> {
     let opts = replay::read_opts(&ctx.git_dir).map_err(|err| {
-        eprintln!("error: {err}");
+        sley_core::diagnostic!(Stderr, true, "error: {err}");
         fatal_failed(ctx.action)
     })?;
     if !replay::todo_path(&ctx.git_dir).exists() {
@@ -1487,20 +1592,33 @@ pub fn continue_sequence(ctx: &PickContext, hosts: &mut PickHosts<'_>) -> Result
         continue_single_pick(ctx, hosts, &opts)?;
     }
     // The stopped item is concluded; replay the rest.
-    pick_commits(ctx, hosts, &opts, &items[1.min(items.len())..])
+    pick_commits(
+        original_cwd,
+        ctx,
+        hosts,
+        &opts,
+        &items[1.min(items.len())..],
+    )
 }
 
 fn read_populate_todo(ctx: &PickContext) -> Result<Vec<TodoItem>> {
     let todo_path = replay::todo_path(&ctx.git_dir);
     let text = std::fs::read_to_string(&todo_path).map_err(|err| {
-        eprintln!("error: could not read '{}': {err}", todo_path.display());
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "error: could not read '{}': {err}",
+            todo_path.display()
+        );
         fatal_failed(ctx.action)
     })?;
     let unusable = |line_errors: &[String]| {
         for error in line_errors {
-            eprintln!("error: {error}");
+            sley_core::diagnostic!(Stderr, true, "error: {error}");
         }
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "error: unusable instruction sheet: '{}'",
             todo_path.display()
         );
@@ -1511,7 +1629,7 @@ fn read_populate_todo(ctx: &PickContext) -> Result<Vec<TodoItem>> {
         Err(err) => return Err(unusable(&err.line_errors)),
     };
     if parsed.is_empty() {
-        eprintln!("error: no commits parsed.");
+        sley_core::diagnostic!(Stderr, true, "error: no commits parsed.");
         return Err(fatal_failed(ctx.action));
     }
     let mut items = Vec::with_capacity(parsed.len());
@@ -1521,7 +1639,7 @@ fn read_populate_todo(ctx: &PickContext) -> Result<Vec<TodoItem>> {
                 ReplayAction::Pick => "cannot cherry-pick during a revert.",
                 ReplayAction::Revert => "cannot revert during a cherry-pick.",
             };
-            eprintln!("error: {message}");
+            sley_core::diagnostic!(Stderr, true, "error: {message}");
             return Err(fatal_failed(ctx.action));
         }
         let oid = match resolve_revision(ctx, &line.object_name) {
@@ -1563,7 +1681,7 @@ fn continue_single_pick(
     let cph = ctx.git_dir.join("CHERRY_PICK_HEAD");
     let rvh = ctx.git_dir.join("REVERT_HEAD");
     if !cph.exists() && !rvh.exists() {
-        eprintln!("error: no cherry-pick or revert in progress");
+        sley_core::diagnostic!(Stderr, true, "error: no cherry-pick or revert in progress");
         return Err(fatal_failed(ctx.action));
     }
     // Unmerged files leave the commit impossible (the `git commit` child's
@@ -1578,14 +1696,30 @@ fn continue_single_pick(
             .filter(|entry| index_entry_stage(entry) > 0)
         {
             has_unmerged = true;
-            println!("U\t{}", entry.path);
+            sley_core::diagnostic!(Stdout, true, "U\t{}", entry.path);
         }
         if has_unmerged {
-            eprintln!("error: Committing is not possible because you have unmerged files.");
-            eprintln!("hint: Fix them up in the work tree, and then use 'git add/rm <file>'");
-            eprintln!("hint: as appropriate to mark resolution and make a commit.");
-            eprintln!("fatal: Exiting because of an unresolved conflict.");
-            return Err(GitError::Exit(128));
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "error: Committing is not possible because you have unmerged files."
+            );
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "hint: Fix them up in the work tree, and then use 'git add/rm <file>'"
+            );
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "hint: as appropriate to mark resolution and make a commit."
+            );
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "fatal: Exiting because of an unresolved conflict."
+            );
+            return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
         }
     }
     let head = ctx.head_oid();
@@ -1597,7 +1731,7 @@ fn continue_single_pick(
     if index_tree == head_tree {
         // Resolved to nil: print the empty advice and stop (exit 1).
         print_empty_halt_advice(ctx);
-        return Err(GitError::Exit(1));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     }
     // Message from MERGE_MSG with comments stripped (--cleanup=strip).
     let raw = std::fs::read(ctx.git_dir.join("MERGE_MSG")).unwrap_or_default();
@@ -1635,28 +1769,37 @@ fn continue_single_pick(
 }
 
 /// `--skip`.
-pub fn skip_sequence(ctx: &PickContext, hosts: &mut PickHosts<'_>) -> Result<()> {
+pub fn skip_sequence(
+    original_cwd: Option<&std::path::Path>,
+    ctx: &PickContext,
+    hosts: &mut PickHosts<'_>,
+) -> Result<()> {
     let last = replay::last_command(&ctx.git_dir);
     let state_file = ctx.git_dir.join(ctx.action.head_file());
     if !state_file.exists() {
         if last != Some(ctx.action) {
-            eprintln!("error: no {} in progress", ctx.action.name());
+            sley_core::diagnostic!(Stderr, true, "error: no {} in progress", ctx.action.name());
             return Err(fatal_failed(ctx.action));
         }
         let head = ctx.head_oid();
         if !replay::rollback_is_safe(&ctx.git_dir, head.as_ref()) {
-            eprintln!("error: there is nothing to skip");
+            sley_core::diagnostic!(Stderr, true, "error: there is nothing to skip");
             if config_bool(&ctx.config, "advice", "resolveConflict").unwrap_or(true) {
-                eprintln!("hint: have you committed already?");
-                eprintln!("hint: try \"git {} --continue\"", ctx.action.name());
+                sley_core::diagnostic!(Stderr, true, "hint: have you committed already?");
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "hint: try \"git {} --continue\"",
+                    ctx.action.name()
+                );
             }
             return Err(fatal_failed(ctx.action));
         }
     }
     // `git reset --merge HEAD` (an unborn HEAD resets to the empty tree).
     let head = ctx.head_oid();
-    reset_merge(ctx, hosts.promisor_fetch, head.as_ref()).map_err(|_| {
-        eprintln!("error: failed to skip the commit");
+    reset_merge(original_cwd, ctx, hosts.promisor_fetch, head.as_ref()).map_err(|_| {
+        sley_core::diagnostic!(Stderr, true, "error: failed to skip the commit");
         fatal_failed(ctx.action)
     })?;
     if !replay::seq_dir(&ctx.git_dir).is_dir() {
@@ -1665,55 +1808,84 @@ pub fn skip_sequence(ctx: &PickContext, hosts: &mut PickHosts<'_>) -> Result<()>
     // Continue after a skip: like `continue_sequence` but the stopped item is
     // dropped without committing.
     let opts = replay::read_opts(&ctx.git_dir).map_err(|err| {
-        eprintln!("error: {err}");
+        sley_core::diagnostic!(Stderr, true, "error: {err}");
         fatal_failed(ctx.action)
     })?;
     let items = read_populate_todo(ctx)?;
-    pick_commits(ctx, hosts, &opts, &items[1.min(items.len())..])
+    pick_commits(
+        original_cwd,
+        ctx,
+        hosts,
+        &opts,
+        &items[1.min(items.len())..],
+    )
 }
 
 /// `--abort` (`sequencer_rollback`).
-pub fn rollback(ctx: &PickContext, hosts: &PickHosts<'_>) -> Result<()> {
+pub fn rollback(
+    original_cwd: Option<&std::path::Path>,
+    ctx: &PickContext,
+    hosts: &PickHosts<'_>,
+) -> Result<()> {
     let head_file = replay::head_path(&ctx.git_dir);
     if !head_file.exists() {
         // Single-pick abort.
         if !ctx.git_dir.join("CHERRY_PICK_HEAD").exists()
             && !ctx.git_dir.join("REVERT_HEAD").exists()
         {
-            eprintln!("error: no cherry-pick or revert in progress");
+            sley_core::diagnostic!(Stderr, true, "error: no cherry-pick or revert in progress");
             return Err(fatal_failed(ctx.action));
         }
         let Some(head) = ctx.head_oid() else {
-            eprintln!("error: cannot abort from a branch yet to be born");
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "error: cannot abort from a branch yet to be born"
+            );
             return Err(fatal_failed(ctx.action));
         };
-        return reset_merge(ctx, hosts.promisor_fetch, Some(&head)).map_err(|err| {
-            eprintln!("error: {err}");
+        return reset_merge(original_cwd, ctx, hosts.promisor_fetch, Some(&head)).map_err(|err| {
+            sley_core::diagnostic!(Stderr, true, "error: {err}");
             fatal_failed(ctx.action)
         });
     }
     let text = std::fs::read_to_string(&head_file).map_err(|err| {
-        eprintln!("error: cannot open '{}': {err}", head_file.display());
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "error: cannot open '{}': {err}",
+            head_file.display()
+        );
         fatal_failed(ctx.action)
     })?;
     let stored = text.trim();
     let oid = ObjectId::from_hex(ctx.format, stored).map_err(|_| {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "error: stored pre-cherry-pick HEAD file '{}' is corrupt",
             head_file.display()
         );
         fatal_failed(ctx.action)
     })?;
     if oid == ObjectId::null(ctx.format) {
-        eprintln!("error: cannot abort from a branch yet to be born");
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "error: cannot abort from a branch yet to be born"
+        );
         return Err(fatal_failed(ctx.action));
     }
     let head = ctx.head_oid();
     if !replay::rollback_is_safe(&ctx.git_dir, head.as_ref()) {
-        eprintln!("warning: You seem to have moved HEAD. Not rewinding, check your HEAD!");
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "warning: You seem to have moved HEAD. Not rewinding, check your HEAD!"
+        );
     } else {
-        reset_merge(ctx, hosts.promisor_fetch, Some(&oid)).map_err(|err| {
-            eprintln!("error: {err}");
+        reset_merge(original_cwd, ctx, hosts.promisor_fetch, Some(&oid)).map_err(|err| {
+            sley_core::diagnostic!(Stderr, true, "error: {err}");
             fatal_failed(ctx.action)
         })?;
     }
@@ -1727,11 +1899,13 @@ pub fn rollback(ctx: &PickContext, hosts: &PickHosts<'_>) -> Result<()> {
 /// index. Conflicted paths are reset outright. Clears the in-progress branch
 /// state on success.
 fn reset_merge(
+    original_cwd: Option<&std::path::Path>,
     ctx: &PickContext,
     fetch: Option<&dyn PromisorObjectFetch>,
     target: Option<&ObjectId>,
 ) -> Result<()> {
     reset_merge_in(
+        original_cwd,
         &ctx.git_dir,
         &ctx.worktree_root,
         ctx.format,
@@ -1744,6 +1918,7 @@ fn reset_merge(
 /// Canonical `git reset --merge` used by the replay `--skip`/`--abort` flows
 /// and `git reset --merge` itself.
 pub fn reset_merge_in(
+    original_cwd: Option<&std::path::Path>,
     git_dir: &Path,
     worktree_root: &Path,
     format: sley_core::ObjectFormat,
@@ -1857,7 +2032,9 @@ pub fn reset_merge_in(
     }
     if !errors.is_empty() {
         for path in &errors {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "error: Entry '{}' not uptodate. Cannot merge.",
                 String::from_utf8_lossy(path)
             );
@@ -1904,7 +2081,7 @@ pub fn reset_merge_in(
     // submodule"). Deletions first leave the parent gone/empty, then the
     // gitlink write recreates the empty directory.
     for path in &deletions {
-        merge_remove_worktree_file(worktree_root, path)?;
+        merge_remove_worktree_file(original_cwd, worktree_root, path)?;
     }
     for (path, (mode, oid)) in &updates {
         let content = if is_gitlink(*mode) {
@@ -1912,7 +2089,7 @@ pub fn reset_merge_in(
         } else {
             merge_read_blob_with_fetch(&db, oid, fetch)?
         };
-        merge_write_worktree_file(worktree_root, path, &content, *mode)?;
+        merge_write_worktree_file(original_cwd, worktree_root, path, &content, *mode)?;
     }
     // Belt-and-suspenders: every target gitlink must exist as a directory
     // placeholder even when no CE_UPDATE was planned (identical oid carried
@@ -1929,7 +2106,7 @@ pub fn reset_merge_in(
         if full.is_dir() {
             continue;
         }
-        merge_write_worktree_file(worktree_root, path, &[], *mode)?;
+        merge_write_worktree_file(original_cwd, worktree_root, path, &[], *mode)?;
     }
     sley_worktree::refresh_index_paths_with_options(
         worktree_root,

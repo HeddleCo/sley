@@ -1,6 +1,6 @@
 //! Remote command module tree (clone, fetch, push, ls-remote, `git remote`).
 
-use crate::{GitError, Result};
+use crate::Result;
 
 mod admin;
 mod clone;
@@ -55,7 +55,7 @@ impl FetchRecurseSubmodules {
             "no" | "false" | "off" => Ok(Self::Off),
             other => {
                 eprintln!("fatal: bad --recurse-submodules argument: {other}");
-                Err(GitError::Exit(128))
+                Err(crate::cli_exit(128))
             }
         }
     }

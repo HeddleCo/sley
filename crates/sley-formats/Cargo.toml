@@ -27,5 +27,8 @@ zlib-rs = ["flate2/zlib-rs"]
 # byte-identical. Select with `--no-default-features --features pure-rust`.
 pure-rust = ["flate2/rust_backend"]
 
+[dev-dependencies]
+tempfile = "3.27.0"
+
 [lints]
 workspace = true

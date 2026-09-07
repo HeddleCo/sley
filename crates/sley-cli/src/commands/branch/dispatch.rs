@@ -38,7 +38,7 @@ pub(crate) fn cmd_branch(cli_session: &crate::session::CliSession, args: &[Strin
             "error: unknown option `{}`",
             option.trim_start_matches("--")
         );
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     if let Some(format_options) =
         setup_branch_format_list_options(git_dir, format, context.replace_objects, args)?
@@ -68,13 +68,13 @@ pub(crate) fn cmd_branch(cli_session: &crate::session::CliSession, args: &[Strin
     }
     if branch_has_conflicting_action_modes(args) {
         eprintln!("fatal: options are incompatible");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     // git: `--recurse-submodules` is create-only. Reject it with the exact
     // message when combined with delete/rename/list/etc. (t3207).
     if branch_has_explicit_recurse_submodules(args) && branch_has_noncreate_action(args) {
         eprintln!("fatal: --recurse-submodules can only be used to create branches");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if let Some(verbose) = setup_branch_verbose_list_options(args)? {
         return run_branch_verbose_list_options(
@@ -96,7 +96,7 @@ pub(crate) fn cmd_branch(cli_session: &crate::session::CliSession, args: &[Strin
             delete_remote_tracking_branches(git_dir, format, store, &branches, quiet)
         } else if matches!(mode, BranchDeleteMode::All) {
             eprintln!("fatal: cannot use -a with -d");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         } else if force {
             force_delete_branches(git_dir, format, store, &branches, quiet)
         } else {

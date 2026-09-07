@@ -161,7 +161,7 @@ fn replace_delete(
         }
     }
     if failed {
-        Err(GitError::Exit(1))
+        Err(crate::cli_exit(1))
     } else {
         Ok(())
     }
@@ -197,7 +197,7 @@ fn replace_create(
             "while '{replacement}' points to a replacement object of type '{}'.",
             replacement_type.as_str()
         );
-        return Err(GitError::Exit(255));
+        return Err(crate::cli_exit(255));
     }
     let name = format!("refs/replace/{object_oid}");
     write_replace_ref(store, &name, replacement_oid, force)
@@ -225,7 +225,7 @@ fn write_replace_ref(
         Ok(()) => Ok(()),
         Err(_) if !force => {
             eprintln!("error: replace ref '{name}' already exists");
-            Err(GitError::Exit(255))
+            Err(crate::cli_exit(255))
         }
         Err(err) => Err(err),
     }
@@ -246,7 +246,7 @@ fn replace_edit(
     let existing = store.read_ref(&ref_name)?;
     if existing.is_some() && !force {
         eprintln!("error: replace ref '{ref_name}' already exists");
-        return Err(GitError::Exit(255));
+        return Err(crate::cli_exit(255));
     }
     // `--force --edit` replaces an existing replacement by editing the
     // original object again, rather than recursively editing the current
@@ -263,7 +263,7 @@ fn replace_edit(
     let _ = fs::remove_file(&edit_path);
     if edited == original.body {
         eprintln!("error: new object is the same as the old one");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     let replacement_oid = db.write_object(EncodedObject::new(original.object_type, edited))?;
     write_replace_ref(store, &ref_name, replacement_oid, force)
@@ -306,7 +306,7 @@ fn replace_graft_oids(
     for mergetag in commit_mergetag_targets(format, &object.body)? {
         if !parents.contains(&mergetag) {
             eprintln!("error: new commit is missing mergetag parent {mergetag}");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
     }
     let mut commit = Commit::parse(format, &object.body)?;
@@ -351,7 +351,7 @@ fn replace_convert_graft_file(
         let parse_oid = |value: &str| {
             ObjectId::from_hex(format, value).map_err(|_| {
                 eprintln!("error: malformed graft data: {line}");
-                GitError::Exit(1)
+                crate::cli_exit(1)
             })
         };
         let commit = parse_oid(fields[0])?;
@@ -372,7 +372,7 @@ fn replace_convert_graft_file(
             })
         {
             eprintln!("error: malformed graft data: {line}");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         grafts.push((commit, parents));
     }

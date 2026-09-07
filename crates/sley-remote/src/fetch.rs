@@ -72,6 +72,8 @@ pub enum FetchSource {
 /// Controls for a [`fetch`] run, mirroring the `git fetch` flags the CLI parses.
 #[derive(Debug, Clone)]
 pub struct FetchOptions {
+    /// Caller-owned namespace and transport policy.
+    pub policy: crate::RemotePolicy,
     /// Suppress prune notices (deletions still happen; only the [`ProgressSink`]
     /// output is silenced — the caller wires that).
     pub quiet: bool,
@@ -324,7 +326,7 @@ impl<'a> FetchServices<'a> {
 /// from (used for `FETCH_HEAD` descriptions and to look up `remote.<name>.*`).
 ///
 /// Emits prune notices through `progress` and returns the structured
-/// [`FetchOutcome`]; never prints or returns `GitError::Exit`.
+/// [`FetchOutcome`]; never prints or returns a process exit request.
 ///
 /// The smart-HTTP transport constructs a default [`UreqHttpClient`]. Hosts that
 /// must enforce network policy on the dial (e.g. SSRF-guard a public mirror URL)
@@ -374,7 +376,7 @@ fn fetch_impl(
     crate::protocol::check_transport_allowed(
         scheme_for_fetch_source(request.source),
         Some(request.config),
-        None,
+        &request.options.policy.transport,
     )
     .map_err(crate::protocol::transport_policy_git_error)?;
     // A pack must be installed as a promisor pack when the remote is already a
@@ -532,6 +534,10 @@ fn fetch_impl(
                     // settings the rest of the request does.
                     default_client = UreqHttpClient::with_limits(
                         crate::transport_limits_from_config(Some(request.config)),
+                    )
+                    .with_protocol_policy(
+                        request.options.policy.transport.clone(),
+                        Some(request.config),
                     );
                     &default_client
                 }
@@ -622,6 +628,7 @@ fn fetch_impl(
             let pack_haves = match negotiation_haves {
                 Some(haves) => Some(haves),
                 None => Some(crate::local::local_negotiation_have_oids(
+                    &request.options.policy,
                     request.git_dir,
                     request.format,
                 )?),
@@ -659,6 +666,7 @@ fn fetch_impl(
                 let ctx = crate::OperationContext::new(services.progress, services.cancel);
                 let v2_outcome =
                     crate::http::install_fetch_pack_via_http_protocol_v2_fetch_with_want_refs(
+                        &request.options.policy,
                         pack_request,
                         want_refs,
                         handshake,
@@ -677,6 +685,7 @@ fn fetch_impl(
             } else {
                 let ctx = crate::OperationContext::new(services.progress, services.cancel);
                 crate::http::install_fetch_pack_via_http_upload_pack(
+                    &request.options.policy,
                     pack_request,
                     services.credentials,
                     ctx.progress,
@@ -767,6 +776,7 @@ fn fetch_impl(
                 shallow_boundary_for_request(request.git_dir, request.format, &options)?;
             let ctx = services.context();
             let shallow_info = crate::ssh::install_fetch_pack_via_ssh_upload_pack(
+                &request.options.policy,
                 crate::ssh::SshFetchPackRequest {
                     git_dir: transfer_git_dir,
                     format: request.format,
@@ -877,6 +887,7 @@ fn fetch_impl(
                 shallow_boundary_for_request(request.git_dir, request.format, &options)?;
             let ctx = services.context();
             let shallow_info = crate::git::install_fetch_pack_via_git_upload_pack(
+                &request.options.policy,
                 crate::git::GitFetchPackRequest {
                     git_dir: transfer_git_dir,
                     format: request.format,
@@ -946,7 +957,11 @@ fn fetch_impl(
             // only in the commit-graph dies before negotiation. Exact-OID wants
             // skip have-building, so this must run for every local fetch
             // (t5330 #4).
-            crate::local::mark_complete_local_refs(request.git_dir, request.format)?;
+            crate::local::mark_complete_local_refs(
+                &request.options.policy,
+                request.git_dir,
+                request.format,
+            )?;
             // Protocol v2: real `ls-refs` with ref-prefix filtering so the
             // packet log and advertised set match git (t5702 #24/#48/#49).
             let advertisements = if request.config.get("protocol", None, "version") == Some("2") {
@@ -959,13 +974,18 @@ fn fetch_impl(
                     prefixes.push("HEAD".into());
                 }
                 crate::local::local_protocol_v2_ls_refs_advertisements(
+                    &request.options.policy,
                     remote_git_dir,
                     request.format,
                     &prefixes,
                     &[],
                 )?
             } else {
-                crate::local::local_fetch_advertisements(remote_git_dir, request.format)?
+                crate::local::local_fetch_advertisements(
+                    &request.options.policy,
+                    remote_git_dir,
+                    request.format,
+                )?
             };
             let remote_config =
                 sley_config::read_repo_config(remote_common_git_dir, None).unwrap_or_default();
@@ -1233,6 +1253,7 @@ fn fetch_impl(
                     .collect();
                 let ref_in_want = crate::local::install_fetch_pack_via_local_protocol_v2(
                     crate::local::LocalProtocolV2FetchRequest {
+                        policy: &request.options.policy,
                         git_dir: request.git_dir,
                         destination_git_dir: transfer_git_dir,
                         remote_git_dir,
@@ -1268,7 +1289,7 @@ fn fetch_impl(
                     sley_protocol::set_packet_trace_identity("fetch");
                     sley_protocol::trace_packet_write_payload(b"include-tag\n");
                 }
-                let transfer = crate::local::install_fetch_pack_via_local_upload_pack_with_promisor_decision_into(
+                let transfer = crate::local::install_fetch_pack_via_local_upload_pack_with_promisor_decision_into(&request.options.policy,
                     request.git_dir,
                     transfer_git_dir,
                     remote_git_dir,
@@ -2150,8 +2171,12 @@ fn validate_incoming_fetch_objects(
     let report = sley_fsck::fsck_objects_with_options(db, format, roots, [], options);
     for issue in &report.issues {
         match issue.stream {
-            sley_fsck::IssueStream::Stdout => println!("{}", issue.message),
-            sley_fsck::IssueStream::Stderr => eprintln!("{}", issue.message),
+            sley_fsck::IssueStream::Stdout => {
+                sley_core::diagnostic!(Stdout, true, "{}", issue.message)
+            }
+            sley_fsck::IssueStream::Stderr => {
+                sley_core::diagnostic!(Stderr, true, "{}", issue.message)
+            }
         }
     }
     if report.is_ok() {
@@ -2423,7 +2448,9 @@ fn report_fetch_ref_apply_error(
         || detail.contains("non-empty directory");
     if is_name_conflict {
         if !*conflict_msg_shown {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "error: some local refs could not be updated; try running\n \
                  'git remote prune {remote_name}' to remove any old, conflicting branches"
             );
@@ -2435,9 +2462,9 @@ fn report_fetch_ref_apply_error(
     // Lock failures already use git's `error: cannot lock ref '…': …` form when
     // raised as InvalidFormat; print them as-is. Otherwise wrap.
     if detail.starts_with("error: ") {
-        eprintln!("{detail}");
+        sley_core::diagnostic!(Stderr, true, "{detail}");
     } else {
-        eprintln!("error: cannot lock ref '{dst}': {detail}");
+        sley_core::diagnostic!(Stderr, true, "error: cannot lock ref '{dst}': {detail}");
     }
 }
 
@@ -2588,8 +2615,12 @@ fn reject_shallow_clone_fetch(
     let deepening =
         options.depth.is_some() || options.deepen_since.is_some() || !options.deepen_not.is_empty();
     if options.reject_shallow && options.cloning && !deepening && !shallow_info.is_empty() {
-        eprintln!("fatal: source repository is shallow, reject to clone.");
-        return Err(GitError::Exit(128));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "fatal: source repository is shallow, reject to clone."
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     Ok(())
 }
@@ -2628,7 +2659,7 @@ fn custom_negotiation_haves(
     let mut seen = HashSet::new();
     let mut haves = Vec::new();
     if restrict.is_empty() {
-        for oid in crate::local::local_have_oids(git_dir, format)? {
+        for oid in crate::local::local_have_oids(&options.policy, git_dir, format)? {
             push_have_oid(&mut haves, &mut seen, oid);
         }
     } else {
@@ -3461,6 +3492,7 @@ mod tests {
 
     fn default_options() -> FetchOptions {
         FetchOptions {
+            policy: Default::default(),
             quiet: true,
             progress: None,
             auto_follow_tags: false,

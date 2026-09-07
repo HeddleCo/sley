@@ -1,7 +1,6 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 #![allow(clippy::expect_used)]
 
-use sley::plumbing::{sley_diff_merge, sley_rev, sley_worktree};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
@@ -148,7 +147,7 @@ impl NotesDisplay {
             if matches!(global_config_value("notes.displayRef"), Ok(Some(v)) if v == "true") {
                 eprintln!("error: missing value for 'notes.displayref'");
                 eprintln!("fatal: unable to parse 'notes.displayref' from command-line config");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             if let Ok(env_value) = env::var("GIT_NOTES_DISPLAY_REF") {
                 for part in env_value.split(':').filter(|s| !s.is_empty()) {
@@ -166,7 +165,7 @@ impl NotesDisplay {
                         eprintln!(
                             "fatal: unable to parse 'notes.displayref' from command-line config"
                         );
-                        return Err(GitError::Exit(128));
+                        return Err(crate::cli_exit(128));
                     }
                     for expanded in expand_notes_glob(store, value)? {
                         push_unique(&mut refs, expanded);
@@ -596,7 +595,7 @@ pub(crate) fn cmd_whatchanged(cli_session: &session::CliSession, args: &[String]
         eprintln!(
             "fatal: git whatchanged is nominated for removal.\nIf you still use this command, add an extra option, '--i-still-use-this',\non the command line and let us know you still use it by sending an e-mail\nto <git@vger.kernel.org>.  Thanks."
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     cmd_log_impl(cli_session, &filtered, true)
 }
@@ -1340,7 +1339,7 @@ fn cmd_log_impl(
             }
             "--no-pickaxe-regex" => {
                 eprintln!("fatal: unrecognized argument: --no-pickaxe-regex");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             "-g" | "--walk-reflogs" => walk_reflogs = true,
             "--no-walk-reflogs" => walk_reflogs = false,
@@ -1540,7 +1539,7 @@ fn cmd_log_impl(
             }
             value if value.starts_with("--unpacked=") => {
                 eprintln!("fatal: --unpacked=<packfile> no longer supported");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             "--min-parents" | "--max-parents" => {
                 return log_fatal_unrecognized_argument(arg);
@@ -2072,7 +2071,7 @@ fn cmd_log_impl(
                     "none" => None,
                     _ => {
                         eprintln!("error: bad --word-diff argument: {mode}");
-                        return Err(GitError::Exit(129));
+                        return Err(crate::cli_exit(129));
                     }
                 };
                 diff_opts.patch = true;
@@ -2225,7 +2224,7 @@ fn cmd_log_impl(
             "-L" => {
                 let value = iter.next().ok_or_else(|| {
                     eprintln!("error: switch `L' requires a value");
-                    GitError::Exit(129)
+                    crate::cli_exit(129)
                 })?;
                 line_log_args.push(crate::commands::line_log::LineLogArg { raw: value.clone() });
                 // `-L` does NOT eagerly force a patch here; the default is
@@ -2247,7 +2246,7 @@ fn cmd_log_impl(
                 if let Some(unsupported) = log_follow_unsupported_pathspec_magic(value) {
                     if saw_follow {
                         eprintln!("fatal: pathspec magic not supported by --follow: {unsupported}");
-                        return Err(GitError::Exit(128));
+                        return Err(crate::cli_exit(128));
                     }
                     follow_config_allowed = false;
                 }
@@ -2293,7 +2292,7 @@ fn cmd_log_impl(
     }
     if show_parents && show_children {
         eprintln!("fatal: options '--parents' and '--children' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if whatchanged && !diff_opts.any() {
         diff_opts.raw = true;
@@ -2448,7 +2447,7 @@ fn cmd_log_impl(
             if name == "HEAD" =>
         {
             eprintln!("fatal: your current branch appears to be broken");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         Err(err) if inserted_default_head => {
             // Match git's diagnose_missing_default (revision.c): a missing
@@ -2458,13 +2457,13 @@ fn cmd_log_impl(
             match diagnose_missing_default_head(&git_dir, format) {
                 MissingDefaultHead::Broken => {
                     eprintln!("fatal: your current branch appears to be broken");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 MissingDefaultHead::Unborn(branch) => {
                     eprintln!(
                         "fatal: your current branch '{branch}' does not have any commits yet"
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 MissingDefaultHead::Other => return Err(err),
             }
@@ -2480,7 +2479,7 @@ fn cmd_log_impl(
                 MissingDefaultHead::Broken
             ) {
                 eprintln!("fatal: your current branch appears to be broken");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             return Err(err);
         }
@@ -2530,11 +2529,11 @@ fn cmd_log_impl(
     }
     if max_count_oldest.is_some() && max_count.is_some() {
         eprintln!("fatal: options '--max-count-oldest' and '--max-count' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if max_count_oldest.is_some() && skip > 0 {
         eprintln!("fatal: options '--max-count-oldest' and '--skip' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if !follow_explicit
         && !saw_follow
@@ -2547,19 +2546,19 @@ fn cmd_log_impl(
     let full_history = revision_options.full_history;
     if graph && reverse {
         eprintln!("fatal: options '--reverse' and '--graph' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if graph && show_linear_break {
         eprintln!("fatal: options '--show-linear-break' and '--graph' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if graph && !walk {
         eprintln!("fatal: options '--no-walk' and '--graph' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if graph && walk_reflogs {
         eprintln!("fatal: options '--walk-reflogs' and '--graph' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     // Compile any `-I<regex>` patterns now (a malformed regex fails like git's
     // diff_opt_ignore_regex, exit 129).
@@ -2592,7 +2591,7 @@ fn cmd_log_impl(
         for pat in &find_object_patterns {
             let oid = repository.resolve_revision(pat).map_err(|_| {
                 eprintln!("error: unable to resolve '{pat}'");
-                GitError::Exit(128)
+                crate::cli_exit(128)
             })?;
             oids.insert(oid);
         }
@@ -2653,7 +2652,12 @@ fn cmd_log_impl(
         if diff_opts.any() || diff_opts.merges_imply_patch || compiled_pickaxe.is_some() {
             let attributes = worktree_root
                 .as_deref()
-                .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
+                .map(|root| {
+                    sley_worktree::StandardAttributeMatcher::from_worktree_root(
+                        cli_session.precompose_unicode(),
+                        root,
+                    )
+                })
                 .transpose()?;
             Some(commands::userdiff::UserdiffResolver::with_attributes(
                 attributes,
@@ -2817,7 +2821,7 @@ fn cmd_log_impl(
     }
     if !walk_reflogs && !reflog_patterns.is_empty() {
         eprintln!("fatal: the option '--grep-reflog' requires '--walk-reflogs'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let author_filters =
         compile_log_filter_matcher(&author_patterns, pattern_kind, regexp_ignore_case, "header")?;
@@ -2916,15 +2920,15 @@ fn cmd_log_impl(
         // command line parsing). git checks pathspec first.
         if !pathspecs.is_empty() {
             eprintln!("fatal: -L<range>:<file> cannot be used with pathspec");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if saw_follow {
             eprintln!("fatal: --follow cannot be used with -L");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if starts.len() != 1 {
             eprintln!("fatal: only one rev expected with -L");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if diff_opts.stat
             || diff_opts.numstat
@@ -2934,47 +2938,50 @@ fn cmd_log_impl(
             || line_log_full_diff_requested
         {
             eprintln!("fatal: -L does not yet support the requested diff format");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
-        return run_line_log_output(LineLogOutputCtx {
-            git_dir: &git_dir,
-            db: &db,
-            lazy_fetch,
-            replace_objects: cli_session.replace_objects(),
-            format,
-            config: &config,
-            tip: starts[0],
-            args: &line_log_args,
-            output: &output,
-            diff_opts: &diff_opts,
-            date_mode: &date_mode,
-            abbrev_len,
-            abbrev_commit,
-            detect_renames: filter_detect_renames,
-            first_parent,
-            max_count,
-            reverse,
-            show_parents,
-            decoration,
-            output_encoding: &output_encoding,
-            src_prefix: line_log_src_prefix.as_deref(),
-            dst_prefix: line_log_dst_prefix.as_deref(),
-            full_index: line_log_full_index,
-            abbrev_len_explicit,
-            max_age,
-            min_age,
-            pickaxe: compiled_pickaxe.as_ref(),
-            pickaxe_ignore_case,
-            pickaxe_text,
-            pickaxe_detect_renames,
-            diff_filter_mask,
-            reverse_diff: diff_reverse,
-            graph,
-            color_always,
-            color_moved: line_log_color_moved,
-            userdiff: log_userdiff.as_ref(),
-            output_path: log_output_path.as_deref(),
-        });
+        return run_line_log_output(
+            &cli_session.remote_policy,
+            LineLogOutputCtx {
+                git_dir: &git_dir,
+                db: &db,
+                lazy_fetch,
+                replace_objects: cli_session.replace_objects(),
+                format,
+                config: &config,
+                tip: starts[0],
+                args: &line_log_args,
+                output: &output,
+                diff_opts: &diff_opts,
+                date_mode: &date_mode,
+                abbrev_len,
+                abbrev_commit,
+                detect_renames: filter_detect_renames,
+                first_parent,
+                max_count,
+                reverse,
+                show_parents,
+                decoration,
+                output_encoding: &output_encoding,
+                src_prefix: line_log_src_prefix.as_deref(),
+                dst_prefix: line_log_dst_prefix.as_deref(),
+                full_index: line_log_full_index,
+                abbrev_len_explicit,
+                max_age,
+                min_age,
+                pickaxe: compiled_pickaxe.as_ref(),
+                pickaxe_ignore_case,
+                pickaxe_text,
+                pickaxe_detect_renames,
+                diff_filter_mask,
+                reverse_diff: diff_reverse,
+                graph,
+                color_always,
+                color_moved: line_log_color_moved,
+                userdiff: log_userdiff.as_ref(),
+                output_path: log_output_path.as_deref(),
+            },
+        );
     }
     if let Some(path) = log_output_path {
         return Err(GitError::Command(format!(
@@ -3801,7 +3808,12 @@ fn cmd_log_impl(
                         // the graph, so use that without advancing it.
                         let prefix_width =
                             graph_state.graph_width() as i64 + log_prefix_display_width(prefix);
-                        log_diff.render(record, prefix_width, &mut diff_block)?;
+                        log_diff.render(
+                            &cli_session.remote_policy,
+                            record,
+                            prefix_width,
+                            &mut diff_block,
+                        )?;
                         if !diff_block.is_empty() {
                             diff_attached = true;
                             if msg.last() != Some(&b'\n') {
@@ -3850,7 +3862,12 @@ fn cmd_log_impl(
                         if let Some(log_diff) = &log_diff {
                             let prefix_width =
                                 graph_state.graph_width() as i64 + log_prefix_display_width(prefix);
-                            log_diff.render(record, prefix_width, &mut diff_block)?;
+                            log_diff.render(
+                                &cli_session.remote_policy,
+                                record,
+                                prefix_width,
+                                &mut diff_block,
+                            )?;
                             if !diff_block.is_empty() {
                                 msg.extend_from_slice(diff_opts.block_separator_for(record));
                                 msg.extend_from_slice(&diff_block);
@@ -3969,7 +3986,12 @@ fn cmd_log_impl(
                         // git's line-prefix callback gives it.
                         let prefix_width =
                             graph_state.graph_width() as i64 + log_prefix_display_width(prefix);
-                        log_diff.render(record, prefix_width, &mut diff_block)?;
+                        log_diff.render(
+                            &cli_session.remote_policy,
+                            record,
+                            prefix_width,
+                            &mut diff_block,
+                        )?;
                         if !diff_block.is_empty() {
                             msg.extend_from_slice(diff_opts.block_separator_for(record));
                             msg.extend_from_slice(&diff_block);
@@ -4011,13 +4033,19 @@ fn cmd_log_impl(
                             log_prefix_display_width(line_prefix.as_deref().unwrap_or(""));
                         if let Some(parent_index) = separate_parent_index {
                             log_diff.render_parent(
+                                &cli_session.remote_policy,
                                 record,
                                 parent_index,
                                 prefix_width,
                                 &mut diff_block,
                             )?;
                         } else {
-                            log_diff.render(record, prefix_width, &mut diff_block)?;
+                            log_diff.render(
+                                &cli_session.remote_policy,
+                                record,
+                                prefix_width,
+                                &mut diff_block,
+                            )?;
                         }
                     }
                     if whatchanged && log_diff.is_some() && diff_block.is_empty() {
@@ -4318,7 +4346,12 @@ fn cmd_log_impl(
                     // entry, with no separating blank line. `--line-prefix`
                     // narrows the stat budget and prefixes every diff line.
                     let prefix = line_prefix.as_deref().unwrap_or("");
-                    log_diff.render(record, log_prefix_display_width(prefix), &mut diff_block)?;
+                    log_diff.render(
+                        &cli_session.remote_policy,
+                        record,
+                        log_prefix_display_width(prefix),
+                        &mut diff_block,
+                    )?;
                     if !diff_block.is_empty() {
                         let mut stdout = io::stdout();
                         let separator = diff_opts.block_separator_for(record);
@@ -4429,10 +4462,10 @@ pub(crate) fn resolve_pretty_spec(
             });
         }
         eprintln!("fatal: invalid --pretty format: {spec}");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     eprintln!("fatal: invalid --pretty format: {spec}");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 // ---------------------------------------------------------------------------
@@ -4467,39 +4500,39 @@ fn log_graph_color_palette(config: &GitConfig) -> Vec<String> {
 
 fn log_fatal_unrecognized_argument(value: &str) -> Result<()> {
     eprintln!("fatal: unrecognized argument: {value}");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn log_diff_merges_requires_value_error() -> GitError {
     eprintln!("fatal: Option '--diff-merges' requires a value");
-    GitError::Exit(128)
+    crate::cli_exit(128)
 }
 
 fn log_max_age_requires_value_error() -> GitError {
     eprintln!("fatal: Option '--max-age' requires a value");
-    GitError::Exit(128)
+    crate::cli_exit(128)
 }
 
 fn log_min_age_requires_value_error() -> GitError {
     eprintln!("fatal: Option '--min-age' requires a value");
-    GitError::Exit(128)
+    crate::cli_exit(128)
 }
 
 fn log_date_cutoff_requires_value_error(option: &str) -> GitError {
     eprintln!("fatal: Option '{option}' requires a value");
-    GitError::Exit(128)
+    crate::cli_exit(128)
 }
 
 fn log_no_walk_invalid_argument(value: &str) -> Result<()> {
     eprintln!("error: invalid argument to --no-walk");
     eprintln!("fatal: unrecognized argument: {value}");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn log_parse_parent_count(value: &str) -> Result<usize> {
     value.parse::<usize>().map_err(|_| {
         eprintln!("fatal: '{value}': not an integer");
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })
 }
 
@@ -4516,7 +4549,7 @@ fn log_show_merge_revisions<R: ObjectReader>(
         sley_rev::resolve_revision_commitish_with_config(git_dir, format, reader, "HEAD", config)
             .map_err(|_| {
             eprintln!("fatal: --merge without HEAD?");
-            GitError::Exit(128)
+            crate::cli_exit(128)
         })?;
 
     let mut other = None;
@@ -4539,7 +4572,7 @@ fn log_show_merge_revisions<R: ObjectReader>(
         eprintln!(
             "fatal: --merge requires one of the pseudorefs MERGE_HEAD, CHERRY_PICK_HEAD, REVERT_HEAD or REBASE_HEAD"
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
 
     let mut revisions = vec!["HEAD".to_string(), other_name.to_string()];

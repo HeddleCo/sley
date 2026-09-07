@@ -6,7 +6,7 @@
 //! interaction independently testable.
 
 use super::CleanTarget;
-use crate::sley_worktree;
+
 use sley::Result;
 use std::env;
 use std::io::{self, BufRead, IsTerminal, Write};

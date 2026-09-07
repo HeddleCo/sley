@@ -830,7 +830,7 @@ fn diff_name_status_index_worktree_changes_for_borrowed_entries(
     std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for chunk in entries.chunks(chunk_size) {
-            handles.push(scope.spawn(move || {
+            handles.push(scope.spawn(sley_core::diagnostics::inherit(move || {
                 diff_name_status_index_worktree_changes_for_borrowed_entry_chunk(
                     worktree_root,
                     format,
@@ -838,7 +838,7 @@ fn diff_name_status_index_worktree_changes_for_borrowed_entries(
                     stat_cache,
                     None,
                 )
-            }));
+            })));
         }
         let mut changes = Vec::new();
         for handle in handles {
@@ -876,7 +876,7 @@ fn diff_name_status_index_worktree_changes_for_entries(
     std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for chunk in entries.chunks(chunk_size) {
-            handles.push(scope.spawn(move || {
+            handles.push(scope.spawn(sley_core::diagnostics::inherit(move || {
                 diff_name_status_index_worktree_changes_for_entry_chunk(
                     worktree_root,
                     format,
@@ -884,7 +884,7 @@ fn diff_name_status_index_worktree_changes_for_entries(
                     stat_cache,
                     None,
                 )
-            }));
+            })));
         }
         let mut changes = Vec::new();
         for handle in handles {
@@ -3529,7 +3529,7 @@ fn worktree_entry_for_path(
                     .filter(|entry| !sley_index::is_gitlink(entry.mode))
             }));
         }
-        Err(err) => return Err(GitError::Io(err.to_string())),
+        Err(err) => return Err(GitError::from(err)),
     };
     let file_type = metadata.file_type();
     if let Some(staged_oid) = index_gitlinks.get(git_path)
@@ -3575,7 +3575,7 @@ fn index_worktree_change_for_entry(
         Err(err) if is_missing_worktree_path_error(&err) => {
             return Ok(Some(index_worktree_deleted_entry(index_entry)));
         }
-        Err(err) => return Err(GitError::Io(err.to_string())),
+        Err(err) => return Err(GitError::from(err)),
     };
     let file_type = metadata.file_type();
     let right = if metadata.is_dir() {

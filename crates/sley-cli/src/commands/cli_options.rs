@@ -5,7 +5,7 @@ use sley_options::{OptFlags, OptValue, OptionSpec, Parsed, ParsedOption, ParsedV
 
 pub(crate) fn cli_usage_error(error: UsageError) -> GitError {
     eprint!("{}", error.render_stderr());
-    GitError::Exit(error.exit_code())
+    crate::cli_exit(error.exit_code())
 }
 
 pub(crate) const fn opt_bool(

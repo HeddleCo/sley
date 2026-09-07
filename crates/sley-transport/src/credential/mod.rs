@@ -187,12 +187,12 @@ pub fn credential_announce_capabilities(
     credential: &GitCredential,
     writer: &mut impl Write,
 ) -> Result<()> {
-    writeln!(writer, "version 0").map_err(|e| GitError::Io(e.to_string()))?;
+    writeln!(writer, "version 0").map_err(GitError::from)?;
     if credential.capa_authtype.request_initial {
-        writeln!(writer, "capability authtype").map_err(|e| GitError::Io(e.to_string()))?;
+        writeln!(writer, "capability authtype").map_err(GitError::from)?;
     }
     if credential.capa_state.request_initial {
-        writeln!(writer, "capability state").map_err(|e| GitError::Io(e.to_string()))?;
+        writeln!(writer, "capability state").map_err(GitError::from)?;
     }
     Ok(())
 }
@@ -217,7 +217,7 @@ pub fn credential_read(
         match reader.read_line(&mut line) {
             Ok(0) => break,
             Ok(_) => {}
-            Err(err) => return Err(GitError::Io(err.to_string())),
+            Err(err) => return Err(GitError::from(err)),
         }
         if line == "\n" || line == "\r\n" {
             break;
@@ -239,7 +239,7 @@ pub(crate) fn apply_credential_line(
     op_type: CredentialOpType,
 ) -> Result<()> {
     let Some((key, value)) = line.split_once('=') else {
-        eprintln!("warning: invalid credential line: {line}");
+        sley_core::diagnostic!(Stderr, true, "warning: invalid credential line: {line}");
         return Err(GitError::InvalidFormat(
             "credential line is missing = delimiter".into(),
         ));
@@ -392,7 +392,7 @@ fn write_item(
              If this is intended, set `credential.protectProtocol=false`"
         )));
     }
-    writeln!(writer, "{key}={value}").map_err(|e| GitError::Io(e.to_string()))?;
+    writeln!(writer, "{key}={value}").map_err(GitError::from)?;
     Ok(())
 }
 

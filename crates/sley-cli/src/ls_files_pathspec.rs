@@ -11,10 +11,8 @@ use sley_pathspec::{
 };
 
 use crate::session_globals::attribute_checks_for_matching;
-use crate::sley_index;
-use crate::sley_worktree;
 
-use sley::plumbing::sley_core::paths::relative_path_bytes;
+use sley_core::paths::relative_path_bytes;
 
 pub(crate) fn index_entry_stage(entry: &sley_index::IndexEntry) -> u16 {
     (entry.flags >> 12) & 0x3
@@ -28,7 +26,8 @@ pub(crate) struct LsFilesPathspec {
 }
 
 impl LsFilesPathspec {
-    pub(crate) fn new(
+    pub(crate) fn with_precompose(
+        precompose: sley_core::PrecomposeUnicode,
         cwd: &Path,
         worktree_root: &Path,
         full_name: bool,
@@ -49,7 +48,7 @@ impl LsFilesPathspec {
                 eprintln!(
                     "fatal: empty string is not a valid pathspec. please use . instead if you meant to match all paths"
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             let parse_arg = normalize_absolute_cli_pathspec(&root, pathspec_cwd, arg)?;
             let element = parse_normalized_pathspec_element(&prefix, &parse_arg, magic)?;
@@ -75,7 +74,7 @@ impl LsFilesPathspec {
             .any(|filter| !filter.element.attr_requirements().is_empty());
         let attributes = if needs_attrs {
             Some(sley_worktree::StandardAttributeMatcher::from_worktree_root(
-                &root,
+                precompose, &root,
             )?)
         } else {
             None
@@ -156,7 +155,7 @@ impl LsFilesPathspec {
         }
         if has_unmatched {
             eprintln!("Did you forget to 'git add'?");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         Ok(())
     }

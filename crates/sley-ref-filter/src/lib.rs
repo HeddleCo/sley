@@ -338,8 +338,12 @@ fn parse_for_each_ref_refname_atom(value: &str) -> Result<Option<ForEachRefAtom>
             // git's refname_atom_parser rejects unknown args outright (the
             // upstream/push variants accept extra modifiers handled later, so
             // only `refname` is strict here).
-            eprintln!("fatal: unrecognized %({prefix}) argument: {modifier}");
-            return Err(GitError::Exit(128));
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "fatal: unrecognized %({prefix}) argument: {modifier}"
+            );
+            return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
         } else {
             continue;
         };

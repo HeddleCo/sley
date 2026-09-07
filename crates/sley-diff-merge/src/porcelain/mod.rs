@@ -195,6 +195,16 @@ impl Error for RenderError {
     }
 }
 
+impl From<RenderError> for sley_core::GitError {
+    fn from(error: RenderError) -> Self {
+        let RenderError::Output(source) = &error;
+        Self::IoKind {
+            kind: source.kind(),
+            message: error.to_string(),
+        }
+    }
+}
+
 impl From<io::Error> for RenderError {
     fn from(error: io::Error) -> Self {
         Self::Output(error)

@@ -15,7 +15,6 @@
 //! `write_diff_stat`, etc.). This keeps every output mode byte-identical with
 //! `git diff` for the formats both commands share.
 
-use sley::plumbing::{sley_core, sley_diff_merge, sley_index, sley_rev};
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -161,7 +160,7 @@ pub(crate) fn cmd_diff_index(
             value if let Some(value) = value.strip_prefix("--ignore-submodules=") => {
                 let Some(mode) = parse_submodule_ignore_mode(value) else {
                     eprintln!("fatal: bad --ignore-submodules argument: {value}");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 };
                 ignore_submodules_cli = Some(mode);
             }
@@ -436,10 +435,12 @@ pub(crate) fn cmd_diff_index(
     // whitespace error, OR-ing in 1 when `--exit-code`/`--quiet` + changes).
     if check {
         let resolver = commands::diff::WhitespaceRuleResolver::from_git_dir_with_config(
+            cli_session.precompose_unicode(),
             git_dir,
             Some(repo.config()),
         )?;
         let check_failed = commands::diff::run_diff_check(
+            &cli_session.remote_policy,
             &entries,
             db,
             worktree_root,
@@ -457,7 +458,7 @@ pub(crate) fn cmd_diff_index(
             code |= 0o1;
         }
         if code != 0 {
-            return Err(GitError::Exit(code));
+            return Err(crate::cli_exit(code));
         }
         return Ok(());
     }
@@ -470,6 +471,7 @@ pub(crate) fn cmd_diff_index(
                 .unwrap_or(true)
         });
         render(
+            &cli_session.remote_policy,
             &entries,
             &output,
             RenderContext {
@@ -492,7 +494,7 @@ pub(crate) fn cmd_diff_index(
     }
 
     if (quiet || exit_code) && has_differences {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -578,6 +580,7 @@ struct RenderContext<'a> {
 }
 
 fn render(
+    policy: &sley_remote::RemotePolicy,
     entries: &[sley_diff_merge::NameStatusEntry],
     output: &DiffIndexOutput,
     ctx: RenderContext<'_>,
@@ -598,13 +601,14 @@ fn render(
             suppress_output: false,
         },
     );
+    let lazy_fetch_adapter_1 = crate::diff_lazy_fetch(policy, ctx.lazy_fetch);
     let stat_entries = if selection.needs_line_stats() {
         collect_diff_stat_entries(
             entries,
             ctx.db,
             ctx.worktree_root,
             ctx.use_worktree_new,
-            crate::diff_lazy_fetch(ctx.lazy_fetch),
+            lazy_fetch_adapter_1.as_option(),
         )?
     } else {
         Vec::new()
@@ -658,6 +662,7 @@ fn render(
             writeln!(stdout)?;
         }
         for entry in entries {
+            let lazy_fetch_adapter_2 = crate::diff_lazy_fetch(policy, ctx.lazy_fetch);
             let options = DiffRenderOptions {
                 line_indicators: sley_diff_merge::render::LineIndicators::default(),
                 suppress_blank_empty: false,
@@ -665,7 +670,7 @@ fn render(
                 anchors: &[],
                 allow_textconv: false,
                 db: ctx.db,
-                lazy_fetch: crate::diff_lazy_fetch(ctx.lazy_fetch),
+                lazy_fetch: lazy_fetch_adapter_2.as_option(),
                 worktree_root: ctx.worktree_root,
                 use_worktree_new: ctx.use_worktree_new,
                 format: ctx.format,
@@ -767,12 +772,12 @@ fn parse_diff_index_abbrev(value: &str) -> Result<usize> {
 
 fn diff_index_usage_error<T>() -> Result<T> {
     eprint!("{DIFF_INDEX_USAGE}");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn diff_index_help() -> Result<()> {
     print!("{DIFF_INDEX_USAGE}");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 const DEFAULT_ABBREV: usize = 7;

@@ -1,7 +1,6 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
 use crate::*;
-use sley::plumbing::{sley_core, sley_index, sley_worktree};
 
 mod interactive;
 
@@ -98,11 +97,12 @@ pub(crate) fn cmd_clean(cli_session: &crate::session::CliSession, args: &[String
                 "fatal: clean.requireForce defaults to true and neither -i, -n, nor -f given; refusing to clean"
             );
         }
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
     let format = repository_object_format(&git_dir)?;
-    let pathspec = LsFilesPathspec::new(
+    let pathspec = LsFilesPathspec::with_precompose(
+        cli_session.precompose_unicode(),
         &cwd,
         &worktree_root,
         false,
@@ -149,7 +149,7 @@ pub(crate) fn cmd_clean(cli_session: &crate::session::CliSession, args: &[String
             .map_err(|err| GitError::InvalidPath(err.to_string()))?;
         let absolute = worktree_root.join(relative);
         if target.is_dir {
-            if clean_target_is_original_cwd(&absolute) {
+            if clean_target_is_original_cwd(cli_session.original_cwd.as_deref(), &absolute) {
                 clean_original_cwd_contents(&absolute, &excludes)?;
                 writeln!(stdout, "Refusing to remove current working directory")?;
                 continue;
@@ -168,11 +168,11 @@ pub(crate) fn cmd_clean(cli_session: &crate::session::CliSession, args: &[String
     Ok(())
 }
 
-fn clean_target_is_original_cwd(path: &Path) -> bool {
-    let Some(cwd) = sley_core::original_cwd().or_else(|| env::current_dir().ok()) else {
+fn clean_target_is_original_cwd(original_cwd: Option<&Path>, path: &Path) -> bool {
+    let Some(cwd) = original_cwd else {
         return false;
     };
-    let cwd = fs::canonicalize(&cwd).unwrap_or(cwd);
+    let cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     path == cwd
 }
@@ -395,7 +395,7 @@ fn clean_directory_is_nested_repository(absolute: &Path) -> Result<bool> {
         match read_gitdir_file(&dot_git) {
             Ok(Some(git_dir)) => return Ok(git_dir.exists()),
             Ok(None) => return Ok(false),
-            Err(GitError::Io(_) | GitError::IoKind { .. }) => return Ok(true),
+            Err(GitError::IoKind { .. }) => return Ok(true),
             Err(err) => return Err(err),
         }
     }

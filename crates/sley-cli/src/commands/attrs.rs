@@ -1,14 +1,12 @@
 //! Attribute and ignore inspection commands (`check-attr`, `check-ignore`).
 
-use crate::sley_object;
-use sley::plumbing::{sley_core, sley_index, sley_rev, sley_worktree};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use sley::plumbing::sley_object::tree_entry_object_type;
 use sley::{GitError, Result};
+use sley_object::tree_entry_object_type;
 use sley_pathspec::normalize_ls_files_pathspec;
 
 use crate::{
@@ -75,31 +73,31 @@ pub(crate) fn cmd_check_ignore(
     if read_stdin {
         if !path_args.is_empty() {
             eprintln!("fatal: cannot specify pathnames with --stdin");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     } else {
         if z {
             eprintln!("fatal: -z only makes sense with --stdin");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if path_args.is_empty() {
             eprintln!("fatal: no path specified");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     if quiet {
         if path_args.len() > 1 {
             eprintln!("fatal: --quiet is only valid with a single pathname");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if verbose {
             eprintln!("fatal: cannot have both --quiet and --verbose");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     if non_matching && !verbose {
         eprintln!("fatal: --non-matching is only valid with --verbose");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let repo = RepositoryContext::from_session(cli_session)?;
@@ -130,7 +128,12 @@ pub(crate) fn cmd_check_ignore(
         let ignore_match = if tracked_paths.contains(&git_path) {
             None
         } else {
-            sley_worktree::standard_ignore_match(worktree_root, &git_path, absolute.is_dir())?
+            sley_worktree::standard_ignore_match(
+                cli_session.precompose_unicode(),
+                worktree_root,
+                &git_path,
+                absolute.is_dir(),
+            )?
         };
         let path_matched = ignore_match
             .as_ref()
@@ -202,7 +205,7 @@ pub(crate) fn cmd_check_ignore(
     if matched_any {
         Ok(())
     } else {
-        Err(GitError::Exit(1))
+        Err(crate::cli_exit(1))
     }
 }
 
@@ -230,7 +233,7 @@ fn validate_check_ignore_pathspec(
                 "fatal: pathspec '{}' is beyond a symbolic link",
                 String::from_utf8_lossy(display_path)
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
 
@@ -245,7 +248,7 @@ fn validate_check_ignore_pathspec(
                 String::from_utf8_lossy(display_path),
                 String::from_utf8_lossy(gitlink)
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     Ok(())
@@ -266,7 +269,7 @@ fn c_unquote_check_ignore_stdin(input: &[u8]) -> Result<Vec<u8>> {
         index += 1;
     }
     eprintln!("fatal: line is badly quoted");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn write_check_ignore_quoted(stdout: &mut impl Write, path: &[u8]) -> Result<()> {
@@ -513,7 +516,7 @@ fn resolve_attr_source_or_die(
         Err(_) if ignore_bad => Ok(None),
         Err(_) => {
             eprintln!("fatal: bad --attr-source or GIT_ATTR_SOURCE");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }

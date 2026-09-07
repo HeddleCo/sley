@@ -117,7 +117,7 @@ pub(crate) fn cmd_interpret_trailers(
         Invocation::Help => {
             print!("{USAGE}");
             io::stdout().flush()?;
-            return Err(GitError::Exit(129));
+            return Err(crate::cli_exit(129));
         }
     };
 
@@ -128,7 +128,7 @@ pub(crate) fn cmd_interpret_trailers(
         eprintln!("fatal: --trailer with --only-input does not make sense");
         eprintln!();
         eprint!("{USAGE}");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
 
     if options.files.is_empty() {
@@ -137,7 +137,7 @@ pub(crate) fn cmd_interpret_trailers(
         // editing")`, exit 128.
         if options.in_place {
             eprintln!("fatal: no input file given for in-place editing");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         // No file operands: read the single message from stdin and stream the
         // result to stdout.
@@ -163,7 +163,7 @@ pub(crate) fn cmd_interpret_trailers(
                     "fatal: could not read input file '{file}': {}",
                     io_reason(&err)
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         };
         let text = String::from_utf8_lossy(&bytes).into_owned();
@@ -262,7 +262,7 @@ fn io_reason(err: &std::io::Error) -> String {
 // ---------------------------------------------------------------------------
 
 /// Parse argv into [`Options`]. On an option error this prints git's diagnostic
-/// to stderr and returns `Err(GitError::Exit(129))`; `-h`/`--help` yields
+/// to stderr and returns `Err(error) if crate::cli_reported_status(&error) == Some(129)`; `-h`/`--help` yields
 /// [`Invocation::Help`].
 fn parse_args(args: &[String], config: Option<&GitConfig>) -> Result<Invocation> {
     // Seed defaults from configuration (best-effort) before applying argv.
@@ -337,17 +337,17 @@ fn parse_args(args: &[String], config: Option<&GitConfig>) -> Result<Invocation>
                         Some(w) => cur_where = Some(w),
                         // git's enum callbacks fail silently here: exit 129 with
                         // no diagnostic on either stream.
-                        None => return Err(GitError::Exit(129)),
+                        None => return Err(crate::cli_exit(129)),
                     }
                 } else if let Some(value) = match_value_option(args, &mut idx, "--if-exists")? {
                     match parse_if_exists(&value) {
                         Some(v) => cur_if_exists = Some(v),
-                        None => return Err(GitError::Exit(129)),
+                        None => return Err(crate::cli_exit(129)),
                     }
                 } else if let Some(value) = match_value_option(args, &mut idx, "--if-missing")? {
                     match parse_if_missing(&value) {
                         Some(v) => cur_if_missing = Some(v),
-                        None => return Err(GitError::Exit(129)),
+                        None => return Err(crate::cli_exit(129)),
                     }
                 } else if arg == "--no-where" {
                     cur_where = None;
@@ -393,7 +393,7 @@ fn match_value_option(args: &[String], idx: &mut usize, name: &str) -> Result<Op
                     "error: option `{}' requires a value",
                     name.trim_start_matches('-')
                 );
-                Err(GitError::Exit(129))
+                Err(crate::cli_exit(129))
             }
         }
     } else if let Some(value) = arg.strip_prefix(&format!("{name}=")) {
@@ -414,7 +414,7 @@ fn unknown_option(name: &str, is_switch: bool) -> Result<Invocation> {
         eprintln!("error: unknown option `{name}'");
     }
     eprint!("{USAGE}");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 /// Parse a placement value. git's `trailer_set_where` compares with `strcasecmp`,

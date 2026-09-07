@@ -230,9 +230,7 @@ fn discover_ancestors_with_device(
     let absolute = if start.is_absolute() {
         start.to_path_buf()
     } else {
-        env::current_dir()
-            .map_err(|err| GitError::Io(err.to_string()))?
-            .join(start)
+        env::current_dir().map_err(GitError::from)?.join(start)
     };
     let start_device = (!options.across_filesystem)
         .then(|| device_of(&absolute))
@@ -296,7 +294,7 @@ fn resolve_candidate(
             return Ok(None);
         }
         let target = if canonicalize_gitfile {
-            fs::canonicalize(target).map_err(|err| GitError::Io(err.to_string()))?
+            fs::canonicalize(target).map_err(GitError::from)?
         } else {
             target
         };
@@ -306,7 +304,7 @@ fn resolve_candidate(
     } else {
         return Ok(None);
     };
-    let common_dir = sley_formats::repository_common_dir(&git_dir, false)?;
+    let common_dir = crate::repository_common_dir(&git_dir, false)?;
     let (worktree, bare) = match kind {
         CandidateKind::Worktree => (path.parent().map(Path::to_path_buf), false),
         CandidateKind::Bare | CandidateKind::Exact => {
@@ -412,7 +410,7 @@ pub fn resolve_explicit_git_dir(start: &Path, git_dir: &Path) -> Result<PathBuf>
         && let Some(target) = read_gitdir_link(&resolved)?
         && is_git_dir(&target)
     {
-        return fs::canonicalize(target).map_err(|err| GitError::Io(err.to_string()));
+        return fs::canonicalize(target).map_err(GitError::from);
     }
     Ok(resolved)
 }
@@ -686,29 +684,13 @@ mod tests {
         options.across_filesystem = true;
         let outer = discover_repository_with_device(&start, options, simulated_device)
             .expect("unbounded discovery reaches outer repository");
-        let unbounded_paths =
-            crate::untracked_paths(temp.path(), outer.git_dir(), sley_core::ObjectFormat::Sha1)
-                .expect("walk outer worktree");
-        assert!(
-            unbounded_paths.contains(&b"sibling/outside.txt".to_vec()),
-            "fixture must prove an unbounded discovery includes the outer sibling"
-        );
-
+        assert_eq!(outer.worktree(), Some(temp.path()));
+        assert!(sibling_file.starts_with(outer.worktree().expect("outer worktree")));
         options.across_filesystem = false;
         let bounded = discover_repository_with_device(&start, options, simulated_device);
-        let bounded_paths = match bounded {
-            Ok(found) => crate::untracked_paths(
-                found.worktree().expect("discovered worktree"),
-                found.git_dir(),
-                sley_core::ObjectFormat::Sha1,
-            )
-            .expect("walk discovered worktree"),
-            Err(GitError::NotFound(_)) => Vec::new(),
-            Err(err) => panic!("unexpected discovery error: {err}"),
-        };
         assert!(
-            !bounded_paths.contains(&b"sibling/outside.txt".to_vec()),
-            "filesystem-bound discovery must never report a sibling outside the mounted worktree"
+            matches!(bounded, Err(GitError::NotFound(_))),
+            "filesystem-bound discovery must not expose the outer worktree"
         );
     }
 

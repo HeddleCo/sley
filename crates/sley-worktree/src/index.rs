@@ -178,7 +178,9 @@ pub(crate) fn fresh_index_default_version(git_dir: &Path) -> u32 {
         return match raw.parse::<u32>() {
             Ok(version) if (2..=4).contains(&version) => version,
             _ => {
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "warning: GIT_INDEX_VERSION set, but the value is invalid.\nUsing version {INDEX_FORMAT_DEFAULT}"
                 );
                 INDEX_FORMAT_DEFAULT
@@ -200,7 +202,9 @@ pub(crate) fn fresh_index_default_version(git_dir: &Path) -> u32 {
         match raw.trim().parse::<i64>() {
             Ok(value) if (2..=4).contains(&value) => version = value as u32,
             _ => {
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "warning: index.version set, but the value is invalid.\nUsing version {INDEX_FORMAT_DEFAULT}"
                 );
                 return INDEX_FORMAT_DEFAULT;
@@ -290,8 +294,11 @@ pub fn update_index_paths_with_index(
     paths: &[PathBuf],
     options: UpdateIndexOptions,
 ) -> Result<UpdateIndexResult> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let ordered = ordered_paths_from_plain(paths, options);
     update_index_paths_impl(
+        precompose,
         worktree_root.as_ref(),
         git_dir.as_ref(),
         format,
@@ -361,6 +368,7 @@ pub fn update_index_ordered_paths_filtered_with_index(
     verbose: bool,
 ) -> Result<UpdateIndexResult> {
     update_index_paths_impl(
+        config.precompose_unicode(),
         worktree_root.as_ref(),
         git_dir.as_ref(),
         format,
@@ -438,6 +446,7 @@ pub fn update_index_paths_filtered_with_index(
 ) -> Result<UpdateIndexResult> {
     let ordered = ordered_paths_from_plain(paths, options);
     update_index_paths_impl(
+        config.precompose_unicode(),
         worktree_root.as_ref(),
         git_dir.as_ref(),
         format,
@@ -475,6 +484,7 @@ pub fn renormalize_index_paths_filtered(
     };
     let ordered = ordered_paths_from_plain(paths, options);
     update_index_paths_impl(
+        config.precompose_unicode(),
         worktree_root.as_ref(),
         git_dir,
         format,
@@ -611,6 +621,8 @@ pub fn collect_index_worktree_status_with_index(
     format: ObjectFormat,
     index: &Index,
 ) -> Result<Vec<ShortStatusEntry>> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
@@ -630,6 +642,7 @@ pub fn collect_index_worktree_status_with_index(
     )?;
     let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
     let untracked = status_untracked_paths_from_index(
+        precompose,
         worktree_root,
         git_dir,
         index,
@@ -1346,6 +1359,7 @@ pub(crate) enum IndexCleanMode {
 }
 
 pub(crate) fn update_index_paths_impl(
+    precompose: sley_core::PrecomposeUnicode,
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -1380,7 +1394,7 @@ pub(crate) fn update_index_paths_impl(
     // dirty in a huge checkout. Large batches still amortize the full matcher.
     let clean_filter = match clean_config {
         Some(_) if paths.len() >= 64 => Some(UpdateIndexCleanFilter::Full(
-            AttributeMatcher::from_worktree_root(worktree_root)?,
+            AttributeMatcher::from_worktree_root(precompose, worktree_root)?,
         )),
         Some(_) => Some(UpdateIndexCleanFilter::PathLocal),
         None => None,
@@ -1414,7 +1428,7 @@ pub(crate) fn update_index_paths_impl(
         let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
             GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
         })?;
-        let git_path = git_path_bytes(relative)?;
+        let git_path = git_path_bytes(precompose, relative)?;
         if index_sparse_dir_contains_path(&index, &git_path) {
             expand_sparse_index_directories(&mut index, &odb, format, |directory| {
                 git_path.starts_with(directory)
@@ -1495,14 +1509,14 @@ pub(crate) fn update_index_paths_impl(
                 continue;
             }
             print_update_index_path_error(&git_path, "does not exist and --remove not passed");
-            return Err(GitError::Exit(128));
+            return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
         };
         if !path_mode.add && index_entries_path_range(&index.entries, &git_path).is_empty() {
             print_update_index_path_error(
                 &git_path,
                 "cannot add to the index - missing --add option?",
             );
-            return Err(GitError::Exit(128));
+            return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
         }
         if metadata.is_dir() {
             if path_mode.remove
@@ -1532,8 +1546,12 @@ pub(crate) fn update_index_paths_impl(
             if let Some(submodule_format) = embedded_repo_object_format(&absolute)
                 && submodule_format != format
             {
-                eprintln!("fatal: cannot add a submodule of a different hash algorithm");
-                return Err(GitError::Exit(128));
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "fatal: cannot add a submodule of a different hash algorithm"
+                );
+                return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
             }
             let Some(head_oid) = sley_diff_merge::gitlink_head_oid(&absolute, format) else {
                 if has_dot_git {
@@ -1543,25 +1561,47 @@ pub(crate) fn update_index_paths_impl(
                         } else {
                             format!("{display}/")
                         };
-                        eprintln!("error: '{display_dir}' does not have a commit checked out");
-                        eprintln!("error: unable to index file '{display_dir}'");
-                        eprintln!("fatal: adding files failed");
+                        sley_core::diagnostic!(
+                            Stderr,
+                            true,
+                            "error: '{display_dir}' does not have a commit checked out"
+                        );
+                        sley_core::diagnostic!(
+                            Stderr,
+                            true,
+                            "error: unable to index file '{display_dir}'"
+                        );
+                        sley_core::diagnostic!(Stderr, true, "fatal: adding files failed");
                     } else {
-                        eprintln!("error: '{display}' does not have a commit checked out");
-                        eprintln!("fatal: Unable to process path {display}");
+                        sley_core::diagnostic!(
+                            Stderr,
+                            true,
+                            "error: '{display}' does not have a commit checked out"
+                        );
+                        sley_core::diagnostic!(
+                            Stderr,
+                            true,
+                            "fatal: Unable to process path {display}"
+                        );
                     }
                 } else {
-                    eprintln!("error: {display}: is a directory - add files inside instead");
-                    eprintln!("fatal: Unable to process path {display}");
+                    sley_core::diagnostic!(
+                        Stderr,
+                        true,
+                        "error: {display}: is a directory - add files inside instead"
+                    );
+                    sley_core::diagnostic!(Stderr, true, "fatal: Unable to process path {display}");
                 }
-                return Err(GitError::Exit(128));
+                return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
             };
             if path_chmod.is_some() {
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "fatal: git update-index: cannot chmod {}x '{display}'",
                     if path_chmod == Some(true) { '+' } else { '-' },
                 );
-                return Err(GitError::Exit(128));
+                return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
             }
             let mut entry = index_entry_from_metadata_with_filemode(
                 git_path.clone(),
@@ -1652,13 +1692,15 @@ pub(crate) fn update_index_paths_impl(
             // writes the blob first, reports the error, and still writes the
             // other index updates.
             if entry.mode & 0o170000 != 0o100000 {
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "fatal: git update-index: cannot chmod {}x '{}'",
                     if executable { '+' } else { '-' },
                     String::from_utf8_lossy(&git_path)
                 );
                 if !non_atomic_chmod_errors {
-                    return Err(GitError::Exit(128));
+                    return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
                 }
                 chmod_error = true;
             } else {
@@ -1698,14 +1740,16 @@ pub(crate) fn update_index_paths_impl(
         .unwrap_or(false);
     write_repository_index_ref_skip_hash(git_dir, format, &index, skip_hash)?;
     if verbose {
-        let mut stdout = std::io::stdout().lock();
+        let mut stdout = sley_core::diagnostics::DiagnosticWriter::new(
+            sley_core::diagnostics::DiagnosticStream::Stdout,
+        );
         for line in &reports {
             writeln!(stdout, "{line}")?;
         }
         stdout.flush()?;
     }
     if chmod_error {
-        return Err(GitError::Exit(128));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     Ok(UpdateIndexResult {
         entries: index.entries.len(),
@@ -1761,6 +1805,8 @@ pub fn refresh_index_paths_with_options(
     allow_unmerged: bool,
     really_refresh: bool,
 ) -> Result<UpdateIndexResult> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
@@ -1794,7 +1840,7 @@ pub fn refresh_index_paths_with_options(
             let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
                 GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
             })?;
-            git_path_bytes(relative)
+            git_path_bytes(precompose, relative)
         })
         .collect::<Result<Vec<_>>>()?;
     let selected_paths = selected_paths.into_iter().collect::<BTreeSet<_>>();
@@ -1955,7 +2001,7 @@ pub fn refresh_index_paths_with_options(
         write_repository_index_ref(git_dir, format, &index)?;
     }
     if needs_update && !quiet {
-        return Err(GitError::Exit(1));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     }
     Ok(UpdateIndexResult {
         entries: index.entries.len(),
@@ -2082,7 +2128,7 @@ pub(crate) fn refresh_all_index_paths_parallel(
         write_repository_index_ref(git_dir, format, &index)?;
     }
     if needs_update && !quiet {
-        return Err(GitError::Exit(1));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     }
     Ok(UpdateIndexResult {
         entries: index.entries.len(),
@@ -2097,10 +2143,12 @@ pub fn update_index_again(
     paths: &[PathBuf],
     options: UpdateIndexOptions,
 ) -> Result<UpdateIndexResult> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let (entry_count, again_paths) =
-        select_index_again_paths(worktree_root, git_dir, format, paths)?;
+        select_index_again_paths(precompose, worktree_root, git_dir, format, paths)?;
     if again_paths.is_empty() {
         return Ok(UpdateIndexResult {
             entries: entry_count,
@@ -2122,10 +2170,12 @@ pub fn set_index_skip_worktree_again(
     paths: &[PathBuf],
     skip_worktree: bool,
 ) -> Result<UpdateIndexResult> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let (entry_count, again_paths) =
-        select_index_again_paths(worktree_root, git_dir, format, paths)?;
+        select_index_again_paths(precompose, worktree_root, git_dir, format, paths)?;
     if again_paths.is_empty() {
         return Ok(UpdateIndexResult {
             entries: entry_count,
@@ -2136,6 +2186,7 @@ pub fn set_index_skip_worktree_again(
 }
 
 fn select_index_again_paths(
+    precompose: sley_core::PrecomposeUnicode,
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -2154,7 +2205,7 @@ fn select_index_again_paths(
     // no observable full-index transition.
     expand_sparse_index_in_memory(&mut index, &db, format)?;
     let head_entries = head_tree_entries(git_dir, format, &db)?;
-    let selected_paths = selected_git_paths(worktree_root, paths)?;
+    let selected_paths = selected_git_paths(precompose, worktree_root, paths)?;
     let mut again_paths = Vec::new();
     for entry in &index.entries {
         if index_entry_stage(entry) != 0 {
@@ -2182,6 +2233,8 @@ pub fn set_index_assume_unchanged_paths(
     paths: &[PathBuf],
     assume_unchanged: bool,
 ) -> Result<UpdateIndexResult> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
@@ -2211,7 +2264,7 @@ pub fn set_index_assume_unchanged_paths(
             let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
                 GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
             })?;
-            git_path_bytes(relative)
+            git_path_bytes(precompose, relative)
         })
         .collect::<Result<Vec<_>>>()?;
     for path in selected_paths {
@@ -2238,6 +2291,7 @@ pub fn set_index_assume_unchanged_paths(
 }
 
 pub(crate) fn selected_git_paths(
+    precompose: sley_core::PrecomposeUnicode,
     worktree_root: &Path,
     paths: &[PathBuf],
 ) -> Result<BTreeSet<Vec<u8>>> {
@@ -2252,7 +2306,7 @@ pub(crate) fn selected_git_paths(
             let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
                 GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
             })?;
-            git_path_bytes(relative)
+            git_path_bytes(precompose, relative)
         })
         .collect()
 }
@@ -2270,6 +2324,8 @@ pub fn set_index_skip_worktree_paths(
     paths: &[PathBuf],
     skip_worktree: bool,
 ) -> Result<UpdateIndexResult> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
@@ -2299,7 +2355,7 @@ pub fn set_index_skip_worktree_paths(
             let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
                 GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
             })?;
-            git_path_bytes(relative)
+            git_path_bytes(precompose, relative)
         })
         .collect::<Result<Vec<_>>>()?;
     for path in selected_paths {
@@ -2336,6 +2392,8 @@ pub fn set_index_fsmonitor_valid_paths(
     paths: &[PathBuf],
     _fsmonitor_valid: bool,
 ) -> Result<UpdateIndexResult> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
@@ -2360,16 +2418,18 @@ pub fn set_index_fsmonitor_valid_paths(
             let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
                 GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
             })?;
-            git_path_bytes(relative)
+            git_path_bytes(precompose, relative)
         })
         .collect::<Result<Vec<_>>>()?;
     for path in selected_paths {
         if !index.entries.iter().any(|entry| entry.path == path) {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "fatal: Unable to mark file {}",
                 String::from_utf8_lossy(&path)
             );
-            return Err(GitError::Exit(128));
+            return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
         }
     }
     Ok(UpdateIndexResult {
@@ -2405,7 +2465,11 @@ pub fn set_index_version(
     // requested version equals the current one ("was 4, set to 4").
     let previous = index.version;
     if verbose {
-        println!("index-version: was {previous}, set to {version}");
+        sley_core::diagnostic!(
+            Stdout,
+            true,
+            "index-version: was {previous}, set to {version}"
+        );
     }
     index.version = version;
     normalize_index_version_for_extended_flags(&mut index);
@@ -2532,11 +2596,22 @@ pub fn refresh_untracked_cache_after_status(
     let old_cache = index.untracked_cache(format).ok().flatten();
     let ident = untracked_cache_ident(worktree_root);
     if old_cache.as_ref().is_some_and(|cache| cache.ident != ident) {
-        eprintln!("warning: untracked cache is disabled on this system or location");
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "warning: untracked cache is disabled on this system or location"
+        );
         emit_untracked_cache_bypass_trace();
         return Ok(());
     }
-    let cache = build_untracked_cache(worktree_root, git_dir, format, &index, untracked_mode)?;
+    let cache = build_untracked_cache(
+        config.precompose_unicode(),
+        worktree_root,
+        git_dir,
+        format,
+        &index,
+        untracked_mode,
+    )?;
     emit_untracked_cache_trace(old_cache.as_ref(), &cache);
     index.set_untracked_cache(format, Some(&cache))?;
     write_repository_index_ref(git_dir, format, &index)?;
@@ -3852,9 +3927,17 @@ pub fn update_index_cacheinfo_with_options(
                 .any(|existing| existing.path == cacheinfo.path)
         {
             let path = String::from_utf8_lossy(&cacheinfo.path);
-            eprintln!("error: {path}: cannot add to the index - missing --add option?");
-            eprintln!("fatal: git update-index: --cacheinfo cannot add {path}");
-            return Err(GitError::Exit(128));
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "error: {path}: cannot add to the index - missing --add option?"
+            );
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "fatal: git update-index: --cacheinfo cannot add {path}"
+            );
+            return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
         }
         if !options.replace
             && index.entries.iter().any(|existing| {
@@ -3862,10 +3945,22 @@ pub fn update_index_cacheinfo_with_options(
             })
         {
             let path = String::from_utf8_lossy(&cacheinfo.path);
-            eprintln!("error: '{path}' appears as both a file and as a directory");
-            eprintln!("error: {path}: cannot add to the index - missing --add option?");
-            eprintln!("fatal: git update-index: --cacheinfo cannot add {path}");
-            return Err(GitError::Exit(128));
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "error: '{path}' appears as both a file and as a directory"
+            );
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "error: {path}: cannot add to the index - missing --add option?"
+            );
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "fatal: git update-index: --cacheinfo cannot add {path}"
+            );
+            return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
         }
         let flags = index_flags(cacheinfo.path.len(), cacheinfo.stage);
         let entry = IndexEntry {
@@ -3917,11 +4012,13 @@ pub fn update_index_cacheinfo_with_options(
         if options.verbose {
             flush_update_index_reports(&reports)?;
         }
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "error: cache entry has null sha1: {}",
             String::from_utf8_lossy(&entry.path)
         );
-        return Err(GitError::Exit(128));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     if !untracked_cache_invalidation_paths.is_empty() {
         index.extensions = index_extensions_without_cache_tree(&index.extensions);
@@ -3952,7 +4049,9 @@ fn index_paths_have_directory_file_conflict(left: &[u8], right: &[u8]) -> bool {
 }
 
 pub(crate) fn flush_update_index_reports(reports: &[String]) -> Result<()> {
-    let mut stdout = std::io::stdout().lock();
+    let mut stdout = sley_core::diagnostics::DiagnosticWriter::new(
+        sley_core::diagnostics::DiagnosticStream::Stdout,
+    );
     for line in reports {
         writeln!(stdout, "{line}")?;
     }
@@ -4082,13 +4181,13 @@ pub(crate) fn index_entry_skip_worktree(entry: &IndexEntry) -> bool {
 
 pub(crate) fn print_update_index_path_error(path: &[u8], message: &str) {
     let path = String::from_utf8_lossy(path);
-    eprintln!("error: {path}: {message}");
-    eprintln!("fatal: Unable to process path {path}");
+    sley_core::diagnostic!(Stderr, true, "error: {path}: {message}");
+    sley_core::diagnostic!(Stderr, true, "fatal: Unable to process path {path}");
 }
 
 pub(crate) fn print_update_index_needs_update(path: &[u8]) {
     let path = String::from_utf8_lossy(path);
-    println!("{path}: needs update");
+    sley_core::diagnostic!(Stdout, true, "{path}: needs update");
 }
 
 pub fn write_tree_from_index(git_dir: impl AsRef<Path>, format: ObjectFormat) -> Result<ObjectId> {
@@ -4354,11 +4453,13 @@ where
         });
     }
     if prefixed.is_empty() {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "fatal: git-write-tree: prefix {} not found",
             String::from_utf8_lossy(prefix)
         );
-        return Err(GitError::Exit(128));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     Ok(prefixed)
 }
@@ -4403,14 +4504,16 @@ where
         {
             let oid = entry.write_tree_oid();
             if !missing_ok && !checker.contains(&oid)? {
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "error: invalid object {:o} {} for '{}'",
                     SPARSE_DIR_MODE,
                     oid,
                     String::from_utf8_lossy(path)
                 );
-                eprintln!("fatal: git-write-tree: error building trees");
-                return Err(GitError::Exit(128));
+                sley_core::diagnostic!(Stderr, true, "fatal: git-write-tree: error building trees");
+                return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
             }
             tree_entries.push(TreeEntry {
                 mode: SPARSE_DIR_MODE,
@@ -4492,14 +4595,16 @@ where
         let mode = entry.write_tree_mode();
         let oid = entry.write_tree_oid();
         if !missing_ok && !sley_index::is_gitlink(mode) && !checker.contains(&oid)? {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "error: invalid object {:o} {} for '{}'",
                 mode,
                 oid,
                 String::from_utf8_lossy(path)
             );
-            eprintln!("fatal: git-write-tree: error building trees");
-            return Err(GitError::Exit(128));
+            sley_core::diagnostic!(Stderr, true, "fatal: git-write-tree: error building trees");
+            return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
         }
         tree_entries.push(TreeEntry {
             mode,

@@ -73,7 +73,7 @@ pub(crate) fn cmd_mktag(cli_session: &session::CliSession, args: &[String]) -> R
         MktagInvocation::Help => {
             print!("{MKTAG_USAGE}");
             io::stdout().flush()?;
-            return Err(GitError::Exit(129));
+            return Err(crate::cli_exit(129));
         }
     };
 
@@ -98,12 +98,12 @@ pub(crate) fn cmd_mktag(cli_session: &session::CliSession, args: &[String]) -> R
     let parsed = fsck_tag(format, &payload, &mut reporter);
     if reporter.is_fatal() {
         eprintln!("{FSCK_FATAL_TEXT}");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     // A non-fatal fsck guarantees the structural headers parsed; the explicit
     // guard keeps the contract clear without an unwrap.
     let Some(parsed) = parsed else {
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
 
     // The tagged object must exist and match the declared type. These checks are
@@ -749,7 +749,7 @@ fn verify_tagged_object(
         Ok(object) => object,
         Err(_) => {
             eprintln!("fatal: could not read tagged object '{}'", parsed.object_id);
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     };
     if object.object_type != parsed.declared_type {
@@ -759,7 +759,7 @@ fn verify_tagged_object(
             parsed.declared_type.as_str(),
             object.object_type.as_str()
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(())
 }
@@ -768,26 +768,26 @@ fn verify_tagged_object(
 /// contents when discovery fails. Exit 128.
 fn mktag_not_a_repository() -> Result<()> {
     eprintln!("fatal: not a git repository (or any of the parent directories): .git");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn mktag_unknown_option_error(option: &str) -> Result<MktagInvocation> {
     eprintln!("error: unknown option `{option}'");
     eprint!("{MKTAG_USAGE}");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn mktag_unknown_switch_error(switch: char) -> Result<MktagInvocation> {
     eprintln!("error: unknown switch `{switch}'");
     eprint!("{MKTAG_USAGE}");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn mktag_option_takes_no_value_error(option: &str) -> Result<MktagInvocation> {
     // git's parse-options prints only the error for a "takes no value" rejection,
     // without the usage block (unlike the unknown-option/switch errors above).
     eprintln!("error: option `{option}' takes no value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 /// The trailing fatal line printed after any fsck problem that aborts `mktag`.
@@ -905,7 +905,7 @@ mod tests {
     #[test]
     fn unknown_long_option_is_exit_129() {
         match parse_mktag_args(&["--bogus".to_string()]) {
-            Err(GitError::Exit(129)) => {}
+            Err(error) if crate::cli_reported_status(&error) == Some(129) => {}
             other => panic!("expected exit 129, got {other:?}"),
         }
     }
@@ -913,7 +913,7 @@ mod tests {
     #[test]
     fn unknown_short_switch_is_exit_129() {
         match parse_mktag_args(&["-z".to_string()]) {
-            Err(GitError::Exit(129)) => {}
+            Err(error) if crate::cli_reported_status(&error) == Some(129) => {}
             other => panic!("expected exit 129, got {other:?}"),
         }
     }
@@ -921,7 +921,7 @@ mod tests {
     #[test]
     fn strict_with_value_is_exit_129() {
         match parse_mktag_args(&["--strict=1".to_string()]) {
-            Err(GitError::Exit(129)) => {}
+            Err(error) if crate::cli_reported_status(&error) == Some(129) => {}
             other => panic!("expected exit 129, got {other:?}"),
         }
     }

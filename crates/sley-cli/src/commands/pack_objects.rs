@@ -18,7 +18,6 @@
 //! reuse exactly like upstream.
 #![allow(clippy::expect_used)]
 
-use sley::plumbing::{sley_config, sley_core, sley_odb, sley_rev};
 use std::collections::BTreeMap;
 use std::io::BufRead;
 use std::io::IsTerminal;
@@ -26,7 +25,7 @@ use std::sync::Arc;
 
 use crate::*;
 use sley::PackWriteOptions;
-use sley::plumbing::sley_pack::{PackInput, PackReverseIndex, pack_order_index_positions};
+use sley_pack::{PackInput, PackReverseIndex, pack_order_index_positions};
 
 struct PackObjectsOptions {
     base_name: Option<String>,
@@ -207,11 +206,11 @@ pub(crate) fn cmd_pack_objects(
             }
             value if !saw_dashdash && value.starts_with("--missing=") => {
                 eprintln!("fatal: invalid value for --missing");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             "--stdin" if !saw_dashdash => {
                 eprintln!("fatal: disallowed abbreviated or ambiguous option 'stdin'");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             "--stdin-packs" if !saw_dashdash => options.stdin_packs = true,
             value if !saw_dashdash && value.starts_with("--stdin-packs=") => {
@@ -223,7 +222,7 @@ pub(crate) fn cmd_pack_objects(
                     options.stdin_packs_follow = true;
                 } else {
                     eprintln!("fatal: invalid value for 'stdin-packs': '{mode}'");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
             }
             "--exclude-promisor-objects" if !saw_dashdash => {
@@ -290,7 +289,7 @@ pub(crate) fn cmd_pack_objects(
                 let value = &value["--name-hash-version=".len()..];
                 options.name_hash_version = Some(value.parse::<i32>().map_err(|_| {
                     eprintln!("fatal: invalid --name-hash-version option: {value}");
-                    GitError::Exit(128)
+                    crate::cli_exit(128)
                 })?);
             }
             "--threads" | "--window" | "--depth" | "--compression" | "--window-memory"
@@ -358,7 +357,7 @@ pub(crate) fn cmd_pack_objects(
     }
     if options.thin && !options.stdout_mode {
         eprintln!("fatal: --thin cannot be used to build an indexable pack");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     validate_pack_objects_options(&options)?;
 
@@ -401,6 +400,7 @@ pub(crate) fn cmd_pack_objects(
         (oids, objects, Vec::new())
     } else if traversal {
         collect_traversal_objects(
+            &cli_session.remote_policy,
             &git_dir,
             &common_git_dir,
             &database,
@@ -414,6 +414,7 @@ pub(crate) fn cmd_pack_objects(
         let mut objects = Vec::with_capacity(oids.len());
         for oid in &oids {
             match crate::read_object_maybe_prefetch_promisor(
+                &cli_session.remote_policy,
                 &database,
                 oid,
                 cli_session.lazy_fetch(),
@@ -421,7 +422,7 @@ pub(crate) fn cmd_pack_objects(
                 Ok(object) => objects.push(object),
                 Err(GitError::NotFound(_)) => {
                     eprintln!("fatal: unable to read {oid}");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 Err(err) => return Err(err),
             }
@@ -594,11 +595,11 @@ fn pack_objects_write_options(git_dir: &Path) -> Result<PackWriteOptions> {
 fn parse_pack_size_limit_arg(value: &str) -> Result<u64> {
     let Some(parsed) = sley_config::parse_config_int(value) else {
         eprintln!("fatal: failed to parse --max-pack-size value '{value}'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
     if parsed < 0 {
         eprintln!("fatal: failed to parse --max-pack-size value '{value}'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(parsed as u64)
 }
@@ -619,7 +620,7 @@ fn pack_objects_pack_size_limit(
     }
     if stdout_mode && arg_limit.is_some() {
         eprintln!("fatal: --max-pack-size cannot be used to build a pack for transfer");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if let Some(size) = limit
         && size < 1024 * 1024
@@ -793,11 +794,11 @@ fn validate_pack_objects_options(options: &PackObjectsOptions) -> Result<()> {
         // die_for_incompatible_opt2 + "cannot use internal rev list").
         if options.object_filter != PackObjectFilter::None {
             eprintln!("fatal: options '--stdin-packs' and '--filter' cannot be used together");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if options.revs || options.all {
             eprintln!("fatal: cannot use internal rev list with --stdin-packs");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     // name-hash-version is accepted and range-checked only: the pack writer
@@ -809,7 +810,7 @@ fn validate_pack_objects_options(options: &PackObjectsOptions) -> Result<()> {
     if let Some(version) = options.name_hash_version {
         if version != -1 && !(1..=2).contains(&version) {
             eprintln!("fatal: invalid --name-hash-version option: {version}");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if options.write_bitmap_index && version != 1 && !options.stdout_mode {
             eprintln!("warning: currently, --write-bitmap-index requires --name-hash-version=1");
@@ -823,7 +824,7 @@ fn validate_pack_objects_options(options: &PackObjectsOptions) -> Result<()> {
 /// pack-objects; callers that need it must use `repack -A` (in-process).
 fn reject_unsupported_unpack_unreachable() -> Result<()> {
     eprintln!("fatal: pack-objects --unpack-unreachable is not supported; use `git repack -A`");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 /// `kind` bitflags for a pack named on `--stdin-packs` input.
@@ -961,7 +962,7 @@ fn collect_stdin_packs_objects(
     if !missing.is_empty() {
         missing.sort();
         eprintln!("fatal: could not find pack '{}'", missing[0]);
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     if options.exclude_promisor_objects {
@@ -978,7 +979,7 @@ fn collect_stdin_packs_objects(
                     "fatal: packfile {} is a promisor but --exclude-promisor-objects was given",
                     pack.pack_path.display()
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
     }
@@ -1122,7 +1123,7 @@ fn collect_stdin_packs_objects(
             Ok(object) => objects.push(object),
             Err(GitError::NotFound(_)) => {
                 eprintln!("fatal: unable to read {oid}");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             Err(err) => return Err(err),
         }
@@ -1310,6 +1311,7 @@ fn include_tags_for_packed_objects(
 /// Returns the objects to encode fresh (oids + bodies) and the optional
 /// verbatim reuse (whose objects are excluded from the fresh list).
 fn collect_traversal_objects(
+    policy: &sley_remote::RemotePolicy,
     git_dir: &Path,
     common_git_dir: &Path,
     database: &FileObjectDatabase,
@@ -1385,7 +1387,7 @@ fn collect_traversal_objects(
             }
             if rev.starts_with('-') {
                 eprintln!("fatal: invalid option '{rev}' in --stdin mode");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             if let Some(range) = sley_rev::parse_revision_range(rev) {
                 match range {
@@ -1395,7 +1397,7 @@ fn collect_traversal_objects(
                                 Ok(oid) => oid,
                                 Err(_) => {
                                     eprintln!("fatal: bad revision '{start}'");
-                                    return Err(GitError::Exit(128));
+                                    return Err(crate::cli_exit(128));
                                 }
                             };
                         let end_oid = match resolve_revision(git_dir, format, &end, replace_objects)
@@ -1403,7 +1405,7 @@ fn collect_traversal_objects(
                             Ok(oid) => oid,
                             Err(_) => {
                                 eprintln!("fatal: bad revision '{end}'");
-                                return Err(GitError::Exit(128));
+                                return Err(crate::cli_exit(128));
                             }
                         };
                         // A..B is always (have start, want end); --not does not
@@ -1413,7 +1415,7 @@ fn collect_traversal_objects(
                     }
                     sley_rev::RevisionRange::Symmetric { .. } => {
                         eprintln!("fatal: bad revision '{rev}'");
-                        return Err(GitError::Exit(128));
+                        return Err(crate::cli_exit(128));
                     }
                 }
                 continue;
@@ -1428,7 +1430,7 @@ fn collect_traversal_objects(
                 Ok(oid) => oid,
                 Err(_) => {
                     eprintln!("fatal: bad revision '{rev}'");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
             };
             if negative {
@@ -1463,7 +1465,7 @@ fn collect_traversal_objects(
             lazy_fetch,
         };
         for oid in wants.iter().rev() {
-            walk.visit_oid(*oid, Vec::new(), 0, true, &mut traversal_state)?;
+            walk.visit_oid(policy, *oid, Vec::new(), 0, true, &mut traversal_state)?;
         }
     }
     let FilteredPackTraversalState {
@@ -1570,12 +1572,12 @@ impl PackObjectFilter {
         }
         if spec.starts_with("sparse:path=") {
             eprintln!("fatal: sparse:path filters support has been dropped");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if let Some(value) = spec.strip_prefix("combine:") {
             if value.is_empty() {
                 eprintln!("fatal: expected something after combine:");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             let mut filters = Vec::new();
             for raw in value.split('+') {
@@ -1585,7 +1587,7 @@ impl PackObjectFilter {
             return Ok(Self::Combine(filters));
         }
         eprintln!("fatal: invalid filter-spec '{spec}'");
-        Err(GitError::Exit(128))
+        Err(crate::cli_exit(128))
     }
 
     fn combine_with(self, other: Self) -> Self {
@@ -1620,7 +1622,7 @@ impl PackObjectFilter {
                 let object = database.read_object(&oid)?;
                 if object.object_type != ObjectType::Blob {
                     eprintln!("fatal: expected blob for sparse:oid filter");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 Ok(Self::Sparse(
                     object
@@ -1707,6 +1709,7 @@ struct FilteredPackTraversalState {
 impl FilteredPackTraversal<'_> {
     fn visit_oid(
         &self,
+        policy: &sley_remote::RemotePolicy,
         oid: ObjectId,
         path: Vec<u8>,
         depth: usize,
@@ -1716,18 +1719,25 @@ impl FilteredPackTraversal<'_> {
         if self.excluded.contains(&oid) {
             return Ok(());
         }
-        let object =
-            crate::read_object_maybe_prefetch_promisor(self.database, &oid, self.lazy_fetch)?;
+        let object = crate::read_object_maybe_prefetch_promisor(
+            policy,
+            self.database,
+            &oid,
+            self.lazy_fetch,
+        )?;
         match object.object_type {
-            ObjectType::Commit => self.visit_commit(oid, object, provided, state),
-            ObjectType::Tree => self.visit_tree(oid, object, path, depth, provided, state),
-            ObjectType::Tag => self.visit_tag(oid, object, provided, state),
-            ObjectType::Blob => self.visit_blob(oid, path, depth, provided, Some(object), state),
+            ObjectType::Commit => self.visit_commit(policy, oid, object, provided, state),
+            ObjectType::Tree => self.visit_tree(policy, oid, object, path, depth, provided, state),
+            ObjectType::Tag => self.visit_tag(policy, oid, object, provided, state),
+            ObjectType::Blob => {
+                self.visit_blob(policy, oid, path, depth, provided, Some(object), state)
+            }
         }
     }
 
     fn visit_commit(
         &self,
+        policy: &sley_remote::RemotePolicy,
         oid: ObjectId,
         object: Arc<EncodedObject>,
         provided: bool,
@@ -1746,15 +1756,16 @@ impl FilteredPackTraversal<'_> {
             return Ok(());
         }
         let commit = Commit::parse_ref(self.format, &object.body)?;
-        self.visit_tree_oid(commit.tree, Vec::new(), 0, false, state)?;
+        self.visit_tree_oid(policy, commit.tree, Vec::new(), 0, false, state)?;
         for parent in commit.parents {
-            self.visit_oid(parent, Vec::new(), 0, false, state)?;
+            self.visit_oid(policy, parent, Vec::new(), 0, false, state)?;
         }
         Ok(())
     }
 
     fn visit_tag(
         &self,
+        policy: &sley_remote::RemotePolicy,
         oid: ObjectId,
         object: Arc<EncodedObject>,
         provided: bool,
@@ -1769,11 +1780,12 @@ impl FilteredPackTraversal<'_> {
             return Ok(());
         }
         let tag = Tag::parse_ref(self.format, &object.body)?;
-        self.visit_oid(tag.object, Vec::new(), 0, false, state)
+        self.visit_oid(policy, tag.object, Vec::new(), 0, false, state)
     }
 
     fn visit_tree_oid(
         &self,
+        policy: &sley_remote::RemotePolicy,
         oid: ObjectId,
         path: Vec<u8>,
         depth: usize,
@@ -1784,6 +1796,7 @@ impl FilteredPackTraversal<'_> {
             return Ok(());
         }
         let object = match crate::read_object_maybe_prefetch_promisor(
+            policy,
             self.database,
             &oid,
             self.lazy_fetch,
@@ -1791,15 +1804,16 @@ impl FilteredPackTraversal<'_> {
             Ok(object) => object,
             Err(GitError::NotFound(_)) => {
                 eprintln!("fatal: bad tree object {oid}");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             Err(err) => return Err(err),
         };
-        self.visit_tree(oid, object, path, depth, provided, state)
+        self.visit_tree(policy, oid, object, path, depth, provided, state)
     }
 
     fn visit_tree(
         &self,
+        policy: &sley_remote::RemotePolicy,
         oid: ObjectId,
         object: Arc<EncodedObject>,
         path: Vec<u8>,
@@ -1832,9 +1846,9 @@ impl FilteredPackTraversal<'_> {
             let entry_path = pack_filter_join_path(&path, entry.name);
             let entry_type = tree_entry_object_type(entry.mode);
             if entry_type == ObjectType::Tree {
-                self.visit_tree_oid(entry.oid, entry_path, depth + 1, false, state)?;
+                self.visit_tree_oid(policy, entry.oid, entry_path, depth + 1, false, state)?;
             } else {
-                self.visit_blob(entry.oid, entry_path, depth + 1, false, None, state)?;
+                self.visit_blob(policy, entry.oid, entry_path, depth + 1, false, None, state)?;
             }
         }
         Ok(())
@@ -1842,6 +1856,7 @@ impl FilteredPackTraversal<'_> {
 
     fn visit_blob(
         &self,
+        policy: &sley_remote::RemotePolicy,
         oid: ObjectId,
         path: Vec<u8>,
         depth: usize,
@@ -1860,6 +1875,7 @@ impl FilteredPackTraversal<'_> {
             match object {
                 Some(ref object) => Some(object.body.len()),
                 None => match crate::read_object_maybe_prefetch_promisor(
+                    policy,
                     self.database,
                     &oid,
                     self.lazy_fetch,
@@ -1888,6 +1904,7 @@ impl FilteredPackTraversal<'_> {
             let object = match object {
                 Some(object) => object,
                 None => match crate::read_object_maybe_prefetch_promisor(
+                    policy,
                     self.database,
                     &oid,
                     self.lazy_fetch,
@@ -1973,7 +1990,7 @@ fn pack_filter_decode_sub_filter(raw: &str) -> Result<String> {
                     "fatal: must escape char in sub-filter-spec: '{}'",
                     bytes[idx] as char
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             b'%' => {
                 let Some(high) = bytes
@@ -1981,14 +1998,14 @@ fn pack_filter_decode_sub_filter(raw: &str) -> Result<String> {
                     .and_then(|byte| (*byte as char).to_digit(16))
                 else {
                     eprintln!("fatal: invalid filter-spec");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 };
                 let Some(low) = bytes
                     .get(idx + 2)
                     .and_then(|byte| (*byte as char).to_digit(16))
                 else {
                     eprintln!("fatal: invalid filter-spec");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 };
                 out.push((high * 16 + low) as u8);
                 idx += 3;
@@ -2060,7 +2077,7 @@ fn pack_reuse_mode(git_dir: &Path) -> Result<PackReuseMode> {
                 Some(false) => PackReuseMode::None,
                 None => {
                     eprintln!("fatal: invalid pack.allowPackReuse value: '{value}'");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
             },
         };
@@ -2706,13 +2723,13 @@ fn pack_objects_garbage<T>(what: &str, line: &[u8]) -> Result<T> {
         "fatal: {what}, got garbage:\n {}\n",
         String::from_utf8_lossy(line)
     );
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn pack_objects_usage<T>() -> Result<T> {
     eprintln!("usage: git pack-objects --stdout [<options>] [< <ref-list> | < <object-list>]");
     eprintln!("   or: git pack-objects [<options>] <base-name> [< <ref-list> | < <object-list>]");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 /// Parse a `--index-version=<version>[,<offset>]` spec the way
@@ -2728,11 +2745,11 @@ fn parse_index_version_spec(spec: &str) -> Result<u32> {
         .unwrap_or(bytes.len());
     let version: u32 = spec[..digits_end].parse().map_err(|_| {
         eprintln!("fatal: bad index version '{spec}'");
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })?;
     if version > 2 {
         eprintln!("fatal: unsupported index version {spec}");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let mut rest = &spec[digits_end..];
     // `if (*c == ',' && c[1])` — only consume the offset when the comma is
@@ -2756,11 +2773,11 @@ fn parse_index_version_spec(spec: &str) -> Result<u32> {
     }
     if !rest.is_empty() {
         eprintln!("fatal: bad index version '{spec}'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if version != 1 && version != 2 {
         eprintln!("fatal: bad index version '{spec}'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(version)
 }
@@ -3220,7 +3237,7 @@ mod tests {
             assert!(
                 matches!(
                     validate_pack_objects_options(&options),
-                    Err(GitError::Exit(128))
+                    Err(error) if crate::cli_reported_status(&error) == Some(128)
                 ),
                 "version {version} should be rejected"
             );
@@ -3242,7 +3259,7 @@ mod tests {
     fn unpack_unreachable_is_rejected_not_silently_ignored() {
         assert!(matches!(
             reject_unsupported_unpack_unreachable(),
-            Err(GitError::Exit(128))
+            Err(error) if crate::cli_reported_status(&error) == Some(128)
         ));
     }
 }

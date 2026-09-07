@@ -20,7 +20,6 @@
 //! rendering to the unified diff path.
 #![allow(clippy::expect_used)]
 
-use sley::plumbing::{sley_core, sley_diff_merge, sley_object, sley_rev};
 // Glob the crate root for shared plumbing; see commands::stash for rationale.
 use crate::*;
 use sley_notes::{NotesRef, read_note_bytes};
@@ -472,6 +471,7 @@ impl sley_rev::format_patch::FormatPatchRevisionResolver for CliFormatPatchRevis
 }
 
 struct CliFormatPatchPatchIds<'a> {
+    policy: &'a sley_remote::RemotePolicy,
     objects: &'a FileObjectDatabase,
     format: ObjectFormat,
     lazy_fetch: bool,
@@ -494,6 +494,7 @@ impl sley_rev::format_patch::FormatPatchPatchId for CliFormatPatchPatchIds<'_> {
             None => ObjectId::empty_tree(self.format),
         };
         let diff = render_tree_to_tree_patch(
+            self.policy,
             self.objects,
             self.format,
             &parent_tree,
@@ -533,7 +534,7 @@ fn format_patch_plan_error(error: sley_rev::format_patch::FormatPatchPlanError) 
         }
         sley_rev::format_patch::FormatPatchPlanError::BaseNotAncestor { .. } => {
             eprintln!("fatal: base commit should be the ancestor of revision list");
-            GitError::Exit(128)
+            crate::cli_exit(128)
         }
         sley_rev::format_patch::FormatPatchPlanError::Engine(error) => error,
     }
@@ -556,7 +557,7 @@ pub(crate) fn cmd_format_patch(
         || (options.output.is_some() && options.output_directory.is_some())
     {
         eprintln!("fatal: multiple output options?");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     // Resolve diff path prefixes: `--no-prefix`/`--default-prefix` win over the
@@ -654,6 +655,7 @@ pub(crate) fn cmd_format_patch(
     };
     let mut revisions = CliFormatPatchRevisionResolver { repo: &repo };
     let mut patch_ids = CliFormatPatchPatchIds {
+        policy: &cli_session.remote_policy,
         objects: db,
         format,
         lazy_fetch: cli_session.lazy_fetch(),
@@ -754,7 +756,7 @@ pub(crate) fn cmd_format_patch(
                 "--range-diff"
             };
             eprintln!("fatal: {option} requires --cover-letter for multi-patch series");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         cover_letter = true;
     }
@@ -781,6 +783,7 @@ pub(crate) fn cmd_format_patch(
     let base_info = plan.base;
     let range_diff = match options.range_diff.as_deref() {
         Some(previous) => Some(commands::range_diff::render_format_patch_range_diff(
+            &cli_session.remote_policy,
             &repo,
             previous,
             &range_diff_setup_args,
@@ -793,6 +796,7 @@ pub(crate) fn cmd_format_patch(
     };
     let interdiff = match options.interdiff.as_deref() {
         Some(previous) => Some(render_format_patch_interdiff(
+            &cli_session.remote_policy,
             &repo,
             previous,
             &commits,
@@ -849,6 +853,7 @@ pub(crate) fn cmd_format_patch(
     // diffstat against the boundary commit. Only built when a cover is emitted.
     let cover = if cover_letter {
         Some(build_cover_letter(
+            &cli_session.remote_policy,
             &repo,
             &options,
             &resolved,
@@ -884,31 +889,34 @@ pub(crate) fn cmd_format_patch(
                     stdout.write_all(b"\n")?;
                 }
             }
-            let mut buffer = render_patch(RenderContext {
-                db,
-                format,
-                options: &options,
-                resolved: &resolved,
-                record,
-                diff_pathspec: diff_pathspec.as_ref(),
-                seq: start_number + idx,
-                last_number,
-                numbered,
-                signoff_line: signoff_line.as_deref(),
-                abbrev,
-                thread: patch_thread(idx),
-                encode_headers,
-                output_encoding: &output_encoding,
-                config,
-                git_dir,
-                notes_refs: &notes_refs,
-                range_diff: range_diff
-                    .as_deref()
-                    .filter(|_| count == 1 && !cover_letter),
-                interdiff: interdiff.as_deref().filter(|_| count == 1 && !cover_letter),
-                base_info: (idx == 0).then_some(base_info.as_ref()).flatten(),
-                lazy_fetch: cli_session.lazy_fetch(),
-            })?;
+            let mut buffer = render_patch(
+                &cli_session.remote_policy,
+                RenderContext {
+                    db,
+                    format,
+                    options: &options,
+                    resolved: &resolved,
+                    record,
+                    diff_pathspec: diff_pathspec.as_ref(),
+                    seq: start_number + idx,
+                    last_number,
+                    numbered,
+                    signoff_line: signoff_line.as_deref(),
+                    abbrev,
+                    thread: patch_thread(idx),
+                    encode_headers,
+                    output_encoding: &output_encoding,
+                    config,
+                    git_dir,
+                    notes_refs: &notes_refs,
+                    range_diff: range_diff
+                        .as_deref()
+                        .filter(|_| count == 1 && !cover_letter),
+                    interdiff: interdiff.as_deref().filter(|_| count == 1 && !cover_letter),
+                    base_info: (idx == 0).then_some(base_info.as_ref()).flatten(),
+                    lazy_fetch: cli_session.lazy_fetch(),
+                },
+            )?;
             if options.graph {
                 buffer =
                     format_patch_graph_prefix(&buffer, idx == 0, resolved.signature.as_deref());
@@ -933,31 +941,34 @@ pub(crate) fn cmd_format_patch(
                     stream.write_all(b"\n")?;
                 }
             }
-            let mut buffer = render_patch(RenderContext {
-                db,
-                format,
-                options: &options,
-                resolved: &resolved,
-                record,
-                diff_pathspec: diff_pathspec.as_ref(),
-                seq: start_number + idx,
-                last_number,
-                numbered,
-                signoff_line: signoff_line.as_deref(),
-                abbrev,
-                thread: patch_thread(idx),
-                encode_headers,
-                output_encoding: &output_encoding,
-                config,
-                git_dir,
-                notes_refs: &notes_refs,
-                range_diff: range_diff
-                    .as_deref()
-                    .filter(|_| count == 1 && !cover_letter),
-                interdiff: interdiff.as_deref().filter(|_| count == 1 && !cover_letter),
-                base_info: (idx == 0).then_some(base_info.as_ref()).flatten(),
-                lazy_fetch: cli_session.lazy_fetch(),
-            })?;
+            let mut buffer = render_patch(
+                &cli_session.remote_policy,
+                RenderContext {
+                    db,
+                    format,
+                    options: &options,
+                    resolved: &resolved,
+                    record,
+                    diff_pathspec: diff_pathspec.as_ref(),
+                    seq: start_number + idx,
+                    last_number,
+                    numbered,
+                    signoff_line: signoff_line.as_deref(),
+                    abbrev,
+                    thread: patch_thread(idx),
+                    encode_headers,
+                    output_encoding: &output_encoding,
+                    config,
+                    git_dir,
+                    notes_refs: &notes_refs,
+                    range_diff: range_diff
+                        .as_deref()
+                        .filter(|_| count == 1 && !cover_letter),
+                    interdiff: interdiff.as_deref().filter(|_| count == 1 && !cover_letter),
+                    base_info: (idx == 0).then_some(base_info.as_ref()).flatten(),
+                    lazy_fetch: cli_session.lazy_fetch(),
+                },
+            )?;
             if options.graph {
                 buffer =
                     format_patch_graph_prefix(&buffer, idx == 0, resolved.signature.as_deref());
@@ -1011,31 +1022,34 @@ pub(crate) fn cmd_format_patch(
     }
     for (idx, record) in commits.iter().enumerate() {
         let seq = start_number + idx;
-        let mut buffer = render_patch(RenderContext {
-            db,
-            format,
-            options: &options,
-            resolved: &resolved,
-            record,
-            diff_pathspec: diff_pathspec.as_ref(),
-            seq,
-            last_number,
-            numbered,
-            signoff_line: signoff_line.as_deref(),
-            abbrev,
-            thread: patch_thread(idx),
-            encode_headers,
-            output_encoding: &output_encoding,
-            config,
-            git_dir,
-            notes_refs: &notes_refs,
-            range_diff: range_diff
-                .as_deref()
-                .filter(|_| count == 1 && !cover_letter),
-            interdiff: interdiff.as_deref().filter(|_| count == 1 && !cover_letter),
-            base_info: (idx == 0).then_some(base_info.as_ref()).flatten(),
-            lazy_fetch: cli_session.lazy_fetch(),
-        })?;
+        let mut buffer = render_patch(
+            &cli_session.remote_policy,
+            RenderContext {
+                db,
+                format,
+                options: &options,
+                resolved: &resolved,
+                record,
+                diff_pathspec: diff_pathspec.as_ref(),
+                seq,
+                last_number,
+                numbered,
+                signoff_line: signoff_line.as_deref(),
+                abbrev,
+                thread: patch_thread(idx),
+                encode_headers,
+                output_encoding: &output_encoding,
+                config,
+                git_dir,
+                notes_refs: &notes_refs,
+                range_diff: range_diff
+                    .as_deref()
+                    .filter(|_| count == 1 && !cover_letter),
+                interdiff: interdiff.as_deref().filter(|_| count == 1 && !cover_letter),
+                base_info: (idx == 0).then_some(base_info.as_ref()).flatten(),
+                lazy_fetch: cli_session.lazy_fetch(),
+            },
+        )?;
         if options.graph {
             buffer = format_patch_graph_prefix(&buffer, idx == 0, resolved.signature.as_deref());
         }
@@ -1132,6 +1146,7 @@ fn resolve_cover_letter(options: &FormatPatchOptions, config: &GitConfig, count:
 /// cumulative diffstat against the boundary commit, and the signature trailer.
 #[allow(clippy::too_many_arguments)]
 fn build_cover_letter(
+    policy: &sley_remote::RemotePolicy,
     repo: &RepositoryContext,
     options: &FormatPatchOptions,
     resolved: &ResolvedFormat,
@@ -1230,7 +1245,7 @@ fn build_cover_letter(
             &head.commit.tree,
         )?;
         if options.stat {
-            write_patch_diffstat(&mut out, &entries, db, options, lazy_fetch)?;
+            write_patch_diffstat(policy, &mut out, &entries, db, options, lazy_fetch)?;
             for entry in &entries {
                 write_diff_summary_entry(&mut out, entry)?;
             }
@@ -1283,6 +1298,7 @@ fn write_range_diff_commentary(out: &mut Vec<u8>, options: &FormatPatchOptions, 
 }
 
 fn render_format_patch_interdiff(
+    remote_policy: &sley_remote::RemotePolicy,
     repo: &RepositoryContext,
     previous: &str,
     commits: &[sley_rev::CommitRecord],
@@ -1327,6 +1343,7 @@ fn render_format_patch_interdiff(
             &mut out,
             entry,
             format_patch_diff_options_with(
+                &crate::diff_lazy_fetch(remote_policy, lazy_fetch),
                 repo.objects(),
                 repo.format(),
                 policy.binary,
@@ -1334,7 +1351,6 @@ fn render_format_patch_interdiff(
                 &policy.dst_prefix,
                 policy.context_lines,
                 abbrev,
-                lazy_fetch,
             ),
         )?;
     }
@@ -1638,7 +1654,7 @@ fn write_commit_list_cover(
         write_commit_list_pretty(out, format, commits)?;
     } else {
         eprintln!("fatal: '{format}' is not a valid format string");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(())
 }
@@ -2334,7 +2350,7 @@ struct RenderContext<'a> {
 }
 
 /// Render one commit into a complete mbox patch byte buffer.
-fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
+fn render_patch(policy: &sley_remote::RemotePolicy, ctx: RenderContext<'_>) -> Result<Vec<u8>> {
     let RenderContext {
         db,
         format,
@@ -2506,7 +2522,7 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
             out.extend_from_slice(b"---\n");
             let notes = render_format_patch_notes(git_dir, format, notes_refs, &record.oid)?;
             out.extend_from_slice(&notes);
-            write_patch_diffstat(&mut out, &entries, db, options, lazy_fetch)?;
+            write_patch_diffstat(policy, &mut out, &entries, db, options, lazy_fetch)?;
             for entry in &entries {
                 write_diff_summary_entry(&mut out, entry)?;
             }
@@ -2526,7 +2542,13 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
             write_diff_patch_entry(
                 &mut out,
                 entry,
-                format_patch_diff_options(db, format, options, abbrev, lazy_fetch),
+                format_patch_diff_options(
+                    &crate::diff_lazy_fetch(policy, lazy_fetch),
+                    db,
+                    format,
+                    options,
+                    abbrev,
+                ),
             )?;
         }
     }
@@ -3270,7 +3292,7 @@ fn parse_format_noprefix_bool(value: &str) -> Result<bool> {
             eprintln!("fatal: bad boolean config value '{value}' for 'format.noprefix'");
             eprintln!("hint: 'format.noprefix' used to accept any value and treat that as 'true'.");
             eprintln!("hint: Now it only accepts boolean values, like what 'diff.noprefix' does.");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -3427,13 +3449,14 @@ fn is_title_char(byte: u8) -> bool {
 // routes through the unified diff helpers with format-patch's byte constraints.
 
 fn format_patch_diff_options<'a>(
+    lazy_adapter: &'a crate::diff_render::CliDiffLazyFetch,
     db: &'a FileObjectDatabase,
     format: ObjectFormat,
     options: &'a FormatPatchOptions,
     abbrev: usize,
-    lazy_fetch: bool,
 ) -> crate::DiffRenderOptions<'a> {
     format_patch_diff_options_with(
+        lazy_adapter,
         db,
         format,
         options.binary,
@@ -3441,12 +3464,12 @@ fn format_patch_diff_options<'a>(
         &options.dst_prefix,
         options.context_lines,
         abbrev,
-        lazy_fetch,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn format_patch_diff_options_with<'a>(
+    lazy_adapter: &'a crate::diff_render::CliDiffLazyFetch,
     db: &'a FileObjectDatabase,
     format: ObjectFormat,
     binary: bool,
@@ -3454,7 +3477,6 @@ fn format_patch_diff_options_with<'a>(
     dst_prefix: &'a str,
     context_lines: usize,
     abbrev: usize,
-    lazy_fetch: bool,
 ) -> crate::DiffRenderOptions<'a> {
     crate::DiffRenderOptions {
         line_indicators: sley_diff_merge::render::LineIndicators::default(),
@@ -3463,7 +3485,7 @@ fn format_patch_diff_options_with<'a>(
         anchors: &[],
         allow_textconv: false,
         db,
-        lazy_fetch: crate::diff_lazy_fetch(lazy_fetch),
+        lazy_fetch: lazy_adapter.as_option(),
         worktree_root: None,
         use_worktree_new: false,
         format,
@@ -3500,14 +3522,16 @@ const HUNK_CONTEXT: usize = 3;
 /// stat-width becomes `MAIL_DEFAULT_WRAP` exactly like `cmd_format_patch`,
 /// and the diff.stat*Width config is never consulted.
 fn write_patch_diffstat(
+    policy: &sley_remote::RemotePolicy,
     out: &mut Vec<u8>,
     entries: &[sley_diff_merge::NameStatusEntry],
     db: &FileObjectDatabase,
     options: &FormatPatchOptions,
     lazy_fetch: bool,
 ) -> Result<()> {
+    let lazy_fetch_adapter_1 = crate::diff_lazy_fetch(policy, lazy_fetch);
     let stat_entries =
-        collect_diff_stat_entries(entries, db, None, false, crate::diff_lazy_fetch(lazy_fetch))?;
+        collect_diff_stat_entries(entries, db, None, false, lazy_fetch_adapter_1.as_option())?;
     let mut widths = options.stat_widths;
     if widths.stat_width == 0 {
         // MAIL_DEFAULT_WRAP
@@ -3636,7 +3660,7 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
             value if let Some(mode) = value.strip_prefix("--ignore-submodules=") => {
                 if !matches!(mode, "" | "all" | "dirty" | "untracked" | "none") {
                     eprintln!("fatal: bad --ignore-submodules argument: {mode}");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
             }
             "--full-index" => options.full_index = true,
@@ -3927,7 +3951,7 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
                     "deep" => ThreadLevel::Deep,
                     other => {
                         eprintln!("fatal: Unknown value for --thread: {other}");
-                        return Err(GitError::Exit(128));
+                        return Err(crate::cli_exit(128));
                     }
                 });
             }
@@ -4009,7 +4033,7 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
             // (`builtin/log.c`: "--%s does not make sense").
             "--name-only" | "--name-status" | "--check" => {
                 eprintln!("fatal: {arg} does not make sense");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             value if value.starts_with('-') && value != "-" => {
                 return Err(GitError::Command(format!(
@@ -4029,7 +4053,7 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
         // stderr text byte-for-byte, so print it here rather than routing through
         // the generic `sley: command failed:` formatter.
         eprintln!("fatal: options '--subject-prefix/--rfc' and '-k' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(options)
 }
@@ -4061,7 +4085,7 @@ fn parse_cover_from_description(arg: &str) -> Result<CoverFromDescription> {
         "auto" => Ok(CoverFromDescription::Auto),
         other => {
             eprintln!("fatal: {other}: invalid cover from description mode");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }

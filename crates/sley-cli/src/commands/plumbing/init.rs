@@ -1,7 +1,6 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
 use crate::*;
-use sley::plumbing::sley_config;
 
 fn init_repo_is_implicitly_bare(
     cli_session: &crate::session::CliSession,
@@ -207,7 +206,7 @@ pub(crate) fn cmd_init(
         Some(branch) => {
             if check_refname_format(&format!("refs/heads/{branch}"), false).is_err() {
                 eprintln!("fatal: invalid initial branch name: '{branch}'");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             branch
         }
@@ -230,7 +229,7 @@ pub(crate) fn cmd_init(
                 Some(name) => {
                     if check_refname_format(&format!("refs/heads/{name}"), false).is_err() {
                         eprintln!("fatal: invalid branch name: init.defaultBranch = {name}");
-                        return Err(GitError::Exit(128));
+                        return Err(crate::cli_exit(128));
                     }
                     name
                 }
@@ -250,7 +249,7 @@ pub(crate) fn cmd_init(
             // init-db.c: `real_git_dir && is_bare_repository_cfg == 1` where the
             // `1` came from the `--bare` option.
             eprintln!("fatal: options '--bare' and '--separate-git-dir' cannot be used together");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         // init-db.c later sets `is_bare_repository_cfg = guess_repository_type(git_dir)`
         // when bare was not explicit, then rejects `--separate-git-dir` against an
@@ -258,7 +257,7 @@ pub(crate) fn cmd_init(
         // whose common repository is bare).
         if init_repo_is_implicitly_bare(cli_session, &cwd)? {
             eprintln!("fatal: --separate-git-dir incompatible with bare repository");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
 
@@ -273,7 +272,7 @@ pub(crate) fn cmd_init(
         eprintln!(
             "fatal: GIT_WORK_TREE (or --work-tree=<directory>) not allowed without specifying GIT_DIR (or --git-dir=<directory>)"
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let mut worktree = worktree;
@@ -370,7 +369,7 @@ pub(crate) fn cmd_init(
         init_config_git_dir.as_deref(),
     )?;
     let shared_repository = match shared_repository {
-        Some(value) => sley::plumbing::sley_formats::canonical_shared_repository_value(&value)?,
+        Some(value) => sley_formats::canonical_shared_repository_value(&value)?,
         None => None,
     };
     let template_dir = resolve_init_template_dir(
@@ -422,7 +421,7 @@ pub(crate) fn cmd_init(
         // and exits 128.
         GitError::Command(message) => {
             eprintln!("fatal: {message}");
-            GitError::Exit(128)
+            crate::cli_exit(128)
         }
         other => other,
     })?;
@@ -625,7 +624,7 @@ fn resolve_init_object_format(
 fn parse_init_object_format(value: &str) -> Result<ObjectFormat> {
     value.parse::<ObjectFormat>().map_err(|_| {
         eprintln!("fatal: unknown hash algorithm '{value}'");
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })
 }
 
@@ -669,7 +668,7 @@ fn parse_init_ref_storage(value: &str) -> Result<RefStorageFormat> {
     RefStorageFormat::parse(value).map_err(|err| match err {
         GitError::Command(message) => {
             eprintln!("fatal: {message}");
-            GitError::Exit(128)
+            crate::cli_exit(128)
         }
         other => other,
     })

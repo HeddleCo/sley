@@ -2195,8 +2195,12 @@ pub fn apply_binary_outcome(
     };
     // For safety, git requires full hex object IDs for old and new.
     if !is_full(patch.old_oid_hex.as_ref()) || !is_full(patch.new_oid_hex.as_ref()) {
-        eprintln!("error: cannot apply binary patch to '{name}' without full index line");
-        return Err(GitError::Exit(1));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "error: cannot apply binary patch to '{name}' without full index line"
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     }
     let old_hex = String::from_utf8_lossy(patch.old_oid_hex.as_ref().unwrap()).into_owned();
     let new_hex = String::from_utf8_lossy(patch.new_oid_hex.as_ref().unwrap()).into_owned();
@@ -2205,15 +2209,21 @@ pub fn apply_binary_outcome(
     if !patch.is_new && patch.old_path.is_some() {
         let got = object_id_for_bytes(format, "blob", image)?.to_hex();
         if got != old_hex {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "error: the patch applies to '{name}' ({got}), which does not match the \
                  current contents."
             );
-            return Err(GitError::Exit(1));
+            return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
         }
     } else if !image.is_empty() {
-        eprintln!("error: the patch applies to an empty '{name}' but it is not empty");
-        return Err(GitError::Exit(1));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "error: the patch applies to an empty '{name}' but it is not empty"
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     }
 
     let new_oid = ObjectId::from_hex(format, &new_hex)?;
@@ -2229,13 +2239,21 @@ pub fn apply_binary_outcome(
 
     // Otherwise reconstruct it from the binary fragment and verify the result.
     let Some(binary) = &patch.binary else {
-        eprintln!("error: missing binary patch data for '{name}'");
-        return Err(GitError::Exit(1));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "error: missing binary patch data for '{name}'"
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     };
     let frag = &binary.forward;
     let binary_apply_failed = || {
-        eprintln!("error: binary patch does not apply to '{name}'");
-        GitError::Exit(1)
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "error: binary patch does not apply to '{name}'"
+        );
+        GitError::Rejected(sley_core::RejectionKind::Incomplete)
     };
     let inflated =
         inflate_zlib_exact(&frag.deflated, frag.origlen).ok_or_else(binary_apply_failed)?;
@@ -2245,11 +2263,13 @@ pub fn apply_binary_outcome(
     };
     let got = object_id_for_bytes(format, "blob", &post)?.to_hex();
     if got != new_hex {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "error: binary patch to '{name}' creates incorrect result \
              (expecting {new_hex}, got {got})"
         );
-        return Err(GitError::Exit(1));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     }
     Ok(BinaryApply::Content(post))
 }

@@ -52,7 +52,6 @@
 //! such as `cli_git_dir`, `repository_object_format`, `read_repo_config`,
 //! `global_config_value`, and `sley_config::parse_config_bool`.
 use crate::*;
-use sley::plumbing::sley_config;
 
 /// Exact usage text git's `patch-id` prints for `-h` and on option errors. A raw
 /// string is used so the four-space indentation on the option lines (and the
@@ -98,7 +97,7 @@ pub(crate) fn cmd_patch_id(
             // `-h` prints usage to stdout and exits 129, like git's parse-options.
             print!("{PATCH_ID_USAGE}");
             io::stdout().flush()?;
-            return Err(GitError::Exit(129));
+            return Err(crate::cli_exit(129));
         }
     };
 
@@ -252,7 +251,7 @@ fn set_patch_id_mode(chosen: &mut Option<PatchIdMode>, mode: PatchIdMode) -> Res
                 mode.flag(),
                 existing.flag()
             );
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
         _ => {
             *chosen = Some(mode);
@@ -265,14 +264,14 @@ fn patch_id_unknown_option_error(option: &str) -> Result<PatchIdInvocation> {
     eprintln!("error: unknown option `{option}'");
     eprint!("{PATCH_ID_USAGE}");
     io::stderr().flush()?;
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn patch_id_unknown_switch_error(switch: char) -> Result<PatchIdInvocation> {
     eprintln!("error: unknown switch `{switch}'");
     eprint!("{PATCH_ID_USAGE}");
     io::stderr().flush()?;
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 /// Resolve default behavior from `patchid.stable` and `patchid.verbatim`.
@@ -316,7 +315,7 @@ fn interpret_patch_id_bool(key: &str, value: Option<&str>) -> Result<bool> {
         Some(flag) => Ok(flag),
         None => {
             eprintln!("fatal: bad boolean config value '{value}' for '{key}'");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }

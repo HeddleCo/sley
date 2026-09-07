@@ -30,7 +30,7 @@ pub(super) fn setup_replace_options(args: &[String]) -> Result<ReplaceOptions> {
             "--format" => {
                 let Some(value) = iter.next() else {
                     eprintln!("error: option `format' requires a value");
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 };
                 format = parse_replace_list_format(value)?;
             }
@@ -40,7 +40,7 @@ pub(super) fn setup_replace_options(args: &[String]) -> Result<ReplaceOptions> {
             }
             value if value.starts_with("--no-force=") => {
                 eprintln!("error: option `no-force' takes no value");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             value if value.starts_with("--") => {
                 eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
@@ -161,7 +161,7 @@ fn parse_replace_list_format(value: &str) -> Result<ReplaceListFormat> {
         other => {
             eprintln!("error: invalid replace format '{other}'");
             eprintln!("valid formats are 'short', 'medium' and 'long'");
-            Err(GitError::Exit(255))
+            Err(crate::cli_exit(255))
         }
     }
 }
@@ -184,5 +184,5 @@ fn replace_usage<T>() -> Result<T> {
     eprintln!("    --[no-]format <format>");
     eprintln!("                          use this format");
     eprintln!();
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }

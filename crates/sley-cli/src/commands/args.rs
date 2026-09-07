@@ -199,17 +199,17 @@ pub(crate) fn long_option_value<'a>(arg: &'a str, option: &str) -> Option<&'a st
 
 pub(crate) fn option_takes_no_value<T>(option: &str) -> Result<T> {
     eprintln!("error: option `{option}' takes no value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 pub(crate) fn switch_requires_value(switch: &str) -> GitError {
     eprintln!("error: switch `{switch}' requires a value");
-    GitError::Exit(129)
+    crate::cli_exit(129)
 }
 
 pub(crate) fn usage_error<T>(message: &str) -> Result<T> {
     eprintln!("error: {message}");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 #[cfg(test)]

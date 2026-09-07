@@ -639,8 +639,12 @@ pub fn bind_merge<P: WorktreeProbe + ?Sized>(
 
     if a.is_some() && old.is_some() {
         let display = String::from_utf8_lossy(path);
-        eprintln!("error: Entry '{display}' overlaps with '{display}'.  Cannot bind.");
-        return Err(GitError::Exit(128));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "error: Entry '{display}' overlaps with '{display}'.  Cannot bind."
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     match (a, old) {
         (Some(a), _) => merged_entry(a, None, path, state, opts, probe),
@@ -969,8 +973,12 @@ fn keep_entry(ce: &CacheEntry, path: &[u8], state: &mut UnpackTreesState) -> Res
 fn reject_merge(ce: &CacheEntry, path: &[u8]) -> Result<()> {
     let _ = ce;
     let display = String::from_utf8_lossy(path);
-    eprintln!("error: Entry '{display}' would be overwritten by merge. Cannot merge.");
-    Err(GitError::Exit(128))
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "error: Entry '{display}' would be overwritten by merge. Cannot merge."
+    );
+    Err(GitError::Rejected(sley_core::RejectionKind::Refused))
 }
 
 // ---------------------------------------------------------------------------
@@ -1648,7 +1656,7 @@ mod tests {
             _reset: ResetType,
         ) -> Result<()> {
             self.absent_checks.set(self.absent_checks.get() + 1);
-            Err(GitError::Exit(128))
+            Err(GitError::Rejected(sley_core::RejectionKind::Refused))
         }
 
         fn verify_absent_remove(&self, _path: &[u8], _reset: ResetType) -> Result<()> {
@@ -2363,7 +2371,7 @@ mod tests {
                 .borrow_mut()
                 .push((path.to_vec(), old_oid.copied(), *new_oid, reset));
             if self.reject_path.as_deref() == Some(path) {
-                return Err(GitError::Exit(128));
+                return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
             }
             Ok(())
         }
@@ -2462,7 +2470,10 @@ mod tests {
         };
         let err = unpack_trees(&index, &[tree], MergeFn::OneWay, &opts(), &probe)
             .expect_err("a would-lose-submodule rejection aborts the merge");
-        assert!(matches!(err, GitError::Exit(128)));
+        assert!(matches!(
+            err,
+            GitError::Rejected(sley_core::RejectionKind::Refused)
+        ));
     }
 
     #[test]

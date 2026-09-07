@@ -99,7 +99,9 @@ deeper format work.
 
 - [ ] Normalize usage errors to git exit code `129` where upstream expects it.
 - [ ] Audit every command that returns `GitError::Command` for usage-style
-  errors and convert true usage errors to `GitError::Exit(129)`.
+  errors and convert true CLI usage errors to `sley_cli::cli_exit(129)`;
+  library validators return `GitError::Rejected(RejectionKind::InvalidArguments)`
+  after delivering their diagnostic through the caller sink.
 - [ ] Preserve fatal/runtime failures as non-usage exits.
 - [ ] Add shared helpers for:
   - [ ] Unknown option.

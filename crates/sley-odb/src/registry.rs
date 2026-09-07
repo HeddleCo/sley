@@ -444,7 +444,9 @@ pub(crate) fn collect_packed_object_ids(
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| midx_pack_names.contains(name)) =>
             {
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "error: packfile {} index unavailable",
                     path.with_extension("pack").display()
                 );
@@ -518,7 +520,7 @@ pub(crate) fn collect_loose_object_ids_with_prefix(
     let entries = match fs::read_dir(&fanout_dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(GitError::Io(err.to_string())),
+        Err(err) => return Err(GitError::from(err)),
     };
     let hex_len = format.hex_len();
     for object_entry in entries {
@@ -575,7 +577,9 @@ pub(crate) fn collect_packed_object_ids_with_prefix(
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| midx_pack_names.contains(name)) =>
             {
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "error: packfile {} index unavailable",
                     path.with_extension("pack").display()
                 );
@@ -726,7 +730,7 @@ fn pack_dir_modified(pack_dir: &Path) -> Result<Option<std::time::SystemTime>> {
     match fs::metadata(pack_dir) {
         Ok(metadata) => Ok(metadata.modified().ok()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(GitError::Io(err.to_string())),
+        Err(err) => Err(GitError::from(err)),
     }
 }
 
@@ -751,7 +755,7 @@ pub(crate) fn scan_pack_registry(
                 Vec::new(),
             ));
         }
-        Err(err) => return Err(GitError::Io(err.to_string())),
+        Err(err) => return Err(GitError::from(err)),
     };
 
     let mut idx_paths = Vec::new();

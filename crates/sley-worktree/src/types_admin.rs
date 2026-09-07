@@ -149,10 +149,12 @@ impl LargeObjectPolicy {
             Some(value) => match sley_config::parse_config_int(value) {
                 Some(value) if value >= 0 => value as u64,
                 _ => {
-                    eprintln!(
+                    sley_core::diagnostic!(
+                        Stderr,
+                        true,
                         "fatal: bad numeric config value '{value}' for 'core.bigfilethreshold': invalid unit"
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
                 }
             },
             None => 512 * 1024 * 1024,
@@ -381,8 +383,13 @@ pub fn submodule_dirt(sub_root: &Path) -> u8 {
 /// `--broken` can tolerate it).
 pub fn submodule_dirt_checked(sub_root: &Path) -> Result<u8> {
     if let Some(target) = sley_diff_merge::gitlink_broken_gitdir(sub_root) {
-        eprintln!("fatal: not a git repository: {}", target.display());
-        return Err(GitError::Exit(128));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "fatal: not a git repository: {}",
+            target.display()
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     Ok(submodule_dirt(sub_root))
 }
@@ -890,70 +897,7 @@ pub(crate) fn empty_index() -> Index {
     }
 }
 
-/// Resolve the working-tree root for a repository identified by its git
-/// directory, returning `Ok(None)` for a bare repository.
-///
-/// This is the repository-intrinsic worktree resolution (it does *not* consult
-/// `GIT_WORK_TREE`/`GIT_DIR` or CLI overrides — those are the caller's job):
-///
-/// 0. for a linked worktree (a git directory that has both a `commondir` and a
-///    `gitdir` administrative file), the directory containing the worktree's
-///    `.git` link, canonicalised;
-/// 1. otherwise, if `core.bare` is true the repository is bare and `Ok(None)` is
-///    returned immediately — `core.bare` takes precedence for the main repo, so
-///    a bare repo ignores `core.worktree` and the `.git`-parent fallback;
-/// 2. otherwise, a `core.worktree` setting in `<git_dir>/config` (absolute, or
-///    relative to the git directory), canonicalised;
-/// 3. otherwise, when the git directory is a `.git` directory, its parent (the
-///    ordinary non-bare layout) — returned verbatim, not canonicalised;
-/// 4. otherwise the repository is bare and `Ok(None)` is returned.
-///
-/// `Ok(None)` means specifically "bare" (case 0 or case 4). A [`GitError::Io`] is
-/// returned if a path that should exist cannot be canonicalised, and a
-/// [`GitError::InvalidPath`] if a `.git` directory has no parent (a malformed
-/// layout).
-pub fn worktree_root_for_git_dir(git_dir: &Path) -> Result<Option<PathBuf>> {
-    if git_dir.join("commondir").is_file() {
-        let gitdir_file = git_dir.join("gitdir");
-        if gitdir_file.is_file() {
-            let value = fs::read_to_string(&gitdir_file)?;
-            let worktree_git_file = resolve_worktree_admin_path(git_dir, value.trim());
-            if let Some(worktree) = worktree_git_file.parent() {
-                return fs::canonicalize(worktree)
-                    .map(Some)
-                    .map_err(|err| GitError::Io(err.to_string()));
-            }
-        }
-    }
-    if let Ok(config) = sley_config::read_repo_config(git_dir, None) {
-        // A bare repository has no working tree, and `core.bare` takes precedence:
-        // a bare repo ignores `core.worktree`. Check it before any worktree
-        // resolution so a bare `.git`-named directory does not fall through to the
-        // "parent of .git" case below.
-        if config.get_bool("core", None, "bare") == Some(true) {
-            return Ok(None);
-        }
-        if let Some(worktree) = config.get("core", None, "worktree") {
-            let worktree = PathBuf::from(worktree);
-            let worktree = if worktree.is_absolute() {
-                worktree
-            } else {
-                git_dir.join(worktree)
-            };
-            return fs::canonicalize(worktree)
-                .map(Some)
-                .map_err(|err| GitError::Io(err.to_string()));
-        }
-    }
-    if git_dir.file_name().and_then(|name| name.to_str()) != Some(".git") {
-        return Ok(None);
-    }
-    git_dir
-        .parent()
-        .map(Path::to_path_buf)
-        .map(Some)
-        .ok_or_else(|| GitError::InvalidPath("git dir has no parent worktree".into()))
-}
+pub use sley_formats::worktree_root_for_git_dir;
 
 /// Delegates to the canonical resolver in [`sley_formats`] (environment always
 /// honored, errors propagate).

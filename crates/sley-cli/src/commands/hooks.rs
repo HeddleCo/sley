@@ -5,7 +5,7 @@ use crate::{ObjectFormat, ObjectId, Result};
 pub(crate) use sley::hooks::{
     HookRun, KNOWN_HOOKS, run_reference_transaction_hook_at, run_traditional_hook_at,
 };
-use sley::plumbing::sley_config::GitConfig;
+use sley_config::GitConfig;
 use std::path::Path;
 
 fn hook_environment(cli_session: &CliSession) -> Result<sley::hooks::HookEnvironment> {
@@ -124,7 +124,7 @@ mod tests {
             GitConfig::parse(b"[gc]\n\trecentObjectsHook = false\n").expect("parse config");
         assert!(matches!(
             run_recent_objects_hooks(&config, ObjectFormat::Sha1, Path::new(".")),
-            Err(crate::GitError::Exit(128))
+            Err(error) if crate::cli_reported_status(&error) == Some(128)
         ));
     }
 }

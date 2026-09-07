@@ -11,8 +11,7 @@
 //! content matches upstream exactly.
 
 use crate::*;
-pub(crate) use sley::plumbing::sley_diff_merge::format::CompiledFuncname;
-use sley::plumbing::{sley_config, sley_worktree};
+pub(crate) use sley_diff_merge::format::CompiledFuncname;
 #[cfg(test)]
 use sley_grep::{Regex, RegexMode};
 use std::cell::RefCell;
@@ -461,8 +460,10 @@ pub(crate) fn run_textconv(command: &str, content: &[u8]) -> Result<Option<Vec<u
         unique
     ));
 
-    std::fs::write(&temp_path, content)
-        .map_err(|err| GitError::Io(format!("textconv tempfile: {err}")))?;
+    std::fs::write(&temp_path, content).map_err(|err| GitError::IoKind {
+        kind: std::io::ErrorKind::Other,
+        message: format!("textconv tempfile: {err}"),
+    })?;
 
     // Upstream builds the child with `use_shell` and args `[pgm, tempname]`,
     // which `prepare_shell_cmd` turns into `sh -c '<pgm> "$@"' <pgm> <tempname>`

@@ -3,6 +3,6 @@
 //! same parser without a presentation-tier dependency). Every historical
 //! `crate::commands::approxidate::*` call site keeps working unchanged.
 
-pub(crate) use crate::sley_core::date::approxidate::{
+pub(crate) use sley_core::date::approxidate::{
     format_expiry_date, parse_approxidate, parse_commit_date, parse_expiry_date,
 };

@@ -2,7 +2,6 @@
 #![allow(clippy::expect_used)]
 
 use crate::*;
-use sley::plumbing::{sley_refs, sley_rev};
 
 pub(super) struct BranchVerboseListOptions {
     pub(crate) mode: BranchListMode,
@@ -565,7 +564,7 @@ pub(super) fn branch_peel_filter_oid(
         Ok(commit) => Ok(commit),
         Err(_) => {
             eprintln!("error: object {rev} must point to a commit");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }

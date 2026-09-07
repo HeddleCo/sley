@@ -68,7 +68,7 @@ pub(crate) fn collect_loose_fanout_object_ids(
     let entries = match fs::read_dir(&fanout_dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(GitError::Io(err.to_string())),
+        Err(err) => return Err(GitError::from(err)),
     };
     let hex_len = format.hex_len();
     for object_entry in entries {
@@ -100,7 +100,7 @@ pub(crate) fn present_loose_fanouts(objects_dir: &Path) -> Result<HashSet<u8>> {
     let entries = match fs::read_dir(objects_dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(present),
-        Err(err) => return Err(GitError::Io(err.to_string())),
+        Err(err) => return Err(GitError::from(err)),
     };
     for entry in entries {
         let entry = entry?;
@@ -195,7 +195,7 @@ fn inflate_header_diagnostic(input: &[u8]) -> Option<&'static str> {
 /// `inflate()` fails, when the failure is classifiable from the stream header.
 fn emit_inflate_diagnostic(input: &[u8]) {
     if let Some(diagnostic) = inflate_header_diagnostic(input) {
-        eprintln!("error: {diagnostic}");
+        sley_core::diagnostic!(Stderr, true, "error: {diagnostic}");
     }
 }
 
@@ -366,7 +366,7 @@ impl LooseObjectStore {
         match fs::metadata(path) {
             Ok(metadata) => Ok(Some(metadata.len())),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(GitError::Io(err.to_string())),
+            Err(err) => Err(GitError::from(err)),
         }
     }
 
@@ -383,7 +383,7 @@ impl LooseObjectStore {
         let compressed = match fs::read(&path) {
             Ok(compressed) => compressed,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(GitError::Io(err.to_string())),
+            Err(err) => return Err(GitError::from(err)),
         };
         match inflate_loose_header(&compressed)? {
             LooseHeader::Ok(header) => {
@@ -435,7 +435,7 @@ impl LooseObjectStore {
         let compressed = match fs::read(&path) {
             Ok(compressed) => compressed,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(GitError::Io(err.to_string())),
+            Err(err) => return Err(GitError::from(err)),
         };
         let mut decoder = ZlibDecoder::new(compressed.as_slice());
         let mut framed = Vec::new();
@@ -449,17 +449,29 @@ impl LooseObjectStore {
             // `unable to unpack contents of <path>`. If inflation died before the
             // header materialized, only the header message fires.
             if framed_loose_header_terminated(&framed) {
-                eprintln!("error: corrupt loose object '{oid}'");
-                eprintln!("error: unable to unpack contents of {display_path}");
+                sley_core::diagnostic!(Stderr, true, "error: corrupt loose object '{oid}'");
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "error: unable to unpack contents of {display_path}"
+                );
             } else {
-                eprintln!("error: unable to unpack header of {display_path}");
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "error: unable to unpack header of {display_path}"
+                );
             }
             return Ok(Some(LooseObjectIntegrity::Corrupt));
         }
         if !framed_loose_header_terminated(&framed) {
             // ULHR_TOO_LONG collapses into the same path-form message here: C's
             // `read_loose_object` treats every non-OK `unpack_loose_header` alike.
-            eprintln!("error: unable to unpack header of {display_path}");
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "error: unable to unpack header of {display_path}"
+            );
             return Ok(Some(LooseObjectIntegrity::Corrupt));
         }
         // git's `unpack_loose_rest`/`check_stream_oid` reject trailing bytes after
@@ -472,8 +484,16 @@ impl LooseObjectStore {
             // git's `unpack_loose_rest` prints `garbage at end of loose object`
             // then returns NULL, so `read_loose_object` also prints `unable to
             // unpack contents of <path>`.
-            eprintln!("error: garbage at end of loose object '{oid}'");
-            eprintln!("error: unable to unpack contents of {display_path}");
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "error: garbage at end of loose object '{oid}'"
+            );
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "error: unable to unpack contents of {display_path}"
+            );
             return Ok(Some(LooseObjectIntegrity::Corrupt));
         }
         // A truncated object can inflate to a clean stream end yet yield fewer
@@ -486,8 +506,12 @@ impl LooseObjectStore {
             let nul = framed.iter().position(|&b| b == 0).unwrap_or(framed.len());
             let body_len = framed.len() - (nul + 1).min(framed.len());
             if body_len < declared {
-                eprintln!("error: corrupt loose object '{oid}'");
-                eprintln!("error: unable to unpack contents of {display_path}");
+                sley_core::diagnostic!(Stderr, true, "error: corrupt loose object '{oid}'");
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "error: unable to unpack contents of {display_path}"
+                );
                 return Ok(Some(LooseObjectIntegrity::Corrupt));
             }
         }
@@ -497,9 +521,17 @@ impl LooseObjectStore {
             // type yields `unable to parse type from header '<header>'`, while a
             // genuinely malformed header yields `unable to parse header`.
             if let Some(header) = loose_header_with_unknown_type(&framed) {
-                eprintln!("error: unable to parse type from header '{header}' of {display_path}");
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "error: unable to parse type from header '{header}' of {display_path}"
+                );
             } else {
-                eprintln!("error: unable to parse header of {display_path}");
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "error: unable to parse header of {display_path}"
+                );
             }
             return Ok(Some(LooseObjectIntegrity::Corrupt));
         };
@@ -626,7 +658,7 @@ impl ObjectReader for LooseObjectStore {
                     MissingObjectContext::Read,
                 ));
             }
-            Err(err) => return Err(GitError::Io(err.to_string())),
+            Err(err) => return Err(GitError::from(err)),
         };
         let mut decoder = ZlibDecoder::new(compressed.as_slice());
         let mut framed = Vec::new();

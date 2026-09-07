@@ -8,7 +8,7 @@
 
 use crate::commands::remote::{RemoteCommandContext, ls_remote_git_dir};
 use crate::*;
-use sley::plumbing::sley_remote::{apply_shallow_info, compute_local_deepen, read_shallow};
+use sley_remote::{apply_shallow_info, compute_local_deepen, read_shallow};
 
 const FETCH_PACK_USAGE: &str = "usage: git fetch-pack [--all] [--stdin] [--quiet | -q] [--keep | -k] [--thin] [--include-tag] [--upload-pack=<git-upload-pack>] [--depth=<n>] [--no-progress] [--diag-url] [-v] [<host>:]<directory> [<refs>...]";
 
@@ -84,7 +84,7 @@ pub(crate) fn cmd_fetch_pack(
         match arg {
             "-h" | "--help" => {
                 println!("{FETCH_PACK_USAGE}");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             "--quiet"
             | "-q"
@@ -119,14 +119,14 @@ pub(crate) fn cmd_fetch_pack(
                     // Accepted but unused by the in-process local transport.
                 } else {
                     eprintln!("{FETCH_PACK_USAGE}");
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 }
             }
         }
     }
     let Some(dest) = args.get(index) else {
         eprintln!("{FETCH_PACK_USAGE}");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     };
     let dest = dest.clone();
     index += 1;
@@ -166,7 +166,11 @@ pub(crate) fn cmd_fetch_pack(
             format.name()
         )));
     }
-    let advertisements = sley_remote::local_fetch_advertisements(&remote_git_dir, format)?;
+    let advertisements = sley_remote::local_fetch_advertisements(
+        &cli_session.remote_policy,
+        &remote_git_dir,
+        format,
+    )?;
     let remote_config = read_repo_config(&remote_common_git_dir)?;
     let transfer_filter = match flags.filter.as_deref() {
         None => None,
@@ -285,6 +289,7 @@ pub(crate) fn cmd_fetch_pack(
     };
     if !wants.is_empty() {
         let shallow_info = sley_remote::install_fetch_pack_via_local_upload_pack(
+            &cli_session.remote_policy,
             &git_dir,
             &remote_git_dir,
             format,
@@ -326,7 +331,7 @@ pub(crate) fn cmd_fetch_pack(
         writeln!(out, "{oid} {name}")?;
     }
     if failed {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -420,7 +425,7 @@ fn get_protocol(name: &str) -> Result<DiagProtocol> {
         "file" => Ok(DiagProtocol::File),
         _ => {
             eprintln!("fatal: protocol '{name}' is not supported");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -509,7 +514,7 @@ fn split_get_port(host: &str) -> (String, Option<String>) {
 
 fn no_path_specified() -> GitError {
     eprintln!("fatal: no path specified; see 'git help pull' for valid url syntax");
-    GitError::Exit(128)
+    crate::cli_exit(128)
 }
 
 struct ParsedConnectUrl {

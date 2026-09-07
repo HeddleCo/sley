@@ -105,7 +105,7 @@ fn setup_am_options(args: &[String]) -> Result<AmOptions> {
             "--empty" => {
                 let value = args.get(index + 1).map(String::as_str).unwrap_or("");
                 eprintln!("error: invalid value for '--empty': '{value}'");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             "--empty=drop" => options.empty_action = AmEmptyAction::Drop,
             "--empty=keep" => options.empty_action = AmEmptyAction::Keep,
@@ -137,7 +137,7 @@ fn setup_am_options(args: &[String]) -> Result<AmOptions> {
             "--no-reject" => options.git_apply_opts.push("--no-reject".to_string()),
             value if let Some(invalid) = value.strip_prefix("--empty=") => {
                 eprintln!("error: invalid value for '--empty': '{invalid}'");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             value if let Some(rest) = value.strip_prefix("--exclude=") => {
                 options.git_apply_opts.push(format!("--exclude={rest}"));
@@ -176,7 +176,7 @@ fn setup_am_options(args: &[String]) -> Result<AmOptions> {
             value if value.starts_with('-') && value != "-" => {
                 eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
                 am_usage();
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             value => options.mboxes.push(value.to_string()),
         }
@@ -221,7 +221,7 @@ fn am_usage() {
 
 fn am_incompatible_resume_error(existing: &str, new: &str) -> Result<()> {
     eprintln!("fatal: options '{existing}' and '{new}' cannot be used together");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 // ---------------------------------------------------------------------------
@@ -249,7 +249,7 @@ fn set_show_patch_mode(slot: &mut Option<ShowPatchMode>, mode: ShowPatchMode) ->
                 show_patch_arg(mode),
                 show_patch_arg(*existing),
             );
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
         _ => {
             *slot = Some(mode);
@@ -272,7 +272,7 @@ fn show_patch_arg(mode: ShowPatchMode) -> &'static str {
 fn am_show_current_patch(state_dir: &Path, mode: ShowPatchMode) -> Result<()> {
     if !state_dir.exists() {
         eprintln!("fatal: Resolve operation not in progress, we are not resuming.");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let path = match mode {
         ShowPatchMode::Raw => {
@@ -286,7 +286,7 @@ fn am_show_current_patch(state_dir: &Path, mode: ShowPatchMode) -> Result<()> {
     };
     let data = fs::read(&path).map_err(|err| {
         eprintln!("fatal: failed to read '{}': {err}", path.display());
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })?;
     io::stdout().write_all(&data)?;
     Ok(())
@@ -321,7 +321,9 @@ fn parse_am_resume_overrides(option_args: &[String]) -> sam::AmResumeOverrides {
 // Engine hand-off: repository context + host services
 // ---------------------------------------------------------------------------
 
-struct AmPrefetch;
+struct AmPrefetch {
+    policy: sley_remote::RemotePolicy,
+}
 
 impl sley_sequencer::apply::PromisorObjectFetch for AmPrefetch {
     fn read_object_maybe_prefetch(
@@ -329,44 +331,42 @@ impl sley_sequencer::apply::PromisorObjectFetch for AmPrefetch {
         db: &FileObjectDatabase,
         oid: &ObjectId,
     ) -> Result<std::sync::Arc<sley_object::EncodedObject>> {
-        crate::read_object_maybe_prefetch_promisor(db, oid, true)
+        crate::read_object_maybe_prefetch_promisor(&self.policy, db, oid, true)
     }
-}
-
-fn am_prefetch() -> Option<&'static dyn sley_sequencer::apply::PromisorObjectFetch> {
-    static PREFETCH: AmPrefetch = AmPrefetch;
-    Some(&PREFETCH)
 }
 
 /// Build the engine's repository view. The paths/config come from the
 /// already-opened session.
-pub(crate) fn am_engine_context(
+pub(crate) fn am_engine_context<'a>(
+    prefetch: &'a dyn sley_sequencer::apply::PromisorObjectFetch,
     git_dir: &Path,
     common_git_dir: &Path,
     worktree_root: &Path,
     format: ObjectFormat,
     config: &GitConfig,
     lazy_fetch: bool,
-) -> sam::AmContext<'static> {
+) -> sam::AmContext<'a> {
     sam::AmContext::new(
         git_dir.to_path_buf(),
         common_git_dir.to_path_buf(),
         worktree_root.to_path_buf(),
         format,
         config.clone(),
-        if lazy_fetch { am_prefetch() } else { None },
+        lazy_fetch.then_some(prefetch),
     )
 }
 
 /// Host services for the am engine: hook execution, autostash stash
 /// primitives, and rerere seams. Each closure is a verbatim relocation of the
 /// call site it used to serve in this module.
-pub(crate) fn am_engine_hosts(
+pub(crate) fn am_engine_hosts<'a>(
+    original_cwd: Option<&'a std::path::Path>,
+    policy: &'a sley_remote::RemotePolicy,
     git_dir: &Path,
     common_git_dir: &Path,
     worktree_root: &Path,
     lazy_fetch: bool,
-) -> sam::AmHosts<'static> {
+) -> sam::AmHosts<'a> {
     let git_dir = git_dir.to_path_buf();
     let common_git_dir = common_git_dir.to_path_buf();
     let worktree_root = worktree_root.to_path_buf();
@@ -394,6 +394,8 @@ pub(crate) fn am_engine_hosts(
         }),
         stash_apply_quietly: Box::new(move |oid| {
             commands::stash::apply_stash_commit_quietly_at(
+                original_cwd,
+                policy,
                 &stash_common,
                 &stash_worktree,
                 oid,
@@ -463,7 +465,7 @@ pub(crate) fn cmd_am(cli_session: &crate::session::CliSession, args: &[String]) 
             value if value.starts_with("--show-current-patch=") => {
                 let arg = &value["--show-current-patch=".len()..];
                 eprintln!("error: invalid value for '--show-current-patch': '{arg}'");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             "--allow-empty" => {
                 allow_empty_resume = true;
@@ -477,7 +479,11 @@ pub(crate) fn cmd_am(cli_session: &crate::session::CliSession, args: &[String]) 
         return am_show_current_patch(&state_dir, mode);
     }
 
+    let prefetch = AmPrefetch {
+        policy: cli_session.remote_policy.clone(),
+    };
     let ctx = am_engine_context(
+        &prefetch,
         &git_dir,
         &common_git_dir,
         &worktree_root,
@@ -486,6 +492,8 @@ pub(crate) fn cmd_am(cli_session: &crate::session::CliSession, args: &[String]) 
         cli_session.lazy_fetch(),
     );
     let hosts = am_engine_hosts(
+        cli_session.original_cwd.as_deref(),
+        &cli_session.remote_policy,
         &git_dir,
         &common_git_dir,
         &worktree_root,
@@ -506,11 +514,33 @@ pub(crate) fn cmd_am(cli_session: &crate::session::CliSession, args: &[String]) 
             let _ = fs::write(state_dir.join("interactive"), flag);
         }
         return match resume {
-            "--abort" => sam::am_abort(&ctx, &hosts, &state_dir),
+            "--abort" => sam::am_abort(
+                cli_session.original_cwd.as_deref(),
+                &ctx,
+                &hosts,
+                &state_dir,
+            ),
             "--quit" => sam::am_quit(&ctx, &hosts, &state_dir),
-            "--skip" => sam::am_skip(&ctx, &hosts, &state_dir),
-            "--continue" => sam::am_continue(&ctx, &hosts, &state_dir, overrides),
-            "--retry" => sam::am_retry(&ctx, &hosts, &state_dir, overrides),
+            "--skip" => sam::am_skip(
+                cli_session.original_cwd.as_deref(),
+                &ctx,
+                &hosts,
+                &state_dir,
+            ),
+            "--continue" => sam::am_continue(
+                cli_session.original_cwd.as_deref(),
+                &ctx,
+                &hosts,
+                &state_dir,
+                overrides,
+            ),
+            "--retry" => sam::am_retry(
+                cli_session.original_cwd.as_deref(),
+                &ctx,
+                &hosts,
+                &state_dir,
+                overrides,
+            ),
             _ => Ok(()),
         };
     }
@@ -523,5 +553,11 @@ pub(crate) fn cmd_am(cli_session: &crate::session::CliSession, args: &[String]) 
     // the user did not pass an explicit `--[no-]…` form.
     apply_am_config_defaults(&config, &option_args, &mut options);
 
-    sam::start_am(&ctx, &hosts, &options, allow_empty_resume)
+    sam::start_am(
+        cli_session.original_cwd.as_deref(),
+        &ctx,
+        &hosts,
+        &options,
+        allow_empty_resume,
+    )
 }

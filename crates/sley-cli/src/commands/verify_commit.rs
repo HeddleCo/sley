@@ -40,7 +40,7 @@ pub(crate) fn cmd_verify_commit(cli_session: &session::CliSession, args: &[Strin
         VerifyCommitInvocation::Help => {
             print!("{VERIFY_COMMIT_USAGE}");
             io::stdout().flush()?;
-            return Err(GitError::Exit(129));
+            return Err(crate::cli_exit(129));
         }
     };
 
@@ -48,7 +48,7 @@ pub(crate) fn cmd_verify_commit(cli_session: &session::CliSession, args: &[Strin
         // `git verify-commit` with no commit-ish is a usage error (exit 129),
         // distinct from the verification-failure exit code (1).
         eprint!("{VERIFY_COMMIT_USAGE}");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
 
     let repo = cli_session.open_repository()?;
@@ -64,7 +64,7 @@ pub(crate) fn cmd_verify_commit(cli_session: &session::CliSession, args: &[Strin
         }
     }
     if failed {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -304,20 +304,20 @@ fn verify_commit_unknown_short_switch(value: &str) -> Option<char> {
 fn verify_commit_unknown_option_error(option: &str) -> Result<VerifyCommitInvocation> {
     eprintln!("error: unknown option `{option}'");
     eprint!("{VERIFY_COMMIT_USAGE}");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn verify_commit_unknown_switch_error(switch: char) -> Result<VerifyCommitInvocation> {
     eprintln!("error: unknown switch `{switch}'");
     eprint!("{VERIFY_COMMIT_USAGE}");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn verify_commit_option_takes_no_value_error(option: &str) -> Result<VerifyCommitInvocation> {
     // git's parse-options prints only the error for a "takes no value" rejection,
     // without the usage block (unlike the unknown-option/switch errors above).
     eprintln!("error: option `{option}' takes no value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 /// The exact usage block git prints for `verify-commit` (stdout for `-h`, stderr
@@ -454,7 +454,7 @@ mod tests {
     fn unknown_long_option_is_exit_129() {
         let args = vec!["--bogus".to_string()];
         match parse_verify_commit_args(&args) {
-            Err(GitError::Exit(129)) => {}
+            Err(error) if crate::cli_reported_status(&error) == Some(129) => {}
             other => panic!("expected exit 129, got {other:?}"),
         }
     }
@@ -463,7 +463,7 @@ mod tests {
     fn unknown_short_switch_is_exit_129() {
         let args = vec!["-z".to_string()];
         match parse_verify_commit_args(&args) {
-            Err(GitError::Exit(129)) => {}
+            Err(error) if crate::cli_reported_status(&error) == Some(129) => {}
             other => panic!("expected exit 129, got {other:?}"),
         }
     }

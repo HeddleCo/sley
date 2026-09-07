@@ -13,7 +13,6 @@
 //! the `diff-files`-specific argument parser and dispatch. Shared plumbing is
 //! pulled in via the crate-root glob; see `commands::stash` for the rationale.
 use crate::*;
-use sley::plumbing::{sley_diff_merge, sley_index, sley_worktree};
 
 /// Usage text emitted for `-h` (to stdout) and on a parse error (to stderr),
 /// matching `git diff-files`'s built-in usage. Kept as a single block so both
@@ -55,14 +54,14 @@ common diff options:
 /// parser can `return Err(diff_files_help())` from any branch.
 fn diff_files_help() -> GitError {
     print!("{DIFF_FILES_USAGE}");
-    GitError::Exit(129)
+    crate::cli_exit(129)
 }
 
 /// Print the usage block to stderr and signal a usage error (exit code 129),
 /// matching git when an unrecognised option is supplied.
 fn diff_files_usage_error() -> GitError {
     eprint!("{DIFF_FILES_USAGE}");
-    GitError::Exit(129)
+    crate::cli_exit(129)
 }
 
 /// Resolved set of `diff-files` options after argument parsing. Mirrors the
@@ -473,7 +472,7 @@ fn diff_files_name_select_conflict() -> GitError {
     eprintln!(
         "fatal: options '--name-only', '--name-status', '--check', and '-s' cannot be used together"
     );
-    GitError::Exit(128)
+    crate::cli_exit(128)
 }
 
 /// Map a `--diff-algorithm=<name>` value to a [`DiffAlgorithm`], rejecting an
@@ -489,7 +488,7 @@ fn parse_diff_files_algorithm(name: &str) -> Result<sley_diff_merge::DiffAlgorit
             eprintln!(
                 "error: option diff-algorithm accepts \"myers\", \"minimal\", \"patience\" and \"histogram\""
             );
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
     }
 }
@@ -500,7 +499,7 @@ fn parse_diff_files_algorithm(name: &str) -> Result<sley_diff_merge::DiffAlgorit
 fn parse_diff_files_context(value: &str) -> Result<usize> {
     value.trim().parse::<usize>().map_err(|_| {
         eprintln!("error: option `unified' expects a numerical value");
-        GitError::Exit(129)
+        crate::cli_exit(129)
     })
 }
 
@@ -659,6 +658,7 @@ fn run_diff_files(cli_session: &crate::session::CliSession, o: DiffFilesOptions)
     let has_differences = !entries.is_empty();
     if !o.quiet && !o.no_patch {
         render_diff_files_entries(
+            &cli_session.remote_policy,
             &entries,
             &o,
             DiffFilesRenderContext {
@@ -677,7 +677,7 @@ fn run_diff_files(cli_session: &crate::session::CliSession, o: DiffFilesOptions)
         )?;
     }
     if (o.quiet || o.exit_code) && has_differences {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -700,6 +700,7 @@ struct DiffFilesRenderContext<'a> {
 }
 
 fn render_diff_files_entries(
+    policy: &sley_remote::RemotePolicy,
     entries: &[sley_diff_merge::NameStatusEntry],
     o: &DiffFilesOptions,
     context: DiffFilesRenderContext<'_>,
@@ -735,13 +736,14 @@ fn render_diff_files_entries(
     // stat-dirty-but-content-identical entries (a `touch`ed / `reset
     // --no-refresh`-restored file: shown `M` in raw/name-status, empty in stat)
     // must be excluded. The raw and name output keep the full set.
+    let lazy_fetch_adapter_1 = crate::diff_lazy_fetch(policy, context.lazy_fetch);
     let content_entries = if show_numstat || show_stat || show_shortstat {
         collect_diff_stat_entries(
             entries,
             context.db,
             worktree_root,
             use_worktree_new,
-            crate::diff_lazy_fetch(context.lazy_fetch),
+            lazy_fetch_adapter_1.as_option(),
         )?
         .into_iter()
         .filter(diff_files_stat_entry_has_content_change)
@@ -785,6 +787,7 @@ fn render_diff_files_entries(
         },
         |_| zero_worktree_oids,
         |stdout, entry| {
+            let lazy_fetch_adapter_2 = crate::diff_lazy_fetch(policy, context.lazy_fetch);
             let patch_options = DiffRenderOptions {
                 line_indicators: sley_diff_merge::render::LineIndicators::default(),
                 suppress_blank_empty: false,
@@ -792,7 +795,7 @@ fn render_diff_files_entries(
                 anchors: &[],
                 allow_textconv: false,
                 db: context.db,
-                lazy_fetch: crate::diff_lazy_fetch(context.lazy_fetch),
+                lazy_fetch: lazy_fetch_adapter_2.as_option(),
                 worktree_root,
                 use_worktree_new,
                 format: context.format,

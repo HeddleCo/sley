@@ -7,7 +7,7 @@ use super::fetch::{
     StdoutProgress, check_transport_allowed_url, repo_config_with_transport_policy,
 };
 use crate::*;
-use sley::plumbing::sley_remote::FetchOptions;
+use sley_remote::FetchOptions;
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -25,10 +25,19 @@ pub(crate) fn fetch_with_remote_helper(
     let Some(spec) = sley_remote::resolve_remote_helper(&config, source) else {
         return Ok(None);
     };
-    check_transport_allowed_url(spec.url.as_deref().unwrap_or(source), Some(&config))?;
-    sley_remote::check_transport_allowed(&spec.name, Some(&config), None).map_err(|error| {
+    check_transport_allowed_url(
+        &context.remote_policy,
+        spec.url.as_deref().unwrap_or(source),
+        Some(&config),
+    )?;
+    sley_remote::check_transport_allowed(
+        &spec.name,
+        Some(&config),
+        &context.remote_policy.transport,
+    )
+    .map_err(|error| {
         eprintln!("fatal: {error}");
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })?;
     trace_remote_helper(&spec);
     let ref_hook = crate::commands::refs::ReferenceTransactionHookRunner::new(git_dir);
@@ -60,6 +69,7 @@ pub(crate) fn fetch_with_remote_helper(
 }
 
 pub(crate) fn discover_remote_helper_for_clone(
+    remote_policy: &sley_remote::RemotePolicy,
     config: &GitConfig,
     git_dir: &Path,
     spec: sley_remote::RemoteHelperSpec,
@@ -67,10 +77,11 @@ pub(crate) fn discover_remote_helper_for_clone(
     // The clone dispatcher already validated the resolved URL. Once it has
     // selected a custom helper, validate the helper transport name rather than
     // reparsing its user-defined URL scheme as a native transport.
-    sley_remote::check_transport_allowed(&spec.name, Some(config), None).map_err(|error| {
-        eprintln!("fatal: {error}");
-        GitError::Exit(128)
-    })?;
+    sley_remote::check_transport_allowed(&spec.name, Some(config), &remote_policy.transport)
+        .map_err(|error| {
+            eprintln!("fatal: {error}");
+            crate::cli_exit(128)
+        })?;
     trace_remote_helper(&spec);
     sley_remote::discover_remote_helper_fetch(spec, git_dir, ObjectFormat::Sha1)
         .map_err(render_remote_helper_error)
@@ -114,6 +125,7 @@ pub(crate) fn fetch_with_discovered_remote_helper(
 }
 
 pub(super) fn push_with_remote_helper(
+    remote_policy: &sley_remote::RemotePolicy,
     git_dir: &Path,
     format: ObjectFormat,
     remote: &str,
@@ -125,10 +137,11 @@ pub(super) fn push_with_remote_helper(
     let Some(spec) = sley_remote::resolve_remote_helper(&config, remote) else {
         return Ok(None);
     };
-    sley_remote::check_transport_allowed(&spec.name, Some(&config), None).map_err(|error| {
-        eprintln!("fatal: {error}");
-        GitError::Exit(128)
-    })?;
+    sley_remote::check_transport_allowed(&spec.name, Some(&config), &remote_policy.transport)
+        .map_err(|error| {
+            eprintln!("fatal: {error}");
+            crate::cli_exit(128)
+        })?;
     trace_remote_helper(&spec);
     let mut plumbing = NativeRemoteHelperPlumbing;
     let mut events = CliRemoteHelperEvents;
@@ -154,7 +167,7 @@ pub(super) fn push_with_remote_helper(
             | sley_remote::RemoteHelperPushError::MarksRequired),
         ) => {
             eprintln!("fatal: {error}");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         Err(sley_remote::RemoteHelperPushError::Engine(error)) => {
             return Err(render_remote_helper_error(error));
@@ -254,7 +267,7 @@ fn run_native_fast_export(request: sley_remote::RemoteHelperExportRequest<'_>) -
     if output.status.success() {
         Ok(output.stdout)
     } else {
-        Err(GitError::Exit(output.status.code().unwrap_or(1)))
+        Err(crate::cli_exit(output.status.code().unwrap_or(1)))
     }
 }
 
@@ -288,7 +301,7 @@ fn run_native_fast_import(git_dir: &Path, stream: &[u8]) -> Result<()> {
         Ok(())
     } else {
         eprintln!("error: error while running fast-import");
-        Err(GitError::Exit(status.code().unwrap_or(1)))
+        Err(crate::cli_exit(status.code().unwrap_or(1)))
     }
 }
 
@@ -323,9 +336,9 @@ fn trace_remote_helper(spec: &sley_remote::RemoteHelperSpec) {
 
 fn render_remote_helper_error(error: GitError) -> GitError {
     match error {
-        GitError::Cli(sley::plumbing::sley_core::CliExit::UserError, message) => {
-            eprintln!("fatal: {message}");
-            GitError::Exit(128)
+        error @ GitError::RemoteHelperAborted { .. } => {
+            eprintln!("fatal: {error}");
+            crate::cli_exit(128)
         }
         error => error,
     }
@@ -346,6 +359,7 @@ mod tests {
             ..GitConfig::default()
         };
         let error = discover_remote_helper_for_clone(
+            &sley_remote::RemotePolicy::default(),
             &config,
             Path::new("/repository-is-not-opened-before-policy-check"),
             sley_remote::RemoteHelperSpec {
@@ -356,7 +370,7 @@ mod tests {
         )
         .err()
         .expect("protocol policy should reject helper");
-        assert_eq!(error, GitError::Exit(128));
+        assert_eq!(crate::cli_reported_status(&error), Some(128));
     }
 
     #[test]

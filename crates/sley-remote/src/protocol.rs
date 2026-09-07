@@ -1,9 +1,17 @@
-use std::env;
 use std::fmt;
 
 use sley_config::GitConfig;
 use sley_core::GitError;
 use sley_transport::{RemoteTransport, RemoteUrl};
+
+pub use sley_transport::TransportPolicy;
+
+/// Namespace and transport policy for one remote operation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemotePolicy {
+    pub namespace: sley_core::Namespace,
+    pub transport: TransportPolicy,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportPolicyError {
@@ -67,9 +75,9 @@ pub fn transport_scheme_for_remote(remote: &RemoteUrl) -> &'static str {
 pub fn check_transport_allowed(
     scheme: &str,
     config: Option<&GitConfig>,
-    from_user: Option<bool>,
+    policy: &TransportPolicy,
 ) -> std::result::Result<(), TransportPolicyError> {
-    if is_transport_allowed(scheme, config, from_user)? {
+    if is_transport_allowed(scheme, config, policy)? {
         Ok(())
     } else {
         Err(TransportPolicyError::NotAllowed {
@@ -85,15 +93,15 @@ pub(crate) fn transport_policy_git_error(err: TransportPolicyError) -> GitError 
 pub fn is_transport_allowed(
     scheme: &str,
     config: Option<&GitConfig>,
-    from_user: Option<bool>,
+    policy: &TransportPolicy,
 ) -> std::result::Result<bool, TransportPolicyError> {
-    if let Ok(allow) = env::var("GIT_ALLOW_PROTOCOL") {
-        return Ok(allow.split(':').any(|entry| entry == scheme));
+    if let Some(allow) = &policy.allow_protocols {
+        return Ok(allow.iter().any(|entry| entry == scheme));
     }
     Ok(match protocol_config(scheme, config)? {
         ProtocolAllow::Always => true,
         ProtocolAllow::Never => false,
-        ProtocolAllow::UserOnly => from_user.unwrap_or_else(protocol_from_user),
+        ProtocolAllow::UserOnly => policy.from_user,
     })
 }
 
@@ -132,24 +140,6 @@ fn parse_protocol_config(
             key: key.to_string(),
             value: value.to_string(),
         })
-    }
-}
-
-fn protocol_from_user() -> bool {
-    env::var("GIT_PROTOCOL_FROM_USER")
-        .ok()
-        .and_then(|value| parse_git_bool(&value))
-        .unwrap_or(true)
-}
-
-fn parse_git_bool(value: &str) -> Option<bool> {
-    if value.is_empty() {
-        return Some(false);
-    }
-    match value.to_ascii_lowercase().as_str() {
-        "true" | "yes" | "on" => Some(true),
-        "false" | "no" | "off" => Some(false),
-        _ => value.parse::<i64>().ok().map(|number| number != 0),
     }
 }
 
@@ -229,19 +219,26 @@ mod tests {
     }
 
     #[test]
-    fn user_policy_honors_from_user_env() {
+    fn user_policy_honors_explicit_origin() {
         let cfg = config(ConfigSection::new(
             "protocol",
             Some("file".into()),
             vec![ConfigEntry::new("allow", Some("user".into()))],
         ));
         assert!(
-            is_transport_allowed("file", Some(&cfg), Some(true))
+            is_transport_allowed("file", Some(&cfg), &TransportPolicy::default())
                 .expect("file transport should evaluate user-allowed policy")
         );
         assert!(
-            !is_transport_allowed("file", Some(&cfg), Some(false))
-                .expect("file transport should evaluate user-denied policy")
+            !is_transport_allowed(
+                "file",
+                Some(&cfg),
+                &TransportPolicy {
+                    from_user: false,
+                    ..TransportPolicy::default()
+                }
+            )
+            .expect("file transport should evaluate user-denied policy")
         );
     }
 }

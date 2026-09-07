@@ -135,7 +135,7 @@ impl NegativeRefSpec {
 #[cfg(test)]
 mod tests {
     use super::{NegativeRefSpec, RefSpec};
-    use crate::plumbing::sley_protocol::{parse_refspec, refspec_matches_source};
+    use sley_protocol::{parse_refspec, refspec_matches_source};
 
     #[test]
     fn forced_spec_renders_the_plus_prefix_and_round_trips() {

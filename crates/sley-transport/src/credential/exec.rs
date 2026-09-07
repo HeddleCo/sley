@@ -274,7 +274,7 @@ pub(crate) fn run_helper_process(
         Stdio::null()
     });
     let deadline = options.timeout.map(|timeout| Instant::now() + timeout);
-    let mut child = command.spawn().map_err(|e| GitError::Io(e.to_string()))?;
+    let mut child = command.spawn().map_err(GitError::from)?;
     let op_type = if want_output {
         CredentialOpType::Helper
     } else {
@@ -284,9 +284,10 @@ pub(crate) fn run_helper_process(
         && credential_write(credential, &mut stdin, op_type).is_err()
     {
         terminate_helper(&mut child);
-        return Err(GitError::Io(format!(
-            "failed to write credential protocol input to helper '{helper}'"
-        )));
+        return Err(GitError::IoKind {
+            kind: std::io::ErrorKind::Other,
+            message: format!("failed to write credential protocol input to helper '{helper}'"),
+        });
     }
     if !want_output {
         return match wait_for_exit(&mut child, deadline) {
@@ -296,9 +297,10 @@ pub(crate) fn run_helper_process(
     }
     let Some(stdout) = child.stdout.take() else {
         terminate_helper(&mut child);
-        return Err(GitError::Io(
-            "credential helper stdout was not piped".into(),
-        ));
+        return Err(GitError::IoKind {
+            kind: std::io::ErrorKind::Other,
+            message: "credential helper stdout was not piped".into(),
+        });
     };
     let output = read_bounded_output(&mut child, stdout, helper, deadline, options)?;
     match wait_for_exit(&mut child, deadline) {
@@ -319,14 +321,14 @@ fn read_bounded_output(
 ) -> Result<Vec<u8>> {
     let max_output_bytes = options.max_output_bytes;
     let (send_output, receive_output) = mpsc::sync_channel(1);
-    thread::spawn(move || {
+    thread::spawn(sley_core::diagnostics::inherit(move || {
         let mut output = Vec::new();
         let result = stdout
             .take(max_output_bytes.saturating_add(1) as u64)
             .read_to_end(&mut output)
             .map(|_| output);
         let _ = send_output.send(result);
-    });
+    }));
     let received = match deadline {
         Some(deadline) => receive_output.recv_timeout(remaining_time(deadline)),
         None => receive_output
@@ -343,7 +345,7 @@ fn read_bounded_output(
         }
         Ok(Err(err)) => {
             terminate_helper(child);
-            Err(GitError::Io(err.to_string()))
+            Err(GitError::from(err))
         }
         Err(_) => {
             terminate_helper(child);

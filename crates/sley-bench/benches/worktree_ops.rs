@@ -85,7 +85,7 @@ struct Worktree {
 impl Worktree {
     fn create() -> Result<Self> {
         let root = unique_temp_dir("sley-bench-worktree");
-        fs::create_dir_all(&root).map_err(|e| GitError::Io(e.to_string()))?;
+        fs::create_dir_all(&root).map_err(GitError::from)?;
         let git = git_bin();
         // Hermetic init: -b main, identity + safe.directory wired via -c so the
         // bench never depends on host gitconfig.
@@ -97,10 +97,9 @@ impl Worktree {
         for index in 0..FILE_COUNT {
             let path = file_path(&root, index);
             if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|e| GitError::Io(e.to_string()))?;
+                fs::create_dir_all(parent).map_err(GitError::from)?;
             }
-            fs::write(&path, format!("content of file {index}\n"))
-                .map_err(|e| GitError::Io(e.to_string()))?;
+            fs::write(&path, format!("content of file {index}\n")).map_err(GitError::from)?;
         }
         run(&git, &root, &["add", "-A"])?;
         run(
@@ -125,7 +124,7 @@ impl Worktree {
         for index in 0..DIRTY_COUNT {
             let path = file_path(&self.root, index);
             fs::write(&path, format!("dirtied content {index} {}\n", nonce()))
-                .map_err(|e| GitError::Io(e.to_string()))?;
+                .map_err(GitError::from)?;
         }
         Ok(())
     }

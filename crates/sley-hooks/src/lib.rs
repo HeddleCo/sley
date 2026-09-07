@@ -131,7 +131,9 @@ pub fn cmd_hook_with_env(args: &[String], hook_env: &HookEnvironment) -> Result<
         Some("run") => cmd_hook_run(&args[1..], hook_env),
         _ => {
             hook_usage();
-            Err(GitError::Exit(129))
+            Err(GitError::Rejected(
+                sley_core::RejectionKind::InvalidArguments,
+            ))
         }
     }
 }
@@ -142,8 +144,8 @@ pub fn run_hook(hook_name: &str, options: HookRun, hook_env: &HookEnvironment) -
     let hooks = list_hook_commands_with_config(hook_name, hook_env, &config)?;
     if hooks.is_empty() {
         if options.error_if_missing {
-            eprintln!("error: cannot find a hook named {hook_name}");
-            return Err(GitError::Exit(1));
+            sley_core::diagnostic!(Stderr, true, "error: cannot find a hook named {hook_name}");
+            return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
         }
         return Ok(false);
     }
@@ -181,7 +183,9 @@ pub fn run_hook(hook_name: &str, options: HookRun, hook_env: &HookEnvironment) -
     for hook in runnable {
         let status = spawn_hook(&hook, &options)?;
         if !status.success() {
-            return Err(GitError::Exit(hook_failure_code(status.code(), &options)));
+            return Err(GitError::ChildProcessFailed {
+                status: Some(hook_failure_code(status.code(), &options)),
+            });
         }
     }
     Ok(true)
@@ -283,7 +287,9 @@ pub fn run_traditional_hook_at(git_dir: &Path, hook_name: &str, options: HookRun
     }
     let status = spawn_hook(&HookCommand::Traditional(path), &options)?;
     if !status.success() {
-        return Err(GitError::Exit(hook_failure_code(status.code(), &options)));
+        return Err(GitError::ChildProcessFailed {
+            status: Some(hook_failure_code(status.code(), &options)),
+        });
     }
     Ok(true)
 }
@@ -300,16 +306,27 @@ fn cmd_hook_list(args: &[String], hook_env: &HookEnvironment) -> Result<()> {
             "--show-scope" => show_scope = true,
             "-h" | "--help" => {
                 hook_list_usage();
-                return Err(GitError::Exit(129));
+                return Err(GitError::Rejected(
+                    sley_core::RejectionKind::InvalidArguments,
+                ));
             }
             value if value.starts_with('-') => {
-                eprintln!("error: unknown option `{}`", value.trim_start_matches('-'));
-                return Err(GitError::Exit(129));
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "error: unknown option `{}`",
+                    value.trim_start_matches('-')
+                );
+                return Err(GitError::Rejected(
+                    sley_core::RejectionKind::InvalidArguments,
+                ));
             }
             value => {
                 if hook_name.is_some() {
                     hook_list_usage();
-                    return Err(GitError::Exit(129));
+                    return Err(GitError::Rejected(
+                        sley_core::RejectionKind::InvalidArguments,
+                    ));
                 }
                 hook_name = Some(value.to_string());
             }
@@ -317,20 +334,32 @@ fn cmd_hook_list(args: &[String], hook_env: &HookEnvironment) -> Result<()> {
     }
     let Some(hook_name) = hook_name else {
         hook_list_usage();
-        return Err(GitError::Exit(129));
+        return Err(GitError::Rejected(
+            sley_core::RejectionKind::InvalidArguments,
+        ));
     };
     if !allow_unknown && !KNOWN_HOOKS.contains(&hook_name.as_str()) {
-        eprintln!("error: unknown hook event '{hook_name}';");
-        eprintln!("use --allow-unknown-hook-name to allow non-native hook names");
-        return Err(GitError::Exit(1));
+        sley_core::diagnostic!(Stderr, true, "error: unknown hook event '{hook_name}';");
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "use --allow-unknown-hook-name to allow non-native hook names"
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     }
     let hooks = list_hook_commands(&hook_name, hook_env)?;
     if hooks.is_empty() {
-        eprintln!("warning: no hooks found for event '{hook_name}'");
-        return Err(GitError::Exit(1));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "warning: no hooks found for event '{hook_name}'"
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     }
     let terminator = if nul { "\0" } else { "\n" };
-    let mut stdout = io::stdout().lock();
+    let mut stdout = sley_core::diagnostics::DiagnosticWriter::new(
+        sley_core::diagnostics::DiagnosticStream::Stdout,
+    );
     for hook in hooks {
         match hook {
             HookCommand::Traditional(_) => write!(stdout, "hook from hookdir{terminator}")?,
@@ -382,7 +411,9 @@ fn cmd_hook_run(args: &[String], hook_env: &HookEnvironment) -> Result<()> {
                 index += 1;
                 let Some(path) = args.get(index) else {
                     hook_run_usage();
-                    return Err(GitError::Exit(129));
+                    return Err(GitError::Rejected(
+                        sley_core::RejectionKind::InvalidArguments,
+                    ));
                 };
                 stdin_path = Some(path.clone());
             }
@@ -393,7 +424,9 @@ fn cmd_hook_run(args: &[String], hook_env: &HookEnvironment) -> Result<()> {
                 index += 1;
                 let Some(value) = args.get(index) else {
                     hook_run_usage();
-                    return Err(GitError::Exit(129));
+                    return Err(GitError::Rejected(
+                        sley_core::RejectionKind::InvalidArguments,
+                    ));
                 };
                 jobs = Some(parse_hook_jobs_arg(value)?);
             }
@@ -405,20 +438,31 @@ fn cmd_hook_run(args: &[String], hook_env: &HookEnvironment) -> Result<()> {
             }
             "-h" | "--help" => {
                 hook_run_usage();
-                return Err(GitError::Exit(129));
+                return Err(GitError::Rejected(
+                    sley_core::RejectionKind::InvalidArguments,
+                ));
             }
             "--" | "--end-of-options" => {
                 hook_args.extend(args[index + 1..].iter().cloned());
                 break;
             }
             value if value.starts_with('-') && hook_name.is_none() => {
-                eprintln!("error: unknown option `{}`", value.trim_start_matches('-'));
-                return Err(GitError::Exit(129));
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "error: unknown option `{}`",
+                    value.trim_start_matches('-')
+                );
+                return Err(GitError::Rejected(
+                    sley_core::RejectionKind::InvalidArguments,
+                ));
             }
             value => {
                 if hook_name.is_some() {
                     hook_run_usage();
-                    return Err(GitError::Exit(129));
+                    return Err(GitError::Rejected(
+                        sley_core::RejectionKind::InvalidArguments,
+                    ));
                 }
                 hook_name = Some(value.to_string());
             }
@@ -427,12 +471,18 @@ fn cmd_hook_run(args: &[String], hook_env: &HookEnvironment) -> Result<()> {
     }
     let Some(hook_name) = hook_name else {
         hook_run_usage();
-        return Err(GitError::Exit(129));
+        return Err(GitError::Rejected(
+            sley_core::RejectionKind::InvalidArguments,
+        ));
     };
     if !allow_unknown && !KNOWN_HOOKS.contains(&hook_name.as_str()) {
-        eprintln!("error: unknown hook event '{hook_name}';");
-        eprintln!("use --allow-unknown-hook-name to allow non-native hook names");
-        return Err(GitError::Exit(1));
+        sley_core::diagnostic!(Stderr, true, "error: unknown hook event '{hook_name}';");
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "use --allow-unknown-hook-name to allow non-native hook names"
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     }
     let stdin = stdin_path.map(fs::read).transpose()?;
     run_hook(
@@ -456,20 +506,24 @@ fn cmd_hook_run(args: &[String], hook_env: &HookEnvironment) -> Result<()> {
 
 fn parse_hook_jobs_arg(value: &str) -> Result<usize> {
     let Ok(parsed) = value.parse::<isize>() else {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "fatal: invalid value for -j: {value} (use -1 for CPU count or a positive integer)"
         );
-        return Err(GitError::Exit(128));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     };
     if parsed == -1 {
         Ok(online_cpus())
     } else if parsed > 0 {
         Ok(parsed as usize)
     } else {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "fatal: invalid value for -j: {parsed} (use -1 for CPU count or a positive integer)"
         );
-        Err(GitError::Exit(128))
+        Err(GitError::Rejected(sley_core::RejectionKind::Refused))
     }
 }
 
@@ -575,14 +629,20 @@ fn configured_hooks(config: &[ScopedSection], hook_name: &str) -> Result<Vec<Hoo
         let command = match state.commands.get(name) {
             Some(command) => command.clone(),
             None if disabled => {
-                eprintln!("warning: disabled hook '{name}' has no command configured");
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "warning: disabled hook '{name}' has no command configured"
+                );
                 String::new()
             }
             None => {
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "fatal: 'hook.{name}.command' must be configured or 'hook.{name}.event' must be removed; aborting."
                 );
-                return Err(GitError::Exit(128));
+                return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
             }
         };
         out.push(HookCommand::Configured {
@@ -623,13 +683,17 @@ fn parse_hook_config(config: &[ScopedSection]) -> Result<HookConfigState> {
                     continue;
                 }
                 if KNOWN_HOOKS.contains(&name) {
-                    eprintln!(
+                    sley_core::diagnostic!(
+                        Stderr,
+                        true,
                         "fatal: hook friendly-name '{name}' collides with a known event name; please choose a different friendly-name"
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
                 }
                 if name == value {
-                    eprintln!(
+                    sley_core::diagnostic!(
+                        Stderr,
+                        true,
                         "warning: hook friendly-name '{name}' is the same as its event; this may cause ambiguity with hook.{name}.enabled"
                     );
                 }
@@ -653,7 +717,9 @@ fn parse_hook_config(config: &[ScopedSection]) -> Result<HookConfigState> {
                     if let Some(value) = sley_config::parse_config_bool(value) {
                         state.parallel.insert(name.to_string(), value);
                     } else {
-                        eprintln!(
+                        sley_core::diagnostic!(
+                            Stderr,
+                            true,
                             "warning: hook.{name}.parallel must be a boolean, ignoring: '{value}'"
                         );
                     }
@@ -725,7 +791,9 @@ fn friendly_name_set(state: &HookConfigState) -> HashSet<String> {
 fn warn_jobs_on_friendly_names(state: &HookConfigState, friendly_names: &HashSet<String>) {
     for name in state.event_jobs.keys() {
         if friendly_names.contains(name) {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "warning: hook.{name}.jobs is set but '{name}' looks like a hook friendly-name, not an event name; hook.<event>.jobs uses the event name (e.g. hook.post-receive.jobs), so this setting will be ignored"
             );
         }
@@ -737,11 +805,19 @@ fn parse_hook_jobs_config(key: &str, value: &str) -> Option<usize> {
         Some(-1) => Some(online_cpus()),
         Some(v) if v > 0 => Some(v as usize),
         Some(v) => {
-            eprintln!("warning: {key} must be a positive integer or -1, ignoring: {v}");
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "warning: {key} must be a positive integer or -1, ignoring: {v}"
+            );
             None
         }
         None => {
-            eprintln!("warning: {key} must be an integer, ignoring: '{value}'");
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "warning: {key} must be an integer, ignoring: '{value}'"
+            );
             None
         }
     }
@@ -870,7 +946,9 @@ fn warn_non_parallel_hooks_override(jobs: usize, hooks: &[HookCommand]) {
             ..
         } = hook
         {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "warning: hook '{name}' is not marked as parallel=true, running in parallel anyway due to -j{jobs}"
             );
         }
@@ -931,11 +1009,17 @@ fn advise_ignored_hook(path: &Path, config: &[ScopedSection]) {
     if !advice_enabled {
         return;
     }
-    eprintln!(
+    sley_core::diagnostic!(
+        Stderr,
+        true,
         "hint: The '{}' hook was ignored because it's not set as executable.",
         path.display()
     );
-    eprintln!("hint: You can disable this warning with `git config advice.ignoredHook false`.");
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "hint: You can disable this warning with `git config advice.ignoredHook false`."
+    );
 }
 
 fn default_hook_cwd() -> Option<PathBuf> {
@@ -946,10 +1030,10 @@ fn default_hook_cwd() -> Option<PathBuf> {
 
 fn hook_cwd_for_git_dir(git_dir: &Path) -> Result<PathBuf> {
     if let Some(work_tree) = environment_work_tree() {
-        let cwd = env::current_dir().map_err(|err| GitError::Io(err.to_string()))?;
+        let cwd = env::current_dir().map_err(GitError::from)?;
         let resolved = resolve_path_from_cwd(&cwd, &work_tree);
         return fs::canonicalize(resolved)
-            .map_err(|err| GitError::Io(err.to_string()))
+            .map_err(GitError::from)
             .or_else(|_| Ok(resolve_path_from_cwd(&cwd, &work_tree)));
     }
     match worktree_root_for_git_dir(git_dir) {
@@ -1000,8 +1084,14 @@ fn run_hooks_parallel(
             merged.extend_from_slice(&output.stderr);
             let status = output.status;
             if !merged.is_empty() {
-                io::stderr().write_all(&merged)?;
-                io::stderr().flush()?;
+                sley_core::diagnostics::DiagnosticWriter::new(
+                    sley_core::diagnostics::DiagnosticStream::Stderr,
+                )
+                .write_all(&merged)?;
+                sley_core::diagnostics::DiagnosticWriter::new(
+                    sley_core::diagnostics::DiagnosticStream::Stderr,
+                )
+                .flush()?;
             }
             if !status.success() && first_failure.is_none() {
                 first_failure = Some(status.code());
@@ -1009,7 +1099,9 @@ fn run_hooks_parallel(
         }
     }
     if let Some(code) = first_failure {
-        return Err(GitError::Exit(hook_failure_code(code, options)));
+        return Err(GitError::ChildProcessFailed {
+            status: Some(hook_failure_code(code, options)),
+        });
     }
     Ok(true)
 }
@@ -1027,8 +1119,14 @@ fn spawn_hook(hook: &HookCommand, options: &HookRun) -> Result<ExitStatus> {
     let running = spawn_hook_child(hook, options, stdout, Stdio::inherit())?;
     let output = running.child.wait_with_output()?;
     if options.stdout_to_stderr {
-        io::stderr().write_all(&output.stdout)?;
-        io::stderr().flush()?;
+        sley_core::diagnostics::DiagnosticWriter::new(
+            sley_core::diagnostics::DiagnosticStream::Stderr,
+        )
+        .write_all(&output.stdout)?;
+        sley_core::diagnostics::DiagnosticWriter::new(
+            sley_core::diagnostics::DiagnosticStream::Stderr,
+        )
+        .flush()?;
     }
     Ok(output.status)
 }
@@ -1077,8 +1175,13 @@ fn spawn_hook_child(
     command.stdout(stdout);
     command.stderr(stderr);
     let mut child = command.spawn().map_err(|err| {
-        eprintln!("fatal: cannot spawn {}: {err}", hook.display_name());
-        GitError::Exit(1)
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "fatal: cannot spawn {}: {err}",
+            hook.display_name()
+        );
+        GitError::Rejected(sley_core::RejectionKind::Incomplete)
     })?;
     if let Some(input) = &options.stdin
         && let Some(mut stdin) = child.stdin.take()
@@ -1102,18 +1205,30 @@ impl HookCommand {
 }
 
 fn hook_usage() {
-    eprintln!(
+    sley_core::diagnostic!(
+        Stderr,
+        true,
         "usage: git hook run [--allow-unknown-hook-name] [--ignore-missing] [--to-stdin=<path>] <hook-name> [-- <hook-args>]"
     );
-    eprintln!("   or: git hook list [--allow-unknown-hook-name] [-z] [--show-scope] <hook-name>");
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "   or: git hook list [--allow-unknown-hook-name] [-z] [--show-scope] <hook-name>"
+    );
 }
 
 fn hook_run_usage() {
-    eprintln!(
+    sley_core::diagnostic!(
+        Stderr,
+        true,
         "usage: git hook run [--allow-unknown-hook-name] [--ignore-missing] [--to-stdin=<path>] <hook-name> [-- <hook-args>]"
     );
 }
 
 fn hook_list_usage() {
-    eprintln!("usage: git hook list [--allow-unknown-hook-name] [-z] [--show-scope] <hook-name>");
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "usage: git hook list [--allow-unknown-hook-name] [-z] [--show-scope] <hook-name>"
+    );
 }

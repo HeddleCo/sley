@@ -2,7 +2,6 @@
 #![allow(clippy::expect_used)]
 
 use crate::*;
-use sley::plumbing::{sley_config, sley_core, sley_index, sley_worktree};
 use sley_worktree::admin::{LinkedWorktreeAdmin, WorktreeAdminOutcome, WorktreeAdminSnapshot};
 
 #[path = "worktree_options.rs"]
@@ -175,7 +174,7 @@ pub(crate) fn cmd_worktree_add(
                 branch,
                 existing_path.display()
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     let add_head = worktree_add_resolve_head(
@@ -208,7 +207,7 @@ pub(crate) fn cmd_worktree_add(
                 branch,
                 existing_path.display()
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     // git prints the "Preparing worktree ..." line in `add()` and then runs
@@ -283,7 +282,12 @@ pub(crate) fn cmd_worktree_add(
         // Build the target tree normally, then reconcile it through the shared
         // sparse engine so skip-worktree bits, sparse-directory collapsing and
         // materialized files all use the same semantics as sparse-checkout set.
-        sley_worktree::reapply_active_sparse_checkout(&path, &admin_dir, format)?;
+        sley_worktree::reapply_active_sparse_checkout(
+            cli_session.original_cwd.as_deref(),
+            &path,
+            &admin_dir,
+            format,
+        )?;
     }
     // The prepare line was already printed (before check_candidate_path); only
     // the post-checkout "HEAD is now at ..." reset line remains.
@@ -395,7 +399,7 @@ fn worktree_usage<T>() -> Result<T> {
     eprintln!(
         "usage: git worktree add [-f] [--detach] [--checkout] [--lock [--reason <string>]]\n                        [--orphan] [(-b | -B) <new-branch>] <path> [<commit-ish>]\n   or: git worktree list [-v | --porcelain [-z]]\n   or: git worktree lock [--reason <string>] <worktree>\n   or: git worktree move <worktree> <new-path>\n   or: git worktree prune [-n] [-v] [--expire <expire>]\n   or: git worktree remove [-f] <worktree>\n   or: git worktree repair [<path>...]\n   or: git worktree unlock <worktree>"
     );
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 pub(crate) fn cmd_worktree_prune(
@@ -508,7 +512,7 @@ pub(crate) fn cmd_worktree_lock(
                 eprint!(", reason: {reason}");
             }
             eprintln!();
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     };
     fs::write(&plan.lock_file, &plan.contents)?;
@@ -529,7 +533,7 @@ pub(crate) fn cmd_worktree_unlock(
     let admin = find_linked_worktree_admin(&snapshot, &common_git_dir, cwd, &path)?;
     let plan = sley_worktree::admin::plan_unlock(&admin).map_err(|_| {
         eprintln!("fatal: '{path}' is not locked");
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })?;
     fs::remove_file(&plan.lock_file)?;
     Ok(WorktreeAdminOutcome::Unlocked {
@@ -556,14 +560,14 @@ pub(crate) fn cmd_worktree_remove(
         }
         eprintln!();
         eprintln!("use 'remove -f -f' to override or unlock first");
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })?;
     if plan.force == 0 && worktree_remove_has_local_changes(&common_git_dir, &admin, format)? {
         eprintln!(
             "fatal: '{}' contains modified or untracked files, use --force to delete it",
             options.path
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if plan.worktree_path.exists() {
         fs::remove_dir_all(&plan.worktree_path)?;
@@ -594,7 +598,7 @@ pub(crate) fn cmd_worktree_move(
         }
         eprintln!();
         eprintln!("use 'move -f -f' to override or unlock first");
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })?;
     let destination = worktree_move_destination(cwd, &admin.path, &options.destination)?;
     let relative_paths = options.relative_paths.unwrap_or_else(|| {
@@ -611,7 +615,7 @@ pub(crate) fn cmd_worktree_move(
             }
             eprintln!();
             eprintln!("use 'move -f -f' to override or unlock first");
-            GitError::Exit(128)
+            crate::cli_exit(128)
         })?;
     fs::rename(&plan.source, &plan.destination)?;
     write_worktree_linking_files(
@@ -665,7 +669,7 @@ pub(crate) fn cmd_worktree_repair(
         repair_registered_worktrees(&common_git_dir, &snapshot, plan.relative_paths, &mut failed)?;
     }
     if failed {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(WorktreeAdminOutcome::Repaired)
 }
@@ -736,13 +740,13 @@ fn find_linked_worktree_admin(
             || target == common_git_dir)
     {
         eprintln!("fatal: The main working tree cannot be locked or unlocked");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if let Some(admin) = snapshot.find_path(&target) {
         return Ok(admin.clone());
     }
     eprintln!("fatal: '{path}' is not a working tree");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn find_linked_worktree_admin_for_remove(
@@ -757,13 +761,13 @@ fn find_linked_worktree_admin_for_remove(
         && canonical_target.as_deref() == fs::canonicalize(main).ok().as_deref()
     {
         eprintln!("fatal: '{path}' is a main working tree");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if let Some(admin) = snapshot.find_path(&target) {
         return Ok(admin.clone());
     }
     eprintln!("fatal: '{path}' is not a working tree");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn find_linked_worktree_admin_for_move(
@@ -778,20 +782,20 @@ fn find_linked_worktree_admin_for_move(
         && canonical_target.as_deref() == fs::canonicalize(main).ok().as_deref()
     {
         eprintln!("fatal: '{path}' is a main working tree");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if let Some(admin) = snapshot.find_path(&target) {
         return Ok(admin.clone());
     }
     eprintln!("fatal: '{path}' is not a working tree");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn worktree_move_destination(cwd: &Path, source: &Path, destination: &str) -> Result<PathBuf> {
     let resolved = resolve_cli_path(cwd, destination);
     if resolved.is_file() {
         eprintln!("fatal: '{destination}' already exists");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if resolved.is_dir() {
         let Some(name) = source.file_name() else {
@@ -1158,7 +1162,7 @@ fn can_use_remote_refs(
             eprintln!(
                 "fatal: No local or remote refs exist despite at least one remote\npresent, stopping; use 'add -f' to override or fetch a remote first"
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     Ok(false)
@@ -1275,11 +1279,11 @@ fn dwim_orphan(
     // git checks --track before --no-checkout.
     if options.track.is_some() {
         eprintln!("fatal: options '--orphan' and '--track' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if !options.checkout {
         eprintln!("fatal: options '--orphan' and '--no-checkout' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(true)
 }
@@ -1374,7 +1378,7 @@ fn worktree_add_resolve_head(
         let refname = branch_ref_name(&branch)?;
         if store.read_ref(&refname)?.is_some() {
             eprintln!("fatal: a branch named '{branch}' already exists");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         return Ok(WorktreeAddHead {
             branch_name: Some(branch.clone()),
@@ -1675,7 +1679,7 @@ fn worktree_add_resolve_commitish(
                 );
             }
             eprintln!("fatal: invalid reference: {commitish}");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -1732,7 +1736,7 @@ fn check_worktree_candidate_path(
                     "fatal: '{original}' is a missing but already registered worktree;\nuse 'add -f' to override, or 'prune' or 'remove' to clear"
                 );
             }
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -1908,11 +1912,11 @@ fn set_config_simple(config: &mut GitConfig, section: &str, key: &str, value: &s
 fn validate_worktree_add_destination(path: &Path, original: &str) -> Result<()> {
     if path.is_file() {
         eprintln!("fatal: '{original}' already exists");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if path.is_dir() && fs::read_dir(path)?.next().is_some() {
         eprintln!("fatal: '{original}' already exists");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(())
 }

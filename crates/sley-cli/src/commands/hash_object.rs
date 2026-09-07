@@ -2,14 +2,13 @@
 //! apply the same worktree-to-blob conversions that Git uses for path-aware
 //! hashing.
 
-use sley::plumbing::sley_worktree;
 use std::fs;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use sley::GitConfig;
-use sley::plumbing::sley_object::ObjectType;
 use sley::{GitError, ObjectFormat, Repository, Result};
+use sley_object::ObjectType;
 
 use super::args::{
     GitArgCursor, LongOption, Terminator, option_takes_no_value, switch_requires_value, usage_error,
@@ -629,7 +628,7 @@ fn validate_hash_object_big_file_threshold(config: &GitConfig) -> Result<()> {
             eprintln!(
                 "fatal: bad numeric config value '{value}' for 'core.bigfilethreshold': invalid unit"
             );
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
         // The accessor already printed git's exact fatal line.
         Err(report) => Err(report),
@@ -669,7 +668,7 @@ fn read_hash_object_path(path: impl AsRef<Path>) -> Result<Vec<u8>> {
                 "fatal: could not open '{}' for reading: {reason}",
                 path.display()
             );
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -736,7 +735,7 @@ fn print_hash_object(
         }
         if report.refuse {
             eprintln!("fatal: refusing to create malformed object");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     let object = sley_object::EncodedObject::new(object_type, body);
@@ -786,13 +785,13 @@ fn parse_hash_object_format(value: &str) -> Result<ObjectFormat> {
 
 fn hash_object_unknown_long_option<T>(option: &str) -> Result<T> {
     eprintln!("error: unknown option `{option}'");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn hash_object_unknown_short_switch<T>(option: &str) -> Result<T> {
     let tail = option.trim_start_matches('-');
     eprintln!("error: unknown switch `{tail}'");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 #[cfg(test)]
@@ -809,7 +808,7 @@ mod tests {
         let args = vec!["--stdin".to_string(), "--stdin".to_string()];
         assert!(matches!(
             HashObjectInvocation::parse(&args),
-            Err(GitError::Exit(129))
+            Err(error) if crate::cli_reported_status(&error) == Some(129)
         ));
     }
 
@@ -818,7 +817,7 @@ mod tests {
         let args = vec!["--bogus".to_string()];
         assert!(matches!(
             HashObjectInvocation::parse(&args),
-            Err(GitError::Exit(129))
+            Err(error) if crate::cli_reported_status(&error) == Some(129)
         ));
     }
 
@@ -827,7 +826,7 @@ mod tests {
         let args = vec!["-x".to_string()];
         assert!(matches!(
             HashObjectInvocation::parse(&args),
-            Err(GitError::Exit(129))
+            Err(error) if crate::cli_reported_status(&error) == Some(129)
         ));
     }
 
@@ -836,7 +835,7 @@ mod tests {
         let args = vec!["--object-format".to_string()];
         assert!(matches!(
             HashObjectInvocation::parse(&args),
-            Err(GitError::Exit(129))
+            Err(error) if crate::cli_reported_status(&error) == Some(129)
         ));
     }
 
@@ -845,7 +844,7 @@ mod tests {
         let args = vec!["--object-format=".to_string()];
         assert!(matches!(
             HashObjectInvocation::parse(&args),
-            Err(GitError::Exit(129))
+            Err(error) if crate::cli_reported_status(&error) == Some(129)
         ));
     }
 

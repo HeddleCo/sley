@@ -24,8 +24,11 @@ pub fn parse_prune_expire(value: &str, option: &str) -> Result<i64> {
         "now" | "all" => Ok(i64::MAX),
         "never" => Ok(i64::MIN),
         _ => parse_reflog_expire_time(value, option).map_err(|err| {
-            if matches!(err, GitError::Exit(_)) {
-                eprintln!("error: malformed expiration date '{value}'");
+            if matches!(
+                err,
+                GitError::Rejected(_) | GitError::ChildProcessFailed { .. } | GitError::Callback(_)
+            ) {
+                sley_core::diagnostic!(Stderr, true, "error: malformed expiration date '{value}'");
             }
             err
         }),
@@ -387,8 +390,12 @@ pub fn run_recent_objects_hooks(
             .stderr(std::process::Stdio::inherit())
             .output()?;
         if !output.status.success() {
-            eprintln!("fatal: unable to enumerate additional recent objects");
-            return Err(GitError::Exit(128));
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "fatal: unable to enumerate additional recent objects"
+            );
+            return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
         }
         for line in output.stdout.split(|byte| *byte == b'\n') {
             let line = line.strip_suffix(b"\r").unwrap_or(line);
@@ -471,9 +478,19 @@ pub fn prune_temporary_files(path: &Path, expire: i64, dry_run: bool, verbose: b
         }
         if dry_run || verbose {
             if metadata.is_dir() {
-                println!("Removing stale temporary directory {}", path.display());
+                sley_core::diagnostic!(
+                    Stdout,
+                    true,
+                    "Removing stale temporary directory {}",
+                    path.display()
+                );
             } else {
-                println!("Removing stale temporary file {}", path.display());
+                sley_core::diagnostic!(
+                    Stdout,
+                    true,
+                    "Removing stale temporary file {}",
+                    path.display()
+                );
             }
         }
         if dry_run {
@@ -515,7 +532,7 @@ pub fn prune_packed_loose_objects(
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(GitError::Io(err.to_string())),
+            Err(err) => return Err(GitError::from(err)),
         }
     }
     if !dry_run {
@@ -639,7 +656,7 @@ pub fn prune_shallow_file(
                 .read_object_header(oid)?
                 .map(|(object_type, _size)| object_type.as_str())
                 .unwrap_or("unknown");
-            println!("{oid} {type_name}");
+            sley_core::diagnostic!(Stdout, true, "{oid} {type_name}");
         }
     }
     if dry_run || removed.is_empty() {
@@ -649,7 +666,7 @@ pub fn prune_shallow_file(
         match fs::remove_file(path) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(GitError::Io(err.to_string())),
+            Err(err) => return Err(GitError::from(err)),
         }
     } else {
         let mut out = retained.join("\n");

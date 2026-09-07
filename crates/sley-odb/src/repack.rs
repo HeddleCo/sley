@@ -1090,7 +1090,7 @@ fn write_filtered_repack_with_size(
     // Ensure the destination directory exists (filter-to may point outside the
     // repository, e.g. `../filtered.git/objects/pack/pack`).
     if let Some(parent) = prefix.parent() {
-        fs::create_dir_all(parent).map_err(|err| GitError::Io(err.to_string()))?;
+        fs::create_dir_all(parent).map_err(GitError::from)?;
     }
     let mut stems = Vec::new();
     let chunks = split_objects_by_pack_size(objects, max_pack_size);
@@ -2246,7 +2246,7 @@ fn install_staged_pack(
             fs::remove_file(staged)?;
             sync_parent_directory(destination)
         }
-        Err(err) => Err(GitError::Io(err.to_string())),
+        Err(err) => Err(GitError::from(err)),
     }
 }
 

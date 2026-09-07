@@ -1,8 +1,8 @@
 //! Repository layout helpers (object format, abbrev width, worktree root, pack counts).
 
 use crate::{common_git_dir_for_git_dir, global_config_value, session};
-use sley::plumbing::sley_odb::repository_objects_dir;
 use sley::{GitConfig, GitError, ObjectFormat, Result};
+use sley_odb::repository_objects_dir;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -117,16 +117,13 @@ fn multi_pack_index_object_count(path: &Path, format: ObjectFormat) -> Result<Op
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err.into()),
     };
-    let midx = sley::plumbing::sley_pack::MultiPackIndex::parse_without_checksum(&bytes, format)?;
+    let midx = sley_pack::MultiPackIndex::parse_without_checksum(&bytes, format)?;
     Ok(Some(midx.objects.len() as u64))
 }
 
 fn pack_index_object_count(path: &Path, format_hash: ObjectFormat) -> Result<u32> {
     let bytes = fs::read(path)?;
-    let index = sley::plumbing::sley_pack::PackIndexView::parse_trusted_without_checksum(
-        &bytes,
-        format_hash,
-    )?;
+    let index = sley_pack::PackIndexView::parse_trusted_without_checksum(&bytes, format_hash)?;
     Ok(index.count() as u32)
 }
 pub(crate) fn worktree_root_for_git_dir(

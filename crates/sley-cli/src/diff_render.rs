@@ -10,15 +10,14 @@
 use crate::{
     BString, DEFAULT_BIG_FILE_THRESHOLD, GitConfig, GitError, ObjectFormat, ObjectId, Result,
     commit_encoding, commit_subject, core_big_file_threshold, log_reencode_message,
-    normalize_absolute_cli_pathspec, read_repo_config, repository_object_format, sley_diff_merge,
-    sley_pretty, sley_remote, sley_rev, sley_worktree,
+    normalize_absolute_cli_pathspec, read_repo_config, repository_object_format,
 };
-use sley::plumbing::sley_object::{Commit, EncodedObject};
-use sley::plumbing::sley_odb::{FileObjectDatabase, ObjectReader};
 pub(crate) use sley_diff_merge::porcelain::DiffRenderOptions;
 use sley_diff_merge::porcelain::{
     LazyObjectFetch, PatchDriver, PatchUserdiff, SubmodulePatchRender,
 };
+use sley_object::{Commit, EncodedObject};
+use sley_odb::{FileObjectDatabase, ObjectReader};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
@@ -63,7 +62,10 @@ fn load_repo_config_for_promisor(git_dir: &Path) -> Option<GitConfig> {
     read_repo_config(git_dir).ok()
 }
 
-struct CliDiffLazyFetch;
+pub(crate) struct CliDiffLazyFetch {
+    policy: sley_remote::RemotePolicy,
+    enabled: bool,
+}
 
 impl LazyObjectFetch for CliDiffLazyFetch {
     fn read_object_maybe_prefetch(
@@ -71,7 +73,16 @@ impl LazyObjectFetch for CliDiffLazyFetch {
         db: &FileObjectDatabase,
         oid: &ObjectId,
     ) -> Result<std::sync::Arc<EncodedObject>> {
-        sley_remote::read_object_maybe_prefetch_promisor(db, oid, &load_repo_config_for_promisor)
+        if self.enabled {
+            sley_remote::read_object_maybe_prefetch_promisor(
+                &self.policy,
+                db,
+                oid,
+                &load_repo_config_for_promisor,
+            )
+        } else {
+            Ok(db.read_object(oid)?)
+        }
     }
 
     fn prefetch_entry_blobs(
@@ -80,7 +91,11 @@ impl LazyObjectFetch for CliDiffLazyFetch {
         entries: &[sley_diff_merge::NameStatusEntry],
         new_side_is_worktree: bool,
     ) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
         sley_remote::prefetch_diff_entry_blobs(
+            &self.policy,
             db,
             entries,
             new_side_is_worktree,
@@ -89,20 +104,29 @@ impl LazyObjectFetch for CliDiffLazyFetch {
     }
 }
 
-static CLI_DIFF_LAZY_FETCH: CliDiffLazyFetch = CliDiffLazyFetch;
+impl CliDiffLazyFetch {
+    pub(crate) fn as_option(&self) -> Option<&dyn LazyObjectFetch> {
+        self.enabled.then_some(self as &dyn LazyObjectFetch)
+    }
+}
 
-/// The lazy-fetch hook corresponding to a `lazy_fetch` flag: `None` disables
-/// promisor hydration exactly like the former `lazy_fetch == false`.
-pub(crate) fn diff_lazy_fetch(enabled: bool) -> Option<&'static dyn LazyObjectFetch> {
-    enabled.then_some(&CLI_DIFF_LAZY_FETCH as &'static dyn LazyObjectFetch)
+pub(crate) fn diff_lazy_fetch(
+    policy: &sley_remote::RemotePolicy,
+    enabled: bool,
+) -> CliDiffLazyFetch {
+    CliDiffLazyFetch {
+        policy: policy.clone(),
+        enabled,
+    }
 }
 
 pub(crate) fn read_object_maybe_prefetch_promisor(
+    policy: &sley_remote::RemotePolicy,
     db: &FileObjectDatabase,
     oid: &ObjectId,
     lazy_fetch: bool,
 ) -> Result<std::sync::Arc<EncodedObject>> {
-    match diff_lazy_fetch(lazy_fetch) {
+    match diff_lazy_fetch(policy, lazy_fetch).as_option() {
         Some(fetch) => fetch.read_object_maybe_prefetch(db, oid),
         None => Ok(db.read_object(oid)?),
     }
@@ -116,18 +140,20 @@ pub(crate) fn promisor_remote_names(config: &GitConfig) -> Vec<String> {
 
 /// Batch-prefetch every missing blob referenced by the queued diff entries.
 pub(crate) fn prefetch_diff_entry_blobs(
+    policy: &sley_remote::RemotePolicy,
     db: &FileObjectDatabase,
     entries: &[sley_diff_merge::NameStatusEntry],
     new_side_is_worktree: bool,
     lazy_fetch: bool,
 ) -> Result<()> {
-    if let Some(fetch) = diff_lazy_fetch(lazy_fetch) {
+    if let Some(fetch) = diff_lazy_fetch(policy, lazy_fetch).as_option() {
         return fetch.prefetch_entry_blobs(db, entries, new_side_is_worktree);
     }
     Ok(())
 }
 
 pub(crate) fn prefetch_promisor_objects(
+    policy: &sley_remote::RemotePolicy,
     db: &FileObjectDatabase,
     oids: &[ObjectId],
     lazy_fetch: bool,
@@ -135,7 +161,7 @@ pub(crate) fn prefetch_promisor_objects(
     if !lazy_fetch {
         return Ok(());
     }
-    sley_remote::prefetch_promisor_objects(db, oids, &load_repo_config_for_promisor)
+    sley_remote::prefetch_promisor_objects(policy, db, oids, &load_repo_config_for_promisor)
 }
 
 pub(crate) fn prefetch_via_configured_upload_pack(command: &str, repository: &str) -> Result<bool> {
@@ -245,6 +271,7 @@ pub(crate) fn collect_dirty_submodules(
 }
 
 pub(crate) fn render_tree_to_tree_patch(
+    policy: &sley_remote::RemotePolicy,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     old_tree: &ObjectId,
@@ -256,7 +283,7 @@ pub(crate) fn render_tree_to_tree_patch(
         format,
         old_tree,
         new_tree,
-        diff_lazy_fetch(lazy_fetch),
+        diff_lazy_fetch(policy, lazy_fetch).as_option(),
         diff_big_file_threshold(db),
     )
 }

@@ -3,7 +3,6 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
-use sley::plumbing::sley_config;
 use sley::{GitConfig, GitError, Result};
 
 use crate::commands::remote::write_repo_config;
@@ -154,21 +153,21 @@ pub(crate) fn report_config_setup_error(err: GitError) -> GitError {
                 || message.starts_with("exceeded maximum include depth")
             {
                 eprintln!("fatal: {message}");
-                return GitError::Exit(128);
+                return crate::cli_exit(128);
             }
             if message
                 == "remote URLs cannot be configured in file directly or indirectly included by includeIf.hasconfig:remote.*.url"
             {
                 eprintln!("fatal: {message}");
-                return GitError::Exit(128);
+                return crate::cli_exit(128);
             }
             if let Some((line, path)) = parse_bad_config_line_with_path(&message) {
                 eprintln!("fatal: bad config line {line} in file {path}");
-                return GitError::Exit(128);
+                return crate::cli_exit(128);
             }
             if let Some(line) = parse_bad_config_line_without_path(&message) {
                 eprintln!("fatal: bad config line {line}");
-                return GitError::Exit(128);
+                return crate::cli_exit(128);
             }
             GitError::InvalidFormat(message)
         }

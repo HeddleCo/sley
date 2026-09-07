@@ -88,8 +88,12 @@ pub fn for_each_ref_validate_tag_pointer(
         .tag_object_type
         .is_some_and(|object_type| object_type != target.object_type)
     {
-        eprintln!("error: bad tag pointer to {target_oid} in {tag_oid}");
-        return Err(GitError::Exit(128));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "error: bad tag pointer to {target_oid} in {tag_oid}"
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     Ok(())
 }

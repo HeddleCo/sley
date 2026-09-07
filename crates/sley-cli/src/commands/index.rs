@@ -1,7 +1,6 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 #![allow(clippy::expect_used)]
 
-use sley::plumbing::{sley_diff_merge, sley_index, sley_rev, sley_worktree};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
@@ -40,7 +39,7 @@ pub(crate) fn cmd_mktree(cli_session: &crate::session::CliSession, args: &[Strin
             }
             if !batch {
                 eprintln!("fatal: input format error: (blank line only valid in batch mode)");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             write_mktree_tree(&mut db, format, &mut entries)?;
             continue;
@@ -69,7 +68,7 @@ fn parse_mktree_record(
             "fatal: input format error: {}",
             String::from_utf8_lossy(record)
         );
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })?;
     let rest = &record[mode_end + 1..];
     let Some(type_end) = rest.iter().position(|byte| *byte == b' ') else {
@@ -82,7 +81,7 @@ fn parse_mktree_record(
             "fatal: input format error: {}",
             String::from_utf8_lossy(record)
         );
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })?;
     let rest = &rest[type_end + 1..];
     let Some(oid_end) = rest.iter().position(|byte| *byte == b'\t') else {
@@ -95,7 +94,7 @@ fn parse_mktree_record(
             "fatal: input format error: {}",
             String::from_utf8_lossy(record)
         );
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })?;
     let name = rest[oid_end + 1..].to_vec();
     if name.is_empty() {
@@ -109,7 +108,7 @@ fn parse_mktree_record(
             requested_type.as_str(),
             expected_type.as_str()
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if requested_type != ObjectType::Commit {
         match db.read_object(&oid) {
@@ -121,7 +120,7 @@ fn parse_mktree_record(
                         object.object_type.as_str(),
                         requested_type.as_str()
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
             }
             Err(_) if allow_missing => {}
@@ -130,7 +129,7 @@ fn parse_mktree_record(
                     "fatal: entry '{}' object {oid} is unavailable",
                     String::from_utf8_lossy(&name)
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
     }
@@ -146,7 +145,7 @@ fn mktree_input_format_error<T>(record: &[u8]) -> Result<T> {
         "fatal: input format error: {}",
         String::from_utf8_lossy(record)
     );
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn mktree_mode_object_type(mode: u32) -> ObjectType {
@@ -573,7 +572,7 @@ fn normalize_ls_tree_pathspec_into(components: &mut Vec<String>, pathspec: &str)
             ".." => {
                 if components.pop().is_none() {
                     eprintln!("fatal: {pathspec}: '{pathspec}' is outside repository");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
             }
             component => components.push(component.to_string()),
@@ -824,7 +823,7 @@ pub(crate) fn cmd_ls_files(
             Ok(contents) => contents,
             Err(_) => {
                 eprintln!("fatal: cannot use {path} as an exclude file");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         };
         exclude_patterns.extend(contents.split(|byte| *byte == b'\n').map(Vec::from));
@@ -835,7 +834,7 @@ pub(crate) fn cmd_ls_files(
     if format_spec.is_some()
         && (stage || others || killed || resolve_undo || deduplicate || show_eol || tag)
     {
-        return Err(GitError::usage(
+        return Err(crate::cli_usage(
             "--format cannot be used with -s, -o, -k, -t, --resolve-undo, --deduplicate, --eol",
         ));
     }
@@ -851,22 +850,22 @@ pub(crate) fn cmd_ls_files(
             || with_tree.is_some())
     {
         eprintln!("fatal: ls-files --recurse-submodules unsupported mode");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if recurse_submodules && error_unmatch {
         eprintln!("fatal: ls-files --recurse-submodules does not support --error-unmatch");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     // git: `--with-tree` cannot combine with stage/unmerged output (die 128).
     if with_tree.is_some() && (stage || unmerged) {
         eprintln!("fatal: options 'ls-files --with-tree' and '-s/-u' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let selected = cached || others || deleted || modified || unmerged || resolve_undo || killed;
     let output_stage = stage || unmerged;
     if ignored && !others && !cached {
         eprintln!("fatal: ls-files -i must be used with either -o or -c");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if ignored
         && !exclude_standard
@@ -874,7 +873,7 @@ pub(crate) fn cmd_ls_files(
         && exclude_per_directory.is_empty()
     {
         eprintln!("fatal: ls-files --ignored needs some exclude pattern");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if !selected
         && !output_stage
@@ -922,7 +921,8 @@ pub(crate) fn cmd_ls_files(
         return Ok(());
     }
     let mut stdout = io::stdout();
-    let pathspec = LsFilesPathspec::new(
+    let pathspec = LsFilesPathspec::with_precompose(
+        cli_session.precompose_unicode(),
         &cwd,
         &worktree_root,
         full_name,
@@ -1092,6 +1092,7 @@ pub(crate) fn cmd_ls_files(
             let oid_candidates = ls_files_oid_candidates(&index);
             if ignored && cached {
                 let ignored_entries = sley_worktree::ignored_index_entries(
+                    cli_session.precompose_unicode(),
                     &worktree_root,
                     &index.entries,
                     exclude_standard,
@@ -1254,14 +1255,14 @@ fn write_ls_files_with_tree(
                     Ok(tree) => tree,
                     Err(_) => {
                         eprintln!("fatal: not a tree-ish object: {with_tree}");
-                        return Err(GitError::Exit(128));
+                        return Err(crate::cli_exit(128));
                     }
                 }
             }
         }
         Err(_) => {
             eprintln!("fatal: tree-ish {with_tree} not found.");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     };
 
@@ -1383,7 +1384,7 @@ fn validate_repo_index_sparse_bool(git_dir: &Path, config: &GitConfig) -> Result
         && target.get_bool("index", None, "sparse").is_none()
     {
         eprintln!("fatal: bad boolean config value '{value}' for 'index.sparse'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(())
 }
@@ -2089,7 +2090,7 @@ pub(crate) fn cmd_ls_tree(cli_session: &crate::session::CliSession, args: &[Stri
             value if value.starts_with("--abbrev=") => {
                 let width = value["--abbrev=".len()..].parse::<usize>().map_err(|_| {
                     eprintln!("error: invalid ls-tree abbreviation width {value}");
-                    GitError::Exit(129)
+                    crate::cli_exit(129)
                 })?;
                 oid_abbrev = (width != 0).then_some(width);
             }
@@ -2187,12 +2188,12 @@ pub(crate) fn cmd_ls_tree(cli_session: &crate::session::CliSession, args: &[Stri
 
 fn ls_tree_usage_error<T>(message: &str) -> Result<T> {
     eprintln!("error: {message}");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn ls_tree_usage<T>() -> Result<T> {
     eprintln!("usage: git ls-tree [<options>] <tree-ish> [<path>...]");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 pub(crate) fn cmd_update_index(
@@ -2261,7 +2262,7 @@ pub(crate) fn cmd_update_index(
         if stdin || index_info {
             let option = if stdin { "stdin" } else { "index-info" };
             eprintln!("error: option '{option}' must be the last argument");
-            return Err(GitError::Exit(129));
+            return Err(crate::cli_exit(129));
         }
         let arg = args[idx].as_str();
         if positional_only {
@@ -2368,7 +2369,7 @@ pub(crate) fn cmd_update_index(
             }
             value if value.starts_with("--no-index-version=") => {
                 eprintln!("error: option `no-index-version' takes no value");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             "-q" => quiet = true,
             "--ignore-submodules" => {
@@ -2721,7 +2722,9 @@ pub(crate) fn cmd_update_index(
             really_refresh,
         ) {
             Ok(_) => {}
-            Err(GitError::Exit(1)) => refresh_had_errors = true,
+            Err(error) if crate::cli_reported_status(&error) == Some(1) => {
+                refresh_had_errors = true
+            }
             Err(err) => return Err(err),
         }
         // Unmerged entries make the refresh fail (`<path>: needs merge`).
@@ -2832,7 +2835,7 @@ pub(crate) fn cmd_update_index(
         )?;
     }
     if refresh_had_errors {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     if !cacheinfo.is_empty() {
         let cacheinfo = cacheinfo
@@ -2933,13 +2936,13 @@ usage: git update-index [<options>] [--] [<file>...]
 /// for an unknown option/switch (after the `error: unknown ...` line).
 fn update_index_usage_error<T>() -> Result<T> {
     eprintln!("{UPDATE_INDEX_USAGE}");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 /// Print the `update-index` usage text and exit 129 — git's `-h`/`--help` path.
 fn update_index_usage_help<T>() -> Result<T> {
     eprintln!("{UPDATE_INDEX_USAGE}");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn print_test_untracked_cache_result(worktree_root: &Path) -> Result<()> {
@@ -3074,7 +3077,7 @@ fn parse_update_index_cacheinfo_split(
         .map_err(|_| GitError::Command(format!("invalid update-index --cacheinfo mode {mode}")))?;
     if mode == sley_index::SPARSE_DIR_MODE && path.ends_with('/') {
         eprintln!("error: option 'cacheinfo' cannot add sparse directory '{path}'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(CliCacheInfoEntry {
         mode,

@@ -4,7 +4,6 @@
 #[path = "ls_remote_options.rs"]
 mod ls_remote_options;
 use ls_remote_options::setup_ls_remote_options;
-use sley::plumbing::sley_config;
 
 use super::fetch::{
     check_transport_allowed_url, configured_server_options, transport_policy_config_for_context,
@@ -16,8 +15,8 @@ use super::pack::{
 };
 use super::resolve::{RemoteCommandContext, ls_remote_git_dir};
 use crate::*;
-use sley::plumbing::sley_odb::ObjectReader;
-use sley::plumbing::sley_remote::LsRemoteRecord;
+use sley_odb::ObjectReader;
+use sley_remote::LsRemoteRecord;
 use std::path::{Path, PathBuf};
 use std::process::Command as Proc;
 
@@ -40,6 +39,7 @@ fn ls_remote_http_records(
     let filter = ls_remote_filter(options);
     let outcome = sley_remote::ls_remote_with(
         sley_remote::LsRemoteRequest {
+            policy: &context.remote_policy,
             source: &source,
             format: ObjectFormat::Sha1,
             filter: &filter,
@@ -264,7 +264,7 @@ fn validate_configured_remote_refspecs(config: Option<&GitConfig>, repository: &
             let value = value.trim_start_matches([' ', '\t']);
             if !configured_refspec_valid(value, fetch) {
                 eprintln!("fatal: invalid refspec '{value}'");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
     }
@@ -309,10 +309,14 @@ pub(crate) fn cmd_ls_remote(
     } else if configured_legacy_protocol(Some(&transport_config)) {
         eprintln!("fatal: server options require protocol version 2 or later");
         eprintln!("fatal: see protocol.version in 'git help config' for more details");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let resolved_repository = context.resolved_remote(&repository)?.url;
-    check_transport_allowed_url(&resolved_repository, Some(&transport_config))?;
+    check_transport_allowed_url(
+        &cli_session.remote_policy,
+        &resolved_repository,
+        Some(&transport_config),
+    )?;
 
     if implicit_repository && !options.quiet {
         eprintln!("From {}", ls_remote_display_url(&context, &repository)?);
@@ -322,7 +326,7 @@ pub(crate) fn cmd_ls_remote(
         ls_remote_ssh_records(&context, &repository, &options, &transport_config)?
     {
         if options.exit_code && records.is_empty() {
-            return Err(GitError::Exit(2));
+            return Err(crate::cli_exit(2));
         }
         sort_ls_remote_records(
             &mut records,
@@ -340,7 +344,7 @@ pub(crate) fn cmd_ls_remote(
         ls_remote_git_records(&context, &repository, &options, &transport_config)?
     {
         if options.exit_code && records.is_empty() {
-            return Err(GitError::Exit(2));
+            return Err(crate::cli_exit(2));
         }
         sort_ls_remote_records(
             &mut records,
@@ -358,7 +362,7 @@ pub(crate) fn cmd_ls_remote(
         ls_remote_http_records(&context, &repository, &options, &transport_config)?
     {
         if options.exit_code && records.is_empty() {
-            return Err(GitError::Exit(2));
+            return Err(crate::cli_exit(2));
         }
         sort_ls_remote_records(
             &mut records,
@@ -376,7 +380,7 @@ pub(crate) fn cmd_ls_remote(
         let mut records = ls_remote_upload_pack_command_records(command, &repository, &options)?;
         let format = ObjectFormat::Sha1;
         if options.exit_code && records.is_empty() {
-            return Err(GitError::Exit(2));
+            return Err(crate::cli_exit(2));
         }
         sort_ls_remote_records(
             &mut records,
@@ -416,6 +420,7 @@ pub(crate) fn cmd_ls_remote(
     let filter = ls_remote_filter(&options);
     let outcome = sley_remote::ls_remote_with(
         sley_remote::LsRemoteRequest {
+            policy: &cli_session.remote_policy,
             source: &source,
             format,
             filter: &filter,
@@ -428,7 +433,7 @@ pub(crate) fn cmd_ls_remote(
     let format = outcome.format;
 
     if options.exit_code && records.is_empty() {
-        return Err(GitError::Exit(2));
+        return Err(crate::cli_exit(2));
     }
     sort_ls_remote_records(
         &mut records,
@@ -448,7 +453,7 @@ fn ls_remote_repository_not_found(repository: &str) -> Result<()> {
     eprintln!();
     eprintln!("Please make sure you have the correct access rights");
     eprintln!("and the repository exists.");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn ls_remote_upload_pack_command_records(
@@ -558,7 +563,7 @@ fn validate_ls_remote_sort_context(
     eprintln!(
         "fatal: not a git repository, but the field '{field}' requires access to object data"
     );
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 /// Resolve `repository` to an SSH remote and list its advertisements via
@@ -583,6 +588,7 @@ fn ls_remote_ssh_records(
     let filter = ls_remote_filter(options);
     let outcome = sley_remote::ls_remote_with(
         sley_remote::LsRemoteRequest {
+            policy: &context.remote_policy,
             source: &source,
             format: ObjectFormat::Sha1,
             filter: &filter,
@@ -608,6 +614,7 @@ fn ls_remote_git_records(
     let filter = ls_remote_filter(options);
     let outcome = sley_remote::ls_remote_with(
         sley_remote::LsRemoteRequest {
+            policy: &context.remote_policy,
             source: &source,
             format: ObjectFormat::Sha1,
             filter: &filter,
@@ -775,7 +782,7 @@ fn ls_remote_sort_key(
             let db = local_db.expect("objecttype sort requires local db");
             let object = db.read_object(&record.oid).map_err(|_| {
                 eprintln!("fatal: missing object {} for {}", record.oid, record.name);
-                GitError::Exit(128)
+                crate::cli_exit(128)
             })?;
             Ok(LsRemoteSortKey::Text(
                 object.object_type.as_str().to_string(),
@@ -785,7 +792,7 @@ fn ls_remote_sort_key(
             let db = local_db.expect("objectsize sort requires local db");
             let object = db.read_object(&record.oid).map_err(|_| {
                 eprintln!("fatal: missing object {} for {}", record.oid, record.name);
-                GitError::Exit(128)
+                crate::cli_exit(128)
             })?;
             Ok(LsRemoteSortKey::Number(object.body.len() as i128))
         }
@@ -794,7 +801,7 @@ fn ls_remote_sort_key(
             let storage = cat_file_object_storage(git_dir, record.oid.format(), &record.oid)
                 .map_err(|_| {
                     eprintln!("fatal: missing object {} for {}", record.oid, record.name);
-                    GitError::Exit(128)
+                    crate::cli_exit(128)
                 })?;
             Ok(LsRemoteSortKey::Number(storage.disk_size as i128))
         }
@@ -821,7 +828,7 @@ fn ls_remote_date_sort_key(
     let db = local_db.expect("date sort requires local db");
     let object = db.read_object(&record.oid).map_err(|_| {
         eprintln!("fatal: missing object {} for {}", record.oid, record.name);
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })?;
     let contents = for_each_ref_contents(record.oid.format(), &object)?;
     Ok(LsRemoteSortKey::Number(for_each_ref_sort_date_key(

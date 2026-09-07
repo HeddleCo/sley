@@ -13,7 +13,6 @@
 //! stdio mode used by `remote-ext` tests. User-relative paths (`~user`) and
 //! syslog are not implemented.
 
-use sley::plumbing::sley_config;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};

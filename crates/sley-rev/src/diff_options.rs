@@ -245,10 +245,14 @@ impl DiffOptions {
                 | DiffOutputFormat::NO_OUTPUT.0,
         );
         if self.output_format.has_multi_bits(check_mask) {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "fatal: options '--name-only', '--name-status', '--check', and '-s' cannot be used together"
             );
-            return Err(GitError::Exit(129));
+            return Err(GitError::Rejected(
+                sley_core::RejectionKind::InvalidArguments,
+            ));
         }
         Ok(())
     }
@@ -296,14 +300,16 @@ pub fn resolve_diff_context(
     let config_context = match config.and_then(|config| config.get("diff", None, "context")) {
         Some(value) => {
             let Some(parsed) = sley_config::parse_config_int(value) else {
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "fatal: bad numeric config value '{value}' for 'diff.context': invalid unit"
                 );
-                return Err(GitError::Exit(128));
+                return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
             };
             if parsed < 0 {
-                eprintln!("fatal: bad config variable 'diff.context'");
-                return Err(GitError::Exit(128));
+                sley_core::diagnostic!(Stderr, true, "fatal: bad config variable 'diff.context'");
+                return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
             }
             Some(parsed as usize)
         }
@@ -955,16 +961,18 @@ fn split_explicit_path_args(args: &[String]) -> (&[String], Vec<String>) {
 
 fn reject_exact_no_rename(args: &[String]) -> Result<()> {
     if args.iter().any(|arg| arg == "--no-rename") {
-        eprintln!("error: invalid option: --no-rename");
-        Err(GitError::Exit(129))
+        sley_core::diagnostic!(Stderr, true, "error: invalid option: --no-rename");
+        Err(GitError::Rejected(
+            sley_core::RejectionKind::InvalidArguments,
+        ))
     } else {
         Ok(())
     }
 }
 
 fn diff_options_usage_error(error: UsageError) -> GitError {
-    eprint!("{}", error.render_stderr());
-    GitError::Exit(error.exit_code())
+    sley_core::diagnostic!(Stderr, false, "{}", error.render_stderr());
+    GitError::Rejected(sley_core::RejectionKind::InvalidArguments)
 }
 
 fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Result<()> {
@@ -1260,8 +1268,12 @@ fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Re
         (_, Some("ignore-submodules")) => {
             let mode = optional_arg(option).unwrap_or("all");
             let Some(mode) = parse_submodule_ignore_mode(mode) else {
-                eprintln!("fatal: bad --ignore-submodules argument: {mode}");
-                return Err(GitError::Exit(128));
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "fatal: bad --ignore-submodules argument: {mode}"
+                );
+                return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
             };
             options.ignore_submodules_cli = Some(mode);
         }
@@ -1391,11 +1403,19 @@ pub fn parse_color_moved_ws(value: &str) -> Result<sley_diff_merge::render::Colo
     if ws.allow_indentation_change
         && (ws.ignore.all_space || ws.ignore.space_change || ws.ignore.space_at_eol)
     {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "error: color-moved-ws: allow-indentation-change cannot be combined with other whitespace modes"
         );
-        eprintln!("error: invalid mode '{value}' in --color-moved-ws");
-        return Err(GitError::Exit(129));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "error: invalid mode '{value}' in --color-moved-ws"
+        );
+        return Err(GitError::Rejected(
+            sley_core::RejectionKind::InvalidArguments,
+        ));
     }
     Ok(ws)
 }
@@ -1423,16 +1443,18 @@ fn optional_arg<'a>(option: &'a ParsedOption<'a>) -> Option<&'a str> {
 }
 
 pub fn diff_pickaxe_requires_non_empty_error() -> GitError {
-    eprintln!("error: -S requires a non-empty argument");
-    GitError::Exit(129)
+    sley_core::diagnostic!(Stderr, true, "error: -S requires a non-empty argument");
+    GitError::Rejected(sley_core::RejectionKind::InvalidArguments)
 }
 
 fn diff_validate_word_diff(value: &str) -> Result<()> {
     match value {
         "plain" | "color" | "porcelain" | "none" => Ok(()),
         _ => {
-            eprintln!("error: bad --word-diff argument: {value}");
-            Err(GitError::Exit(129))
+            sley_core::diagnostic!(Stderr, true, "error: bad --word-diff argument: {value}");
+            Err(GitError::Rejected(
+                sley_core::RejectionKind::InvalidArguments,
+            ))
         }
     }
 }

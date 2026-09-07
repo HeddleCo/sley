@@ -8,7 +8,7 @@ use crate::commands::remote::{
     fetch_ssh_repository_with_outcome, resolve_fetch_recurse_submodules,
 };
 use crate::*;
-use sley::plumbing::sley_remote::FetchOptions;
+use sley_remote::FetchOptions;
 
 mod merge;
 mod merge_base;

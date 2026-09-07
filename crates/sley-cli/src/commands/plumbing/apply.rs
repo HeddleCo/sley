@@ -2,7 +2,6 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use crate::*;
-use sley::plumbing::{sley_core, sley_rev, sley_worktree};
 
 use super::add::add_intent_to_add;
 
@@ -258,7 +257,7 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
     // git's `apply_state_init`: `--reject` and `--3way` are mutually exclusive.
     if reject && three_way {
         eprintln!("error: options '--reject' and '--3way' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     // Plain textual apply remains usable outside a repository. Index/object
     // modes require the optional session repository to have opened.
@@ -315,6 +314,7 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
         .get_bool("core", None, "fileMode")
         .unwrap_or(true);
     let ws_resolver = commands::diff::WhitespaceRuleResolver::from_git_dir_with_config(
+        cli_session.precompose_unicode(),
         git_dir,
         Some(repo_config),
     )?;
@@ -354,24 +354,24 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
                     {
                         let line = message.strip_prefix("corrupt-hunk-body:").unwrap_or("1");
                         eprintln!("error: corrupt patch at {name}:{line}");
-                        GitError::Exit(1)
+                        crate::cli_exit(1)
                     }
                     GitError::InvalidFormat(message)
                         if message.starts_with("git diff header lacks filename") =>
                     {
                         eprintln!("error: {message}");
-                        GitError::Exit(1)
+                        crate::cli_exit(1)
                     }
                     GitError::InvalidFormat(message)
                         if message.starts_with("unable to find filename in patch") =>
                     {
                         eprintln!("error: {message}");
-                        GitError::Exit(1)
+                        crate::cli_exit(1)
                     }
                     GitError::InvalidFormat(message) if message.starts_with("binary-corrupt:") => {
                         let line = message.strip_prefix("binary-corrupt:").unwrap_or("");
                         eprintln!("error: corrupt binary patch at {name}:{line}: ");
-                        GitError::Exit(128)
+                        crate::cli_exit(128)
                     }
                     GitError::InvalidFormat(message)
                         if message.starts_with("binary-unrecognized:") =>
@@ -381,13 +381,13 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
                         eprintln!(
                             "error: No valid patches in input (allow with \"--allow-empty\")"
                         );
-                        GitError::Exit(128)
+                        crate::cli_exit(128)
                     }
                     GitError::InvalidFormat(message)
                         if message.starts_with("invalid mode on line") =>
                     {
                         eprintln!("error: {message}");
-                        GitError::Exit(128)
+                        crate::cli_exit(128)
                     }
                     other => other,
                 })?;
@@ -399,7 +399,7 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
             .flat_map(|(_, group)| group.iter())
             .any(apply_patch_is_noop)
     {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     // `-R`/`--reverse`: undo the patch by reversing each file patch before any
     // whitespace handling or application (git reverses the parsed patches up
@@ -550,6 +550,8 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
     // direct apply below when the pre-image blobs are not available.
     if three_way
         && apply_three_way_path(
+            cli_session.original_cwd.as_deref(),
+            &cli_session.remote_policy,
             git_dir,
             worktree_root,
             format,
@@ -632,7 +634,7 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
                             .or(patch.old_path.as_deref())
                             .unwrap_or(b"");
                         eprintln!("error: patch failed: {}", String::from_utf8_lossy(name));
-                        return Err(GitError::Exit(1));
+                        return Err(crate::cli_exit(1));
                     }
                 };
                 let Some(target) = patch.new_path.clone().or_else(|| patch.old_path.clone()) else {
@@ -798,7 +800,7 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
                             .or(patch.old_path.as_deref())
                             .unwrap_or(b"");
                         eprintln!("error: patch failed: {}", String::from_utf8_lossy(name));
-                        return Err(GitError::Exit(1));
+                        return Err(crate::cli_exit(1));
                     }
                 }
             } else {
@@ -815,7 +817,7 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
                             .or(patch.old_path.as_deref())
                             .unwrap_or(b"");
                         eprintln!("error: patch failed: {}", String::from_utf8_lossy(name));
-                        return Err(GitError::Exit(1));
+                        return Err(crate::cli_exit(1));
                     }
                 }
             };
@@ -937,7 +939,7 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
         }
     }
     if ws_error_count > 0 && matches!(ws_action, WsAction::Error | WsAction::ErrorAll) {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
 
     if check {
@@ -976,6 +978,7 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
             } => {
                 if !cached {
                     apply_write_worktree_file(
+                        cli_session.original_cwd.as_deref(),
                         &worktree_base,
                         worktree_root,
                         git_dir,
@@ -999,7 +1002,11 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
             }
             ApplyAction::Remove { path } => {
                 if !cached {
-                    merge_remove_worktree_file(&worktree_base, path)?;
+                    merge_remove_worktree_file(
+                        cli_session.original_cwd.as_deref(),
+                        &worktree_base,
+                        path,
+                    )?;
                 }
                 if index.is_some() {
                     index_mutations
@@ -1023,7 +1030,11 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
                 // empty (ENOTEMPTY is warn-only) and prune empty leading dirs
                 // via remove_path (t4134).
                 if !cached {
-                    merge_remove_worktree_file(&worktree_base, path)?;
+                    merge_remove_worktree_file(
+                        cli_session.original_cwd.as_deref(),
+                        &worktree_base,
+                        path,
+                    )?;
                 }
                 if index.is_some() {
                     index_mutations
@@ -1067,7 +1078,14 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
             )?;
         }
     } else if intent_to_add && !index_paths.is_empty() {
-        add_intent_to_add(worktree_root, worktree_root, git_dir, format, &index_paths)?;
+        add_intent_to_add(
+            cli_session.precompose_unicode(),
+            worktree_root,
+            worktree_root,
+            git_dir,
+            format,
+            &index_paths,
+        )?;
     }
     // `--reject`: write each `<file>.rej` (git opens it `O_CREAT|O_EXCL`, unlinking
     // a stale one first), then exit 1 because the patch did not fully apply.
@@ -1081,7 +1099,7 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
         fs::write(&rej_path, bytes)?;
     }
     if had_reject {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -1127,7 +1145,7 @@ fn parse_apply_p_value(arg: &str) -> Result<usize> {
         Ok(n) if n >= 0 => Ok(n as usize),
         _ => {
             eprintln!("fatal: option -p expects a non-negative integer, got '{arg}'");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -1145,7 +1163,7 @@ fn normalize_apply_directory(arg: &str) -> Result<Vec<u8>> {
         }
         None => {
             eprintln!("error: unable to normalize directory: '{arg}'");
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
     }
 }
@@ -1204,7 +1222,7 @@ fn check_apply_path_safety(
             for name in [old, new].into_iter().flatten() {
                 if !apply_path_is_valid(name) {
                     eprintln!("error: invalid path '{}'", String::from_utf8_lossy(name));
-                    return Err(GitError::Exit(1));
+                    return Err(crate::cli_exit(1));
                 }
             }
         }
@@ -1309,7 +1327,7 @@ fn check_apply_path_safety(
                     "error: affected file '{}' is beyond a symbolic link",
                     String::from_utf8_lossy(name)
                 );
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
         }
     }
@@ -1700,7 +1718,7 @@ fn validate_apply_input(input: &[u8], name: &str) -> Result<()> {
                     String::from_utf8_lossy(apply_trim_ascii_end(rest))
                 );
                 eprintln!();
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
             saw_header = true;
             saw_metadata = true;
@@ -1726,15 +1744,15 @@ fn validate_apply_input(input: &[u8], name: &str) -> Result<()> {
                     "error: patch fragment without header at {name}:{line_nr}: {}",
                     String::from_utf8_lossy(line)
                 );
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
             if expect_new_header {
                 eprintln!("error: git diff header lacks filename information at {name}:{line_nr}");
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
             if !apply_hunk_header_well_formed(line) {
                 eprintln!("error: corrupt patch at {name}:{line_nr}");
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
             after_file_header = false;
             saw_hunk = true;
@@ -1742,7 +1760,7 @@ fn validate_apply_input(input: &[u8], name: &str) -> Result<()> {
         }
         if after_file_header && !saw_hunk && !saw_metadata && !line.is_empty() {
             eprintln!("error: patch with only garbage at {name}:{line_nr}");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
     }
     Ok(())
@@ -1755,7 +1773,7 @@ fn apply_corrupt_patch_error(input: &[u8], name: &str) -> GitError {
         .map(|idx| idx + 1)
         .unwrap_or(1);
     eprintln!("error: corrupt patch at {name}:{line_nr}");
-    GitError::Exit(1)
+    crate::cli_exit(1)
 }
 
 fn apply_hunk_header_well_formed(line: &[u8]) -> bool {
@@ -2006,7 +2024,7 @@ fn apply_check_to_create(
                 "error: {}: already exists in index",
                 String::from_utf8_lossy(new_name)
             );
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         if !cached
             && let Ok(rel) = std::str::from_utf8(new_name)
@@ -2017,7 +2035,7 @@ fn apply_check_to_create(
                 "error: {}: already exists in working directory",
                 String::from_utf8_lossy(new_name)
             );
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
     }
     Ok(())
@@ -2083,7 +2101,7 @@ fn apply_gitlink_oid_from_content(
             "error: corrupt patch for submodule {}",
             String::from_utf8_lossy(path)
         );
-        GitError::Exit(1)
+        crate::cli_exit(1)
     }
     let rest = content
         .strip_prefix(b"Subproject commit ")
@@ -2178,7 +2196,7 @@ fn read_patch_base(
             "error: {}: No such file or directory",
             String::from_utf8_lossy(old)
         );
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     // Gitlink (submodule) preimage: synthesize `Subproject commit <sha>\n` from
     // the index entry's recorded commit (git's `read_file_or_gitlink`), or, when
@@ -2213,7 +2231,7 @@ fn read_patch_base(
                 "error: {}: does not exist in index",
                 String::from_utf8_lossy(old)
             );
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         };
         let blob = db.read_object(&entry.oid)?.body.clone();
         if verify_worktree_match
@@ -2230,7 +2248,7 @@ fn read_patch_base(
                 "error: {}: does not match index",
                 String::from_utf8_lossy(old)
             );
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         return Ok(blob);
     }
@@ -2248,7 +2266,7 @@ fn read_patch_base(
             "error: {}: No such file or directory",
             String::from_utf8_lossy(old)
         );
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     };
     Ok(blob)
 }
@@ -2281,6 +2299,7 @@ fn record_apply_result_overlay(
 /// umask, e.g. `0077` -> `0700`/`0600`, and never widens via `core.sharedRepository`.)
 /// `umask_complement` is `0777 & ~umask`, derived once per invocation.
 fn apply_write_worktree_file(
+    original_cwd: Option<&std::path::Path>,
     worktree_base: &Path,
     filter_worktree_root: &Path,
     git_dir: &Path,
@@ -2303,7 +2322,7 @@ fn apply_write_worktree_file(
     } else {
         content.to_vec()
     };
-    merge_write_worktree_file(worktree_base, path, &content, mode)?;
+    merge_write_worktree_file(original_cwd, worktree_base, path, &content, mode)?;
     // Only regular files carry a umask-derived mode; symlinks/gitlinks are left
     // as `merge_write_worktree_file` created them.
     #[cfg(unix)]
@@ -2446,6 +2465,8 @@ fn read_worktree_patch_blob_bytes_with_eol(
 /// when a pre-image blob was unavailable (the caller falls back to direct apply).
 #[allow(clippy::too_many_arguments)]
 fn apply_three_way_path(
+    original_cwd: Option<&std::path::Path>,
+    policy: &sley_remote::RemotePolicy,
     git_dir: &Path,
     worktree_root: &Path,
     format: ObjectFormat,
@@ -2519,7 +2540,7 @@ fn apply_three_way_path(
                         "error: {}: does not match index",
                         String::from_utf8_lossy(path)
                     );
-                    return Err(GitError::Exit(1));
+                    return Err(crate::cli_exit(1));
                 }
             }
         }
@@ -2588,6 +2609,7 @@ fn apply_three_way_path(
 
     let (results, conflicts, _info) =
         commands::merge_rebase::three_way_merge_trees_inner_with_info(
+            policy,
             db,
             config,
             lazy_fetch,
@@ -2604,6 +2626,8 @@ fn apply_three_way_path(
 
     if !check {
         apply_write_three_way(
+            original_cwd,
+            policy,
             git_dir,
             worktree_root,
             format,
@@ -2625,7 +2649,7 @@ fn apply_three_way_path(
             commands::rerere::repo_rerere(git_dir, worktree_root, format, None)?;
         }
         // git exits non-zero, leaving conflict markers + a conflicted index.
-        Err(GitError::Exit(1))
+        Err(crate::cli_exit(1))
     }
 }
 
@@ -2668,6 +2692,8 @@ fn apply_resolve_preimage_blob(
 /// Write the 3-way merge result: a conflicted index (stages 1/2/3) for conflicts,
 /// stage-0 entries otherwise, plus the worktree (unless `--cached`).
 fn apply_write_three_way(
+    original_cwd: Option<&std::path::Path>,
+    policy: &sley_remote::RemotePolicy,
     git_dir: &Path,
     worktree_root: &Path,
     format: ObjectFormat,
@@ -2723,16 +2749,19 @@ fn apply_write_three_way(
         match result {
             MergePathResult::Resolved(Some((mode, oid))) => {
                 if ours_map.get(path) != Some(&(*mode, *oid)) {
-                    let content = commands::merge_rebase::merge_read_blob(db, oid, lazy_fetch)?;
-                    merge_write_worktree_file(worktree_root, path, &content, *mode)?;
+                    let content =
+                        commands::merge_rebase::merge_read_blob(policy, db, oid, lazy_fetch)?;
+                    merge_write_worktree_file(original_cwd, worktree_root, path, &content, *mode)?;
                 }
             }
-            MergePathResult::Resolved(None) => merge_remove_worktree_file(worktree_root, path)?,
+            MergePathResult::Resolved(None) => {
+                merge_remove_worktree_file(original_cwd, worktree_root, path)?
+            }
             MergePathResult::Conflict { worktree, .. } => match worktree {
                 Some((mode, content)) => {
-                    merge_write_worktree_file(worktree_root, path, content, *mode)?;
+                    merge_write_worktree_file(original_cwd, worktree_root, path, content, *mode)?;
                 }
-                None => merge_remove_worktree_file(worktree_root, path)?,
+                None => merge_remove_worktree_file(original_cwd, worktree_root, path)?,
             },
         }
     }
@@ -2781,8 +2810,8 @@ fn apply_patch_whitespace(
     error_count: &mut usize,
     squelched: &mut usize,
 ) {
-    use sley::plumbing::sley_diff_merge::HunkLine;
-    use sley::plumbing::sley_diff_merge::ws;
+    use sley_diff_merge::HunkLine;
+    use sley_diff_merge::ws;
 
     let fixing = matches!(action, WsAction::Fix);
 

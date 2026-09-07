@@ -8,7 +8,6 @@
 use std::cmp::Ordering;
 use std::path::Path;
 
-use sley::GitError;
 use sley::NameStatusEntry;
 use sley::Result;
 use sley_pathspec::wildmatch;
@@ -21,7 +20,7 @@ use sley_pathspec::wildmatch;
 pub(crate) fn read_orderfile(path: &str) -> Result<Vec<Vec<u8>>> {
     let data = std::fs::read(Path::new(path)).map_err(|_| {
         eprintln!("fatal: failed to read orderfile '{path}'");
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })?;
     Ok(parse_orderfile_bytes(&data))
 }
@@ -120,7 +119,7 @@ pub(crate) fn rotate_entries(
                 "fatal: No such path '{}' in the diff",
                 String::from_utf8_lossy(rotate_to)
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         return Ok(());
     }

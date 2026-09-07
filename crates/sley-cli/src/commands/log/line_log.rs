@@ -1,5 +1,4 @@
 use super::*;
-use sley::plumbing::{sley_diff_merge, sley_rev};
 
 /// Bundle of the context `run_line_log_output` needs (avoids a 20-arg fn).
 pub(super) struct LineLogOutputCtx<'a> {
@@ -60,7 +59,10 @@ pub(super) struct LineLogOutputCtx<'a> {
 /// touched a tracked range, with its patch clipped to that range. Mirrors git's
 /// `line_log_filter` + the log-tree output loop (the `-s`/`-p`/format cases the
 /// test suite exercises).
-pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
+pub(super) fn run_line_log_output(
+    policy: &sley_remote::RemotePolicy,
+    ctx: LineLogOutputCtx<'_>,
+) -> Result<()> {
     let LineLogOutputCtx {
         git_dir,
         db,
@@ -335,6 +337,7 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
             }
             patch_block.clear();
             render_line_log_diff(
+                policy,
                 &mut patch_block,
                 db,
                 format,
@@ -429,6 +432,7 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
                 if diff_opts.any() {
                     patch_block.clear();
                     render_line_log_diff(
+                        policy,
                         &mut patch_block,
                         db,
                         format,
@@ -486,6 +490,7 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
                 if diff_opts.any() {
                     patch_block.clear();
                     render_line_log_diff(
+                        policy,
                         &mut patch_block,
                         db,
                         format,
@@ -554,6 +559,7 @@ fn line_log_files_match_diff_filter(
 /// post-image line ranges.
 #[allow(clippy::too_many_arguments)]
 fn render_line_log_diff(
+    policy: &sley_remote::RemotePolicy,
     out: &mut Vec<u8>,
     db: &FileObjectDatabase,
     format: ObjectFormat,
@@ -609,7 +615,7 @@ fn render_line_log_diff(
                     anchors: &[],
                     allow_textconv: false,
                     db,
-                    lazy_fetch: crate::diff_lazy_fetch(lazy_fetch),
+                    lazy_fetch: crate::diff_lazy_fetch(policy, lazy_fetch).as_option(),
                     worktree_root: None,
                     use_worktree_new: false,
                     format,

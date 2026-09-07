@@ -7,7 +7,6 @@
 //! unless `--summary` is requested, the folded subject of every commit indented
 //! beneath a `Name (count):` header.
 
-use sley::plumbing::sley_rev;
 // Command modules pull their shared plumbing from the crate root. A glob import
 // works because a submodule can access its ancestor module's items (including
 // private ones), so every helper, type, and re-export visible at the crate root
@@ -106,7 +105,7 @@ pub(crate) fn cmd_shortlog(
 }
 
 /// Parse the command line into [`ShortlogOptions`]. Every error path (unknown
-/// option, malformed value, `-h`) funnels through `Err(GitError::Exit(...))` after
+/// option, malformed value, `-h`) funnels through `Err(crate::cli_exit(...))` after
 /// emitting git-compatible diagnostics.
 fn parse_shortlog_args(args: &[String]) -> Result<ShortlogOptions> {
     let mut options = ShortlogOptions::default();
@@ -327,13 +326,13 @@ fn shortlog_parse_revision_number(value: &str) -> Result<usize> {
     };
     parsed.ok_or_else(|| {
         eprintln!("fatal: '{value}': not an integer");
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })
 }
 
 fn shortlog_unknown_short_option(tail: &str) -> Result<()> {
     eprint!("error: unknown option `-{tail}'\n{SHORTLOG_USAGE}");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 /// Resolve every revision argument, walk the graph, apply filters/limit, and
@@ -349,7 +348,7 @@ fn read_shortlog_from_revisions(
         Err(err) => {
             if !options.setup_args.is_empty() {
                 eprintln!("fatal: too many arguments");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             return Err(err);
         }
@@ -378,7 +377,7 @@ fn read_shortlog_from_revisions(
         // touched a path; rather than silently ignore it (and report wrong
         // counts) we surface an explicit, non-zero failure.
         eprintln!("fatal: shortlog pathspec limiting is not supported");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     // git's shortlog *always* mailmaps the grouping identity (no flag needed).
@@ -465,7 +464,7 @@ fn read_shortlog_from_stdin(
 ) -> Result<()> {
     if options.groups.len() > 1 {
         eprintln!("fatal: stdin shortlog does not support multiple groups");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let mut input = Vec::new();
     io::stdin().read_to_end(&mut input)?;
@@ -996,7 +995,7 @@ fn parse_shortlog_group(value: &str) -> Result<ShortlogGroup> {
         value if value.contains('%') => Ok(ShortlogGroup::Format(value.to_string())),
         other => {
             eprintln!("error: unknown group type: {other}");
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
     }
 }
@@ -1010,7 +1009,7 @@ fn shortlog_pretty_format_value(value: &str) -> Result<String> {
         Ok(value.to_string())
     } else {
         eprintln!("fatal: invalid --pretty format: {value}");
-        Err(GitError::Exit(128))
+        Err(crate::cli_exit(128))
     }
 }
 
@@ -1057,7 +1056,7 @@ fn parse_shortlog_wrap_field(value: &str) -> Result<usize> {
 
 fn shortlog_wrap_syntax_error() -> GitError {
     eprintln!("error: -w[<width>[,<indent1>[,<indent2>]]]");
-    GitError::Exit(129)
+    crate::cli_exit(129)
 }
 
 fn parse_shortlog_count(value: &str) -> Result<usize> {
@@ -1101,27 +1100,27 @@ fn shortlog_boolean_option_with_value(value: &str) -> Option<&'static str> {
 
 fn shortlog_option_requires_value(option: &str) -> GitError {
     eprintln!("error: option `{option}' requires a value");
-    GitError::Exit(129)
+    crate::cli_exit(129)
 }
 
 fn shortlog_option_takes_no_value(option: &str) -> Result<ShortlogOptions> {
     eprintln!("error: option `{option}' takes no value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn shortlog_unknown_option(option: &str) -> Result<ShortlogOptions> {
     eprint!("error: unknown option `{option}'\n{SHORTLOG_USAGE}");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn shortlog_unrecognized_argument(value: &str) -> Result<ShortlogOptions> {
     eprint!("error: unrecognized argument: {value}\n{SHORTLOG_USAGE}");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn shortlog_usage_help() -> Result<ShortlogOptions> {
     print!("{SHORTLOG_USAGE}");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 const SHORTLOG_USAGE: &str = "usage: git shortlog [<options>] [<revision-range>] [[--] <path>...]\n   or: git log --pretty=short | git shortlog [<options>]\n\n    -c, --[no-]committer  group by committer rather than author\n    -n, --[no-]numbered   sort output according to the number of commits per author\n    -s, --[no-]summary    suppress commit descriptions, only provides commit count\n    -e, --[no-]email      show the email address of each author\n    -w[<w>[,<i1>[,<i2>]]] linewrap output\n    --[no-]group <field>  group by field\n\n";

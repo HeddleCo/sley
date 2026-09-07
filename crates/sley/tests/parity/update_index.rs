@@ -1,8 +1,8 @@
 //! `update-index` engine parity.
 
 use sley::Repository;
-use sley::plumbing::sley_worktree::UpdateIndexOptions;
 use sley_testkit::engine_parity::EngineParityCase;
+use sley_worktree::UpdateIndexOptions;
 
 use super::common::{index_stage_output, run_update_index};
 

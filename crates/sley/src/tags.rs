@@ -389,7 +389,7 @@ fn tag_points_at(
     Ok(points_at.iter().any(|point| point == &parsed.object))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "history-editing"))]
 mod tests {
     use super::*;
     use crate::{RefChange, TagCreate};

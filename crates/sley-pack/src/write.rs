@@ -1273,16 +1273,21 @@ pub(crate) fn compress_planned_payloads(
         let mut handles = Vec::new();
         for (chunk_idx, chunk) in order.chunks(chunk_len).enumerate() {
             let chunk_start = chunk_idx * chunk_len;
-            handles.push(scope.spawn(move || -> Result<Vec<(usize, Vec<u8>)>> {
-                let mut chunk_payloads = Vec::with_capacity(chunk.len());
-                for (offset, &idx) in chunk.iter().enumerate() {
-                    chunk_payloads.push((
-                        chunk_start + offset,
-                        compressed_payload(planned_payload(objects, plan, idx), compression_level)?,
-                    ));
-                }
-                Ok(chunk_payloads)
-            }));
+            handles.push(scope.spawn(sley_core::diagnostics::inherit(
+                move || -> Result<Vec<(usize, Vec<u8>)>> {
+                    let mut chunk_payloads = Vec::with_capacity(chunk.len());
+                    for (offset, &idx) in chunk.iter().enumerate() {
+                        chunk_payloads.push((
+                            chunk_start + offset,
+                            compressed_payload(
+                                planned_payload(objects, plan, idx),
+                                compression_level,
+                            )?,
+                        ));
+                    }
+                    Ok(chunk_payloads)
+                },
+            )));
         }
 
         let mut first_error = None;
@@ -1346,19 +1351,21 @@ pub(crate) fn compress_streaming_planned_payloads(
         let mut handles = Vec::new();
         for (chunk_idx, chunk) in order.chunks(chunk_len).enumerate() {
             let chunk_start = chunk_idx * chunk_len;
-            handles.push(scope.spawn(move || -> Result<Vec<(usize, Vec<u8>)>> {
-                let mut chunk_payloads = Vec::with_capacity(chunk.len());
-                for (offset, &idx) in chunk.iter().enumerate() {
-                    chunk_payloads.push((
-                        chunk_start + offset,
-                        compressed_payload(
-                            streaming_planned_payload(objects, plan, idx),
-                            compression_level,
-                        )?,
-                    ));
-                }
-                Ok(chunk_payloads)
-            }));
+            handles.push(scope.spawn(sley_core::diagnostics::inherit(
+                move || -> Result<Vec<(usize, Vec<u8>)>> {
+                    let mut chunk_payloads = Vec::with_capacity(chunk.len());
+                    for (offset, &idx) in chunk.iter().enumerate() {
+                        chunk_payloads.push((
+                            chunk_start + offset,
+                            compressed_payload(
+                                streaming_planned_payload(objects, plan, idx),
+                                compression_level,
+                            )?,
+                        ));
+                    }
+                    Ok(chunk_payloads)
+                },
+            )));
         }
 
         let mut first_error = None;
@@ -1419,16 +1426,18 @@ pub(crate) fn compress_undeltified_payloads(
         let mut handles = Vec::new();
         for (chunk_idx, chunk) in objects.chunks(chunk_len).enumerate() {
             let chunk_start = chunk_idx * chunk_len;
-            handles.push(scope.spawn(move || -> Result<Vec<(usize, Vec<u8>)>> {
-                let mut chunk_payloads = Vec::with_capacity(chunk.len());
-                for (offset, object) in chunk.iter().enumerate() {
-                    chunk_payloads.push((
-                        chunk_start + offset,
-                        compressed_payload(&object.body, compression_level)?,
-                    ));
-                }
-                Ok(chunk_payloads)
-            }));
+            handles.push(scope.spawn(sley_core::diagnostics::inherit(
+                move || -> Result<Vec<(usize, Vec<u8>)>> {
+                    let mut chunk_payloads = Vec::with_capacity(chunk.len());
+                    for (offset, object) in chunk.iter().enumerate() {
+                        chunk_payloads.push((
+                            chunk_start + offset,
+                            compressed_payload(&object.body, compression_level)?,
+                        ));
+                    }
+                    Ok(chunk_payloads)
+                },
+            )));
         }
 
         let mut first_error = None;

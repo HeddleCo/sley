@@ -38,29 +38,7 @@ impl LoadedObject {
     }
 }
 
-/// Options for lazy blob reads that may cross a promisor/remote boundary.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct BlobFetchOptions {
-    remote: Option<String>,
-}
-
-impl BlobFetchOptions {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn from_remote(remote: impl Into<String>) -> Self {
-        Self {
-            remote: Some(remote.into()),
-        }
-    }
-
-    pub fn remote(&self) -> Option<&str> {
-        self.remote.as_deref()
-    }
-}
-
-/// Blob read facade for embedders that need a single local/lazy boundary.
+/// Local blob reads. Hydration is an explicit remote operation.
 #[derive(Debug, Clone)]
 pub struct BlobStore<'repo> {
     repo: &'repo Repository,
@@ -73,40 +51,19 @@ impl<'repo> BlobStore<'repo> {
 
     /// Read a local blob.
     pub fn read(&self, oid: ObjectId) -> Result<Vec<u8>> {
-        self.read_local_blob(oid, MissingObjectContext::Read)
+        self.read_local_blob(oid)
     }
 
-    /// Read a blob, returning a typed remote-boundary missing-object error when
-    /// the local object is absent and a remote fetch policy was supplied.
-    ///
-    /// This async signature is intentionally stable for future promisor fetch
-    /// support; today it completes immediately after the local object lookup.
-    pub async fn read_or_fetch(&self, oid: ObjectId, options: BlobFetchOptions) -> Result<Vec<u8>> {
-        self.read_or_fetch_blocking(oid, options)
-    }
-
-    /// Synchronous form of [`BlobStore::read_or_fetch`] for non-async callers.
-    pub fn read_or_fetch_blocking(
-        &self,
-        oid: ObjectId,
-        options: BlobFetchOptions,
-    ) -> Result<Vec<u8>> {
-        let context = if options.remote().is_some() {
-            MissingObjectContext::RemoteBoundary
-        } else {
-            MissingObjectContext::Read
-        };
-        self.read_local_blob(oid, context)
-    }
-
-    fn read_local_blob(&self, oid: ObjectId, context: MissingObjectContext) -> Result<Vec<u8>> {
+    fn read_local_blob(&self, oid: ObjectId) -> Result<Vec<u8>> {
         let object = self
             .repo
             .read_object(&oid)
             .map_err(|err| match err.not_found_kind() {
-                Some(crate::NotFoundKind::Object { .. }) => {
-                    GitError::object_kind_not_found_in(oid, MissingObjectKind::Blob, context)
-                }
+                Some(crate::NotFoundKind::Object { .. }) => GitError::object_kind_not_found_in(
+                    oid,
+                    MissingObjectKind::Blob,
+                    MissingObjectContext::Read,
+                ),
                 _ => err,
             })?;
         if object.object_type != ObjectType::Blob {
@@ -148,7 +105,7 @@ impl Repository {
         self.object_database().clone()
     }
 
-    /// Blob reads with a single boundary for future lazy hydration support.
+    /// Local blob reads with typed missing-object errors.
     pub fn blobs(&self) -> BlobStore<'_> {
         BlobStore::new(self)
     }

@@ -35,6 +35,7 @@ pub struct ReceivePackServerOptions<'a> {
 }
 
 pub struct ReceivePackServerRequest<'a> {
+    pub policy: &'a crate::RemotePolicy,
     pub git_dir: &'a Path,
     pub format: ObjectFormat,
     pub header: &'a ReceivePackPushRequestHeader,
@@ -57,8 +58,10 @@ pub struct ReceivePackServerOutcome {
 }
 
 pub fn serve_receive_pack(
+    original_cwd: Option<&std::path::Path>,
     request: ReceivePackServerRequest<'_>,
 ) -> Result<ReceivePackServerOutcome> {
+    let policy = request.policy;
     let mut discard_stderr = Vec::new();
     let capture_stderr = request.options.remote_stderr.is_some();
     let remote_stderr = request.options.remote_stderr.unwrap_or(&mut discard_stderr);
@@ -94,7 +97,7 @@ pub fn serve_receive_pack(
                 continue;
             }
             let logical = state.command.name.as_str();
-            let physical = sley_core::expand_namespace(logical);
+            let physical = policy.namespace.expand(logical);
             if sley_core::ref_is_hidden(Some(logical), &physical, &hidden_patterns) {
                 let reason = if state.command.new_id.is_null() {
                     "deny deleting a hidden ref"
@@ -257,7 +260,13 @@ pub fn serve_receive_pack(
     }
 
     if unpack_error.is_none()
-        && let Err(err) = apply_command_updates(request.git_dir, request.format, &command_states)
+        && let Err(err) = apply_command_updates(
+            original_cwd,
+            request.policy,
+            request.git_dir,
+            request.format,
+            &command_states,
+        )
     {
         let message = err.to_string();
         for state in &mut command_states {
@@ -572,11 +581,13 @@ fn validate_receive_objects(
     if report.is_ok() {
         Ok(())
     } else {
-        Err(GitError::Exit(1))
+        Err(GitError::Rejected(sley_core::RejectionKind::Incomplete))
     }
 }
 
 fn apply_command_updates(
+    original_cwd: Option<&std::path::Path>,
+    policy: &crate::RemotePolicy,
     git_dir: &Path,
     format: ObjectFormat,
     states: &[ReceivePackCommandState],
@@ -588,7 +599,7 @@ fn apply_command_updates(
         .filter(|state| state.error_string.is_none() && !state.defer_ref_update())
         .map(|state| {
             let mut command = state.command.clone();
-            command.name = sley_core::expand_namespace(&command.name);
+            command.name = policy.namespace.expand(&command.name);
             command
         })
         .collect();
@@ -631,7 +642,14 @@ fn apply_command_updates(
         .filter(|c| !c.new_id.is_null())
         .cloned()
         .collect();
-    apply_receive_pack_ref_transaction(git_dir, format, &store, &updates, &applicable)?;
+    apply_receive_pack_ref_transaction(
+        original_cwd,
+        git_dir,
+        format,
+        &store,
+        &updates,
+        &applicable,
+    )?;
     Ok(())
 }
 
@@ -823,19 +841,23 @@ mod tests {
             push_options: None,
         };
         let mut reader = Cursor::new(pack);
-        serve_receive_pack(ReceivePackServerRequest {
-            git_dir,
-            format,
-            header: &header,
-            pack_reader: &mut reader,
-            config,
-            validation: policy,
-            options: ReceivePackServerOptions {
-                quiet: true,
-                remote_stderr: None,
-                run_post_hooks: false,
+        serve_receive_pack(
+            None,
+            ReceivePackServerRequest {
+                policy: &Default::default(),
+                git_dir,
+                format,
+                header: &header,
+                pack_reader: &mut reader,
+                config,
+                validation: policy,
+                options: ReceivePackServerOptions {
+                    quiet: true,
+                    remote_stderr: None,
+                    run_post_hooks: false,
+                },
             },
-        })
+        )
         .expect("serve receive pack")
     }
 

@@ -28,11 +28,11 @@ pub(super) fn setup_worktree_list_options(args: &[String]) -> Result<WorktreeLis
     }
     if z && !porcelain {
         eprintln!("fatal: the option '-z' requires '--porcelain'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if verbose && porcelain {
         eprintln!("fatal: options '--verbose' and '--porcelain' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(WorktreeListOptions {
         porcelain,
@@ -183,27 +183,27 @@ pub(super) fn setup_worktree_add_options(args: &[String]) -> Result<WorktreeAddO
         > 1
     {
         eprintln!("fatal: options '-b', '-B', and '--detach' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if detach && orphan {
         eprintln!("fatal: options '--orphan' and '--detach' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if orphan && track.is_some() {
         eprintln!("fatal: options '--orphan' and '--track' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if orphan && !checkout {
         eprintln!("fatal: options '--orphan' and '--no-checkout' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if orphan && paths.len() == 2 {
         eprintln!("fatal: option '--orphan' and commit-ish cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if lock_reason.is_some() && !keep_locked {
         eprintln!("fatal: the option '--reason' requires '--lock'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if paths.is_empty() || paths.len() > 2 {
         return worktree_add_usage();
@@ -232,7 +232,7 @@ pub(super) fn setup_worktree_add_options(args: &[String]) -> Result<WorktreeAddO
 fn parse_worktree_prune_expire(value: &str) -> Result<i64> {
     let Some(timestamp) = crate::commands::approxidate::parse_expiry_date(value) else {
         eprintln!("fatal: invalid approxidate value: '{value}'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
     let timestamp = timestamp as u64;
     Ok(if timestamp >= i64::MAX as u64 {
@@ -443,7 +443,7 @@ fn worktree_list_usage<T>() -> Result<T> {
         "    --[no-]expire <expiry-date>\n                          add 'prunable' annotation to missing worktrees older than <time>"
     );
     eprintln!("    -z                    terminate records with a NUL character");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn worktree_prune_usage<T>() -> Result<T> {
@@ -454,7 +454,7 @@ fn worktree_prune_usage<T>() -> Result<T> {
     eprintln!(
         "    --[no-]expire <expiry-date>\n                          prune missing working trees older than <time>"
     );
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn worktree_lock_usage<T>() -> Result<T> {
@@ -463,13 +463,13 @@ fn worktree_lock_usage<T>() -> Result<T> {
     eprintln!("    --[no-]reason <string>");
     eprintln!("                          reason for locking");
     eprintln!();
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn worktree_unlock_usage<T>() -> Result<T> {
     eprintln!("usage: git worktree unlock <worktree>");
     eprintln!();
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn worktree_remove_usage<T>() -> Result<T> {
@@ -477,7 +477,7 @@ fn worktree_remove_usage<T>() -> Result<T> {
     eprintln!();
     eprintln!("    -f, --[no-]force      force removal even if worktree is dirty or locked");
     eprintln!();
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn worktree_move_usage<T>() -> Result<T> {
@@ -486,7 +486,7 @@ fn worktree_move_usage<T>() -> Result<T> {
     eprintln!("    -f, --[no-]force      force move even if worktree is dirty or locked");
     eprintln!("    --[no-]relative-paths use relative paths for worktrees");
     eprintln!();
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn worktree_add_usage<T>() -> Result<T> {
@@ -512,5 +512,5 @@ fn worktree_add_usage<T>() -> Result<T> {
     );
     eprintln!("    --[no-]relative-paths use relative paths for worktrees");
     eprintln!();
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }

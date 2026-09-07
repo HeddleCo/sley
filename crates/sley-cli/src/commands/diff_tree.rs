@@ -27,8 +27,7 @@
 //! A glob of the crate root brings every shared helper/type into scope via
 //! descendant-privacy; see commands::stash for the rationale.
 use crate::*;
-use sley::plumbing::sley_object::TreeEntries;
-use sley::plumbing::{sley_diff_merge, sley_rev, sley_worktree};
+use sley_object::TreeEntries;
 
 /// Which output formats to produce, mirroring git's `output_format` bitmask:
 /// the explicit format options accumulate (`--stat --summary` prints both, and
@@ -595,7 +594,7 @@ pub(crate) fn cmd_diff_tree(
     }
     if options.max_depth.is_some() && diff_tree_has_wildcard_pathspec(&setup.pathspecs) {
         eprintln!("fatal: max-depth cannot be used with wildcard pathspecs");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if !setup.options.negatives.is_empty() || !setup.options.symmetric_ranges.is_empty() {
         return Err(GitError::Unsupported(
@@ -618,6 +617,7 @@ pub(crate) fn cmd_diff_tree(
     };
     let ws_resolver = if options.check {
         Some(commands::diff::WhitespaceRuleResolver::from_git_dir(
+            cli_session.precompose_unicode(),
             git_dir,
         )?)
     } else {
@@ -675,7 +675,12 @@ pub(crate) fn cmd_diff_tree(
                 continue;
             }
             for request in parse_stdin_request(git_dir, format, db, &options, line)? {
-                if run_diff_request(&mut stdout, &request_context, &request)? {
+                if run_diff_request(
+                    &cli_session.remote_policy,
+                    &mut stdout,
+                    &request_context,
+                    &request,
+                )? {
                     has_differences = true;
                 }
             }
@@ -683,11 +688,11 @@ pub(crate) fn cmd_diff_tree(
     } else {
         if options.merge_base && setup.options.positives.len() == 1 {
             eprintln!("fatal: --merge-base only works with two commits");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if setup.options.positives.is_empty() {
             print_diff_tree_usage();
-            return Err(GitError::Exit(129));
+            return Err(crate::cli_exit(129));
         }
         let requests = if options.merge_base {
             resolve_merge_base_arg_request(git_dir, db, &setup.options.positives)?
@@ -695,17 +700,22 @@ pub(crate) fn cmd_diff_tree(
             resolve_arg_request(git_dir, db, &options, &setup.options.positives)?
         };
         for request in requests {
-            if run_diff_request(&mut stdout, &request_context, &request)? {
+            if run_diff_request(
+                &cli_session.remote_policy,
+                &mut stdout,
+                &request_context,
+                &request,
+            )? {
                 has_differences = true;
             }
         }
     }
 
     if options.check && request_context.check_failed.get() {
-        return Err(GitError::Exit(2));
+        return Err(crate::cli_exit(2));
     }
     if options.exit_code && has_differences {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -789,7 +799,7 @@ fn resolve_merge_base_arg_request(
 ) -> Result<Vec<DiffRequest>> {
     if revs.len() != 2 {
         print_diff_tree_usage();
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     let format = db.object_format();
     let left = commands::diff::diff_resolve_commit_arg(git_dir, format, db, &revs[0].rev)?;
@@ -1081,6 +1091,7 @@ struct DiffRequestContext<'a> {
 }
 
 fn run_diff_request(
+    policy: &sley_remote::RemotePolicy,
     stdout: &mut io::Stdout,
     context: &DiffRequestContext<'_>,
     request: &DiffRequest,
@@ -1114,7 +1125,7 @@ fn run_diff_request(
     // Combined merge diff (`-c`/`--cc`): render the result tree against all
     // parents at once instead of the two-tree path below.
     if let Some(combined) = &request.combined {
-        return run_combined_request(stdout, context, combined);
+        return run_combined_request(policy, stdout, context, combined);
     }
 
     let Some(right) = request.right.clone() else {
@@ -1137,6 +1148,7 @@ fn run_diff_request(
     };
     let entries = if let Some(needle) = context.options.pickaxe.as_deref() {
         commands::diff::apply_diff_pickaxe(
+            policy,
             entries,
             needle.as_bytes(),
             context.options.pickaxe_all,
@@ -1156,6 +1168,7 @@ fn run_diff_request(
     if context.options.check {
         if let Some(resolver) = &context.ws_resolver {
             let failed = commands::diff::run_diff_check(
+                policy,
                 &entries,
                 context.db,
                 None,
@@ -1209,13 +1222,14 @@ fn run_diff_request(
         }
         wrote_block = true;
     }
+    let lazy_fetch_adapter_1 = crate::diff_lazy_fetch(policy, context.lazy_fetch);
     let stat_entries_for_render = if output.numstat || output.stat || output.shortstat {
         collect_diff_stat_entries(
             &entries,
             context.db,
             None,
             false,
-            crate::diff_lazy_fetch(context.lazy_fetch),
+            lazy_fetch_adapter_1.as_option(),
         )?
     } else {
         Vec::new()
@@ -1264,12 +1278,13 @@ fn run_diff_request(
         },
         |_| false,
         |stdout, entry| {
+            let lazy_fetch_adapter_2 = crate::diff_lazy_fetch(policy, context.lazy_fetch);
             let patch_options = DiffRenderOptions {
                 binary: context.options.patch_binary,
                 anchors: &[],
                 allow_textconv: false,
                 db: context.db,
-                lazy_fetch: crate::diff_lazy_fetch(context.lazy_fetch),
+                lazy_fetch: lazy_fetch_adapter_2.as_option(),
                 worktree_root: None,
                 use_worktree_new: false,
                 format: context.format,
@@ -1310,6 +1325,7 @@ fn run_diff_request(
 /// module (the same code `show`/`log` use). The stat/summary family is computed
 /// solely against the first parent (git's STAT_FORMAT_MASK).
 fn run_combined_request(
+    policy: &sley_remote::RemotePolicy,
     stdout: &mut io::Stdout,
     context: &DiffRequestContext<'_>,
     combined: &CombinedRequest,
@@ -1407,13 +1423,14 @@ fn run_combined_request(
             true,
         )?;
         has_differences |= !first_parent_entries.is_empty();
+        let lazy_fetch_adapter_3 = crate::diff_lazy_fetch(policy, context.lazy_fetch);
         let stat_entries = if output.numstat || output.stat || output.shortstat {
             collect_diff_stat_entries(
                 &first_parent_entries,
                 db,
                 None,
                 false,
-                crate::diff_lazy_fetch(context.lazy_fetch),
+                lazy_fetch_adapter_3.as_option(),
             )?
         } else {
             Vec::new()
@@ -1457,7 +1474,7 @@ fn run_combined_request(
             writeln!(stdout)?;
         }
         for path in &paths {
-            commands::combined::write_combined_patch(stdout, &render_ctx, path)?;
+            commands::combined::write_combined_patch(policy, stdout, &render_ctx, path)?;
         }
     }
 
@@ -1550,7 +1567,7 @@ fn compute_entries(
 fn parse_diff_tree_max_depth(value: &str) -> Result<i64> {
     value.parse::<i64>().map_err(|_| {
         eprintln!("error: option `max-depth' expects a numerical value");
-        GitError::Exit(129)
+        crate::cli_exit(129)
     })
 }
 

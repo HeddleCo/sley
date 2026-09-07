@@ -1506,9 +1506,30 @@ pub trait HttpClient {
     }
 }
 
+/// Explicit transport environment policy, resolved by the caller once.
+/// Config `protocol.*.allow` is still evaluated for the target operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportPolicy {
+    /// An allow-list overriding config (including an explicitly empty list).
+    pub allow_protocols: Option<Vec<String>>,
+    /// Whether user-only protocols may be used by this operation.
+    pub from_user: bool,
+}
+
+impl Default for TransportPolicy {
+    fn default() -> Self {
+        Self {
+            allow_protocols: None,
+            from_user: true,
+        }
+    }
+}
+
 /// [`HttpClient`] backed by [`ureq`] with rustls + bundled Mozilla roots.
 #[cfg(feature = "http-client")]
 pub struct UreqHttpClient {
+    transport_policy: TransportPolicy,
+    protocol_config: Option<sley_config::GitConfig>,
     agent: ureq::Agent,
     limits: TransportLimits,
 }
@@ -1646,6 +1667,18 @@ impl UreqHttpClient {
         Self::with_limits(TransportLimits::default())
     }
 
+    /// Bind protocol gating to this client. The same snapshot governs every
+    /// request and redirect, independent of process environment changes.
+    pub fn with_protocol_policy(
+        mut self,
+        policy: TransportPolicy,
+        config: Option<&sley_config::GitConfig>,
+    ) -> Self {
+        self.transport_policy = policy;
+        self.protocol_config = config.cloned();
+        self
+    }
+
     /// A client whose buffered-response ceilings, and the body deadlines
     /// derived from them, come from `limits`.
     ///
@@ -1695,6 +1728,8 @@ impl UreqHttpClient {
     ) -> Self {
         let limits = limits.clamped();
         Self {
+            transport_policy: TransportPolicy::default(),
+            protocol_config: None,
             agent: ureq_agent(http_timeouts(limits), tls_config),
             limits,
         }
@@ -1786,20 +1821,21 @@ impl HttpClient for UreqHttpClient {
             let mut handles = Vec::with_capacity(ranges.len());
             for (index, (start, end)) in ranges.into_iter().enumerate() {
                 let client = UreqHttpClient {
+                    transport_policy: self.transport_policy.clone(),
+                    protocol_config: self.protocol_config.clone(),
                     agent: self.agent.clone(),
                     limits: self.limits,
                 };
-                handles.push(
-                    scope.spawn(move || download_packfile_range(client, url, index, start, end)),
-                );
+                handles.push(scope.spawn(sley_core::diagnostics::inherit(move || {
+                    download_packfile_range(client, url, index, start, end)
+                })));
             }
             handles
                 .into_iter()
                 .map(|handle| {
-                    handle.join().map_err(|_| {
-                        GitError::Io(format!(
-                            "HTTP range request to {url} failed: worker panicked"
-                        ))
+                    handle.join().map_err(|_| GitError::IoKind {
+                        kind: std::io::ErrorKind::Other,
+                        message: format!("HTTP range request to {url} failed: worker panicked"),
                     })?
                 })
                 .collect::<Result<Vec<_>>>()
@@ -1849,7 +1885,12 @@ impl HttpClient for UreqHttpClient {
         // `SendBody::from_reader` carries no known length, so ureq sends the
         // request with `Transfer-Encoding: chunked` and pulls bytes on demand.
         // Initial POST is from_user; check before dial.
-        check_http_layer_scheme_allowed(url, true)?;
+        check_http_layer_scheme_allowed(
+            url,
+            self.transport_policy.from_user,
+            &self.transport_policy,
+            self.protocol_config.as_ref(),
+        )?;
         let response = request
             .send(ureq::SendBody::from_reader(body))
             .map_err(|err| http_transport_error(url, &err))?;
@@ -1858,7 +1899,12 @@ impl HttpClient for UreqHttpClient {
             let next = resolve_redirect_url(url, parts.location.as_deref())?;
             // Subsequent hops are GETs without a body (body already consumed)
             // and are not from-user (CURLOPT_REDIR_PROTOCOLS).
-            check_http_layer_scheme_allowed(&next, false)?;
+            check_http_layer_scheme_allowed(
+                &next,
+                false,
+                &self.transport_policy,
+                self.protocol_config.as_ref(),
+            )?;
             return self.request_with_redirects_from_user("GET", &next, headers, None, false);
         }
         Ok(HttpResponse {
@@ -1894,18 +1940,24 @@ fn download_packfile_range(
     let range = format!("bytes={start}-{end}");
     let mut response = client.get(url, &[("Range", &range)])?;
     if response.status != 206 {
-        return Err(GitError::Io(format!(
-            "HTTP range request to {url} returned status {}",
-            response.status
-        )));
+        return Err(GitError::IoKind {
+            kind: std::io::ErrorKind::Other,
+            message: format!(
+                "HTTP range request to {url} returned status {}",
+                response.status
+            ),
+        });
     }
     let expected = end - start + 1;
     let mut file = tempfile::tempfile()?;
     let written = std::io::copy(&mut response.body.by_ref().take(expected + 1), &mut file)?;
     if written != expected {
-        return Err(GitError::Io(format!(
-            "HTTP range request to {url} returned {written} bytes, expected {expected}"
-        )));
+        return Err(GitError::IoKind {
+            kind: std::io::ErrorKind::Other,
+            message: format!(
+                "HTTP range request to {url} returned {written} bytes, expected {expected}"
+            ),
+        });
     }
     file.seek(SeekFrom::Start(0))?;
     Ok((index, file))
@@ -1943,7 +1995,13 @@ impl UreqHttpClient {
         body: Option<&[u8]>,
     ) -> Result<HttpResponse> {
         // Initial request is from_user (CURLOPT_PROTOCOLS).
-        self.request_with_redirects_from_user(method, url, headers, body, true)
+        self.request_with_redirects_from_user(
+            method,
+            url,
+            headers,
+            body,
+            self.transport_policy.from_user,
+        )
     }
 
     fn request_with_redirects_from_user(
@@ -1963,7 +2021,12 @@ impl UreqHttpClient {
         // protocol.http.allow=user blocks smart-redir-perm (t5812).
         let mut from_user = initial_from_user;
         for _ in 0..=MAX_REDIRECTS {
-            check_http_layer_scheme_allowed(&current, from_user)?;
+            check_http_layer_scheme_allowed(
+                &current,
+                from_user,
+                &self.transport_policy,
+                self.protocol_config.as_ref(),
+            )?;
             let chunked = false;
             trace_curl_request(&method, &current, headers, chunked);
             let response = match method.as_str() {
@@ -1991,9 +2054,12 @@ impl UreqHttpClient {
                         .map_err(|err| http_transport_error(&current, &err))?
                 }
                 other => {
-                    return Err(GitError::Io(format!(
-                        "HTTP request to {current} failed: unsupported method {other}"
-                    )));
+                    return Err(GitError::IoKind {
+                        kind: std::io::ErrorKind::Other,
+                        message: format!(
+                            "HTTP request to {current} failed: unsupported method {other}"
+                        ),
+                    });
                 }
             };
             let parts = http_response_parts_from_ureq(response);
@@ -2016,9 +2082,10 @@ impl UreqHttpClient {
                 body: parts.body,
             });
         }
-        Err(GitError::Io(format!(
-            "HTTP request to {url} failed: too many redirects"
-        )))
+        Err(GitError::IoKind {
+            kind: std::io::ErrorKind::Other,
+            message: format!("HTTP request to {url} failed: too many redirects"),
+        })
     }
 }
 
@@ -2071,9 +2138,10 @@ fn http_response_parts_from_ureq(response: ureq::http::Response<ureq::Body>) -> 
 #[cfg(feature = "http-client")]
 fn resolve_redirect_url(current: &str, location: Option<&str>) -> Result<String> {
     let Some(location) = location.filter(|value| !value.is_empty()) else {
-        return Err(GitError::Io(format!(
-            "HTTP request to {current} failed: redirect with no Location"
-        )));
+        return Err(GitError::IoKind {
+            kind: std::io::ErrorKind::Other,
+            message: format!("HTTP request to {current} failed: redirect with no Location"),
+        });
     };
     if location.contains("://") {
         return Ok(location.to_string());
@@ -2105,7 +2173,12 @@ fn resolve_redirect_url(current: &str, location: Option<&str>) -> Result<String>
 /// `Protocol "ftp" not supported or disabled in libcurl` so t5812's
 /// `ftp.*disabled` grep matches.
 #[cfg(feature = "http-client")]
-fn check_http_layer_scheme_allowed(url: &str, from_user: bool) -> Result<()> {
+fn check_http_layer_scheme_allowed(
+    url: &str,
+    from_user: bool,
+    policy: &TransportPolicy,
+    config: Option<&sley_config::GitConfig>,
+) -> Result<()> {
     let scheme = url
         .split_once("://")
         .map(|(scheme, _)| scheme.to_ascii_lowercase())
@@ -2113,12 +2186,13 @@ fn check_http_layer_scheme_allowed(url: &str, from_user: bool) -> Result<()> {
     if scheme.is_empty() {
         return Ok(());
     }
-    if http_layer_scheme_allowed(&scheme, from_user) {
+    if http_layer_scheme_allowed(&scheme, from_user, policy, config) {
         return Ok(());
     }
-    Err(GitError::Io(format!(
-        "Protocol \"{scheme}\" not supported or disabled in libcurl"
-    )))
+    Err(GitError::IoKind {
+        kind: std::io::ErrorKind::Other,
+        message: format!("Protocol \"{scheme}\" not supported or disabled in libcurl"),
+    })
 }
 
 #[cfg(feature = "http-client")]
@@ -2132,13 +2206,16 @@ enum HttpProtocolAllow {
 /// Mirror of git's `get_curl_allowed_protocols` + `is_transport_allowed` for the
 /// schemes curl's HTTP layer can dial (http/https/ftp/ftps).
 #[cfg(feature = "http-client")]
-fn http_layer_scheme_allowed(scheme: &str, from_user: bool) -> bool {
-    if let Ok(allow) = std::env::var("GIT_ALLOW_PROTOCOL") {
-        return allow
-            .split(':')
-            .any(|entry| entry.eq_ignore_ascii_case(scheme));
+fn http_layer_scheme_allowed(
+    scheme: &str,
+    from_user: bool,
+    policy: &TransportPolicy,
+    config: Option<&sley_config::GitConfig>,
+) -> bool {
+    if let Some(allow) = &policy.allow_protocols {
+        return allow.iter().any(|entry| entry.eq_ignore_ascii_case(scheme));
     }
-    match http_layer_protocol_policy(scheme) {
+    match http_layer_protocol_policy(scheme, config) {
         HttpProtocolAllow::Always => true,
         HttpProtocolAllow::Never => false,
         HttpProtocolAllow::UserOnly => from_user,
@@ -2148,8 +2225,11 @@ fn http_layer_scheme_allowed(scheme: &str, from_user: bool) -> bool {
 /// Resolve protocol.<scheme>.allow / protocol.allow, including `-c` values
 /// folded into `GIT_CONFIG_PARAMETERS`.
 #[cfg(feature = "http-client")]
-fn http_layer_protocol_policy(scheme: &str) -> HttpProtocolAllow {
-    if let Some(policy) = http_layer_protocol_policy_from_config(scheme) {
+fn http_layer_protocol_policy(
+    scheme: &str,
+    config: Option<&sley_config::GitConfig>,
+) -> HttpProtocolAllow {
+    if let Some(policy) = http_layer_protocol_policy_from_config(scheme, config) {
         return policy;
     }
     match scheme {
@@ -2161,19 +2241,11 @@ fn http_layer_protocol_policy(scheme: &str) -> HttpProtocolAllow {
 }
 
 #[cfg(feature = "http-client")]
-fn http_layer_protocol_policy_from_config(scheme: &str) -> Option<HttpProtocolAllow> {
-    let context = sley_config::ConfigIncludeContext::new(None, None);
-    let mut config = sley_config::load_pre_dispatch_config(None, &context).ok()?;
-    // `None` folds in the process-global `-c`/`--config-env` fragment so
-    // `git -c protocol.http.allow=user clone …` is visible here.
-    if let Ok(parameters) = sley_config::injected_config_parameters(None) {
-        let _ = sley_config::append_injected_config_sections_with_includes(
-            &mut config,
-            &parameters,
-            &context,
-            std::path::Path::new("."),
-        );
-    }
+fn http_layer_protocol_policy_from_config(
+    scheme: &str,
+    config: Option<&sley_config::GitConfig>,
+) -> Option<HttpProtocolAllow> {
+    let config = config?;
     if let Some(value) = config.get("protocol", Some(scheme), "allow") {
         return parse_http_protocol_allow(value);
     }
@@ -2274,7 +2346,10 @@ fn curl_trace_enabled() -> bool {
 /// including the offending `url` in the message.
 #[cfg(feature = "http-client")]
 fn http_transport_error(url: &str, err: &ureq::Error) -> GitError {
-    GitError::Io(format!("HTTP request to {url} failed: {err}"))
+    GitError::IoKind {
+        kind: std::io::ErrorKind::Other,
+        message: format!("HTTP request to {url} failed: {err}"),
+    }
 }
 
 // Small private framing helpers, duplicated verbatim from git-protocol so the

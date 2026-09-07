@@ -246,7 +246,7 @@ pub fn read_bisect_terms(git_dir: impl AsRef<Path>) -> Result<BisectTerms> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Ok(BisectTerms::default());
         }
-        Err(err) => return Err(GitError::Io(err.to_string())),
+        Err(err) => return Err(GitError::from(err)),
     };
     let mut lines = contents.lines();
     let bad = match lines.next() {
@@ -658,7 +658,9 @@ pub fn warn_ambiguous_refname_with_sink(
         return;
     }
     match sink {
-        AmbiguousRefnameWarning::Stderr => eprintln!("warning: refname '{rev}' is ambiguous."),
+        AmbiguousRefnameWarning::Stderr => {
+            sley_core::diagnostic!(Stderr, true, "warning: refname '{rev}' is ambiguous.")
+        }
         AmbiguousRefnameWarning::Custom(warn) => warn(rev),
     }
 }
@@ -937,7 +939,7 @@ fn ambiguous_candidate_type_for_sort(
     match db.read_object_header(oid) {
         Ok(Some((object_type, _))) => Some(object_type),
         Err(GitError::InvalidObject(message)) if message.starts_with("unable to unpack ") => {
-            eprintln!("error: {message}");
+            sley_core::diagnostic!(Stderr, true, "error: {message}");
             None
         }
         Ok(None) | Err(_) => None,
@@ -966,7 +968,7 @@ fn ambiguous_short_object_id_line(
             return Err(GitError::InvalidObject(message));
         }
         Err(GitError::InvalidObject(message)) if message.starts_with("unable to unpack ") => {
-            eprintln!("error: {message}");
+            sley_core::diagnostic!(Stderr, true, "error: {message}");
             return Ok(format!("{abbrev} [bad object]"));
         }
         Ok(None) | Err(_) => return Ok(format!("{abbrev} [bad object]")),
@@ -980,7 +982,7 @@ fn ambiguous_short_object_id_line(
             return Err(GitError::InvalidObject(message));
         }
         Err(GitError::InvalidObject(message)) if message.starts_with("unable to unpack ") => {
-            eprintln!("error: {message}");
+            sley_core::diagnostic!(Stderr, true, "error: {message}");
             return Ok(format!("{abbrev} [bad object]"));
         }
         Err(_) => return Ok(format!("{abbrev} [bad object]")),
@@ -1129,7 +1131,11 @@ fn resolve_revision_ref_candidate(refs: &FileRefStore, name: &str) -> Result<Opt
                     if name == "HEAD" {
                         return Err(GitError::broken_reference(name, target));
                     }
-                    eprintln!("warning: ignoring dangling symref {name}");
+                    sley_core::diagnostic!(
+                        Stderr,
+                        true,
+                        "warning: ignoring dangling symref {name}"
+                    );
                     return Ok(None);
                 }
                 current = target;
@@ -1462,7 +1468,9 @@ fn resolve_reflog_date(
     }
     let first_time = reflog_entry_timestamp(&entries[0])?;
     if cutoff < first_time {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "warning: log for '{}' only goes back to {}",
             display_name,
             reflog_entry_rfc2822_date(&entries[0])?
@@ -1475,7 +1483,9 @@ fn resolve_reflog_date(
         if entry_time <= cutoff {
             if let Some(next) = entries.get(index + 1) {
                 if next.old_oid != entry.new_oid {
-                    eprintln!(
+                    sley_core::diagnostic!(
+                        Stderr,
+                        true,
                         "warning: log for ref {} has gap after {}",
                         ref_name,
                         reflog_entry_rfc2822_date(entry)?
@@ -1485,7 +1495,9 @@ fn resolve_reflog_date(
                 && let Some(current) = resolve_revision_ref_candidate(&refs, &ref_name)?
                 && current != entry.new_oid
             {
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "warning: log for ref {} unexpectedly ended on {}",
                     ref_name,
                     reflog_entry_rfc2822_date(entry)?
@@ -3083,7 +3095,7 @@ impl<'a> CommitGraphContext<'a> {
                     {
                         // git prints the error and treats the entry as unparsed
                         // so the walk falls back to the object database.
-                        eprintln!("error: {message}");
+                        sley_core::diagnostic!(Stderr, true, "error: {message}");
                         return Ok(None);
                     }
                     Err(_) => return Ok(None),
@@ -3123,7 +3135,9 @@ fn verify_commit_graph_entry_exists<R: ObjectReader>(reader: &R, oid: &ObjectId)
     match reader.read_object(oid) {
         Ok(_) => Ok(()),
         Err(GitError::NotFound(_)) => {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "error: commit {} exists in commit-graph but not in the object database",
                 oid.to_hex()
             );
@@ -3173,7 +3187,7 @@ fn load_commit_graph_map_inner(
     if single.exists() {
         let bytes = match fs::read(&single) {
             Ok(bytes) => bytes,
-            Err(err) => return Err(GitError::Io(err.to_string())),
+            Err(err) => return Err(GitError::from(err)),
         };
         // Hash-version mismatch is a soft error: warn once and fall back to
         // object reads, matching `load_commit_graph_one` (graph stays usable
@@ -3294,9 +3308,9 @@ fn report_commit_graph_load_error(message: &str) {
         }
         other => (other, None),
     };
-    eprintln!("error: {primary}");
+    sley_core::diagnostic!(Stderr, true, "error: {primary}");
     if let Some(secondary) = secondary {
-        eprintln!("error: {secondary}");
+        sley_core::diagnostic!(Stderr, true, "error: {secondary}");
     }
 }
 
@@ -3435,7 +3449,9 @@ fn commit_graph_hash_version_mismatch(bytes: &[u8], format: ObjectFormat) -> boo
     use std::sync::atomic::{AtomicBool, Ordering};
     static WARNED: AtomicBool = AtomicBool::new(false);
     if !WARNED.swap(true, Ordering::Relaxed) {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "error: commit-graph hash version {file_version} does not match version {repo_version}"
         );
     }
@@ -3469,7 +3485,7 @@ fn load_commit_graph_chain(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Ok(HashMap::new());
         }
-        Err(err) => return Err(GitError::Io(err.to_string())),
+        Err(err) => return Err(GitError::from(err)),
     };
     let mut merged: HashMap<ObjectId, GraphCommit> = HashMap::new();
     for line in contents.lines() {
@@ -3480,7 +3496,7 @@ fn load_commit_graph_chain(
         let layer = info
             .join("commit-graphs")
             .join(format!("graph-{hash}.graph"));
-        let bytes = fs::read(&layer).map_err(|err| GitError::Io(err.to_string()))?;
+        let bytes = fs::read(&layer).map_err(GitError::from)?;
         let graph = match CommitGraph::parse(&bytes, format) {
             Ok(graph) => graph,
             Err(err) => {
@@ -3549,7 +3565,7 @@ fn load_commit_graph_bloom_chain(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Ok(HashMap::new());
         }
-        Err(err) => return Err(GitError::Io(err.to_string())),
+        Err(err) => return Err(GitError::from(err)),
     };
     let mut layers = Vec::new();
     let chain_dir = info.join("commit-graphs");
@@ -3559,7 +3575,7 @@ fn load_commit_graph_bloom_chain(
             continue;
         }
         let layer = chain_dir.join(format!("graph-{hash}.graph"));
-        let bytes = fs::read(&layer).map_err(|err| GitError::Io(err.to_string()))?;
+        let bytes = fs::read(&layer).map_err(GitError::from)?;
         let graph = match CommitGraph::parse(&bytes, format) {
             Ok(graph) => graph,
             Err(err) => {
@@ -3588,7 +3604,9 @@ fn load_commit_graph_bloom_chain(
             (canonical_settings, layer_settings)
             && !commit_graph_bloom_settings_match(settings, canonical)
         {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "warning: disabling Bloom filters for commit-graph layer '{hash}' due to incompatible settings"
             );
             graph_to_bloom_map_without_filters(&graph, settings, &base_oids)?
@@ -3694,7 +3712,7 @@ fn emit_commit_graph_bloom_warning_once(path: &Path, message: String) {
     {
         return;
     }
-    eprintln!("{message}");
+    sley_core::diagnostic!(Stderr, true, "{message}");
 }
 
 fn warn_invalid_commit_graph_bloom_for_objects_dir(
@@ -6357,7 +6375,7 @@ fn resolve_index_path<R: ObjectReader>(
                 "path '{path}' is not in the index"
             )));
         }
-        Err(err) => return Err(GitError::Io(err.to_string())),
+        Err(err) => return Err(GitError::from(err)),
     };
     let index = Index::parse(&bytes, format)?;
     let mut path_exists = false;
@@ -7385,7 +7403,10 @@ mod tests {
     fn setup_revisions_reports_ambiguous_argument() {
         let fixture = setup_revisions_fixture();
         let err = run_setup(&fixture, ["not-a-rev-or-path"]).expect_err("setup should fail");
-        assert!(matches!(err, GitError::Exit(128)));
+        assert!(matches!(
+            err,
+            GitError::Rejected(sley_core::RejectionKind::Refused)
+        ));
         assert_eq!(
             ambiguous_argument_message("not-a-rev-or-path"),
             "fatal: ambiguous argument 'not-a-rev-or-path': unknown revision or path not in the working tree.\nUse '--' to separate paths from revisions, like this:\n'git <command> [<revision>...] -- [<file>...]'"

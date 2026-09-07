@@ -301,6 +301,7 @@ pub(crate) fn read_default_global_excludes_file(patterns: &mut Vec<IgnorePattern
 }
 
 pub(crate) fn collect_per_directory_patterns_into_matcher(
+    precompose: sley_core::PrecomposeUnicode,
     root: &Path,
     dir: &Path,
     names: &[String],
@@ -311,7 +312,7 @@ pub(crate) fn collect_per_directory_patterns_into_matcher(
         let relative = dir.strip_prefix(root).map_err(|_| {
             GitError::InvalidPath(format!("path {} is outside worktree", dir.display()))
         })?;
-        let base = git_path_bytes(relative)?;
+        let base = git_path_bytes(precompose, relative)?;
         let mut source = base.clone();
         if !source.is_empty() {
             source.push(b'/');
@@ -335,9 +336,11 @@ pub(crate) fn collect_per_directory_patterns_into_matcher(
             let relative = path.strip_prefix(root).map_err(|_| {
                 GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
             })?;
-            let git_path = git_path_bytes(relative)?;
+            let git_path = git_path_bytes(precompose, relative)?;
             if !matcher.is_ignored(&git_path, true) {
-                collect_per_directory_patterns_into_matcher(root, &path, names, matcher)?;
+                collect_per_directory_patterns_into_matcher(
+                    precompose, root, &path, names, matcher,
+                )?;
             }
         }
     }
@@ -368,7 +371,7 @@ pub(crate) fn read_per_directory_ignore_patterns_into_matcher(
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(GitError::Io(err.to_string())),
+        Err(err) => return Err(GitError::from(err)),
     };
     if metadata.file_type().is_symlink() {
         return Err(GitError::Command(format!(
@@ -920,11 +923,14 @@ pub(crate) struct AttributeAssignment {
 }
 
 impl AttributeMatcher {
-    pub(crate) fn from_worktree_root(root: &Path) -> Result<Self> {
+    pub(crate) fn from_worktree_root(
+        precompose: sley_core::PrecomposeUnicode,
+        root: &Path,
+    ) -> Result<Self> {
         let mut matcher = Self::default();
         let git_dir = root.join(".git");
         matcher.configure_from_repo(root, &git_dir);
-        collect_attribute_patterns(root, root, &mut matcher)?;
+        collect_attribute_patterns(precompose, root, root, &mut matcher)?;
         read_attribute_patterns(
             git_dir.join("info").join("attributes"),
             &mut matcher,
@@ -1182,6 +1188,7 @@ pub(crate) fn read_dir_ignore_patterns_for_base(
 /// within `root`. Used both by the eager full-tree pass and by the status/diff
 /// worktree walk as it descends, so the tree is read for attributes exactly once.
 pub(crate) fn read_dir_attribute_patterns(
+    precompose: sley_core::PrecomposeUnicode,
     root: &Path,
     dir: &Path,
     matcher: &mut AttributeMatcher,
@@ -1189,7 +1196,7 @@ pub(crate) fn read_dir_attribute_patterns(
     let relative = dir.strip_prefix(root).map_err(|_| {
         GitError::InvalidPath(format!("path {} is outside worktree", dir.display()))
     })?;
-    let base = git_path_bytes(relative)?;
+    let base = git_path_bytes(precompose, relative)?;
     read_dir_attribute_patterns_for_base(dir, &base, matcher)
 }
 
@@ -1208,11 +1215,12 @@ pub(crate) fn read_dir_attribute_patterns_for_base(
 }
 
 pub(crate) fn collect_attribute_patterns(
+    precompose: sley_core::PrecomposeUnicode,
     root: &Path,
     dir: &Path,
     matcher: &mut AttributeMatcher,
 ) -> Result<()> {
-    read_dir_attribute_patterns(root, dir, matcher)?;
+    read_dir_attribute_patterns(precompose, root, dir, matcher)?;
 
     let mut entries = fs::read_dir(dir)?.collect::<std::result::Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.file_name());
@@ -1222,7 +1230,7 @@ pub(crate) fn collect_attribute_patterns(
             continue;
         }
         if entry.metadata()?.is_dir() {
-            collect_attribute_patterns(root, &path, matcher)?;
+            collect_attribute_patterns(precompose, root, &path, matcher)?;
         }
     }
     Ok(())
@@ -1240,7 +1248,9 @@ pub(crate) fn read_attribute_patterns(
         && let Ok(metadata) = fs::symlink_metadata(path)
         && metadata.file_type().is_symlink()
     {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "warning: unable to access '{}': Too many levels of symbolic links",
             String::from_utf8_lossy(source)
         );
@@ -1260,7 +1270,9 @@ pub(crate) fn read_attribute_patterns_from_bytes(
 ) {
     for (index, raw) in contents.split(|byte| *byte == b'\n').enumerate() {
         if raw.len() >= 2048 {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "warning: ignoring overly long attributes line {}",
                 index + 1
             );
@@ -1379,7 +1391,9 @@ pub(crate) fn push_attribute_pattern(
         // definition but keep parsing later rules so inherited macros remain
         // available there.
         if !base.is_empty() {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "{} not allowed: {}:{}",
                 String::from_utf8_lossy(line),
                 String::from_utf8_lossy(source),
@@ -1416,7 +1430,9 @@ pub(crate) fn push_attribute_pattern(
         matcher.push_attribute_order(&assignment.attribute);
     }
     if raw_pattern.starts_with(b"!") {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "warning: Negative patterns are ignored in git attributes\nUse '\\!' for literal leading exclamation."
         );
         return;
@@ -1596,7 +1612,9 @@ pub(crate) fn report_invalid_attribute_name(attribute: &[u8], source: &[u8], lin
     {
         return;
     }
-    eprintln!(
+    sley_core::diagnostic!(
+        Stderr,
+        true,
         "{} is not a valid attribute name: {}:{}",
         String::from_utf8_lossy(attribute),
         String::from_utf8_lossy(source),

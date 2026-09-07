@@ -144,15 +144,15 @@ fn run_git_replay(cli_session: &crate::session::CliSession, args: &[String]) -> 
     let parsed = parse_git_replay_args(args)?;
     if parsed.onto.is_some() && parsed.advance.is_some() {
         eprintln!("fatal: options '--onto' and '--advance' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if parsed.revert.is_some() && parsed.onto.is_some() {
         eprintln!("fatal: options '--revert' and '--onto' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if parsed.revert.is_some() && parsed.advance.is_some() {
         eprintln!("fatal: options '--revert' and '--advance' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let modes = usize::from(parsed.onto.is_some())
         + usize::from(parsed.advance.is_some())
@@ -160,23 +160,23 @@ fn run_git_replay(cli_session: &crate::session::CliSession, args: &[String]) -> 
     if modes != 1 {
         eprintln!("error: exactly one of --onto, --advance, or --revert is required");
         eprint!("{REPLAY_USAGE}");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     if parsed.advance.is_some() && parsed.contained {
         eprintln!("fatal: options '--advance' and '--contained' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if parsed.revert.is_some() && parsed.contained {
         eprintln!("fatal: options '--revert' and '--contained' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if parsed.ref_name.is_some() && parsed.contained {
         eprintln!("fatal: options '--ref' and '--contained' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if parsed.rev_args.is_empty() {
         eprintln!("error: empty commit set passed");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let cwd = cli_session.cwd().to_path_buf();
@@ -202,7 +202,10 @@ fn run_git_replay(cli_session: &crate::session::CliSession, args: &[String]) -> 
         replace_objects: cli_session.replace_objects(),
         db,
     };
-    let hosts = replay_hosts(cli_session.lazy_fetch());
+    let prefetch = CliPromisorPrefetch {
+        policy: cli_session.remote_policy.clone(),
+    };
+    let hosts = replay_hosts(cli_session.lazy_fetch().then_some(&prefetch));
     let plan = build_git_replay_plan(&ctx, parsed)?;
     let new_oid = replay_commits_to_base(&ctx, &hosts, &plan)?;
     emit_or_update_replay_ref(&ctx, &plan, &new_oid)
@@ -229,7 +232,7 @@ fn parse_git_replay_args(args: &[String]) -> Result<GitReplayArgs> {
             "--" => positional_only = true,
             "-h" | "--help" => {
                 print!("{REPLAY_USAGE}");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             "--contained" => parsed.contained = true,
             "--no-contained" => parsed.contained = false,
@@ -294,7 +297,7 @@ fn parse_replay_ref_action(value: &str) -> Result<ReplayRefAction> {
         "print" => Ok(ReplayRefAction::Print),
         _ => {
             eprintln!("fatal: invalid value for --ref-action: {value}");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -322,11 +325,11 @@ fn build_git_replay_plan(
         eprintln!(
             "fatal: '{option}' cannot be used with multiple revision ranges because the ordering would be ill-defined"
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if parsed.ref_name.is_some() && parsed.rev_args.len() != 1 {
         eprintln!("fatal: --ref cannot be used with multiple revision ranges");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let ref_action = match parsed.ref_action {
         Some(action) => action,
@@ -335,7 +338,7 @@ fn build_git_replay_plan(
             Some("update") | None => ReplayRefAction::Update,
             Some(value) => {
                 eprintln!("fatal: invalid replay.refAction value: {value}");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         },
     };
@@ -345,7 +348,7 @@ fn build_git_replay_plan(
             let base = resolve_revision(&ctx.git_dir, ctx.format, onto, ctx.replace_objects)
                 .map_err(|_| {
                     eprintln!("fatal: '{onto}' is not a valid commit-ish for --onto");
-                    GitError::Exit(128)
+                    crate::cli_exit(128)
                 })?;
             let target = replay_target_from_revision(&refs, &parsed.rev_args)?;
             let old_oid = read_direct_ref(&refs, ctx.format, &target)?;
@@ -363,7 +366,7 @@ fn build_git_replay_plan(
             let old_oid = read_direct_ref(&refs, ctx.format, &target)?;
             let Some(base) = old_oid else {
                 eprintln!("fatal: argument to --advance must be a reference");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             };
             (
                 ReplayAction::Pick,
@@ -379,7 +382,7 @@ fn build_git_replay_plan(
             let old_oid = read_direct_ref(&refs, ctx.format, &target)?;
             let Some(base) = old_oid else {
                 eprintln!("fatal: argument to --revert must be a reference");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             };
             (
                 ReplayAction::Revert,
@@ -424,7 +427,7 @@ fn replay_existing_ref(store: &FileRefStore, name: &str, option: &str) -> Result
         }
     }
     eprintln!("fatal: argument to {option} must be a reference");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn replay_target_from_revision(store: &FileRefStore, rev_args: &[String]) -> Result<String> {
@@ -440,13 +443,13 @@ fn replay_target_from_revision(store: &FileRefStore, rev_args: &[String]) -> Res
         }
     }
     eprintln!("fatal: could not determine ref to update");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn validate_replay_ref(name: &str) -> Result<String> {
     if !(name == "HEAD" || name.starts_with("refs/")) || validate_ref_name(name).is_err() {
         eprintln!("fatal: '{name}' is not a valid refname");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(name.to_string())
 }
@@ -493,7 +496,7 @@ fn select_git_replay_commits(
         commits.reverse();
         return Ok(commits);
     }
-    let hosts = replay_hosts(false);
+    let hosts = replay_hosts(None);
     sley_sequencer::pick::select_commits(ctx, &hosts, action, rev_args)
 }
 
@@ -530,7 +533,7 @@ fn replay_one_commit_to(
     let commit = Commit::parse(ctx.format, &object.body)?;
     if commit.parents.len() > 1 {
         eprintln!("fatal: replaying merge commits is not supported yet!");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let parent = commit.parents.first().copied();
     let (base_map, theirs_map) = match action {
@@ -570,10 +573,10 @@ fn replay_one_commit_to(
         )
         .map_err(|err| {
             eprintln!("error: {err}");
-            GitError::Exit(128)
+            crate::cli_exit(128)
         })?;
     if !conflicts.is_empty() {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     let tree_map = sley_sequencer::pick::merge_results_to_tree_map(&results);
     let new_tree = write_tree_map_object(&db, ctx.format, &tree_map)?;
@@ -621,11 +624,11 @@ fn tree_map_of_commit_or_halt(
 ) -> Result<MergeTreeMap> {
     let tree = commit_tree_oid(db, ctx.format, oid).map_err(|err| {
         eprintln!("error: {err}");
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })?;
     sley_diff_merge::flatten_tree(db, ctx.format, &tree).map_err(|err| {
         eprintln!("error: {err}");
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })
 }
 
@@ -760,12 +763,12 @@ struct ParsedReplay {
 
 fn usage_error(action: ReplayAction) -> GitError {
     eprint!("{}", usage_text(action));
-    GitError::Exit(129)
+    crate::cli_exit(129)
 }
 
 fn option_error(message: &str) -> GitError {
     eprintln!("error: {message}");
-    GitError::Exit(129)
+    crate::cli_exit(129)
 }
 
 /// `die()`-style failure: the porcelain prints `fatal: <action> failed` after
@@ -784,7 +787,7 @@ fn parse_replay_args(action: ReplayAction, args: &[String]) -> Result<ParsedRepl
                 mode.option(),
                 prev.option()
             );
-            return Err(GitError::Exit(129));
+            return Err(crate::cli_exit(129));
         }
         *current = Some(mode);
         Ok(())
@@ -927,7 +930,9 @@ fn parse_mainline(value: &str) -> Result<u32> {
 // too; its extra lazy-fetch flag travels through the host bundle instead.
 
 /// Partial-clone hydration adapter handed to the sequencer engine.
-struct CliPromisorPrefetch;
+struct CliPromisorPrefetch {
+    policy: sley_remote::RemotePolicy,
+}
 
 impl sley_sequencer::apply::PromisorObjectFetch for CliPromisorPrefetch {
     fn read_object_maybe_prefetch(
@@ -935,7 +940,7 @@ impl sley_sequencer::apply::PromisorObjectFetch for CliPromisorPrefetch {
         db: &FileObjectDatabase,
         oid: &ObjectId,
     ) -> Result<std::sync::Arc<EncodedObject>> {
-        read_object_maybe_prefetch_promisor(db, oid, true)
+        read_object_maybe_prefetch_promisor(&self.policy, db, oid, true)
     }
 }
 
@@ -994,7 +999,7 @@ fn run_replay(
         for (name, set) in incompatible {
             if *set {
                 eprintln!("fatal: {me}: {name} cannot be used with {}", cmd.option());
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
         return match cmd {
@@ -1004,16 +1009,33 @@ fn run_replay(
                 Ok(())
             }
             CmdMode::Continue => {
-                let mut hosts = replay_hosts(cli_session.lazy_fetch());
-                sley_sequencer::pick::continue_sequence(&ctx, &mut hosts)
+                let prefetch = CliPromisorPrefetch {
+                    policy: cli_session.remote_policy.clone(),
+                };
+                let mut hosts = replay_hosts(cli_session.lazy_fetch().then_some(&prefetch));
+                sley_sequencer::pick::continue_sequence(
+                    cli_session.original_cwd.as_deref(),
+                    &ctx,
+                    &mut hosts,
+                )
             }
             CmdMode::Abort => {
-                let hosts = replay_hosts(cli_session.lazy_fetch());
-                sley_sequencer::pick::rollback(&ctx, &hosts)
+                let prefetch = CliPromisorPrefetch {
+                    policy: cli_session.remote_policy.clone(),
+                };
+                let hosts = replay_hosts(cli_session.lazy_fetch().then_some(&prefetch));
+                sley_sequencer::pick::rollback(cli_session.original_cwd.as_deref(), &ctx, &hosts)
             }
             CmdMode::Skip => {
-                let mut hosts = replay_hosts(cli_session.lazy_fetch());
-                sley_sequencer::pick::skip_sequence(&ctx, &mut hosts)
+                let prefetch = CliPromisorPrefetch {
+                    policy: cli_session.remote_policy.clone(),
+                };
+                let mut hosts = replay_hosts(cli_session.lazy_fetch().then_some(&prefetch));
+                sley_sequencer::pick::skip_sequence(
+                    cli_session.original_cwd.as_deref(),
+                    &ctx,
+                    &mut hosts,
+                )
             }
         };
     }
@@ -1043,22 +1065,30 @@ fn run_replay(
         ] {
             if set {
                 eprintln!("fatal: {me}: --ff cannot be used with {name}");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
     }
     if parsed.rev_args.is_empty() {
         return Err(usage_error(action));
     }
-    let mut hosts = replay_hosts(cli_session.lazy_fetch());
-    sley_sequencer::pick::pick_revisions(&ctx, &mut hosts, &opts, &parsed.rev_args)
+    let prefetch = CliPromisorPrefetch {
+        policy: cli_session.remote_policy.clone(),
+    };
+    let mut hosts = replay_hosts(cli_session.lazy_fetch().then_some(&prefetch));
+    sley_sequencer::pick::pick_revisions(
+        cli_session.original_cwd.as_deref(),
+        &ctx,
+        &mut hosts,
+        &opts,
+        &parsed.rev_args,
+    )
 }
 
 /// Assemble the host services (editor/hook runs, trailer recognition,
 /// partial-clone hydration) for one invocation. All seams are plain static
 /// functions, so the bundle carries no borrows.
-fn replay_hosts(lazy_fetch: bool) -> sley_sequencer::pick::PickHosts<'static> {
-    static PREFETCH: CliPromisorPrefetch = CliPromisorPrefetch;
+fn replay_hosts(prefetch: Option<&CliPromisorPrefetch>) -> sley_sequencer::pick::PickHosts<'_> {
     sley_sequencer::pick::PickHosts {
         prepare_commit_message: &|git_dir, message, source_merge, edit| {
             prepare_replay_host_message(git_dir, message, source_merge, edit)
@@ -1067,7 +1097,8 @@ fn replay_hosts(lazy_fetch: bool) -> sley_sequencer::pick::PickHosts<'static> {
         has_conforming_trailer_block: &|config, text| {
             commands::interpret_trailers::message_has_conforming_trailer_block(config, text)
         },
-        promisor_fetch: if lazy_fetch { Some(&PREFETCH) } else { None },
+        promisor_fetch: prefetch
+            .map(|fetch| fetch as &dyn sley_sequencer::apply::PromisorObjectFetch),
         usage_error: &|action| usage_error(action),
     }
 }
@@ -1187,6 +1218,8 @@ pub(crate) fn comment_char(git_dir: &Path) -> u8 {
 /// Historical CLI signature; the canonical implementation (and its
 /// partial-clone hydration seam) lives in the sequencer.
 pub(crate) fn reset_merge_in(
+    original_cwd: Option<&std::path::Path>,
+    policy: &sley_remote::RemotePolicy,
     git_dir: &Path,
     worktree_root: &Path,
     format: ObjectFormat,
@@ -1194,14 +1227,17 @@ pub(crate) fn reset_merge_in(
     config: &GitConfig,
     lazy_fetch: bool,
 ) -> Result<()> {
-    static PREFETCH: CliPromisorPrefetch = CliPromisorPrefetch;
+    let prefetch = CliPromisorPrefetch {
+        policy: policy.clone(),
+    };
     sley_sequencer::pick::reset_merge_in(
+        original_cwd,
         git_dir,
         worktree_root,
         format,
         target,
         config,
-        lazy_fetch.then_some(&PREFETCH as &'static dyn sley_sequencer::apply::PromisorObjectFetch),
+        lazy_fetch.then_some(&prefetch as &dyn sley_sequencer::apply::PromisorObjectFetch),
     )
 }
 

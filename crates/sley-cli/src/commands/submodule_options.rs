@@ -52,7 +52,7 @@ const SUBMODULE_QUIET_SPEC: OptionSpec<'static> = OptionSpec {
 fn parse_submodule_depth(value: &str) -> Result<u32> {
     value.parse::<u32>().map_err(|_| {
         eprintln!("fatal: invalid depth '{value}'");
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })
 }
 
@@ -301,7 +301,7 @@ pub(super) fn setup_submodule_update_options(
     let filter = parsed.last_str("filter").map(str::to_string);
     if filter.is_some() && !init {
         eprintln!("fatal: --filter can only be used with the --init option");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     Ok(SubmoduleUpdateOptions {
         init,
@@ -387,11 +387,11 @@ pub(super) fn setup_submodule_set_branch_options(
     let branch = parsed.last_str("branch");
     if branch.is_none() && !default {
         eprintln!("fatal: --branch or --default required");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if branch.is_some() && default {
         eprintln!("fatal: options '--branch' and '--default' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     match (parsed.positionals.as_slice(), branch, default) {
         ([path], Some(branch), false) => {
@@ -515,7 +515,7 @@ pub(super) fn setup_submodule_summary_options(
     let files = parsed.last_bool("files", false);
     if cached && files {
         eprintln!("fatal: options '--cached' and '--files' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let summary_limit = parsed
         .last_str("summary-limit")

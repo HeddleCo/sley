@@ -14,38 +14,38 @@
     clippy::items_after_test_module
 )]
 
-use sley::plumbing::sley_config::{ConfigBoolOrInt, ConfigEntry, ConfigSection};
-use sley::plumbing::sley_core::DateMode;
-use sley::plumbing::sley_formats::{
-    Bundle, BundleCapability, BundlePrerequisite, BundleReference, CommitGraph,
-    CommitGraphWriteEntry, InitOptions, RefStorageFormat, RepositoryBootstrap,
-};
-use sley::plumbing::sley_object::{
-    Commit, EncodedObject, ObjectType, Tag, Tree, TreeEntries, TreeEntry, tree_entry_object_type,
-};
-use sley::plumbing::sley_odb::{
-    FileObjectDatabase, LooseObjectIntegrity, ObjectPrefixResolution, ObjectReader, ObjectWriter,
-    build_reachable_pack, collect_reachable_object_ids, grafted_parents, install_bundle_pack,
-    install_reachable_pack, prune_unreachable_loose, repository_object_ids, repository_objects_dir,
-};
-use sley::plumbing::sley_pack::{MultiPackIndex, PackFile, PackIndex};
-use sley::plumbing::sley_refs::{
-    FileRefStore, PackRefDecision, Ref, RefTransactionHookUpdate, RefTransactionPhase, RefUpdate,
-    ReferenceTransactionHook, ReflogEntry, branch_ref_name, check_refname_format,
-    parse_packed_refs, resolve_ref_peeled, tag_ref_name, validate_ref_name, validate_symref_name,
-    validate_symref_target,
-};
-use sley::plumbing::sley_remote::FetchOutcome;
 use sley::{
     BString, GitConfig, GitError, Index, IndexEntry, ObjectFormat, ObjectId, RefPrecondition,
     ReferenceTarget as RefTarget, Result,
 };
+use sley_config::{ConfigBoolOrInt, ConfigEntry, ConfigSection};
+use sley_core::DateMode;
+use sley_formats::{
+    Bundle, BundleCapability, BundlePrerequisite, BundleReference, CommitGraph,
+    CommitGraphWriteEntry, InitOptions, RefStorageFormat, RepositoryBootstrap,
+};
+use sley_object::{
+    Commit, EncodedObject, ObjectType, Tag, Tree, TreeEntries, TreeEntry, tree_entry_object_type,
+};
+use sley_odb::{
+    FileObjectDatabase, LooseObjectIntegrity, ObjectPrefixResolution, ObjectReader, ObjectWriter,
+    build_reachable_pack, collect_reachable_object_ids, grafted_parents, install_bundle_pack,
+    install_reachable_pack, prune_unreachable_loose, repository_object_ids, repository_objects_dir,
+};
+use sley_pack::{MultiPackIndex, PackFile, PackIndex};
 use sley_protocol::{
     FetchHeadRecord, ProtocolVersion, ReceivePackCommand, RefAdvertisement, RefAdvertisementSet,
     UploadPackFeatures, parse_refspec, read_fetch_head, read_receive_pack_push_options,
     read_receive_pack_request, read_ref_advertisement_set, read_upload_pack_negotiation_request,
     read_upload_pack_request, refspec_map_source, write_ref_advertisement_set,
 };
+use sley_refs::{
+    FileRefStore, PackRefDecision, Ref, RefTransactionHookUpdate, RefTransactionPhase, RefUpdate,
+    ReferenceTransactionHook, ReflogEntry, branch_ref_name, check_refname_format,
+    parse_packed_refs, resolve_ref_peeled, tag_ref_name, validate_ref_name, validate_symref_name,
+    validate_symref_target,
+};
+use sley_remote::FetchOutcome;
 use sley_transport::{RemoteTransport, RemoteUrl, parse_remote_url};
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -67,6 +67,11 @@ mod commit_message;
 mod diff_render;
 mod discovery;
 mod dispatch;
+mod error;
+pub use error::{
+    CliExit, cli_diagnostic, cli_exit, cli_exit_code, cli_message, cli_reported_status, cli_usage,
+    cli_user_error,
+};
 mod global_options;
 mod init_config;
 mod interrupt_cancel;
@@ -85,13 +90,9 @@ mod setup;
 mod status_format;
 mod trace2_cli;
 
-pub(crate) use sley::plumbing::sley_rev::revlist::*;
-pub(crate) use sley::plumbing::{
-    sley_config, sley_core, sley_diff_merge, sley_index, sley_object, sley_odb, sley_pack,
-    sley_pretty, sley_refs, sley_remote, sley_rev, sley_worktree,
-};
 pub(crate) use sley_options::validators::*;
 pub(crate) use sley_ref_filter::*;
+pub(crate) use sley_rev::revlist::*;
 
 pub use global_options::argv_string_from_os;
 pub(crate) use global_options::{
@@ -152,7 +153,7 @@ pub(crate) use repo_helpers::{
     worktree_root_for_git_dir,
 };
 
-pub(crate) use sley::plumbing::sley_pretty::{
+pub(crate) use sley_pretty::{
     CompiledLogFormat, FormatToken, LogDescribeLookup, LogFormatContext, LogFormatDialect,
     MailmapLookup, StashFormatContext, append_log_oid, commit_author_for_commit_encoding,
     commit_body, commit_encoding, commit_encoding_config, commit_encoding_header_from_config,
@@ -165,7 +166,7 @@ pub(crate) use sley::plumbing::sley_pretty::{
     format_log_commit_header_oid, format_log_oid, git_color_name_to_ansi, git_color_spec_to_ansi,
     log_output_encoding, log_reencode_message, log_rewrap, presets, try_git_color_spec_to_ansi,
 };
-pub(crate) use sley::plumbing::sley_rev::diff_options::{
+pub(crate) use sley_rev::diff_options::{
     DiffFilter, DiffStatWidths, DirstatMode, DirstatOptions, SubmoduleIgnoreMode,
     diff_stat_count_option, diff_stat_parse_width_option, parse_diff_filter,
     parse_similarity_threshold, parse_submodule_ignore_mode,
@@ -207,8 +208,8 @@ pub(crate) use sley_mail::patch_id::{PatchIdOptions, get_one_patchid, split_keep
 // historical unqualified names working across command modules with no per-site
 // edits.
 pub(crate) use session_globals::*;
-pub(crate) use sley::plumbing::sley_rev::resolve_revision_symbolic_full_name as rev_parse_symbolic_full_name;
-pub(crate) use sley::plumbing::sley_rev::{
+pub(crate) use sley_rev::resolve_revision_symbolic_full_name as rev_parse_symbolic_full_name;
+pub(crate) use sley_rev::{
     resolve_revision_commitish_with_replacement_policy as resolve_revision_commitish,
     resolve_revision_treeish_with_replacement_policy as resolve_revision_treeish,
     resolve_revision_with_replacement_policy as resolve_revision,
@@ -217,7 +218,7 @@ pub(crate) use sley::plumbing::sley_rev::{
 pub(crate) use status_format::*;
 // Tree printing moved to `sley-formats::tree_print`; the glob keeps the
 // historical unqualified names available across command modules.
-pub(crate) use sley::plumbing::sley_formats::tree_print::*;
+pub(crate) use sley_formats::tree_print::*;
 
 pub(crate) use cli_misc::{
     AddAction, add_path_matches, check_ignore_tracked_paths, count_objects_human_bytes,
@@ -237,7 +238,7 @@ pub(crate) use init_config::{
 pub(crate) use ls_files_pathspec::{
     LsFilesPathspec, index_entry_stage, normalize_absolute_cli_pathspec, path_component_count,
 };
-pub(crate) use sley::plumbing::sley_config::parse_config_bool;
+pub(crate) use sley_config::parse_config_bool;
 // Canonical implementations moved to `sley_core::paths`; the legacy local
 // spellings stay available under their historical names.
 pub(crate) use reflog_parse::{
@@ -245,11 +246,11 @@ pub(crate) use reflog_parse::{
     parse_reflog_max_parent_count, parse_reflog_min_parent_count, parse_reflog_skip_count,
     reflog_reference_name,
 };
-pub(crate) use sley::plumbing::sley_core::paths::normalize_lexical as normalize_lexical_path;
-pub(crate) use sley::plumbing::sley_core::paths::{
+pub(crate) use sley_core::paths::normalize_lexical as normalize_lexical_path;
+pub(crate) use sley_core::paths::{
     relative_path_from_absolute, relative_path_from_absolute_components,
 };
-pub(crate) use sley::plumbing::sley_refs::refname_pattern_matches_case;
+pub(crate) use sley_refs::refname_pattern_matches_case;
 
 pub(crate) fn refname_pattern_matches(pattern: &str, name: &str) -> bool {
     refname_pattern_matches_case(pattern, name, false)
@@ -293,15 +294,14 @@ pub(crate) fn collect_short_status_with_options(
 }
 
 pub fn run(args: Vec<String>) -> Result<()> {
-    sley_core::set_original_cwd(env::current_dir().ok());
+    sley_core::diagnostics::Diagnostics::new(crate::error::CliDiagnostics).scope(|| run_inner(args))
+}
+
+fn run_inner(args: Vec<String>) -> Result<()> {
+    let original_cwd = env::current_dir().ok();
     let global = apply_global_options(&args)?;
-    // `--namespace` overrides `GIT_NAMESPACE` for this process (git uses setenv;
-    // the workspace forbids `env::set_var`, so a process-local override is used).
-    if let Some(namespace) = global.namespace.clone() {
-        sley_core::set_git_namespace_override(Some(namespace));
-    }
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let cli_session = session::CliSession::from_parsed_globals(
+    let mut cli_session = session::CliSession::from_parsed_globals(
         cwd,
         global.git_dir.clone(),
         global.work_tree.clone(),
@@ -311,6 +311,11 @@ pub fn run(args: Vec<String>) -> Result<()> {
         global.lazy_fetch,
         global.pathspec_flags,
     );
+    cli_session.original_cwd = original_cwd;
+    cli_session.remote_policy = session::remote_policy_from_environment();
+    if let Some(namespace) = &global.namespace {
+        cli_session.remote_policy.namespace = sley_core::Namespace::new(namespace);
+    }
     sley_core::trace2::touch();
     sley_core::trace2::start(global.args);
     trace2_emit_process_ancestry_at_depth(sley_core::trace2::depth(), &[]);
@@ -333,13 +338,11 @@ pub fn run(args: Vec<String>) -> Result<()> {
     let mut dispatch_args: Vec<String> = global.args.to_vec();
     match cli_session.repository_snapshot() {
         Ok(snapshot) => {
-            sley_core::activate_precompose_unicode(snapshot.config.get_bool(
-                "core",
-                None,
-                "precomposeunicode",
-            ));
             if dispatch_args.len() > 1 {
-                sley_core::precompose_argv_if_needed(&mut dispatch_args[1..]);
+                snapshot
+                    .config
+                    .precompose_unicode()
+                    .argv(&mut dispatch_args[1..]);
             }
         }
         // Commands such as `config --global` remain valid without a repository;
@@ -355,7 +358,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use sley::plumbing::sley_diff_merge::porcelain::count_line_diff;
+    use sley_diff_merge::porcelain::count_line_diff;
 
     #[test]
     fn diff_stat_line_count_fast_paths_are_exact() {

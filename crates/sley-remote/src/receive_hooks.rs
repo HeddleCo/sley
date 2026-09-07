@@ -59,7 +59,10 @@ pub fn run_update_hooks(
             remote_stderr,
             capture_stderr,
         ) {
-            if matches!(err, GitError::Exit(_)) {
+            if matches!(
+                err,
+                GitError::Rejected(_) | GitError::ChildProcessFailed { .. } | GitError::Callback(_)
+            ) {
                 return Ok(Some(command.name.clone()));
             }
             return Err(err);
@@ -148,9 +151,10 @@ pub fn run_push_to_checkout_hook(
         capture_stderr,
     ) {
         Ok(()) => Ok(true),
-        Err(GitError::Command(_)) | Err(GitError::Exit(_)) => {
-            Err(GitError::Command("push-to-checkout hook declined".into()))
-        }
+        Err(GitError::Command(_))
+        | Err(
+            GitError::Rejected(_) | GitError::ChildProcessFailed { .. } | GitError::Callback(_),
+        ) => Err(GitError::Command("push-to-checkout hook declined".into())),
         Err(err) => Err(err),
     }
 }
@@ -182,6 +186,7 @@ pub fn run_push_to_checkout(
 /// refuse dirty worktrees / staged changes, refuse untracked paths that the new
 /// tree would overwrite, then hard-reset the index+worktree to `new_oid`.
 pub fn update_worktree_for_update_instead(
+    original_cwd: Option<&std::path::Path>,
     git_dir: &Path,
     format: sley_core::ObjectFormat,
     new_oid: &sley_core::ObjectId,
@@ -196,11 +201,12 @@ pub fn update_worktree_for_update_instead(
     if run_push_to_checkout_hook(git_dir, new_oid, &worktree, remote_stderr, true)? {
         return Ok(());
     }
-    push_to_deploy(git_dir, &worktree, format, new_oid)
+    push_to_deploy(original_cwd, git_dir, &worktree, format, new_oid)
 }
 
 /// Default updateInstead path when no push-to-checkout hook is installed.
 fn push_to_deploy(
+    original_cwd: Option<&std::path::Path>,
     git_dir: &Path,
     worktree: &Path,
     format: sley_core::ObjectFormat,
@@ -240,9 +246,16 @@ fn push_to_deploy(
         ));
     }
 
-    sley_worktree::reset_index_and_worktree_to_commit(worktree, git_dir, format, new_oid).map_err(
-        |err| GitError::Command(format!("Could not update working tree to new HEAD: {err}")),
-    )?;
+    sley_worktree::reset_index_and_worktree_to_commit(
+        original_cwd,
+        worktree,
+        git_dir,
+        format,
+        new_oid,
+    )
+    .map_err(|err| {
+        GitError::Command(format!("Could not update working tree to new HEAD: {err}"))
+    })?;
     Ok(())
 }
 
@@ -414,15 +427,16 @@ fn spawn_hook(
     for (key, value) in env {
         command.env(key, value);
     }
-    let mut child = command
-        .spawn()
-        .map_err(|err| GitError::Io(format!("cannot spawn hook {}: {err}", path.display())))?;
+    let mut child = command.spawn().map_err(|err| GitError::IoKind {
+        kind: std::io::ErrorKind::Other,
+        message: format!("cannot spawn hook {}: {err}", path.display()),
+    })?;
     if let Some(input) = stdin
         && let Some(mut hook_stdin) = child.stdin.take()
     {
         let _ = hook_stdin.write_all(input);
     }
-    let status = child.wait().map_err(|err| GitError::Io(err.to_string()))?;
+    let status = child.wait().map_err(GitError::from)?;
     if capture_stderr {
         if let Some(mut stdout) = child.stdout.take() {
             let _ = std::io::copy(&mut stdout, remote_stderr);
@@ -434,7 +448,9 @@ fn spawn_hook(
     if status.success() {
         Ok(())
     } else {
-        Err(GitError::Exit(status.code().unwrap_or(1)))
+        Err(GitError::ChildProcessFailed {
+            status: status.code(),
+        })
     }
 }
 

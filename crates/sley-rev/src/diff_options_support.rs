@@ -2,8 +2,7 @@
 // to `sley-diff-merge::porcelain` (the diff render engine owns them); these
 // re-exports keep the historical `sley_rev::diff_options` spellings working.
 pub use sley_diff_merge::porcelain::{
-    DiffStatWidths, DirstatMode, DirstatOptions, SubmoduleIgnoreMode,
-    parse_submodule_ignore_mode,
+    DiffStatWidths, DirstatMode, DirstatOptions, SubmoduleIgnoreMode, parse_submodule_ignore_mode,
 };
 #[derive(Debug, Clone, Default)]
 pub struct DiffFilter {
@@ -29,8 +28,14 @@ pub fn parse_diff_filter(value: &str) -> Result<DiffFilter> {
             }
             '*' => f.all_or_none = true,
             other => {
-                eprintln!("error: unknown change class '{other}' in --diff-filter={value}");
-                return Err(GitError::Exit(129));
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "error: unknown change class '{other}' in --diff-filter={value}"
+                );
+                return Err(GitError::Rejected(
+                    sley_core::RejectionKind::InvalidArguments,
+                ));
             }
         }
     }
@@ -130,8 +135,14 @@ fn validate_diff_rename_limit(value: &str) -> Result<()> {
     if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
         Ok(())
     } else {
-        eprintln!("error: switch `l' expects an integer value with an optional k/m/g suffix");
-        Err(GitError::Exit(129))
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "error: switch `l' expects an integer value with an optional k/m/g suffix"
+        );
+        Err(GitError::Rejected(
+            sley_core::RejectionKind::InvalidArguments,
+        ))
     }
 }
 fn parse_abbrev(value: &str) -> Result<usize> {
@@ -152,7 +163,9 @@ fn git_count_value_is_valid(value: &str) -> bool {
 }
 fn commit_validate_unified_context(value: &str, short: bool) -> Result<()> {
     if value.is_empty() {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "error: {} expects a numerical value",
             if short {
                 "switch `U'"
@@ -160,16 +173,26 @@ fn commit_validate_unified_context(value: &str, short: bool) -> Result<()> {
                 "option `unified'"
             }
         );
-        return Err(GitError::Exit(129));
+        return Err(GitError::Rejected(
+            sley_core::RejectionKind::InvalidArguments,
+        ));
     }
     if value.starts_with('-') {
-        eprintln!("error: --unified expects a non-negative integer");
-        return Err(GitError::Exit(129));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "error: --unified expects a non-negative integer"
+        );
+        return Err(GitError::Rejected(
+            sley_core::RejectionKind::InvalidArguments,
+        ));
     }
     if git_count_value_is_valid(value) {
         return Ok(());
     }
-    eprintln!(
+    sley_core::diagnostic!(
+        Stderr,
+        true,
         "error: {} expects an integer value with an optional k/m/g suffix",
         if short {
             "switch `U'"
@@ -177,22 +200,34 @@ fn commit_validate_unified_context(value: &str, short: bool) -> Result<()> {
             "option `unified'"
         }
     );
-    Err(GitError::Exit(129))
+    Err(GitError::Rejected(
+        sley_core::RejectionKind::InvalidArguments,
+    ))
 }
 fn log_validate_diff_algorithm(value: &str) -> Result<()> {
     match value {
         "myers" | "minimal" | "patience" | "histogram" | "default" => Ok(()),
         _ => {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "error: option diff-algorithm accepts \"myers\", \"minimal\", \"patience\" and \"histogram\""
             );
-            Err(GitError::Exit(129))
+            Err(GitError::Rejected(
+                sley_core::RejectionKind::InvalidArguments,
+            ))
         }
     }
 }
 fn log_inter_hunk_context_requires_number_error() -> Result<()> {
-    eprintln!("error: option `inter-hunk-context' expects a numerical value");
-    Err(GitError::Exit(129))
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "error: option `inter-hunk-context' expects a numerical value"
+    );
+    Err(GitError::Rejected(
+        sley_core::RejectionKind::InvalidArguments,
+    ))
 }
 fn log_validate_inter_hunk_context(value: &str) -> Result<()> {
     let n = match value.as_bytes().last() {
@@ -206,10 +241,14 @@ fn log_validate_inter_hunk_context(value: &str) -> Result<()> {
     if !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()) {
         return Ok(());
     }
-    eprintln!(
+    sley_core::diagnostic!(
+        Stderr,
+        true,
         "error: option `inter-hunk-context' expects a non-negative integer value with an optional k/m/g suffix"
     );
-    Err(GitError::Exit(129))
+    Err(GitError::Rejected(
+        sley_core::RejectionKind::InvalidArguments,
+    ))
 }
 fn log_validate_output_indicator(option: &str, value: &str) -> Result<()> {
     // Single-byte indicator always accepted; empty value accepted only by BSD
@@ -226,18 +265,28 @@ fn log_validate_output_indicator(option: &str, value: &str) -> Result<()> {
     {
         return Ok(());
     }
-    eprintln!(
+    sley_core::diagnostic!(
+        Stderr,
+        true,
         "error: {option} expects a character, got '{}'",
         if value.is_empty() { "''" } else { value }
     );
-    Err(GitError::Exit(129))
+    Err(GitError::Rejected(
+        sley_core::RejectionKind::InvalidArguments,
+    ))
 }
 fn log_validate_submodule_format(value: &str) -> Result<()> {
     match value {
         "short" | "log" | "diff" => Ok(()),
         _ => {
-            eprintln!("error: failed to parse --submodule option parameter: '{value}'");
-            Err(GitError::Exit(129))
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "error: failed to parse --submodule option parameter: '{value}'"
+            );
+            Err(GitError::Rejected(
+                sley_core::RejectionKind::InvalidArguments,
+            ))
         }
     }
 }
@@ -246,11 +295,15 @@ fn log_validate_color_moved(value: &str) -> Result<()> {
         "" | "no" | "default" | "blocks" | "zebra" | "dimmed-zebra" | "plain" | "true" | "1"
         | "on" | "yes" | "false" | "0" | "off" => Ok(()),
         _ => {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "error: color moved setting must be one of 'no', 'default', 'blocks', 'zebra', 'dimmed-zebra', 'plain'"
             );
-            eprintln!("error: bad --color-moved argument: {value}");
-            Err(GitError::Exit(129))
+            sley_core::diagnostic!(Stderr, true, "error: bad --color-moved argument: {value}");
+            Err(GitError::Rejected(
+                sley_core::RejectionKind::InvalidArguments,
+            ))
         }
     }
 }
@@ -258,8 +311,14 @@ fn log_validate_color(value: &str) -> Result<()> {
     match value {
         "always" | "auto" | "never" => Ok(()),
         _ => {
-            eprintln!("error: option `color' expects \"always\", \"auto\", or \"never\"");
-            Err(GitError::Exit(129))
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "error: option `color' expects \"always\", \"auto\", or \"never\""
+            );
+            Err(GitError::Rejected(
+                sley_core::RejectionKind::InvalidArguments,
+            ))
         }
     }
 }
@@ -275,20 +334,36 @@ fn log_validate_color_moved_ws(value: &str) -> Result<()> {
         }
     }
     if a && n > 1 {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "error: color-moved-ws: allow-indentation-change cannot be combined with other whitespace modes"
         );
-        eprintln!("error: invalid mode '{value}' in --color-moved-ws");
-        return Err(GitError::Exit(129));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "error: invalid mode '{value}' in --color-moved-ws"
+        );
+        return Err(GitError::Rejected(
+            sley_core::RejectionKind::InvalidArguments,
+        ));
     }
     Ok(())
 }
 fn log_color_moved_ws_invalid_mode(value: &str, mode: &str) -> Result<()> {
-    eprintln!(
+    sley_core::diagnostic!(
+        Stderr,
+        true,
         "error: unknown color-moved-ws mode '{mode}', possible values are 'ignore-space-change', 'ignore-space-at-eol', 'ignore-all-space', 'allow-indentation-change'"
     );
-    eprintln!("error: invalid mode '{value}' in --color-moved-ws");
-    Err(GitError::Exit(129))
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "error: invalid mode '{value}' in --color-moved-ws"
+    );
+    Err(GitError::Rejected(
+        sley_core::RejectionKind::InvalidArguments,
+    ))
 }
 fn log_validate_ws_error_highlight(value: &str) -> Result<()> {
     if value.is_empty() {
@@ -302,8 +377,14 @@ fn log_validate_ws_error_highlight(value: &str) -> Result<()> {
                 p.push(',');
             }
             _ => {
-                eprintln!("error: unknown value after ws-error-highlight={p}");
-                return Err(GitError::Exit(129));
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "error: unknown value after ws-error-highlight={p}"
+                );
+                return Err(GitError::Rejected(
+                    sley_core::RejectionKind::InvalidArguments,
+                ));
             }
         }
     }
@@ -317,8 +398,10 @@ fn log_validate_similarity_option(value: &str, option: &str) -> Result<()> {
     if !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()) {
         return Ok(());
     }
-    eprintln!("error: invalid argument to {option}");
-    Err(GitError::Exit(129))
+    sley_core::diagnostic!(Stderr, true, "error: invalid argument to {option}");
+    Err(GitError::Rejected(
+        sley_core::RejectionKind::InvalidArguments,
+    ))
 }
 fn log_valid_break_rewrites_part(value: &str) -> bool {
     if value.is_empty() {
@@ -328,8 +411,10 @@ fn log_valid_break_rewrites_part(value: &str) -> bool {
     !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())
 }
 fn log_break_rewrites_form_error() -> Result<()> {
-    eprintln!("error: break-rewrites expects <n>/<m> form");
-    Err(GitError::Exit(129))
+    sley_core::diagnostic!(Stderr, true, "error: break-rewrites expects <n>/<m> form");
+    Err(GitError::Rejected(
+        sley_core::RejectionKind::InvalidArguments,
+    ))
 }
 fn log_validate_break_rewrites_option(value: &str) -> Result<()> {
     if value.is_empty() {

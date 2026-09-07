@@ -5,42 +5,11 @@ use crate::{
     StatusIgnoredMode, StatusUntrackedMode, StreamControl, SubmoduleStatus,
 };
 
-/// Caller-owned key for status/index cache reuse.
-///
-/// The current facade records the key so callers can keep one plan identity
-/// across commands; deeper shared-cache storage can attach behind this type
-/// without changing Heddle call sites.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct StatusCacheKey(String);
-
-impl StatusCacheKey {
-    pub fn new(key: impl Into<String>) -> Self {
-        Self(key.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl From<String> for StatusCacheKey {
-    fn from(value: String) -> Self {
-        Self(value)
-    }
-}
-
-impl From<&str> for StatusCacheKey {
-    fn from(value: &str) -> Self {
-        Self(value.to_string())
-    }
-}
-
 /// Builder for a repository status work plan.
 #[derive(Debug, Clone)]
 pub struct StatusPlanBuilder<'repo> {
     repo: &'repo Repository,
     options: ShortStatusOptions,
-    cache_key: Option<StatusCacheKey>,
 }
 
 /// A prepared status/index work plan.
@@ -48,7 +17,6 @@ pub struct StatusPlanBuilder<'repo> {
 pub struct StatusPlan<'repo> {
     repo: &'repo Repository,
     options: ShortStatusOptions,
-    cache_key: Option<StatusCacheKey>,
 }
 
 impl Repository {
@@ -57,7 +25,6 @@ impl Repository {
         StatusPlanBuilder {
             repo: self,
             options: ShortStatusOptions::default(),
-            cache_key: None,
         }
     }
 }
@@ -88,11 +55,6 @@ impl<'repo> StatusPlanBuilder<'repo> {
         self
     }
 
-    pub fn reuse_index_cache(mut self, cache_key: impl Into<StatusCacheKey>) -> Self {
-        self.cache_key = Some(cache_key.into());
-        self
-    }
-
     pub fn build(self) -> Result<StatusPlan<'repo>> {
         if self.repo.workdir().is_none() {
             return Err(GitError::Unsupported(
@@ -102,7 +64,6 @@ impl<'repo> StatusPlanBuilder<'repo> {
         Ok(StatusPlan {
             repo: self.repo,
             options: self.options,
-            cache_key: self.cache_key,
         })
     }
 }
@@ -110,10 +71,6 @@ impl<'repo> StatusPlanBuilder<'repo> {
 impl StatusPlan<'_> {
     pub fn options(&self) -> ShortStatusOptions {
         self.options
-    }
-
-    pub fn cache_key(&self) -> Option<&StatusCacheKey> {
-        self.cache_key.as_ref()
     }
 
     /// Stream typed status rows without collecting them.

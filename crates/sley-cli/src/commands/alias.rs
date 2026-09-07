@@ -17,10 +17,9 @@
 //! remainder after `alias.` becomes the two-level alias name (`foo.bar`),
 //! matched case-insensitively. See `config_alias_cb` in git's `alias.c`.
 
-use crate::sley_config;
-use sley::plumbing::sley_config::ConfigIncludeContext;
-use sley::plumbing::sley_core;
 use sley::{GitError, Result};
+use sley_config::ConfigIncludeContext;
+
 use std::env;
 use std::fs;
 use std::mem;
@@ -319,14 +318,12 @@ pub(crate) fn run_shell_alias(
     if let Some(params) = crate::effective_config_parameters_env() {
         process.env("GIT_CONFIG_PARAMETERS", params);
     }
-    let status = process
-        .status()
-        .map_err(|err| GitError::Io(err.to_string()))?;
+    let status = process.status().map_err(GitError::from)?;
     if status.success() {
         Ok(())
     } else {
         let code = status.code().unwrap_or(1);
-        Err(GitError::Exit(code))
+        Err(crate::cli_exit(code))
     }
 }
 
