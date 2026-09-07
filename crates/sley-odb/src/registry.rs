@@ -731,12 +731,11 @@ fn pack_dir_modified(pack_dir: &Path) -> Result<Option<std::time::SystemTime>> {
 }
 
 /// Scan `pack_dir` for `.idx` files that have a matching `.pack` sibling and
-/// parse each index into a registered pack. An `.idx` without its `.pack` is
+/// register each pair for lazy index parsing. An `.idx` without its `.pack` is
 /// skipped (an orphan index cannot serve objects), matching the prior per-read
 /// behavior.
 pub(crate) fn scan_pack_registry(
     pack_dir: &Path,
-    _format: ObjectFormat,
     delta_base_cache_budget: usize,
 ) -> Result<PackRegistrySnapshot> {
     let modified = pack_dir_modified(pack_dir)?;

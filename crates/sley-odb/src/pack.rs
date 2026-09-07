@@ -719,8 +719,23 @@ impl FileObjectDatabase {
 
     pub fn new(objects_dir: impl Into<PathBuf>, format: ObjectFormat) -> Self {
         let objects_dir = objects_dir.into();
-        let (pack_dir, midx_path) = pack_layout_paths(&objects_dir);
         let alternates = alternate_object_dirs(&objects_dir);
+        Self::with_alternates(objects_dir, format, alternates)
+    }
+
+    pub(crate) fn without_alternates(
+        objects_dir: impl Into<PathBuf>,
+        format: ObjectFormat,
+    ) -> Self {
+        Self::with_alternates(objects_dir.into(), format, Vec::new())
+    }
+
+    fn with_alternates(
+        objects_dir: PathBuf,
+        format: ObjectFormat,
+        alternates: Vec<PathBuf>,
+    ) -> Self {
+        let (pack_dir, midx_path) = pack_layout_paths(&objects_dir);
         let delta_base_cache_budget_per_pack =
             per_pack_delta_base_cache_budget(&objects_dir, &alternates);
         Self {
@@ -728,37 +743,6 @@ impl FileObjectDatabase {
             pack_dir,
             midx_path,
             alternates,
-            objects_dir,
-            format,
-            pack_bytes: Arc::new(RwLock::new(HashMap::new())),
-            pack_indexes: Arc::new(RwLock::new(HashMap::new())),
-            pack_reverse_indexes: Arc::new(RwLock::new(HashMap::new())),
-            multi_pack_indexes: Arc::new(RwLock::new(HashMap::new())),
-            multi_pack_oid_lookups: Arc::new(RwLock::new(HashMap::new())),
-            pack_registry: Arc::new(Mutex::new(None)),
-            decoded: Arc::new(Mutex::new(LruObjectCache::new(object_cache_budget()))),
-            pack_deltas: Arc::new(Mutex::new(HashMap::new())),
-            delta_base_cache_budget_per_pack,
-            pack_header_types: Arc::new(Mutex::new(HashMap::new())),
-            promisor_objects: Arc::new(OnceLock::new()),
-            promisor_remote_present: false,
-            shallow_grafts: Arc::new(std::sync::OnceLock::new()),
-            replacements: Arc::new(ObjectReplacements::default()),
-        }
-    }
-
-    pub(crate) fn without_alternates(
-        objects_dir: impl Into<PathBuf>,
-        format: ObjectFormat,
-    ) -> Self {
-        let objects_dir = objects_dir.into();
-        let (pack_dir, midx_path) = pack_layout_paths(&objects_dir);
-        let delta_base_cache_budget_per_pack = per_pack_delta_base_cache_budget(&objects_dir, &[]);
-        Self {
-            loose: LooseObjectStore::new(objects_dir.clone(), format),
-            pack_dir,
-            midx_path,
-            alternates: Vec::new(),
             objects_dir,
             format,
             pack_bytes: Arc::new(RwLock::new(HashMap::new())),
@@ -1397,7 +1381,6 @@ impl FileObjectDatabase {
         }
         let scanned = Arc::new(scan_pack_registry(
             pack_dir,
-            self.format,
             self.delta_base_cache_budget_per_pack,
         )?);
         if let Ok(mut cache) = self.pack_registry.lock() {
