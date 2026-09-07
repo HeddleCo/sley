@@ -98,6 +98,7 @@ jobs:
             sley-strbuf-expand
             sley-ref-filter
             sley-pretty
+            sley-mail
             sley-sequencer
             sley-notes
             sley-fsck
