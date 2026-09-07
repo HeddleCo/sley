@@ -26,10 +26,13 @@ const THIN_PUSH_STREAMING_MIN_OBJECTS: usize = 4096;
 
 /// The advertised tips the local repository already has, deduplicated and
 /// excluding the all-zero sentinel — the safe negotiation base for the push pack.
-pub fn remote_advertisement_tips_known_to_local(
-    local_db: &FileObjectDatabase,
+pub fn remote_advertisement_tips_known_to_local<R>(
+    local_db: &R,
     advertisements: &[RefAdvertisement],
-) -> Result<Vec<ObjectId>> {
+) -> Result<Vec<ObjectId>>
+where
+    R: ObjectReader,
+{
     let mut tips = Vec::new();
     let mut seen = HashSet::new();
     for advertisement in advertisements {
@@ -44,9 +47,12 @@ pub fn remote_advertisement_tips_known_to_local(
 }
 
 /// Inputs for building a push packfile or full receive-pack request body.
-pub struct PushPackRequest<'a> {
+pub struct PushPackRequest<'a, R = FileObjectDatabase>
+where
+    R: ObjectReader,
+{
     /// Local object database supplying objects to pack.
-    pub local_db: &'a FileObjectDatabase,
+    pub local_db: &'a R,
     /// Object format of [`PushPackRequest::local_db`].
     pub format: ObjectFormat,
     /// Planned receive-pack ref updates (only non-null `new_id` roots are packed).
@@ -70,26 +76,31 @@ pub struct PushPackRequest<'a> {
 /// When [`PushPackRequest::thin`] is `true` and the remote did not advertise
 /// `no-thin`, reachable objects are deltified against those remote tips using
 /// [`PackWriteOptions::with_thin_bases`].
-pub fn build_push_packfile(req: &PushPackRequest<'_>) -> Result<Vec<u8>> {
+pub fn build_push_packfile<R>(req: &PushPackRequest<'_, R>) -> Result<Vec<u8>>
+where
+    R: ObjectReader,
+{
     let mut packfile = Vec::new();
     write_push_packfile(req, &mut packfile)?;
     Ok(packfile)
 }
 
-pub fn write_push_packfile<W>(req: &PushPackRequest<'_>, writer: &mut W) -> Result<()>
+pub fn write_push_packfile<R, W>(req: &PushPackRequest<'_, R>, writer: &mut W) -> Result<()>
 where
+    R: ObjectReader,
     W: Write,
 {
     write_push_packfile_with_cancel(req, writer, CancelFlag::never())
 }
 
 /// Like [`write_push_packfile`], polling `cancel` while generating the pack.
-pub fn write_push_packfile_with_cancel<W>(
-    req: &PushPackRequest<'_>,
+pub fn write_push_packfile_with_cancel<R, W>(
+    req: &PushPackRequest<'_, R>,
     writer: &mut W,
     cancel: CancelFlag<'_>,
 ) -> Result<()>
 where
+    R: ObjectReader,
     W: Write,
 {
     let remote_excluded_tips =
@@ -148,14 +159,15 @@ pub(crate) fn push_pack_roots(
         .collect()
 }
 
-fn write_thin_push_packfile_with_cancel<W>(
-    req: &PushPackRequest<'_>,
+fn write_thin_push_packfile_with_cancel<R, W>(
+    req: &PushPackRequest<'_, R>,
     starts: Vec<sley_core::ObjectId>,
     remote_excluded: &HashSet<sley_core::ObjectId>,
     writer: &mut W,
     cancel: CancelFlag<'_>,
 ) -> Result<()>
 where
+    R: ObjectReader,
     W: Write,
 {
     let reachable = collect_reachable_object_ids(req.local_db, req.format, starts)?;
@@ -217,26 +229,31 @@ where
 
 /// Build a complete receive-pack push request body: planned commands, negotiated
 /// capabilities, optional push-options, and the packfile from [`build_push_packfile`].
-pub fn build_receive_pack_body(req: &PushPackRequest<'_>) -> Result<Vec<u8>> {
+pub fn build_receive_pack_body<R>(req: &PushPackRequest<'_, R>) -> Result<Vec<u8>>
+where
+    R: ObjectReader,
+{
     let mut body = Vec::new();
     write_receive_pack_body(req, &mut body)?;
     Ok(body)
 }
 
-pub fn write_receive_pack_body<W>(req: &PushPackRequest<'_>, writer: &mut W) -> Result<()>
+pub fn write_receive_pack_body<R, W>(req: &PushPackRequest<'_, R>, writer: &mut W) -> Result<()>
 where
+    R: ObjectReader,
     W: Write,
 {
     write_receive_pack_body_with_cancel(req, writer, CancelFlag::never())
 }
 
 /// Like [`write_receive_pack_body`], threading `cancel` into pack generation.
-pub fn write_receive_pack_body_with_cancel<W>(
-    req: &PushPackRequest<'_>,
+pub fn write_receive_pack_body_with_cancel<R, W>(
+    req: &PushPackRequest<'_, R>,
     writer: &mut W,
     cancel: CancelFlag<'_>,
 ) -> Result<()>
 where
+    R: ObjectReader,
     W: Write,
 {
     let header = build_receive_pack_push_request_header(

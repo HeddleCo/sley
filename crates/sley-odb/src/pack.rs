@@ -93,6 +93,10 @@ impl ObjectDatabase {
 }
 
 impl ObjectReader for ObjectDatabase {
+    fn contains(&self, oid: &ObjectId) -> Result<bool> {
+        Ok(ObjectDatabase::contains(self, oid))
+    }
+
     fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
         self.objects
             .lock()
@@ -1797,6 +1801,10 @@ impl FileObjectDatabase {
     }
 }
 impl ObjectReader for FileObjectDatabase {
+    fn contains(&self, oid: &ObjectId) -> Result<bool> {
+        FileObjectDatabase::contains(self, oid)
+    }
+
     fn reusable_pack_candidates(
         &self,
         object_ids: &HashSet<ObjectId>,

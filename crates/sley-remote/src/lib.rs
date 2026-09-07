@@ -218,12 +218,17 @@ pub use fetch::{
 mod pack;
 pub use pack::{
     PushPackRequest, build_push_packfile, build_receive_pack_body,
-    remote_advertisement_tips_known_to_local,
+    remote_advertisement_tips_known_to_local, write_push_packfile, write_push_packfile_with_cancel,
+    write_receive_pack_body, write_receive_pack_body_with_cancel,
 };
 
 mod push;
 #[cfg(feature = "http")]
-pub use push::push_actions_with_http_client;
+pub use push::{
+    HttpPushActionsRequest, HttpReceivePackObservation, HttpReceivePackObservationRequest,
+    observe_http_receive_pack, push_actions_with_http_client, push_http_actions_with_reader,
+    push_http_actions_with_reader_from_observation,
+};
 pub use push::{
     PushAction, PushActionPlan, PushActionRequest, PushCommand, PushDestination, PushOptions,
     PushOutcome, PushPlan, PushQuarantine, PushRefStatus, PushReportRef, PushReportRequest,
