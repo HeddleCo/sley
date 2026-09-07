@@ -37,7 +37,7 @@ PASS — exactly 31 publishable crates, topologically ordered
 
 The publish-list validator also passed its negative self-tests (missing, bogus,
 misordered, and duplicate entries are rejected). Direct nightly rustfmt with
-`--edition 2024 --config skip_children=true --check` passed for all 292 changed
+`--edition 2024 --config skip_children=true --check` passed for all 294 changed
 Rust files, including renamed files, and `git diff --check` passed. No workspace version was bumped.
 The regular Clippy result reuses the successful 12.95-second check of the same
 source; the all-feature and minimal-feature runs independently checked their
