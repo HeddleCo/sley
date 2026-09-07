@@ -84,7 +84,7 @@ pub(crate) fn cmd_fetch_pack(
         match arg {
             "-h" | "--help" => {
                 println!("{FETCH_PACK_USAGE}");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             "--quiet"
             | "-q"
@@ -119,14 +119,14 @@ pub(crate) fn cmd_fetch_pack(
                     // Accepted but unused by the in-process local transport.
                 } else {
                     eprintln!("{FETCH_PACK_USAGE}");
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 }
             }
         }
     }
     let Some(dest) = args.get(index) else {
         eprintln!("{FETCH_PACK_USAGE}");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     };
     let dest = dest.clone();
     index += 1;
@@ -331,7 +331,7 @@ pub(crate) fn cmd_fetch_pack(
         writeln!(out, "{oid} {name}")?;
     }
     if failed {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -425,7 +425,7 @@ fn get_protocol(name: &str) -> Result<DiagProtocol> {
         "file" => Ok(DiagProtocol::File),
         _ => {
             eprintln!("fatal: protocol '{name}' is not supported");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -514,7 +514,7 @@ fn split_get_port(host: &str) -> (String, Option<String>) {
 
 fn no_path_specified() -> GitError {
     eprintln!("fatal: no path specified; see 'git help pull' for valid url syntax");
-    GitError::Exit(128)
+    crate::cli_exit(128)
 }
 
 struct ParsedConnectUrl {

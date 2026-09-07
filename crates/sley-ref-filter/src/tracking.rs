@@ -230,7 +230,9 @@ pub fn for_each_ref_ahead_behind_with_diagnostic(
 ) -> Result<Option<ForEachRefTrack>> {
     let Ok(local_commit) = sley_rev::peel_to_commit(db, format, oid) else {
         if let Ok(object) = db.read_object(oid) {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "error: object {} is a {}, not a commit",
                 oid,
                 object.object_type.as_str()

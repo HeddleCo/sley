@@ -26,7 +26,7 @@ pub(super) fn run_branch_upstream_options(
         BranchUpstreamAction::Set(upstream) => {
             if options.branches.len() > 1 {
                 eprintln!("fatal: too many arguments to set new upstream");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             let upstream = branch_upstream_resolve_previous_checkout(git_dir, &upstream)?;
             let branch = branch_upstream_target_branch(
@@ -42,7 +42,7 @@ pub(super) fn run_branch_upstream_options(
         BranchUpstreamAction::Unset => {
             if options.branches.len() > 1 {
                 eprintln!("fatal: too many arguments to unset upstream");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             let branch = branch_upstream_target_branch(
                 git_dir,
@@ -91,7 +91,7 @@ pub(super) fn branch_upstream_target_branch(
                 Ok(resolved) => resolved,
                 Err(GitError::InvalidPath(_)) => {
                     branch_upstream_missing_branch(branch, setting);
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 Err(err) => return Err(err),
             };
@@ -101,7 +101,7 @@ pub(super) fn branch_upstream_target_branch(
             } else {
                 eprintln!("fatal: branch '{branch}' has no upstream information");
             }
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         return Ok(branch);
     }
@@ -115,7 +115,7 @@ pub(super) fn branch_upstream_target_branch(
                 "fatal: could not unset upstream of HEAD when it does not point to any branch"
             );
         }
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
     Ok(branch)
 }
@@ -164,7 +164,7 @@ pub(super) fn set_branch_upstream(
         eprintln!(
             "fatal: cannot set up tracking information; starting point '{upstream}' is not a branch"
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let Some(upstream) = resolve_branch_upstream(git_dir, format, store, &effective, upstream)?
     else {
@@ -180,7 +180,7 @@ pub(super) fn set_branch_upstream(
         eprintln!(
             "hint: Disable this message with \"git config set advice.setUpstreamFailure false\""
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
     let branch_ref = branch_ref_name(branch)?;
     if upstream.remote == "." && upstream.merge == branch_ref {
@@ -339,7 +339,7 @@ pub(super) fn unset_branch_upstream(git_dir: &Path, branch: &str) -> Result<()> 
         section.name == "branch" && section.subsection.as_deref() == Some(branch)
     }) else {
         eprintln!("fatal: branch '{branch}' has no upstream information");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
     let had_upstream = {
         let section = &mut config.sections[section_idx];
@@ -351,7 +351,7 @@ pub(super) fn unset_branch_upstream(git_dir: &Path, branch: &str) -> Result<()> 
     };
     if !had_upstream {
         eprintln!("fatal: branch '{branch}' has no upstream information");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     config
         .sections

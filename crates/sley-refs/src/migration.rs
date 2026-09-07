@@ -180,7 +180,10 @@ fn create_migration_dir(common_git_dir: &Path) -> Result<PathBuf, MigrateRefStor
             Err(err) => return Err(err.into()),
         }
     }
-    Err(MigrateRefStorageError::Storage(GitError::IoKind { kind: std::io::ErrorKind::Other, message: "unable to create temporary ref migration directory".into() }))
+    Err(MigrateRefStorageError::Storage(GitError::IoKind {
+        kind: std::io::ErrorKind::Other,
+        message: "unable to create temporary ref migration directory".into(),
+    }))
 }
 
 fn write_migrated_ref_store(

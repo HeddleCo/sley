@@ -107,7 +107,7 @@ pub struct LsRemoteOutcome {
 /// `format` is the request/expected object format (SHA-1 for HTTP, the local
 /// repository's format for local); the returned [`ObjectFormat`] is the format
 /// actually in effect (HTTP resolves it from the advertisement). Returns the
-/// records and that format; never sorts, prints, or returns `GitError::Exit`. The
+/// records and that format; never sorts, prints, or returns a process exit request. The
 /// caller applies `--sort`, `--symref` formatting, and the `--exit-code` mapping.
 pub fn ls_remote(
     policy: &crate::RemotePolicy,

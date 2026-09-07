@@ -1052,27 +1052,27 @@ fn resolve_patch_config(
         && value < 0
     {
         eprintln!("fatal: diff.context cannot be negative");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let mut interhunk = read_int("interHunkContext");
     if let Some(value) = interhunk
         && value < 0
     {
         eprintln!("fatal: diff.interHunkContext cannot be negative");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     // Command-line `-U` / `--inter-hunk-context` override the config, validated.
     if let Some(value) = cli_context {
         if value < 0 {
             eprintln!("fatal: --unified cannot be negative");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         context = Some(value);
     }
     if let Some(value) = cli_interhunk {
         if value < 0 {
             eprintln!("fatal: --inter-hunk-context cannot be negative");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         interhunk = Some(value);
     }

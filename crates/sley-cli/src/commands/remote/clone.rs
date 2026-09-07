@@ -485,11 +485,11 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
         .unwrap_or(depth.is_some() || deepen_since.is_some() || !deepen_not.is_empty());
     if also_filter_submodules && partial_clone_filter.is_none() {
         eprintln!("fatal: the option '--also-filter-submodules' requires '--filter'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if also_filter_submodules && submodule_active.is_empty() {
         eprintln!("fatal: the option '--also-filter-submodules' requires '--recurse-submodules'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let submodule_filter = if also_filter_submodules {
         partial_clone_filter.as_deref()
@@ -501,11 +501,11 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
         eprintln!(
             "fatal: options '--bundle-uri' and '--depth/--shallow-since/--shallow-exclude' cannot be used together"
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if revision.is_some() && branch.is_some() {
         eprintln!("fatal: options '--revision' and '--branch' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if !explicit_origin
         && let Some(default_remote) = clone_default_remote_name_config(&config_overrides)?
@@ -517,16 +517,16 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
     let bare = mirror || explicit_bare.unwrap_or(false);
     if revision.is_some() && mirror {
         eprintln!("fatal: options '--revision' and '--mirror' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if bare && separate_git_dir.is_some() {
         eprintln!("fatal: options '--bare' and '--separate-git-dir' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if bare && sparse {
         eprintln!("fatal: this operation must be run in a work tree");
         eprintln!("error: failed to initialize sparse-checkout");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     trace_index_pack_fsck_objects_if_configured();
     trace_pack_objects_filter(partial_clone_filter.as_deref());
@@ -589,7 +589,7 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
     } else if configured_legacy_protocol(Some(&transport_config)) {
         eprintln!("fatal: server options require protocol version 2 or later");
         eprintln!("fatal: see protocol.version in 'git help config' for more details");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let mut ssh_options = sley_remote::ssh_transport_options_from_config(&transport_config);
     ssh_options.ip_version = ssh_ip_version;
@@ -621,7 +621,7 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
             "fatal: destination path '{}' already exists and is not an empty directory.",
             destination_display.display()
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     if let Some(bundle_path) = bundle_source_path.as_deref() {
@@ -854,14 +854,14 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
             env::var("GIT_NO_LAZY_FETCH").ok().as_deref() == Some("0") && cli_session.lazy_fetch();
         if !clone_lazy_fetch_reenabled {
             eprintln!("fatal: lazy fetching disabled; some objects may be missing");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if !run_source_promisor_upload_pack_probe(&remote_common_git_dir)? {
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     if upload_pack.as_deref() == Some("false") {
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     // `--branch=<name>` may name a tag rather than a branch; git then checks the
     // tag's commit out with a detached HEAD (`our_head_points_at` is a tag ⇒
@@ -947,7 +947,7 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
     // shallow — matching `--no-local` (the only way to reject-shallow a path).
     if reject_shallow_config == Some(true) && remote_common_git_dir.join("shallow").exists() {
         eprintln!("fatal: source repository is shallow, reject to clone.");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if !quiet {
         if bare {
@@ -2512,7 +2512,7 @@ fn map_clone_missing_branch(
                     == format!("remote ref refs/remotes/{origin}/{checkout_branch}") =>
         {
             eprintln!("fatal: Remote branch {checkout_branch} not found in upstream {origin}");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
         other => other,
     }
@@ -2531,7 +2531,7 @@ fn reject_unknown_clone_ref_format(value: &str) -> Result<()> {
         "files" | "reftable" => Ok(()),
         _ => {
             eprintln!("fatal: unknown ref storage format '{value}'");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -2568,7 +2568,7 @@ fn validate_local_clone_source_ref_dir(
             Ok(reference) => reference,
             Err(GitError::InvalidFormat(message)) => {
                 eprintln!("fatal: {message}");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             Err(err) => return Err(err),
         };
@@ -2576,7 +2576,7 @@ fn validate_local_clone_source_ref_dir(
             && oid.is_null()
         {
             eprintln!("fatal: reference {name} points to null OID");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     Ok(())
@@ -2651,7 +2651,7 @@ pub(super) fn normalize_clone_filter(value: &str) -> Result<String> {
     if let Some(limit) = value.strip_prefix("blob:limit=") {
         let limit = git_parse_blob_limit(limit).ok_or_else(|| {
             eprintln!("fatal: invalid filter-spec 'blob:limit={limit}'");
-            GitError::Exit(128)
+            crate::cli_exit(128)
         })?;
         return Ok(format!("blob:limit={limit}"));
     }
@@ -2663,7 +2663,7 @@ pub(super) fn normalize_clone_filter(value: &str) -> Result<String> {
         return Ok(value.to_string());
     }
     eprintln!("fatal: invalid filter-spec '{value}'");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn add_clone_filter(current: &mut Option<String>, value: &str) {
@@ -2681,7 +2681,7 @@ pub(super) fn validate_upload_pack_filter_config() -> Result<()> {
         && value.parse::<u32>().is_err()
     {
         eprintln!("fatal: unable to parse uploadpackfilter.tree.maxdepth");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(())
 }
@@ -2713,7 +2713,7 @@ fn validate_server_filter_policy(config: &GitConfig, filter: &str) -> Result<()>
             && depth > max_depth
         {
             eprintln!("fatal: tree filter allows max depth {max_depth}, but got {depth}");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         return Ok(());
     }
@@ -2732,7 +2732,7 @@ fn upload_pack_filter_allowed(config: &GitConfig, name: &str) -> bool {
 
 fn filter_not_supported(filter: &str) -> Result<()> {
     eprintln!("fatal: filter '{filter}' not supported");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 pub(super) fn trace_index_pack_fsck_objects_if_configured() {
@@ -3020,7 +3020,7 @@ pub(super) fn parse_clone_config_override(value: &str) -> Result<GlobalConfigOve
     };
     if key.is_empty() {
         eprintln!("error: key does not contain a section: {value}");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(GlobalConfigOverride {
         key: key.to_string(),
@@ -3366,7 +3366,7 @@ fn install_local_clone_objects(
             "fatal: '{}' is a symlink, refusing to clone with --local",
             source_objects.display()
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     clear_local_clone_object_files(&destination_objects)?;
     fs::create_dir_all(&destination_objects)?;
@@ -3436,7 +3436,7 @@ fn copy_or_link_local_object_directory(
                 "fatal: symlink '{}' exists, refusing to clone with --local",
                 entry_relative.display()
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if metadata.is_dir() {
             fs::create_dir_all(&destination)?;
@@ -3459,10 +3459,13 @@ fn copy_or_link_local_object_directory(
             match fs::hard_link(&source, &destination) {
                 Ok(()) => continue,
                 Err(err) if matches!(mode, LocalObjectInstall::Hardlink { required: true }) => {
-                    return Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!(
-                        "failed to create link '{}': {err}",
-                        destination.display()
-                    ) });
+                    return Err(GitError::IoKind {
+                        kind: std::io::ErrorKind::Other,
+                        message: format!(
+                            "failed to create link '{}': {err}",
+                            destination.display()
+                        ),
+                    });
                 }
                 Err(_) => *hardlink = false,
             }
@@ -3683,7 +3686,7 @@ fn recurse_clone_submodules(
         .status()
         .map_err(GitError::from)?;
     if !status.success() {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -4063,7 +4066,7 @@ fn resolve_clone_revision(
 
 fn clone_revision_not_found(rev: &str, origin: &str) -> GitError {
     eprintln!("fatal: Remote revision {rev} not found in upstream {origin}");
-    GitError::Exit(128)
+    crate::cli_exit(128)
 }
 
 fn peel_clone_revision_to_commit<R: ObjectReader>(
@@ -4080,7 +4083,7 @@ fn peel_clone_revision_to_commit<R: ObjectReader>(
         }
         other => {
             eprintln!("error: object {oid} is a {}, not a commit", other.as_str());
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -4366,7 +4369,7 @@ pub(super) fn register_promisor_remote(
         && let Some(unknown) = first_unknown_repository_extension(&config)
     {
         eprintln!("error: cannot upgrade repository format: unknown extension {unknown}");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let format_key = parse_config_key("core.repositoryformatversion")?;
     config_set_value(&mut config, &format_key, "1", false);

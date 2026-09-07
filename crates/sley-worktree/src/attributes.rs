@@ -1248,7 +1248,9 @@ pub(crate) fn read_attribute_patterns(
         && let Ok(metadata) = fs::symlink_metadata(path)
         && metadata.file_type().is_symlink()
     {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "warning: unable to access '{}': Too many levels of symbolic links",
             String::from_utf8_lossy(source)
         );
@@ -1268,7 +1270,9 @@ pub(crate) fn read_attribute_patterns_from_bytes(
 ) {
     for (index, raw) in contents.split(|byte| *byte == b'\n').enumerate() {
         if raw.len() >= 2048 {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "warning: ignoring overly long attributes line {}",
                 index + 1
             );
@@ -1387,7 +1391,9 @@ pub(crate) fn push_attribute_pattern(
         // definition but keep parsing later rules so inherited macros remain
         // available there.
         if !base.is_empty() {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "{} not allowed: {}:{}",
                 String::from_utf8_lossy(line),
                 String::from_utf8_lossy(source),
@@ -1424,7 +1430,9 @@ pub(crate) fn push_attribute_pattern(
         matcher.push_attribute_order(&assignment.attribute);
     }
     if raw_pattern.starts_with(b"!") {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "warning: Negative patterns are ignored in git attributes\nUse '\\!' for literal leading exclamation."
         );
         return;
@@ -1604,7 +1612,9 @@ pub(crate) fn report_invalid_attribute_name(attribute: &[u8], source: &[u8], lin
     {
         return;
     }
-    eprintln!(
+    sley_core::diagnostic!(
+        Stderr,
+        true,
         "{} is not a valid attribute name: {}:{}",
         String::from_utf8_lossy(attribute),
         String::from_utf8_lossy(source),

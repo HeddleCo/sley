@@ -594,7 +594,7 @@ pub(crate) fn cmd_diff_tree(
     }
     if options.max_depth.is_some() && diff_tree_has_wildcard_pathspec(&setup.pathspecs) {
         eprintln!("fatal: max-depth cannot be used with wildcard pathspecs");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if !setup.options.negatives.is_empty() || !setup.options.symmetric_ranges.is_empty() {
         return Err(GitError::Unsupported(
@@ -688,11 +688,11 @@ pub(crate) fn cmd_diff_tree(
     } else {
         if options.merge_base && setup.options.positives.len() == 1 {
             eprintln!("fatal: --merge-base only works with two commits");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if setup.options.positives.is_empty() {
             print_diff_tree_usage();
-            return Err(GitError::Exit(129));
+            return Err(crate::cli_exit(129));
         }
         let requests = if options.merge_base {
             resolve_merge_base_arg_request(git_dir, db, &setup.options.positives)?
@@ -712,10 +712,10 @@ pub(crate) fn cmd_diff_tree(
     }
 
     if options.check && request_context.check_failed.get() {
-        return Err(GitError::Exit(2));
+        return Err(crate::cli_exit(2));
     }
     if options.exit_code && has_differences {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -799,7 +799,7 @@ fn resolve_merge_base_arg_request(
 ) -> Result<Vec<DiffRequest>> {
     if revs.len() != 2 {
         print_diff_tree_usage();
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     let format = db.object_format();
     let left = commands::diff::diff_resolve_commit_arg(git_dir, format, db, &revs[0].rev)?;
@@ -1567,7 +1567,7 @@ fn compute_entries(
 fn parse_diff_tree_max_depth(value: &str) -> Result<i64> {
     value.parse::<i64>().map_err(|_| {
         eprintln!("error: option `max-depth' expects a numerical value");
-        GitError::Exit(129)
+        crate::cli_exit(129)
     })
 }
 

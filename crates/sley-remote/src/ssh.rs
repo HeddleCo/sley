@@ -160,12 +160,12 @@ struct StderrDrain {
 impl StderrDrain {
     fn start(stderr: ChildStderr) -> Self {
         Self {
-            handle: std::thread::spawn(move || {
+            handle: std::thread::spawn(sley_core::diagnostics::inherit(move || {
                 let mut sink = Vec::new();
                 let mut stderr = stderr;
                 let _ = stderr.read_to_end(&mut sink);
                 sink
-            }),
+            })),
         }
     }
 
@@ -197,7 +197,7 @@ fn with_ssh_child_cancel_watch<T>(
         let watch_child = Arc::clone(child);
         let watch_cancel = cancel;
         let watch_stop = &stop;
-        scope.spawn(move || {
+        scope.spawn(sley_core::diagnostics::inherit(move || {
             while !watch_stop.load(Ordering::Relaxed) {
                 if watch_cancel.is_cancelled() {
                     if let Ok(mut guard) = watch_child.lock() {
@@ -207,7 +207,7 @@ fn with_ssh_child_cancel_watch<T>(
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
-        });
+        }));
         // Ensure the watcher always observes stop, even if `body` panics.
         let _stop_guard = StopOnDrop(&stop);
         body()

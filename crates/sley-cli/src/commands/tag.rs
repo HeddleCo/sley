@@ -519,7 +519,7 @@ pub(crate) fn cmd_tag(cli_session: &crate::session::CliSession, args: &[String])
     }
     if file_message.is_some() && !messages.is_empty() {
         eprintln!("fatal: options '-F' and '-m' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if !messages.is_empty() || file_message.is_some() || !trailers.is_empty() {
         annotated = true;
@@ -595,17 +595,17 @@ pub(crate) fn cmd_tag(cli_session: &crate::session::CliSession, args: &[String])
         };
         if let Some(option) = only_in_list {
             eprintln!("fatal: the '{option}' option is only allowed in list mode");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     if verify {
         if explicit_list {
             eprintln!("error: options '-l' and '-v' cannot be used together");
-            return Err(GitError::Exit(129));
+            return Err(crate::cli_exit(129));
         }
         if annotation_lines.is_some() {
             eprintln!("fatal: the '-n' option is only allowed in list mode");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if annotated || force || delete || !messages.is_empty() || file_message.is_some() {
             return Err(GitError::Command(
@@ -636,7 +636,7 @@ pub(crate) fn cmd_tag(cli_session: &crate::session::CliSession, args: &[String])
         }
         if column_explicit && column != TagListColumn::None && annotation_lines.is_some() {
             eprintln!("fatal: options '--column' and '-n' cannot be used together");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         let column = if column_explicit {
             column
@@ -695,7 +695,7 @@ pub(crate) fn cmd_tag(cli_session: &crate::session::CliSession, args: &[String])
         [tag, target] => (tag.as_str(), target.as_str()),
         _ => {
             eprintln!("fatal: too many arguments");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     };
     let target_oid = resolve_tag_target(&repo, target)?;
@@ -704,7 +704,7 @@ pub(crate) fn cmd_tag(cli_session: &crate::session::CliSession, args: &[String])
         let use_editor = edit || (!edit_disabled && !has_message_source);
         if !use_editor && messages.is_empty() && file_message.is_none() && trailers.is_empty() {
             eprintln!("fatal: no tag message?");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
         let target_object = db.read_object(&target_oid)?;
@@ -732,7 +732,7 @@ pub(crate) fn cmd_tag(cli_session: &crate::session::CliSession, args: &[String])
             message = tag_cleanup_message(message, cleanup_mode);
             if message.is_empty() {
                 eprintln!("fatal: no tag message?");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
         let tagger = commit_identity_from_env("COMMITTER", &config)?;
@@ -855,7 +855,7 @@ fn delete_tags(store: &FileRefStore, tags: &[String]) -> Result<()> {
         }
     }
     if failed {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -875,7 +875,7 @@ fn verify_tags(
         }
     }
     if failed {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -953,7 +953,7 @@ fn resolve_tag_target(repo: &sley::Repository, target: &str) -> Result<ObjectId>
         Ok(oid) => Ok(oid),
         Err(GitError::NotFound(_)) => {
             eprintln!("fatal: Failed to resolve '{target}' as a valid ref.");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
         Err(err) => Err(err),
     }
@@ -964,15 +964,15 @@ fn render_tag_query_error(err: sley::TagQueryError) -> GitError {
         sley::TagQueryError::MalformedRevision { kind, spec } => match kind {
             sley::TagQueryRevisionKind::PointsAt => {
                 eprintln!("error: malformed object name '{spec}'");
-                GitError::Exit(129)
+                crate::cli_exit(129)
             }
             sley::TagQueryRevisionKind::Contains => {
                 eprintln!("error: malformed object name {spec}");
-                GitError::Exit(129)
+                crate::cli_exit(129)
             }
             sley::TagQueryRevisionKind::Merged => {
                 eprintln!("fatal: malformed object name {spec}");
-                GitError::Exit(128)
+                crate::cli_exit(128)
             }
         },
         sley::TagQueryError::NotACommit {
@@ -985,7 +985,7 @@ fn render_tag_query_error(err: sley::TagQueryError) -> GitError {
                 object_type.as_str()
             );
             eprintln!("error: no such commit {spec}");
-            GitError::Exit(129)
+            crate::cli_exit(129)
         }
         sley::TagQueryError::Source(err) => err,
     }
@@ -1040,7 +1040,7 @@ fn tag_object_body(
 fn write_tag_verify_format(format_spec: &str, tag: &Tag) -> Result<()> {
     if format_spec.contains("%(rest)") {
         eprintln!("fatal: unknown field name: rest");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let format = ForEachRefFormat::parse(format_spec)?;
     let mut stdout = io::stdout();
@@ -1090,7 +1090,7 @@ fn create_or_update_tag(options: TagCreateOrUpdate<'_>) -> Result<()> {
     if !force {
         if store.read_ref(&name)?.is_some() {
             eprintln!("fatal: tag '{tag}' already exists");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         let mut tx = store.transaction();
         tx.update(RefUpdate {
@@ -1143,7 +1143,7 @@ fn validate_tag_creation_name(tag: &str) -> Result<String> {
         Ok(refname) => Ok(refname),
         Err(GitError::InvalidPath(_)) => {
             eprintln!("fatal: '{tag}' is not a valid tag name.");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
         Err(err) => Err(err),
     }
@@ -1223,12 +1223,12 @@ fn tag_reflog_message(git_dir: &Path, format: ObjectFormat, target: &ObjectId) -
 
 fn tag_message_requires_value_error() -> Result<()> {
     eprintln!("error: switch `m' requires a value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn tag_file_requires_value_error() -> Result<()> {
     eprintln!("error: switch `F' requires a value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 #[derive(Clone, Copy)]
@@ -1245,46 +1245,46 @@ fn parse_tag_cleanup_mode(value: &str) -> Result<TagCleanupMode> {
         "verbatim" => Ok(TagCleanupMode::Verbatim),
         _ => {
             eprintln!("fatal: Invalid cleanup mode {value}");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
 
 fn tag_cleanup_requires_value_error() -> Result<()> {
     eprintln!("error: option `cleanup' requires a value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn tag_trailer_requires_value_error() -> Result<()> {
     eprintln!("error: option `trailer' requires a value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn tag_option_takes_no_value_error(option: &str) -> Result<()> {
     eprintln!("error: option `{option}' takes no value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn tag_option_requires_value_error(option: &str) -> Result<()> {
     eprintln!("error: option `{option}' requires a value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn tag_unknown_option_error(option: &str) -> Result<()> {
     eprintln!("error: unknown option `{option}'");
     print_tag_usage();
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn tag_unknown_switch_error(switch: char) -> Result<()> {
     eprintln!("error: unknown switch `{switch}'");
     print_tag_usage();
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn tag_usage_error() -> Result<()> {
     print_tag_usage();
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn tag_unknown_short_switch(value: &str) -> Option<char> {
@@ -1357,7 +1357,7 @@ fn tag_local_user_requires_value_error(option: &str, short: bool) -> Result<()> 
     } else {
         eprintln!("error: option `{option}' requires a value");
     }
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 pub(crate) fn parse_tag_trailer(value: &str) -> Vec<u8> {
@@ -1929,7 +1929,7 @@ fn tag_sort_key_error(key: &str) -> Result<TagListSort> {
     } else {
         eprintln!("fatal: unknown field name: {atom}");
     }
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn parse_tag_list_annotation_lines(value: &str) -> Result<usize> {
@@ -1960,12 +1960,12 @@ fn parse_tag_list_annotation_lines(value: &str) -> Result<usize> {
 
 fn tag_annotation_lines_invalid_error() -> Result<usize> {
     eprintln!("error: switch `n' expects an integer value with an optional k/m/g suffix");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn tag_annotation_lines_range_error(value: &str) -> Result<usize> {
     eprintln!("error: value {value} for switch `n' not in range [-2147483648,2147483647]");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn parse_tag_list_column(value: &str) -> Result<TagListColumn> {
@@ -1991,7 +1991,7 @@ fn parse_tag_list_column(value: &str) -> Result<TagListColumn> {
             _ => {
                 let unsupported = if idx == 0 { value } else { token };
                 eprintln!("error: unsupported option '{unsupported}'");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
         }
     }
@@ -2008,7 +2008,7 @@ fn parse_tag_list_color(value: &str) -> Result<bool> {
         "auto" | "never" => Ok(false),
         _ => {
             eprintln!("error: option `color' expects \"always\", \"auto\", or \"never\"");
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
     }
 }

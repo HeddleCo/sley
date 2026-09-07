@@ -52,12 +52,12 @@ pub(crate) fn cmd_stash(cli_session: &crate::session::CliSession, args: &[String
     match args.first().map(String::as_str) {
         Some("-h") | Some("--help") => {
             stash_usage_stdout();
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
         Some(value) if value.starts_with('-') && !stash_can_start_assumed_push(value) => {
             eprintln!("error: unknown option `{}`", value.trim_start_matches('-'));
             stash_usage_stderr();
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
         Some("apply") => cmd_stash_apply(cli_session, &args[1..]),
         Some("branch") => cmd_stash_branch(cli_session, &args[1..]),
@@ -236,7 +236,7 @@ fn stash_assumed_push_unexpected_token(token: &str) -> GitError {
     eprintln!(
         "fatal: subcommand wasn't specified; 'push' can't be assumed due to unexpected token '{token}'"
     );
-    GitError::Exit(128)
+    crate::cli_exit(128)
 }
 
 pub(super) struct StashApplyOptions {
@@ -291,15 +291,15 @@ fn cmd_stash_pop(cli_session: &crate::session::CliSession, args: &[String]) -> R
 fn cmd_stash_branch(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     if args.is_empty() {
         eprintln!("No branch name specified");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     if args.len() > 2 {
         eprintln!("Too many revisions specified: '{}' '{}'", args[1], args[2]);
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     if args[0].starts_with('-') {
         eprintln!("usage: git stash branch <branchname> [<stash>]");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     let branch = &args[0];
     let display = args
@@ -374,13 +374,13 @@ fn stash_apply_parse_combined_quiet(value: &str, command: &str) -> Result<()> {
 fn stash_apply_unknown_option_error<T>(command: &str, value: &str) -> Result<T> {
     eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
     stash_apply_usage(command);
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn stash_apply_unknown_switch_error<T>(command: &str, switch: char) -> Result<T> {
     eprintln!("error: unknown switch `{switch}'");
     stash_apply_usage(command);
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn stash_apply_usage(command: &str) {
@@ -446,14 +446,14 @@ fn apply_stash_entry(
         if entries.is_empty() {
             if options.explicit_selector {
                 eprintln!("error: {} is not a valid reference", options.display);
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
             eprintln!("No stash entries found.");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         if options.selector >= entries.len() {
             eprintln!("fatal: log for 'stash' only has {} entries", entries.len());
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         let entry_index = entries.len() - 1 - options.selector;
         entries[entry_index].new_oid
@@ -464,7 +464,7 @@ fn apply_stash_entry(
     let head_store = FileRefStore::new(&git_dir, format);
     let Some((_head_oid, _head_commit)) = stash_head_commit(&head_store, &db, format)? else {
         eprintln!("You do not have the initial commit yet");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     };
     let base_oid = stash_commit
         .parents
@@ -553,7 +553,7 @@ fn apply_stash_entry(
         if reinstate_index {
             eprintln!("Index was not unstashed.");
         }
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(AppliedStash {
         common_git_dir,
@@ -629,7 +629,7 @@ fn apply_stash_via_merge(
         .any(|entry| index_entry_stage(entry) != 0)
     {
         eprintln!("error: cannot apply a stash in the middle of a merge");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     expand_sparse_stash_index_view(&mut index, db, format)?;
     let ours_map: MergeTreeMap = index
@@ -664,7 +664,7 @@ fn apply_stash_via_merge(
             )?;
             if !idx_conflicts.is_empty() {
                 eprintln!("Conflicts in index. Try without --index.");
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
             let mut merged: MergeTreeMap = BTreeMap::new();
             for (path, result) in &idx_results {
@@ -929,7 +929,7 @@ fn verify_stash_apply_safe(
         }
         eprintln!("Please commit your changes or stash them before you merge.");
         eprintln!("Aborting");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     if !untracked.is_empty() {
         eprintln!(
@@ -940,7 +940,7 @@ fn verify_stash_apply_safe(
         }
         eprintln!("Please move or remove them before you merge.");
         eprintln!("Aborting");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -1171,10 +1171,10 @@ fn cmd_stash_clear(cli_session: &crate::session::CliSession, args: &[String]) ->
             eprintln!("error: unknown option `{}'", arg.trim_start_matches('-'));
             eprintln!("usage: git stash clear");
             eprintln!();
-            return Err(GitError::Exit(129));
+            return Err(crate::cli_exit(129));
         }
         eprintln!("error: git stash clear with arguments is unimplemented");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
@@ -1199,7 +1199,7 @@ fn cmd_stash_drop(cli_session: &crate::session::CliSession, args: &[String]) -> 
             value if value.starts_with('-') => {
                 eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
                 stash_drop_usage();
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             value => specs.push(value.to_string()),
         }
@@ -1209,7 +1209,7 @@ fn cmd_stash_drop(cli_session: &crate::session::CliSession, args: &[String]) -> 
             "Too many revisions specified: '{}' '{}'",
             specs[0], specs[1]
         );
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     let display = specs
         .first()
@@ -1239,11 +1239,11 @@ fn drop_stash_entry(
             Ok(plan) => plan,
             Err(sley_sequencer::stash::StashDropError::Empty) => {
                 eprintln!("No stash entries found.");
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
             Err(sley_sequencer::stash::StashDropError::OutOfRange { available }) => {
                 eprintln!("fatal: log for 'stash' only has {available} entries");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         };
     if plan.remaining.is_empty() {
@@ -1299,7 +1299,7 @@ fn stash_numeric_selector(spec: &str) -> Option<Result<usize>> {
 
 fn stash_invalid_reference_error(spec: &str) -> GitError {
     eprintln!("error: {spec} is not a valid reference");
-    GitError::Exit(1)
+    crate::cli_exit(1)
 }
 
 fn stash_drop_usage() {
@@ -1437,7 +1437,7 @@ fn cmd_stash_push(cli_session: &crate::session::CliSession, args: &[String]) -> 
                     } else {
                         eprintln!("error: switch `{option}' requires a value");
                     }
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 };
                 message_args = vec![value.clone()];
             }
@@ -1489,7 +1489,7 @@ fn cmd_stash_push(cli_session: &crate::session::CliSession, args: &[String]) -> 
             value if value.starts_with('-') => {
                 eprintln!("error: unknown option `{}`", value.trim_start_matches('-'));
                 stash_push_usage_stdout();
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             value => {
                 if pathspec_from_file.is_some() {
@@ -1502,13 +1502,13 @@ fn cmd_stash_push(cli_session: &crate::session::CliSession, args: &[String]) -> 
     }
     if pathspec_file_nul && pathspec_from_file.is_none() {
         eprintln!("fatal: the option '--pathspec-file-nul' requires '--pathspec-from-file'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     // git rejects `--pathspec-from-file` together with `--patch` before reading
     // the pathspec file or entering interactive mode (t3909 "error conditions").
     if pathspec_from_file.is_some() && patch {
         eprintln!("fatal: options '--pathspec-from-file' and '--patch' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if let Some(pathspec_file) = pathspec_from_file.as_deref() {
         pathspecs.extend(
@@ -1519,7 +1519,7 @@ fn cmd_stash_push(cli_session: &crate::session::CliSession, args: &[String]) -> 
     }
     if create_mode == StashCreateMode::Staged && include_untracked {
         eprintln!("Can't use --staged and --include-untracked or --all at the same time");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     if no_auto_advance && !patch {
         return stash_patch_option_requires_patch_error("no-auto-advance");
@@ -1533,7 +1533,7 @@ fn cmd_stash_push(cli_session: &crate::session::CliSession, args: &[String]) -> 
     if patch {
         if include_untracked {
             eprintln!("Can't use --patch and --include-untracked or --all at the same time");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         return stash_push_patch(
             cli_session,
@@ -1571,22 +1571,22 @@ fn cmd_stash_push(cli_session: &crate::session::CliSession, args: &[String]) -> 
 
 fn stash_pathspec_from_file_requires_value_error<T>() -> Result<T> {
     eprintln!("error: option `pathspec-from-file' requires a value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn stash_pathspec_from_file_with_inline_pathspec_error<T>() -> Result<T> {
     eprintln!("fatal: '--pathspec-from-file' and pathspec arguments cannot be used together");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn stash_option_takes_no_value_error<T>(option: &str) -> Result<T> {
     eprintln!("error: option `{option}' takes no value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn stash_patch_option_requires_patch_error<T>(option: &str) -> Result<T> {
     eprintln!("fatal: the option '--{option}' requires '--patch'");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn stash_push_patch(
@@ -1621,7 +1621,7 @@ fn stash_push_patch(
         if !quiet {
             eprintln!("Cannot save the current index state");
         }
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
 
     let applied = match commands::add_interactive::cmd_stash_patch(
@@ -1683,7 +1683,7 @@ fn stash_record_selected_patch(
         if !quiet {
             eprintln!("You do not have the initial commit yet");
         }
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     };
     let selected_index = read_repository_index(git_dir, format)?.unwrap_or(Index {
         version: 2,
@@ -1782,7 +1782,7 @@ fn stash_selected_patch(pathspecs: &[String]) -> Result<Vec<u8>> {
         .output()
         .map_err(GitError::from)?;
     if !output.status.success() {
-        return Err(GitError::Exit(output.status.code().unwrap_or(1)));
+        return Err(crate::cli_exit(output.status.code().unwrap_or(1)));
     }
     Ok(output.stdout)
 }
@@ -1794,13 +1794,11 @@ fn stash_reverse_apply_selected_patch(patch: &[u8]) -> Result<()> {
         .spawn()
         .map_err(GitError::from)?;
     if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(patch)
-            .map_err(GitError::from)?;
+        stdin.write_all(patch).map_err(GitError::from)?;
     }
     let status = child.wait().map_err(GitError::from)?;
     if !status.success() {
-        return Err(GitError::Exit(status.code().unwrap_or(1)));
+        return Err(crate::cli_exit(status.code().unwrap_or(1)));
     }
     Ok(())
 }
@@ -1838,7 +1836,7 @@ fn cmd_stash_save(cli_session: &crate::session::CliSession, args: &[String]) -> 
             "--no-quiet" => quiet = false,
             "-h" | "--help" => {
                 stash_push_usage_stdout();
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             "-u" | "--include-untracked" => include_untracked = true,
             "--no-include-untracked" => {
@@ -1927,7 +1925,7 @@ fn cmd_stash_save(cli_session: &crate::session::CliSession, args: &[String]) -> 
                     } else {
                         eprintln!("error: switch `{option}' requires a value");
                     }
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 };
                 explicit_message = vec![value.clone()];
             }
@@ -1948,7 +1946,7 @@ fn cmd_stash_save(cli_session: &crate::session::CliSession, args: &[String]) -> 
             value if value.starts_with('-') => {
                 eprintln!("error: unknown option `{}`", value.trim_start_matches('-'));
                 stash_push_usage_stdout();
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             value => positional_message.push(value.to_string()),
         }
@@ -1961,7 +1959,7 @@ fn cmd_stash_save(cli_session: &crate::session::CliSession, args: &[String]) -> 
     };
     if create_mode == StashCreateMode::Staged && include_untracked {
         eprintln!("Can't use --staged and --include-untracked or --all at the same time");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     if no_auto_advance && !patch {
         return stash_patch_option_requires_patch_error("no-auto-advance");
@@ -1975,7 +1973,7 @@ fn cmd_stash_save(cli_session: &crate::session::CliSession, args: &[String]) -> 
     if patch {
         if include_untracked {
             eprintln!("Can't use --patch and --include-untracked or --all at the same time");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         return stash_push_patch(
             cli_session,
@@ -2066,7 +2064,7 @@ fn cleanup_stored_stash(
 ) -> Result<()> {
     if !created.staged_worktree_conflicts.is_empty() {
         report_stash_staged_worktree_conflicts(&created.staged_worktree_conflicts, quiet);
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
 
     for path in &created.untracked_paths {
@@ -2192,7 +2190,7 @@ fn create_stash_commit_at(
         if !quiet {
             eprintln!("You do not have the initial commit yet");
         }
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     };
     let mut index = read_repository_index(&git_dir, format)?.unwrap_or(Index {
         version: 2,
@@ -2215,7 +2213,7 @@ fn create_stash_commit_at(
         if !quiet {
             eprintln!("Cannot save the current index state");
         }
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     let pathspec = if pathspecs.is_empty() {
         None
@@ -2296,7 +2294,7 @@ fn create_stash_commit_at(
         if index_tree == head_commit.tree {
             if worktree_tree != head_commit.tree {
                 eprintln!("No staged changes");
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
             return Ok(None);
         }
@@ -2408,7 +2406,7 @@ fn stash_check_index_lock_quiet(git_dir: &Path, quiet: bool) -> Result<()> {
                 lock_path.display()
             );
         }
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -2903,7 +2901,7 @@ fn cmd_stash_store(cli_session: &crate::session::CliSession, args: &[String]) ->
                     } else {
                         eprintln!("error: switch `{option}' requires a value");
                     }
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 };
                 message = value.as_bytes().to_vec();
             }
@@ -2919,7 +2917,7 @@ fn cmd_stash_store(cli_session: &crate::session::CliSession, args: &[String]) ->
     }
     if commits.len() != 1 {
         eprintln!("\"git stash store\" requires one <commit> argument");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     let commit = &commits[0];
 
@@ -2936,7 +2934,7 @@ fn cmd_stash_store(cli_session: &crate::session::CliSession, args: &[String]) ->
         Ok(oid) => oid,
         Err(_) => {
             eprintln!("Cannot update refs/stash with {commit}");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
     };
     validate_stash_like_commit(&db, format, &stash_oid)?;
@@ -2971,7 +2969,7 @@ fn resolve_stash_argument(
         None => {
             if store.read_ref("refs/stash")?.is_none() {
                 eprintln!("No stash entries found.");
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
             "refs/stash@{0}".to_string()
         }
@@ -2993,10 +2991,10 @@ fn resolve_stash_argument(
                 .filter(|message| message.contains(" only has "))
             {
                 eprintln!("fatal: {message}");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             eprintln!("error: {revision} is not a valid reference");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
     };
     validate_stash_like_commit(db, format, &oid)?;
@@ -3012,7 +3010,7 @@ fn validate_stash_like_commit(
         Ok(object) => object,
         Err(GitError::NotFound(_)) => {
             eprintln!("fatal: '{oid}' is not a stash-like commit");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         Err(err) => return Err(err),
     };
@@ -3022,21 +3020,21 @@ fn validate_stash_like_commit(
             object.object_type.as_str()
         );
         eprintln!("fatal: '{oid}' is not a stash-like commit");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let commit = Commit::parse(format, &object.body)?;
     if commit.parents.len() < 2 {
         eprintln!("fatal: '{oid}' is not a stash-like commit");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     for parent in &commit.parents[..2] {
         let Ok(parent_object) = db.read_object(parent) else {
             eprintln!("fatal: '{oid}' is not a stash-like commit");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         };
         if parent_object.object_type != ObjectType::Commit {
             eprintln!("fatal: '{oid}' is not a stash-like commit");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     Ok(())
@@ -3085,12 +3083,12 @@ fn cmd_stash_show(cli_session: &crate::session::CliSession, args: &[String]) -> 
                     "error: invalid --stat value: {}",
                     value.trim_start_matches("--stat=")
                 );
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             "--no-stat" | "--no-raw" | "--no-name-only" | "--no-name-status" | "--no-numstat"
             | "--no-shortstat" | "--no-summary" => {
                 stash_show_usage();
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             value
                 if value.starts_with("--no-stat=")
@@ -3102,7 +3100,7 @@ fn cmd_stash_show(cli_session: &crate::session::CliSession, args: &[String]) -> 
                     || value.starts_with("--no-summary=") =>
             {
                 stash_show_usage();
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             "--raw" => {
                 if !matches!(mode, StashShowMode::NameOnly | StashShowMode::NameStatus) {
@@ -3223,7 +3221,7 @@ fn cmd_stash_show(cli_session: &crate::session::CliSession, args: &[String]) -> 
                     eprintln!(
                         "fatal: options '--name-only', '--name-status', '--check', and '-s' cannot be used together"
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 mode = StashShowMode::NameOnly;
             }
@@ -3235,7 +3233,7 @@ fn cmd_stash_show(cli_session: &crate::session::CliSession, args: &[String]) -> 
                     eprintln!(
                         "fatal: options '--name-only', '--name-status', '--check', and '-s' cannot be used together"
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 mode = StashShowMode::NameStatus;
             }
@@ -3394,16 +3392,16 @@ fn cmd_stash_show(cli_session: &crate::session::CliSession, args: &[String]) -> 
             }
             "--no-only-untracked" => {
                 stash_show_usage();
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             value if value.starts_with("--no-only-untracked=") => {
                 stash_show_usage();
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             "--diff-filter" => {
                 if idx + 1 == args.len() {
                     eprintln!("error: option `diff-filter' requires a value");
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 }
             }
             value if value.starts_with("--abbrev=") => {
@@ -3424,7 +3422,7 @@ fn cmd_stash_show(cli_session: &crate::session::CliSession, args: &[String]) -> 
             value if value.starts_with('-') => {
                 eprintln!("error: unknown option `{}`", value.trim_start_matches('-'));
                 stash_show_usage();
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             value => specs.push(value.to_string()),
         }
@@ -3435,7 +3433,7 @@ fn cmd_stash_show(cli_session: &crate::session::CliSession, args: &[String]) -> 
             "Too many revisions specified: '{}' '{}'",
             specs[0], specs[1]
         );
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     if matches!(mode, StashShowMode::Stat)
         && diff_filter_seen
@@ -3525,7 +3523,7 @@ fn cmd_stash_show(cli_session: &crate::session::CliSession, args: &[String]) -> 
                     String::from_utf8_lossy(path)
                 );
                 eprintln!("fatal: failed to unpack trees");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
         entries.extend(sley_diff_merge::diff_name_status_empty_tree_with_options(
@@ -3569,7 +3567,7 @@ fn cmd_stash_show(cli_session: &crate::session::CliSession, args: &[String]) -> 
     let has_entries = !entries.is_empty();
     if quiet {
         if has_entries {
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         return Ok(());
     }
@@ -3706,7 +3704,7 @@ fn cmd_stash_show(cli_session: &crate::session::CliSession, args: &[String]) -> 
         StashShowMode::NoPatch => {}
     }
     if exit_code && has_entries {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -3838,7 +3836,7 @@ fn cmd_stash_list(cli_session: &crate::session::CliSession, args: &[String]) -> 
 
 fn stash_list_option_takes_no_value_error(option: &str) -> Result<()> {
     eprintln!("error: option `{option}' takes no value");
-    Err(GitError::Exit(1))
+    Err(crate::cli_exit(1))
 }
 
 fn stash_list_note_ref(value: &str) -> String {
@@ -3887,7 +3885,7 @@ fn stash_list_diff_option_with_value(value: &str) -> Option<&'static str> {
 
 fn stash_list_fatal_unrecognized_argument(value: &str) -> Result<()> {
     eprintln!("fatal: unrecognized argument: {value}");
-    Err(GitError::Exit(1))
+    Err(crate::cli_exit(1))
 }
 
 fn stash_list_no_walk_invalid_argument(value: &str) -> Result<()> {
@@ -3898,76 +3896,76 @@ fn stash_list_no_walk_invalid_argument(value: &str) -> Result<()> {
 fn stash_list_validate_non_negative_integer(value: &str) -> Result<()> {
     value.parse::<usize>().map(|_| ()).map_err(|_| {
         eprintln!("fatal: '{value}': not a non-negative integer");
-        GitError::Exit(1)
+        crate::cli_exit(1)
     })
 }
 
 fn stash_list_validate_color(value: &str) -> Result<()> {
     log_validate_color(value).map_err(|err| match err {
-        GitError::Exit(129) => GitError::Exit(1),
+        error if crate::cli_reported_status(&error) == Some(129) => crate::cli_exit(1),
         err => err,
     })
 }
 
 fn stash_list_validate_color_moved(value: &str) -> Result<()> {
     log_validate_color_moved(value).map_err(|err| match err {
-        GitError::Exit(129) => GitError::Exit(1),
+        error if crate::cli_reported_status(&error) == Some(129) => crate::cli_exit(1),
         err => err,
     })
 }
 
 fn stash_list_validate_color_moved_ws(value: &str) -> Result<()> {
     log_validate_color_moved_ws(value).map_err(|err| match err {
-        GitError::Exit(129) => GitError::Exit(1),
+        error if crate::cli_reported_status(&error) == Some(129) => crate::cli_exit(1),
         err => err,
     })
 }
 
 fn stash_list_validate_diff_merges(value: &str) -> Result<()> {
     log_validate_diff_merges(value).map_err(|err| match err {
-        GitError::Exit(128) => GitError::Exit(1),
+        error if crate::cli_reported_status(&error) == Some(128) => crate::cli_exit(1),
         err => err,
     })
 }
 
 fn stash_list_validate_output_indicator(option: &str, value: &str) -> Result<()> {
     log_validate_output_indicator(option, value).map_err(|err| match err {
-        GitError::Exit(129) => GitError::Exit(1),
+        error if crate::cli_reported_status(&error) == Some(129) => crate::cli_exit(1),
         err => err,
     })
 }
 
 fn stash_list_validate_ws_error_highlight(value: &str) -> Result<()> {
     log_validate_ws_error_highlight(value).map_err(|err| match err {
-        GitError::Exit(129) => GitError::Exit(1),
+        error if crate::cli_reported_status(&error) == Some(129) => crate::cli_exit(1),
         err => err,
     })
 }
 
 fn stash_list_validate_submodule_format(value: &str) -> Result<()> {
     log_validate_submodule_format(value).map_err(|err| match err {
-        GitError::Exit(129) => GitError::Exit(1),
+        error if crate::cli_reported_status(&error) == Some(129) => crate::cli_exit(1),
         err => err,
     })
 }
 
 fn stash_list_validate_ignore_submodules(value: &str) -> Result<()> {
     log_validate_ignore_submodules(value).map_err(|err| match err {
-        GitError::Exit(128) => GitError::Exit(1),
+        error if crate::cli_reported_status(&error) == Some(128) => crate::cli_exit(1),
         err => err,
     })
 }
 
 fn stash_list_validate_similarity_option(value: &str, option: &str) -> Result<()> {
     log_validate_similarity_option(value, option).map_err(|err| match err {
-        GitError::Exit(129) => GitError::Exit(1),
+        error if crate::cli_reported_status(&error) == Some(129) => crate::cli_exit(1),
         err => err,
     })
 }
 
 fn stash_list_validate_break_rewrites_option(value: &str) -> Result<()> {
     log_validate_break_rewrites_option(value).map_err(|err| match err {
-        GitError::Exit(129) => GitError::Exit(1),
+        error if crate::cli_reported_status(&error) == Some(129) => crate::cli_exit(1),
         err => err,
     })
 }
@@ -3982,7 +3980,7 @@ fn parse_stash_list_abbrev(value: &str) -> Option<usize> {
 
 fn parse_stash_list_age(value: &str) -> Result<i64> {
     log_parse_age(value).map_err(|err| match err {
-        GitError::Exit(128) => GitError::Exit(1),
+        error if crate::cli_reported_status(&error) == Some(128) => crate::cli_exit(1),
         err => err,
     })
 }
@@ -3994,14 +3992,14 @@ fn parse_stash_list_min_age(value: &str) -> Result<i64> {
 
 fn stash_list_date_mode(value: &str) -> Result<DateMode> {
     log_date_mode(value).map_err(|err| match err {
-        GitError::Exit(128) => GitError::Exit(1),
+        error if crate::cli_reported_status(&error) == Some(128) => crate::cli_exit(1),
         err => err,
     })
 }
 
 fn parse_stash_list_date_cutoff(value: &str) -> Result<i64> {
     log_parse_date_cutoff(value).map_err(|err| match err {
-        GitError::Exit(128) => GitError::Exit(1),
+        error if crate::cli_reported_status(&error) == Some(128) => crate::cli_exit(1),
         err => err,
     })
 }
@@ -4016,7 +4014,7 @@ fn parse_stash_list_filter_patterns(
         sley_grep::RegexDiagnosticVerbosity::platform_default(),
     )
     .map_err(|err| match err {
-        GitError::Exit(128) => GitError::Exit(1),
+        error if crate::cli_reported_status(&error) == Some(128) => crate::cli_exit(1),
         err => err,
     })
 }
@@ -4260,7 +4258,7 @@ fn cmd_stash_export(cli_session: &crate::session::CliSession, args: &[String]) -
                 index += 1;
                 let Some(value) = args.get(index) else {
                     eprintln!("error: option `to-ref' requires a value");
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 };
                 to_ref = Some(value.clone());
             }
@@ -4270,7 +4268,7 @@ fn cmd_stash_export(cli_session: &crate::session::CliSession, args: &[String]) -
             value if value.starts_with('-') => {
                 eprintln!("error: unknown option `{}`", value.trim_start_matches('-'));
                 eprintln!("usage: git stash export (--print | --to-ref <ref>) [<stash>...]");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             value => specs.push(value.to_string()),
         }
@@ -4278,7 +4276,7 @@ fn cmd_stash_export(cli_session: &crate::session::CliSession, args: &[String]) -
     }
     if print == to_ref.is_some() {
         eprintln!("error: exactly one of --print and --to-ref is required");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
 
     let git_dir = cli_session.git_dir()?;
@@ -4303,7 +4301,7 @@ fn cmd_stash_export(cli_session: &crate::session::CliSession, args: &[String]) -
                 Ok(oid) => oid,
                 Err(_) => {
                     eprintln!("error: unable to find stash entry {spec}");
-                    return Err(GitError::Exit(1));
+                    return Err(crate::cli_exit(1));
                 }
             };
             stash_oids.push(oid);
@@ -4391,7 +4389,7 @@ fn write_stash_export_chain(
 fn cmd_stash_import(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     if args.len() != 1 || args.first().is_some_and(|arg| arg.starts_with('-')) {
         eprintln!("usage: git stash import <commit>");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
@@ -4406,7 +4404,7 @@ fn cmd_stash_import(cli_session: &crate::session::CliSession, args: &[String]) -
         Ok(oid) => oid,
         Err(_) => {
             eprintln!("error: not a valid revision: {}", args[0]);
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
     };
     let stashes = read_stash_export_chain(&db, format, &chain)?;
@@ -4431,25 +4429,25 @@ fn read_stash_export_chain(
         let object = db.read_object(&current)?;
         if object.object_type != ObjectType::Commit {
             eprintln!("error: not a commit: {current}");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         let commit = Commit::parse(format, &object.body)?;
         if commit.tree != empty_tree || (commit.parents.len() != 2 && !commit.parents.is_empty()) {
             eprintln!("error: {current} is not a valid exported stash commit");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         if commit.parents.is_empty() {
             if commit.author != stash_export_identity()
                 || commit.committer != stash_export_identity()
             {
                 eprintln!("error: found root commit {current} with invalid data");
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
             break;
         }
         if !commit.message.starts_with(b"git stash: ") {
             eprintln!("error: found stash commit {current} without expected prefix");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         let stash_oid = commit.parents[1];
         validate_stash_like_commit(db, format, &stash_oid)?;

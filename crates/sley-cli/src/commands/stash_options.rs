@@ -20,7 +20,7 @@ pub(super) fn setup_stash_apply_options(
             "--no-quiet" => quiet = false,
             "-h" | "--help" => {
                 super::stash_push_usage_stdout();
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             value if value.starts_with("-q") && value.len() > 2 => {
                 super::stash_apply_parse_combined_quiet(value, command)?;
@@ -32,7 +32,7 @@ pub(super) fn setup_stash_apply_options(
                 if index + 1 >= args.len() {
                     eprintln!("error: option `{}` requires a value", &arg[2..]);
                     super::stash_apply_usage(command);
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 }
                 index += 1;
                 match arg.as_str() {
@@ -97,7 +97,7 @@ pub(super) fn setup_stash_apply_options(
             "Too many revisions specified: '{}' '{}'",
             specs[0], specs[1]
         );
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     let display = specs
         .first()
@@ -167,7 +167,7 @@ pub(super) fn setup_stash_list_options(args: &[String]) -> Result<StashListOptio
                 eprintln!(
                     "fatal: options '--reverse' and '--walk-reflogs' cannot be used together"
                 );
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
             "-q"
             | "--quiet"
@@ -274,11 +274,11 @@ pub(super) fn setup_stash_list_options(args: &[String]) -> Result<StashListOptio
             | "--simplify-by-decoration"
             | "--simplify-merges" => {
                 eprintln!("fatal: cannot combine --walk-reflogs with history-limiting options");
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
             value if value.starts_with("--no-decorate=") => {
                 eprintln!("error: option `no-decorate' takes no value");
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
             value if let Some(value) = value.strip_prefix("--expand-tabs=") => {
                 super::stash_list_validate_non_negative_integer(value)?;
@@ -375,7 +375,7 @@ pub(super) fn setup_stash_list_options(args: &[String]) -> Result<StashListOptio
             }
             value if let Some(value) = value.strip_prefix("--ancestry-path=") => {
                 eprintln!("error: could not get commit for --ancestry-path argument {value}");
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
             "--decorate" => {}
             value if let Some(value) = value.strip_prefix("--decorate=") => {
@@ -396,7 +396,7 @@ pub(super) fn setup_stash_list_options(args: &[String]) -> Result<StashListOptio
                     // Decorations are not shown in the covered stash-list formats.
                 } else {
                     eprintln!("fatal: invalid --decorate option: {value}");
-                    return Err(GitError::Exit(1));
+                    return Err(crate::cli_exit(1));
                 }
             }
             "--decorate-refs" | "--decorate-refs-exclude" => {

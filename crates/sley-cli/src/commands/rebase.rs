@@ -99,7 +99,7 @@ struct RebaseArgs {
 
 fn rebase_usage_error() -> GitError {
     print_rebase_usage();
-    GitError::Exit(129)
+    crate::cli_exit(129)
 }
 
 fn option_requires_value(name: &str) -> GitError {
@@ -222,7 +222,7 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
                         eprintln!(
                             "fatal: unrecognized empty type '{other}'; valid values are \"drop\", \"keep\", and \"stop\"."
                         );
-                        return Err(GitError::Exit(128));
+                        return Err(crate::cli_exit(128));
                     }
                 };
             }
@@ -314,11 +314,11 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
                 let value = &arg[2..];
                 if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
                     eprintln!("fatal: switch `C' expects a numerical value");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 let Ok(context) = value.parse() else {
                     eprintln!("fatal: switch `C' expects a numerical value");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 };
                 out.context_lines = Some(context);
             }
@@ -329,7 +329,7 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
                     "warn" | "nowarn" | "error" | "error-all" | "fix" | "strip"
                 ) {
                     eprintln!("fatal: Invalid whitespace option: '{value}'");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 out.whitespace = Some(value.to_string());
             }
@@ -348,7 +348,7 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
                     }
                     other => {
                         eprintln!("fatal: Unknown mode: {other}");
-                        return Err(GitError::Exit(128));
+                        return Err(crate::cli_exit(128));
                     }
                 };
             }
@@ -372,11 +372,11 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
             .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | 0x0c | 0x0b))
         {
             eprintln!("error: empty exec command");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         if command.contains('\n') {
             eprintln!("error: exec commands cannot contain newlines");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
     }
     Ok(out)
@@ -820,7 +820,7 @@ pub(crate) fn cmd_rebase(cli_session: &crate::session::CliSession, args: &[Strin
     });
     if history_plan == seq::HistoryEditPlan::MissingState {
         eprintln!("fatal: no rebase in progress");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let (rctx, hosts) = (
         drive_context(&ctx),
@@ -916,17 +916,17 @@ pub(crate) fn cmd_rebase(cli_session: &crate::session::CliSession, args: &[Strin
                     return Ok(());
                 }
                 eprintln!("fatal: there is no current patch");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             RebaseAction::EditTodo => {
                 eprintln!(
                     "error: The --edit-todo action can only be used during interactive rebase."
                 );
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
             RebaseAction::None => {
                 eprintln!("fatal: It looks like 'git am' is in progress. Cannot rebase.");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
     }
@@ -953,7 +953,7 @@ pub(crate) fn cmd_rebase(cli_session: &crate::session::CliSession, args: &[Strin
                 return Ok(());
             }
             eprintln!("fatal: there is no current patch");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         RebaseAction::None => {}
     }
@@ -963,7 +963,7 @@ pub(crate) fn cmd_rebase(cli_session: &crate::session::CliSession, args: &[Strin
             "fatal: It seems that there is already a rebase-merge directory, and\nI wonder if you are in the middle of another rebase.  If that is the\ncase, please try\n\tgit rebase (--continue | --abort | --skip)\nIf that is not the case, please\n\trm -fr \"{}\"\nand run me again.  I am stopping in case you still have something\nvaluable there.",
             seq::merge_dir(&ctx.git_dir).display()
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     start_rebase(
@@ -1032,24 +1032,24 @@ fn start_rebase(
             eprintln!(
                 "fatal: apply options are incompatible with rebase.rebaseMerges; use --no-rebase-merges"
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if args.update_refs.is_none() && config_update_refs {
             eprintln!(
                 "fatal: apply options are incompatible with rebase.updateRefs; use --no-update-refs"
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         eprintln!("fatal: apply options and merge options cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if args.keep_base && args.onto_name.is_some() {
         eprintln!("fatal: options '--keep-base' and '--onto' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if args.keep_base && args.root {
         eprintln!("fatal: options '--keep-base' and '--root' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let reapply_cherry_picks = args.reapply_cherry_picks.unwrap_or(args.keep_base);
 
@@ -1067,7 +1067,7 @@ fn start_rebase(
                 Some(name) => name,
                 None => {
                     print_missing_upstream_advice(ctx, refs);
-                    return Err(GitError::Exit(1));
+                    return Err(crate::cli_exit(1));
                 }
             },
         }
@@ -1086,7 +1086,7 @@ fn start_rebase(
             Ok(oid) => Some(oid),
             Err(_) => {
                 eprintln!("fatal: invalid upstream '{upstream_name}'");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
     };
@@ -1106,7 +1106,7 @@ fn start_rebase(
                 (branch.clone(), None, oid, Some(branch.clone()))
             } else {
                 eprintln!("fatal: no such branch/commit '{branch}'");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
         None => {
@@ -1121,7 +1121,7 @@ fn start_rebase(
                         Some(RefTarget::Direct(oid)) => oid,
                         _ => {
                             eprintln!("fatal: Could not resolve HEAD to a commit");
-                            return Err(GitError::Exit(128));
+                            return Err(crate::cli_exit(128));
                         }
                     };
                     (branch, Some(name), oid, None)
@@ -1129,7 +1129,7 @@ fn start_rebase(
                 Some(RefTarget::Direct(oid)) => ("HEAD".to_string(), None, oid, None),
                 None => {
                     eprintln!("fatal: No such ref: HEAD");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
             }
         }
@@ -1151,7 +1151,7 @@ fn start_rebase(
             "fatal: '{branch_name}' is already used by worktree at '{}'",
             other.display()
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let fork_point = match args.fork_point {
@@ -1247,7 +1247,7 @@ fn start_rebase(
                         } else {
                             eprintln!("fatal: '{onto_name}': need exactly one merge base");
                         }
-                        return Err(GitError::Exit(128));
+                        return Err(crate::cli_exit(128));
                     }
                 }
             }
@@ -1257,7 +1257,7 @@ fn start_rebase(
                 } else {
                     eprintln!("fatal: '{onto_name}': need exactly one merge base");
                 }
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
     } else {
@@ -1267,7 +1267,7 @@ fn start_rebase(
             Ok(oid) => oid,
             Err(_) => {
                 eprintln!("fatal: Does not point to a valid commit '{onto_name}'");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
     };
@@ -1555,7 +1555,7 @@ fn start_rebase(
         rdrive::apply_autostash(&rctx, &hosts);
         seq::remove_merge_state(&ctx.git_dir);
         eprintln!("error: nothing to do");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
 
     rdrive::complete_action(
@@ -1782,7 +1782,7 @@ fn checkout_onto_for_apply(
         eprintln!("Please move or remove them before you switch branches.");
         eprintln!("Aborting");
         eprintln!("error: could not detach HEAD");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     rdrive::reset_index_and_worktree_to_commit_for_rebase(original_cwd, rctx, hosts, base)?;
     let committer = committer_identity_for_reflog(&ctx.config)?;
@@ -1872,7 +1872,7 @@ fn require_clean_work_tree(ctx: &Ctx, action: &str, with_hint: bool) -> Result<(
     if with_hint {
         eprintln!("error: Please commit or stash them.");
     }
-    Err(GitError::Exit(1))
+    Err(crate::cli_exit(1))
 }
 
 fn rebase_status_is_submodule(entry: &sley_worktree::ShortStatusEntry) -> bool {
@@ -1929,7 +1929,7 @@ fn checkout_up_to_date(
         eprintln!("Please move or remove them before you switch branches.");
         eprintln!("Aborting");
         eprintln!("error: could not switch to branch '{branch}'");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     sley_worktree::reset_index_and_worktree_to_commit_with_process_filter_metadata(
         original_cwd,
@@ -3084,7 +3084,7 @@ fn launch_sequence_editor(ctx: &Ctx, path: &Path) -> Result<()> {
         .status()?;
     if !status.success() {
         eprintln!("error: there was a problem with the editor '{editor}'");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }

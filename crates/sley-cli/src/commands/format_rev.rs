@@ -43,11 +43,11 @@ pub(crate) fn cmd_format_rev(
     let options = parse_format_rev_options(args)?;
     let Some(format) = options.format.as_deref() else {
         eprintln!("fatal: '--format' is required");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
     let Some(stdin_mode) = options.stdin_mode else {
         eprintln!("fatal: '--stdin-mode' is required");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
     let repo = RepositoryContext::from_session(cli_session)?;
     let repository = repo.repository();
@@ -130,7 +130,7 @@ fn resolve_format_rev_format(resolved: &ResolvedPretty) -> Result<FormatRevForma
         }),
         _ => {
             eprintln!("fatal: unsupported format for format-rev");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -382,7 +382,7 @@ fn parse_format_rev_options(args: &[String]) -> Result<FormatRevOptions> {
         if arg == "--format" {
             let Some(value) = iter.next() else {
                 eprintln!("error: option `--format` requires a value");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             };
             options.format = Some(value.clone());
             continue;
@@ -394,7 +394,7 @@ fn parse_format_rev_options(args: &[String]) -> Result<FormatRevOptions> {
         if arg == "--stdin-mode" {
             let Some(value) = iter.next() else {
                 eprintln!("error: option `--stdin-mode` requires a value");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             };
             options.stdin_mode = Some(parse_stdin_mode(value)?);
             continue;
@@ -406,26 +406,26 @@ fn parse_format_rev_options(args: &[String]) -> Result<FormatRevOptions> {
         if arg == "--notes" {
             let Some(value) = iter.next() else {
                 eprintln!("error: option `--notes` requires a value");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             };
             options.notes_refs.push(value.clone());
             continue;
         }
         if arg == "-h" || arg == "--help" {
             print_format_rev_usage();
-            return Err(GitError::Exit(129));
+            return Err(crate::cli_exit(129));
         }
         if arg.starts_with('-') {
             eprintln!("error: unknown option `{arg}`");
             print_format_rev_usage();
-            return Err(GitError::Exit(129));
+            return Err(crate::cli_exit(129));
         }
         positional.push(arg.clone());
     }
     if !positional.is_empty() {
         eprintln!("error: too many arguments");
         print_format_rev_usage();
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     Ok(options)
 }
@@ -436,7 +436,7 @@ fn parse_stdin_mode(value: &str) -> Result<StdinMode> {
         "revs" | "rev" => Ok(StdinMode::Revs),
         _ => {
             eprintln!("fatal: '--stdin-mode' needs to be either text, revs, or rev");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }

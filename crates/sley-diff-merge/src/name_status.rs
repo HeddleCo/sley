@@ -830,7 +830,7 @@ fn diff_name_status_index_worktree_changes_for_borrowed_entries(
     std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for chunk in entries.chunks(chunk_size) {
-            handles.push(scope.spawn(move || {
+            handles.push(scope.spawn(sley_core::diagnostics::inherit(move || {
                 diff_name_status_index_worktree_changes_for_borrowed_entry_chunk(
                     worktree_root,
                     format,
@@ -838,7 +838,7 @@ fn diff_name_status_index_worktree_changes_for_borrowed_entries(
                     stat_cache,
                     None,
                 )
-            }));
+            })));
         }
         let mut changes = Vec::new();
         for handle in handles {
@@ -876,7 +876,7 @@ fn diff_name_status_index_worktree_changes_for_entries(
     std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for chunk in entries.chunks(chunk_size) {
-            handles.push(scope.spawn(move || {
+            handles.push(scope.spawn(sley_core::diagnostics::inherit(move || {
                 diff_name_status_index_worktree_changes_for_entry_chunk(
                     worktree_root,
                     format,
@@ -884,7 +884,7 @@ fn diff_name_status_index_worktree_changes_for_entries(
                     stat_cache,
                     None,
                 )
-            }));
+            })));
         }
         let mut changes = Vec::new();
         for handle in handles {

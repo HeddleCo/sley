@@ -284,8 +284,12 @@ pub fn for_each_ref_try_email_atom(
             Ok(options) => options,
             Err(bad_arg) => {
                 let name = atom.strip_prefix('*').unwrap_or(atom);
-                eprintln!("fatal: unrecognized %({name}) argument: {bad_arg}");
-                return Some(Err(GitError::Exit(128)));
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "fatal: unrecognized %({name}) argument: {bad_arg}"
+                );
+                return Some(Err(GitError::Rejected(sley_core::RejectionKind::Refused)));
             }
         },
         None => ForEachRefEmailOptions::default(),
@@ -364,11 +368,13 @@ pub fn for_each_ref_try_date_atom(
     };
     let Some(mode) = DateMode::parse_atom_modifier(arg) else {
         let name = atom.strip_prefix('*').unwrap_or(atom);
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "fatal: unrecognized %({name}) argument: {}",
             arg.unwrap_or("")
         );
-        return Some(Err(GitError::Exit(128)));
+        return Some(Err(GitError::Rejected(sley_core::RejectionKind::Refused)));
     };
     Some((|| -> Result<()> {
         if let Some(identity) = for_each_ref_typed_identity(context, peeled, role)
@@ -401,13 +407,21 @@ pub fn for_each_ref_oid_atom_width(
     } else if let Some(value) = arg.strip_prefix("short=") {
         Ok(Some(parse_for_each_ref_abbrev_width(value).map_err(
             |_| {
-                eprintln!("fatal: positive value expected '{value}' in %({atom})");
-                GitError::Exit(128)
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "fatal: positive value expected '{value}' in %({atom})"
+                );
+                GitError::Rejected(sley_core::RejectionKind::Refused)
             },
         )?))
     } else {
-        eprintln!("fatal: unrecognized %({atom}) argument: {arg}");
-        Err(GitError::Exit(128))
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "fatal: unrecognized %({atom}) argument: {arg}"
+        );
+        Err(GitError::Rejected(sley_core::RejectionKind::Refused))
     }
 }
 
@@ -437,8 +451,12 @@ pub fn for_each_ref_try_name_atom(
         Some("mailmap") => true,
         Some(bad_arg) => {
             let name = atom.strip_prefix('*').unwrap_or(atom);
-            eprintln!("fatal: unrecognized %({name}) argument: {bad_arg}");
-            return Some(Err(GitError::Exit(128)));
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "fatal: unrecognized %({name}) argument: {bad_arg}"
+            );
+            return Some(Err(GitError::Rejected(sley_core::RejectionKind::Refused)));
         }
     };
     Some((|| -> Result<()> {

@@ -581,7 +581,7 @@ fn validate_receive_objects(
     if report.is_ok() {
         Ok(())
     } else {
-        Err(GitError::Exit(1))
+        Err(GitError::Rejected(sley_core::RejectionKind::Incomplete))
     }
 }
 

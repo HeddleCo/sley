@@ -11,7 +11,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use sley_config::GitConfig;
 use sley_config::remotes::{remote_config_values, remote_exists, rewrite_url_with_config};
-use sley_core::{CliExit, GitError, ObjectFormat, ObjectId, Result};
+use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_protocol::{RefAdvertisement, parse_refspec, refspec_map_source};
 use sley_refs::{FileRefStore, RefTarget, RefUpdate};
 
@@ -628,10 +628,9 @@ impl RemoteHelperSession {
 
     fn aborted_error(&mut self) -> GitError {
         let _ = self.child.try_wait();
-        GitError::cli_exit(
-            CliExit::UserError,
-            format!("remote helper '{}' aborted session", self.spec.name),
-        )
+        GitError::RemoteHelperAborted {
+            name: self.spec.name.clone(),
+        }
     }
 }
 
@@ -859,7 +858,7 @@ pub fn push_via_remote_helper(
         }
     }
     if failed {
-        return Err(GitError::Exit(1).into());
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete).into());
     }
     update_helper_push_tracking_refs(
         request.git_dir,
@@ -1524,8 +1523,8 @@ mod tests {
             "remote-helper export requires marks"
         );
         assert!(matches!(
-            RemoteHelperPushError::from(GitError::Exit(7)),
-            RemoteHelperPushError::Engine(GitError::Exit(7))
+            RemoteHelperPushError::from(GitError::ChildProcessFailed { status: Some(7) }),
+            RemoteHelperPushError::Engine(GitError::ChildProcessFailed { status: Some(7) })
         ));
     }
 
@@ -1597,7 +1596,9 @@ mod tests {
         .expect("helper should abort");
         assert_eq!(
             error,
-            GitError::cli_exit(CliExit::UserError, "remote helper 'broken' aborted session")
+            GitError::RemoteHelperAborted {
+                name: "broken".into()
+            }
         );
         let _ = fs::remove_dir_all(root);
     }

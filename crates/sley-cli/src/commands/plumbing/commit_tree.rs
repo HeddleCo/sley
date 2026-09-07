@@ -162,10 +162,10 @@ pub(crate) fn cmd_commit_tree(
 
 fn commit_tree_parent_requires_value_error() -> Result<()> {
     eprintln!("error: switch `p' requires a value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn commit_tree_requires_one_tree_error() -> Result<()> {
     eprintln!("fatal: must give exactly one tree");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }

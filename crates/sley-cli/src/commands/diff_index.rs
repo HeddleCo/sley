@@ -160,7 +160,7 @@ pub(crate) fn cmd_diff_index(
             value if let Some(value) = value.strip_prefix("--ignore-submodules=") => {
                 let Some(mode) = parse_submodule_ignore_mode(value) else {
                     eprintln!("fatal: bad --ignore-submodules argument: {value}");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 };
                 ignore_submodules_cli = Some(mode);
             }
@@ -458,7 +458,7 @@ pub(crate) fn cmd_diff_index(
             code |= 0o1;
         }
         if code != 0 {
-            return Err(GitError::Exit(code));
+            return Err(crate::cli_exit(code));
         }
         return Ok(());
     }
@@ -494,7 +494,7 @@ pub(crate) fn cmd_diff_index(
     }
 
     if (quiet || exit_code) && has_differences {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -772,12 +772,12 @@ fn parse_diff_index_abbrev(value: &str) -> Result<usize> {
 
 fn diff_index_usage_error<T>() -> Result<T> {
     eprint!("{DIFF_INDEX_USAGE}");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn diff_index_help() -> Result<()> {
     print!("{DIFF_INDEX_USAGE}");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 const DEFAULT_ABBREV: usize = 7;

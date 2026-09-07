@@ -144,15 +144,15 @@ fn run_git_replay(cli_session: &crate::session::CliSession, args: &[String]) -> 
     let parsed = parse_git_replay_args(args)?;
     if parsed.onto.is_some() && parsed.advance.is_some() {
         eprintln!("fatal: options '--onto' and '--advance' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if parsed.revert.is_some() && parsed.onto.is_some() {
         eprintln!("fatal: options '--revert' and '--onto' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if parsed.revert.is_some() && parsed.advance.is_some() {
         eprintln!("fatal: options '--revert' and '--advance' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let modes = usize::from(parsed.onto.is_some())
         + usize::from(parsed.advance.is_some())
@@ -160,23 +160,23 @@ fn run_git_replay(cli_session: &crate::session::CliSession, args: &[String]) -> 
     if modes != 1 {
         eprintln!("error: exactly one of --onto, --advance, or --revert is required");
         eprint!("{REPLAY_USAGE}");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     if parsed.advance.is_some() && parsed.contained {
         eprintln!("fatal: options '--advance' and '--contained' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if parsed.revert.is_some() && parsed.contained {
         eprintln!("fatal: options '--revert' and '--contained' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if parsed.ref_name.is_some() && parsed.contained {
         eprintln!("fatal: options '--ref' and '--contained' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if parsed.rev_args.is_empty() {
         eprintln!("error: empty commit set passed");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let cwd = cli_session.cwd().to_path_buf();
@@ -232,7 +232,7 @@ fn parse_git_replay_args(args: &[String]) -> Result<GitReplayArgs> {
             "--" => positional_only = true,
             "-h" | "--help" => {
                 print!("{REPLAY_USAGE}");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             "--contained" => parsed.contained = true,
             "--no-contained" => parsed.contained = false,
@@ -297,7 +297,7 @@ fn parse_replay_ref_action(value: &str) -> Result<ReplayRefAction> {
         "print" => Ok(ReplayRefAction::Print),
         _ => {
             eprintln!("fatal: invalid value for --ref-action: {value}");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -325,11 +325,11 @@ fn build_git_replay_plan(
         eprintln!(
             "fatal: '{option}' cannot be used with multiple revision ranges because the ordering would be ill-defined"
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if parsed.ref_name.is_some() && parsed.rev_args.len() != 1 {
         eprintln!("fatal: --ref cannot be used with multiple revision ranges");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let ref_action = match parsed.ref_action {
         Some(action) => action,
@@ -338,7 +338,7 @@ fn build_git_replay_plan(
             Some("update") | None => ReplayRefAction::Update,
             Some(value) => {
                 eprintln!("fatal: invalid replay.refAction value: {value}");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         },
     };
@@ -348,7 +348,7 @@ fn build_git_replay_plan(
             let base = resolve_revision(&ctx.git_dir, ctx.format, onto, ctx.replace_objects)
                 .map_err(|_| {
                     eprintln!("fatal: '{onto}' is not a valid commit-ish for --onto");
-                    GitError::Exit(128)
+                    crate::cli_exit(128)
                 })?;
             let target = replay_target_from_revision(&refs, &parsed.rev_args)?;
             let old_oid = read_direct_ref(&refs, ctx.format, &target)?;
@@ -366,7 +366,7 @@ fn build_git_replay_plan(
             let old_oid = read_direct_ref(&refs, ctx.format, &target)?;
             let Some(base) = old_oid else {
                 eprintln!("fatal: argument to --advance must be a reference");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             };
             (
                 ReplayAction::Pick,
@@ -382,7 +382,7 @@ fn build_git_replay_plan(
             let old_oid = read_direct_ref(&refs, ctx.format, &target)?;
             let Some(base) = old_oid else {
                 eprintln!("fatal: argument to --revert must be a reference");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             };
             (
                 ReplayAction::Revert,
@@ -427,7 +427,7 @@ fn replay_existing_ref(store: &FileRefStore, name: &str, option: &str) -> Result
         }
     }
     eprintln!("fatal: argument to {option} must be a reference");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn replay_target_from_revision(store: &FileRefStore, rev_args: &[String]) -> Result<String> {
@@ -443,13 +443,13 @@ fn replay_target_from_revision(store: &FileRefStore, rev_args: &[String]) -> Res
         }
     }
     eprintln!("fatal: could not determine ref to update");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn validate_replay_ref(name: &str) -> Result<String> {
     if !(name == "HEAD" || name.starts_with("refs/")) || validate_ref_name(name).is_err() {
         eprintln!("fatal: '{name}' is not a valid refname");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(name.to_string())
 }
@@ -533,7 +533,7 @@ fn replay_one_commit_to(
     let commit = Commit::parse(ctx.format, &object.body)?;
     if commit.parents.len() > 1 {
         eprintln!("fatal: replaying merge commits is not supported yet!");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let parent = commit.parents.first().copied();
     let (base_map, theirs_map) = match action {
@@ -573,10 +573,10 @@ fn replay_one_commit_to(
         )
         .map_err(|err| {
             eprintln!("error: {err}");
-            GitError::Exit(128)
+            crate::cli_exit(128)
         })?;
     if !conflicts.is_empty() {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     let tree_map = sley_sequencer::pick::merge_results_to_tree_map(&results);
     let new_tree = write_tree_map_object(&db, ctx.format, &tree_map)?;
@@ -624,11 +624,11 @@ fn tree_map_of_commit_or_halt(
 ) -> Result<MergeTreeMap> {
     let tree = commit_tree_oid(db, ctx.format, oid).map_err(|err| {
         eprintln!("error: {err}");
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })?;
     sley_diff_merge::flatten_tree(db, ctx.format, &tree).map_err(|err| {
         eprintln!("error: {err}");
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })
 }
 
@@ -763,12 +763,12 @@ struct ParsedReplay {
 
 fn usage_error(action: ReplayAction) -> GitError {
     eprint!("{}", usage_text(action));
-    GitError::Exit(129)
+    crate::cli_exit(129)
 }
 
 fn option_error(message: &str) -> GitError {
     eprintln!("error: {message}");
-    GitError::Exit(129)
+    crate::cli_exit(129)
 }
 
 /// `die()`-style failure: the porcelain prints `fatal: <action> failed` after
@@ -787,7 +787,7 @@ fn parse_replay_args(action: ReplayAction, args: &[String]) -> Result<ParsedRepl
                 mode.option(),
                 prev.option()
             );
-            return Err(GitError::Exit(129));
+            return Err(crate::cli_exit(129));
         }
         *current = Some(mode);
         Ok(())
@@ -999,7 +999,7 @@ fn run_replay(
         for (name, set) in incompatible {
             if *set {
                 eprintln!("fatal: {me}: {name} cannot be used with {}", cmd.option());
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
         return match cmd {
@@ -1065,7 +1065,7 @@ fn run_replay(
         ] {
             if set {
                 eprintln!("fatal: {me}: --ff cannot be used with {name}");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
     }

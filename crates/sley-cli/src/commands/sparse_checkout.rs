@@ -79,7 +79,7 @@ pub(crate) fn cmd_sparse_checkout(
         eprintln!("error: need a subcommand");
         eprintln!("{SPARSE_USAGE}");
         eprintln!();
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     };
     match sub.as_str() {
         "init" => cmd_sparse_init(cli_session, &args[1..]),
@@ -94,7 +94,7 @@ pub(crate) fn cmd_sparse_checkout(
             eprintln!("error: unknown subcommand: `{other}'");
             eprintln!("{SPARSE_USAGE}");
             eprintln!();
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
     }
 }
@@ -162,7 +162,7 @@ fn cmd_sparse_list(cli_session: &crate::session::CliSession, args: &[String]) ->
     // unknown option on a non-sparse worktree still reports "not sparse".
     if !sparse_checkout_enabled(&ctx)? {
         eprintln!("fatal: this worktree is not sparse");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     // `list` has no options; reject flags but ignore stray positionals (upstream
     // does the same).
@@ -242,7 +242,7 @@ fn cmd_sparse_add(cli_session: &crate::session::CliSession, args: &[String]) -> 
     // Upstream checks for an existing sparse-checkout before option parsing.
     if !sparse_checkout_enabled(&ctx)? {
         eprintln!("fatal: no sparse-checkout to add to");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     // `add` does not accept the cone toggles (they are not in its option set).
     let parsed = parse_set_like(args, ADD_HELP, false)?;
@@ -260,7 +260,7 @@ fn cmd_sparse_add(cli_session: &crate::session::CliSession, args: &[String]) -> 
     let content = if cone_mode {
         if !cone_patterns_are_valid(&existing, true) {
             eprintln!("fatal: existing sparse-checkout patterns do not use cone mode");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         // Recover the directory set from the existing cone file and union it with
         // the new directories, then regenerate.
@@ -293,7 +293,7 @@ fn cmd_sparse_reapply(cli_session: &crate::session::CliSession, args: &[String])
     // Upstream requires an active sparse-checkout before it parses options.
     if !sparse_checkout_enabled(&ctx)? {
         eprintln!("fatal: must be in a sparse-checkout to reapply sparsity patterns");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let mut cone = ConeFlag::Unset;
     let mut sparse_index = SparseIndexFlag::Unset;
@@ -489,7 +489,7 @@ fn cmd_sparse_check_rules(cli_session: &crate::session::CliSession, args: &[Stri
                     "fatal: unable to unquote C-style string '{}'",
                     String::from_utf8_lossy(line)
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             buf
         } else {
@@ -520,11 +520,11 @@ fn cmd_sparse_clean(cli_session: &crate::session::CliSession, args: &[String]) -
     let ctx = sparse_context(cli_session)?;
     if !sparse_checkout_enabled(&ctx)? {
         eprintln!("fatal: must be in a sparse-checkout to clean directories");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if !sparse_cone_enabled(&ctx)? {
         eprintln!("fatal: must be in a cone-mode sparse-checkout to clean directories");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let mut dry_run = false;
@@ -543,7 +543,7 @@ fn cmd_sparse_clean(cli_session: &crate::session::CliSession, args: &[String]) -
     let require_force = clean_require_force(&ctx)?;
     if require_force && !force && !dry_run {
         eprintln!("fatal: for safety, refusing to clean without one of --force or --dry-run");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let index_path = sley_worktree::repository_index_path(&ctx.git_dir);
@@ -557,7 +557,7 @@ fn cmd_sparse_clean(cli_session: &crate::session::CliSession, args: &[String]) -
             eprintln!(
                 "fatal: failed to convert index to a sparse index; resolve merge conflicts and try again"
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
 
@@ -838,7 +838,7 @@ fn sanitize_set_paths(
 
     if !cone_mode && !prefix.is_empty() {
         eprintln!("fatal: please run from the toplevel directory in non-cone mode");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     // Reject (cone) or warn (non-cone) when an argument names a *tracked file*
@@ -851,7 +851,7 @@ fn sanitize_set_paths(
                     "fatal: '{}' is not a directory; to treat it as a directory anyway, rerun with --skip-checks",
                     String::from_utf8_lossy(arg)
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             eprintln!(
                 "warning: pass a leading slash before paths such as '{}' if you want a single file (see NON-CONE PROBLEMS in the git-sparse-checkout manual).",
@@ -909,13 +909,13 @@ fn prefix_path(prefix: &[u8], arg: &[u8]) -> Vec<u8> {
 fn validate_cone_dir(arg: &[u8], skip_checks: bool) -> Result<Vec<u8>> {
     if !skip_checks && arg.starts_with(b"/") {
         eprintln!("fatal: specify directories rather than patterns (no leading slash)");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if !skip_checks && arg.starts_with(b"!") {
         eprintln!(
             "fatal: specify directories rather than patterns.  If your directory starts with a '!', pass --skip-checks"
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if !skip_checks
         && arg
@@ -925,7 +925,7 @@ fn validate_cone_dir(arg: &[u8], skip_checks: bool) -> Result<Vec<u8>> {
         eprintln!(
             "fatal: specify directories rather than patterns.  If your directory really has any of '*?[]\\' in it, pass --skip-checks"
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(normalize_cone_dir(arg))
 }
@@ -1444,7 +1444,7 @@ fn write_sparse_file(ctx: &SparseContext, content: &[u8]) -> Result<()> {
         eprintln!(
             "Another git process seems to be running in this repository, or the lock file may be stale"
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     fs::write(sparse_file_path(&ctx.git_dir), content)?;
     Ok(())
@@ -1734,5 +1734,5 @@ fn unknown_option<T>(option: &str, help: &str) -> Result<T> {
     eprintln!("error: unknown option `{}'", option.trim_start_matches('-'));
     eprint!("{help}");
     eprintln!();
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }

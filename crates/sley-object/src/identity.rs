@@ -151,8 +151,8 @@ fn injected_config_value(key: &str) -> Option<String> {
                 None => "true".to_string(),
             }),
         Err(err) => {
-            eprintln!("error: {}", err.message());
-            eprintln!("fatal: unable to parse command-line config");
+            sley_core::diagnostic!(Stderr, true, "error: {}", err.message());
+            sley_core::diagnostic!(Stderr, true, "fatal: unable to parse command-line config");
             None
         }
     }
@@ -205,25 +205,33 @@ pub fn identity_use_config_only(config: &mut IdentityConfig<'_>) -> bool {
 }
 
 pub fn identity_use_config_only_error<T>() -> Result<T> {
-    eprintln!("fatal: no email was given and auto-detection is disabled");
-    Err(GitError::Exit(128))
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "fatal: no email was given and auto-detection is disabled"
+    );
+    Err(GitError::Rejected(sley_core::RejectionKind::Refused))
 }
 
 pub fn validate_commit_identity_name(role: &str, name: &[u8], email: &[u8]) -> Result<()> {
     if name.is_empty() {
         print_identity_unknown_hint(role);
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "fatal: empty ident name (for <{}>) not allowed",
             String::from_utf8_lossy(email)
         );
-        return Err(GitError::Exit(128));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     if !name.iter().any(|byte| !commit_identity_name_crud(*byte)) {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "fatal: name consists only of disallowed characters: {}",
             String::from_utf8_lossy(name)
         );
-        return Err(GitError::Exit(128));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     Ok(())
 }
@@ -237,8 +245,8 @@ pub fn commit_identity_name_crud(byte: u8) -> bool {
 
 pub fn print_identity_unknown_hint(role: &str) {
     match role {
-        "AUTHOR" => eprintln!("Author identity unknown"),
-        "COMMITTER" => eprintln!("Committer identity unknown"),
+        "AUTHOR" => sley_core::diagnostic!(Stderr, true, "Author identity unknown"),
+        "COMMITTER" => sley_core::diagnostic!(Stderr, true, "Committer identity unknown"),
         _ => {}
     }
 }

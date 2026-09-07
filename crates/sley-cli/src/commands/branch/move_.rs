@@ -50,7 +50,7 @@ pub(super) fn run_branch_move_options(
         {
             if !options.force && store.read_ref(&new_ref)?.is_some() {
                 eprintln!("fatal: a branch named '{new_branch}' already exists");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             if old_is_head {
                 let mut tx = store.transaction();
@@ -71,7 +71,7 @@ pub(super) fn run_branch_move_options(
         } else {
             eprintln!("fatal: no branch named '{old_branch}'");
         }
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     // A dangling symref destination does not "exist" for the purposes of the
     // rename collision check (git's validate_branchname uses RESOLVE_REF_READING),
@@ -94,11 +94,11 @@ pub(super) fn run_branch_move_options(
             "fatal: branch {old_ref} is being {operation} at {}",
             worktree.path.display()
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if !options.force && sley_refs::resolve_ref_peeled(store, &new_ref)?.is_some() {
         eprintln!("fatal: a branch named '{new_branch}' already exists");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if options.force
         && old_ref != new_ref
@@ -109,7 +109,7 @@ pub(super) fn run_branch_move_options(
             "fatal: cannot force update the branch '{new_branch}' used by worktree at '{}'",
             worktree_root
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     match options.kind {
@@ -204,7 +204,7 @@ pub(super) fn branch_move_failed(err: GitError, operation: &str) -> Result<()> {
         GitError::Transaction(message) => {
             eprintln!("error: {message}");
             eprintln!("fatal: branch {operation} failed");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
         err => Err(err),
     }
@@ -229,7 +229,7 @@ pub(super) fn update_all_worktree_heads(
     }
     if failed {
         eprintln!("error: could not update one or more linked worktree HEADs");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -299,7 +299,7 @@ pub(super) fn branch_move_branches(
     match branches {
         [] => {
             eprintln!("fatal: branch name required");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
         [new_branch] => {
             let Some(old_branch) = store.current_branch()? else {
@@ -311,7 +311,7 @@ pub(super) fn branch_move_branches(
                         eprintln!("fatal: cannot copy the current branch while not on any");
                     }
                 }
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             };
             Ok((old_branch, new_branch.to_string()))
         }
@@ -325,7 +325,7 @@ pub(super) fn branch_move_branches(
                     eprintln!("fatal: too many branches for a copy operation");
                 }
             }
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }

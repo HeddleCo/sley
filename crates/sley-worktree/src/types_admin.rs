@@ -149,10 +149,12 @@ impl LargeObjectPolicy {
             Some(value) => match sley_config::parse_config_int(value) {
                 Some(value) if value >= 0 => value as u64,
                 _ => {
-                    eprintln!(
+                    sley_core::diagnostic!(
+                        Stderr,
+                        true,
                         "fatal: bad numeric config value '{value}' for 'core.bigfilethreshold': invalid unit"
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
                 }
             },
             None => 512 * 1024 * 1024,
@@ -381,8 +383,13 @@ pub fn submodule_dirt(sub_root: &Path) -> u8 {
 /// `--broken` can tolerate it).
 pub fn submodule_dirt_checked(sub_root: &Path) -> Result<u8> {
     if let Some(target) = sley_diff_merge::gitlink_broken_gitdir(sub_root) {
-        eprintln!("fatal: not a git repository: {}", target.display());
-        return Err(GitError::Exit(128));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "fatal: not a git repository: {}",
+            target.display()
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     Ok(submodule_dirt(sub_root))
 }

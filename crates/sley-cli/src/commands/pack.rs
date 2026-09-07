@@ -102,12 +102,12 @@ pub(crate) fn cmd_index_pack(
                 sley_core::trace2::region("progress", "index-pack");
             }
             if options.strict && pack_has_duplicate_objects(&pack, format)? {
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
             if options.fsck {
                 let exit = fsck_pack_objects(&pack, format, &options.fsck_overrides)?;
                 if exit != 0 {
-                    return Err(GitError::Exit(exit));
+                    return Err(crate::cli_exit(exit));
                 }
             }
             let mut reader = pack.as_slice();
@@ -154,7 +154,7 @@ pub(crate) fn cmd_index_pack(
             "fatal: pack exceeds maximum allowed size ({})",
             humanise_byte_count(limit)
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let indexed = PackFile::index_pack(&pack, format)?;
     // `--strict` / `--fsck-objects`: fsck every object the pack carries and
@@ -166,11 +166,11 @@ pub(crate) fn cmd_index_pack(
         // pack (every link resolvable in-pack) fscks fine outside a repo.
         if repo.is_none() && pack_has_unresolved_link(&pack, format)? {
             eprintln!("fatal: cannot perform queued object checks outside of a repository");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         let exit = fsck_pack_objects(&pack, format, &options.fsck_overrides)?;
         if exit != 0 {
-            return Err(GitError::Exit(exit));
+            return Err(crate::cli_exit(exit));
         }
     }
     let write_reverse_index =
@@ -279,7 +279,7 @@ fn setup_index_pack_options(args: &[String]) -> Result<IndexPackOptions> {
                         .map_err(|_| GitError::Command(format!("bad index version '{spec}'")))?;
                     if version != 1 && version != 2 {
                         eprintln!("fatal: bad index version '{spec}'");
-                        return Err(GitError::Exit(128));
+                        return Err(crate::cli_exit(128));
                     }
                     options.index_version = Some(version);
                 }
@@ -315,7 +315,7 @@ fn setup_index_pack_options(args: &[String]) -> Result<IndexPackOptions> {
         index_pack_add_pack_file(&mut options, positional)?;
     }
     if options.output.is_some() && options.verify {
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if !options.stdin && options.pack_file.is_none() {
         return index_pack_usage();
@@ -684,7 +684,7 @@ fn index_pack_usage<T>() -> Result<T> {
     eprintln!(
         "usage: git index-pack [-v] [-o <index-file>] [--keep | --keep=<msg>] [--[no-]rev-index] [--verify] [--strict[=<msg-id>=<severity>...]] [--fsck-objects[=<msg-id>=<severity>...]] (<pack-file> | --stdin [--fix-thin] [<pack-file>])"
     );
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 #[derive(Debug)]
@@ -801,7 +801,7 @@ fn verify_pack_one(
         Ok(bytes) => bytes,
         Err(err) => {
             eprintln!("fatal: cannot open packfile {}: {err}", pack_path.display());
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
     };
     // `verify_pack_stats` parses + resolves the pack (validating checksum,
@@ -811,7 +811,7 @@ fn verify_pack_one(
         Err(err) => {
             eprintln!("error: {err}");
             eprintln!("fatal: packfile {} cannot be verified", pack_path.display());
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
     };
 
@@ -821,7 +821,7 @@ fn verify_pack_one(
             "fatal: {}: pack checksum mismatch with index",
             pack_path.display()
         );
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
 
     // Every object the index advertises must exist in the pack at the same
@@ -836,7 +836,7 @@ fn verify_pack_one(
             "fatal: {}: object count mismatch between pack and index",
             pack_path.display()
         );
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     for entry in &index.entries {
         match stat_by_offset.get(&entry.offset) {
@@ -848,7 +848,7 @@ fn verify_pack_one(
                     entry.oid,
                     entry.offset
                 );
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
         }
     }
@@ -923,7 +923,7 @@ fn parse_verify_pack_object_format(value: &str) -> Result<ObjectFormat> {
         "sha256" => Ok(ObjectFormat::Sha256),
         _ => {
             eprintln!("fatal: unknown hash algorithm '{value}'");
-            Err(GitError::Exit(1))
+            Err(crate::cli_exit(1))
         }
     }
 }
@@ -936,7 +936,7 @@ fn verify_pack_usage<T>() -> Result<T> {
     eprintln!("    --[no-]object-format <hash>");
     eprintln!("                          specify the hash algorithm to use");
     eprintln!();
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn expand_repack_short_clusters(args: &[String]) -> Vec<String> {
@@ -1332,7 +1332,7 @@ pub(crate) fn cmd_gc(cli_session: &crate::session::CliSession, args: &[String]) 
                     return Ok(());
                 }
                 eprintln!("fatal: gc is already running");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
     };
@@ -1544,7 +1544,7 @@ fn gc_usage<T>() -> Result<T> {
     eprintln!("    --[no-]force          force running gc even if there may be another gc running");
     eprintln!("    --[no-]keep-largest-pack");
     eprintln!("                          repack all other packs except the largest pack");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 pub(crate) fn cmd_maintenance(
@@ -1562,7 +1562,7 @@ pub(crate) fn cmd_maintenance(
         "-h" | "--help" => {
             println!("usage: git maintenance <subcommand> [<options>]");
             println!();
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
         "run" => cmd_maintenance_run(cli_session, &args[1..]),
         "is-needed" => cmd_maintenance_is_needed(cli_session, &args[1..]),
@@ -1581,7 +1581,7 @@ pub(crate) fn cmd_maintenance(
 
 fn maintenance_usage<T>() -> Result<T> {
     eprintln!("usage: git maintenance <subcommand> [<options>]");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn maintenance_run_usage<T>() -> Result<T> {
@@ -1593,7 +1593,7 @@ fn maintenance_run_usage<T>() -> Result<T> {
     eprintln!("                          run tasks based on frequency");
     eprintln!("    --[no-]quiet          do not report progress or other information over stderr");
     eprintln!("    --task <task>         run a specific task");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn cmd_maintenance_run(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
@@ -1619,7 +1619,7 @@ fn cmd_maintenance_run(cli_session: &crate::session::CliSession, args: &[String]
                 index += 1;
                 let Some(value) = args.get(index) else {
                     eprintln!("error: option `schedule' requires a value");
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 };
                 schedule = Some(validate_maintenance_schedule(value)?);
             }
@@ -1630,7 +1630,7 @@ fn cmd_maintenance_run(cli_session: &crate::session::CliSession, args: &[String]
                 index += 1;
                 let Some(task) = args.get(index) else {
                     eprintln!("error: option `task' requires a value");
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 };
                 push_maintenance_task(&mut tasks, task)?;
             }
@@ -1650,11 +1650,11 @@ fn cmd_maintenance_run(cli_session: &crate::session::CliSession, args: &[String]
     // die_for_incompatible_opt2 pair, builtin/gc.c maintenance_run).
     if auto && schedule.is_some() {
         eprintln!("fatal: options '--auto' and '--schedule=' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if !tasks.is_empty() && schedule.is_some() {
         eprintln!("fatal: options '--task=' and '--schedule=' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     trace2_touch();
@@ -1713,11 +1713,11 @@ fn push_maintenance_task(tasks: &mut Vec<String>, task: &str) -> Result<()> {
         .any(|known| known.eq_ignore_ascii_case(task))
     {
         eprintln!("error: '{task}' is not a valid task");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     if tasks.iter().any(|seen| seen.eq_ignore_ascii_case(task)) {
         eprintln!("error: task '{task}' cannot be selected multiple times");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     tasks.push(task.to_string());
     Ok(())
@@ -1771,7 +1771,7 @@ fn cmd_maintenance_is_needed(
     {
         Ok(())
     } else {
-        Err(GitError::Exit(1))
+        Err(crate::cli_exit(1))
     }
 }
 
@@ -1822,12 +1822,12 @@ fn cmd_maintenance_unregister(
     let repo = env::current_dir()?.display().to_string();
     let missing_repo_value = gc_maintenance::report_missing_maintenance_repo(&common_git_dir);
     if missing_repo_value && !force {
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let file = config_file.unwrap_or(gc_maintenance::maintenance_global_config_path()?);
     if !gc_maintenance::config_remove_value(&file, "maintenance", "repo", &repo)? && !force {
         eprintln!("fatal: repository '{repo}' is not registered");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(())
 }
@@ -1888,7 +1888,7 @@ fn maintenance_subcommand_usage<T>(subcommand: &str) -> Result<T> {
         "stop" => eprintln!("usage: git maintenance stop"),
         _ => eprintln!("usage: git maintenance <subcommand> [<options>]"),
     }
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 pub(crate) fn cmd_maintenance_start(
@@ -1961,7 +1961,7 @@ fn parse_scheduler(value: &str) -> Result<MaintenanceScheduler> {
         "schtasks" => Ok(MaintenanceScheduler::Schtasks),
         _ => {
             eprintln!("error: unrecognized --scheduler argument '{value}'");
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
     }
 }
@@ -2002,7 +2002,7 @@ pub(crate) fn cmd_unpack_objects(
     if strict {
         let exit = fsck_pack_objects(&pack_bytes, format, &[])?;
         if exit != 0 {
-            return Err(GitError::Exit(exit));
+            return Err(crate::cli_exit(exit));
         }
     }
     sley_odb::unpack_packfile_objects(&pack_bytes, format, repository.object_database().loose())?;
@@ -2047,10 +2047,10 @@ pub(crate) fn cmd_pack_refs(
             };
             if locked {
                 eprintln!("error: unable to compact stack: data is locked");
-                GitError::Exit(1)
+                crate::cli_exit(1)
             } else if matches!(err, GitError::InvalidFormat(ref message) if message == "entry too large") {
                 eprintln!("error: unable to compact stack: entry too large");
-                GitError::Exit(1)
+                crate::cli_exit(1)
             } else {
                 err
             }
@@ -2085,7 +2085,7 @@ fn reftable_write_options(git_dir: &Path) -> Result<ReftableWriteOptions> {
     {
         if block_size > 16_777_215 {
             eprintln!("fatal: reftable block size cannot exceed 16MB");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         options.block_size = block_size as u32;
     }
@@ -2094,7 +2094,7 @@ fn reftable_write_options(git_dir: &Path) -> Result<ReftableWriteOptions> {
     {
         if restart_interval > 65_535 {
             eprintln!("fatal: reftable block size cannot exceed 65535");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         options.restart_interval = restart_interval as u16;
     }
@@ -2206,7 +2206,7 @@ fn pack_refs_usage<T>() -> Result<T> {
     eprintln!("    --[no-]exclude <pattern>");
     eprintln!("                          references to exclude");
     eprintln!();
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn pack_refs_help<T>() -> Result<T> {
@@ -2222,7 +2222,7 @@ fn pack_refs_help<T>() -> Result<T> {
     println!("    --[no-]exclude <pattern>");
     println!("                          references to exclude");
     println!();
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn pack_refs_should_include(name: &str, options: &PackRefsOptions) -> bool {
@@ -2408,7 +2408,7 @@ fn prune_help<T>() -> Result<T> {
     println!("    --[no-]exclude-promisor-objects");
     println!("                          limit traversal to objects outside promisor packfiles");
     println!();
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 const MULTI_PACK_INDEX_USAGE: &str = "\
@@ -2429,7 +2429,7 @@ pub(crate) fn cmd_multi_pack_index(
         let Some(arg) = iter.next() else {
             // No subcommand ⇒ usage error (exit 129).
             eprint!("{MULTI_PACK_INDEX_USAGE}");
-            return Err(GitError::Exit(129));
+            return Err(crate::cli_exit(129));
         };
         match arg.as_str() {
             "--object-dir" => {
@@ -2451,7 +2451,7 @@ pub(crate) fn cmd_multi_pack_index(
             value if value.starts_with('-') => {
                 eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
                 eprint!("{MULTI_PACK_INDEX_USAGE}");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             other => break other.to_string(),
         }
@@ -2473,7 +2473,7 @@ pub(crate) fn cmd_multi_pack_index(
         other => {
             eprintln!("error: unknown subcommand: `{other}'");
             eprint!("{MULTI_PACK_INDEX_USAGE}");
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
     }
 }
@@ -2593,7 +2593,7 @@ pub(crate) fn cmd_pack_redundant(
                 eprintln!(
                     "usage: git pack-redundant [--verbose] [--alt-odb] (--all | <pack-filename>...)"
                 );
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             other => {
                 filenames.push(other.to_string());
@@ -2616,7 +2616,7 @@ pub(crate) fn cmd_pack_redundant(
                to determine a suitable replacement\n"
         );
         eprintln!("fatal: refusing to run without --i-still-use-this");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let cwd = cli_session.cwd().to_path_buf();
@@ -2654,14 +2654,14 @@ pub(crate) fn cmd_pack_redundant(
         for filename in &filenames {
             if filename.len() < 40 {
                 eprintln!("fatal: Bad pack filename: {filename}");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             let Some(found) = local
                 .iter()
                 .position(|pack| pack.pack_path.to_string_lossy().contains(filename.as_str()))
             else {
                 eprintln!("fatal: Filename {filename} not found in packed_git");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             };
             packs.push(local.remove(found));
         }
@@ -2669,7 +2669,7 @@ pub(crate) fn cmd_pack_redundant(
 
     if !packs.iter().any(|pack| pack.local) {
         eprintln!("fatal: Zero packs found!");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let alt_count = packs.iter().filter(|pack| !pack.local).count();
@@ -2712,7 +2712,7 @@ pub(crate) fn cmd_pack_redundant(
             }
             let Ok(oid) = ObjectId::from_hex(format, token) else {
                 eprintln!("fatal: Bad object ID on stdin: {line}");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             };
             ignore.push(oid);
         }

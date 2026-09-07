@@ -457,7 +457,7 @@ pub(crate) fn cmd_help(cli_session: &crate::session::CliSession, args: &[String]
         match arg.as_str() {
             "-h" | "--help" => {
                 print_help_usage();
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             "-a" | "--all" => {
                 mode = set_mode(mode, HelpMode::All)?;
@@ -781,7 +781,7 @@ const SYMBOLIC_REF_COMPLETION_HELPER: &str =
 
 pub(crate) fn unknown_command(command: &str, code: i32) -> Result<()> {
     eprintln!("git: '{command}' is not a git command. See 'git --help'.");
-    Err(GitError::Exit(code))
+    Err(crate::cli_exit(code))
 }
 
 fn set_mode(current: HelpMode, next: HelpMode) -> Result<HelpMode> {
@@ -820,7 +820,7 @@ fn open_html_doc(cli_session: &crate::session::CliSession, name: &str) -> Result
     } else {
         let path = Path::new(&html_path).join(page);
         if !path.exists() {
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         path.to_string_lossy().into_owned()
     };
@@ -837,7 +837,7 @@ fn open_html_doc(cli_session: &crate::session::CliSession, name: &str) -> Result
     if status.success() {
         Ok(())
     } else {
-        Err(GitError::Exit(status.code().unwrap_or(1)))
+        Err(crate::cli_exit(status.code().unwrap_or(1)))
     }
 }
 
@@ -1291,7 +1291,7 @@ fn print_config_sections_for_completion() {
 
 fn help_usage_error<T>() -> Result<T> {
     print_help_usage();
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn print_help_usage() {

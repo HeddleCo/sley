@@ -237,7 +237,7 @@ pub(crate) fn trace_promisor_remote_contact(remote_name: &str) {
     }
     let line = promisor_remote_contact_trace_line(remote_name);
     if matches!(value.to_ascii_lowercase().as_str(), "1" | "2" | "true") {
-        eprintln!("{line}");
+        sley_core::diagnostic!(Stderr, true, "{line}");
     } else if Path::new(target.as_os_str()).is_absolute()
         && let Ok(mut file) = fs::OpenOptions::new()
             .create(true)

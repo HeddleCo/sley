@@ -45,7 +45,7 @@ pub(crate) fn cmd_verify_tag(cli_session: &session::CliSession, args: &[String])
         VerifyTagInvocation::Help => {
             print!("{VERIFY_TAG_USAGE}");
             io::stdout().flush()?;
-            return Err(GitError::Exit(129));
+            return Err(crate::cli_exit(129));
         }
     };
 
@@ -53,7 +53,7 @@ pub(crate) fn cmd_verify_tag(cli_session: &session::CliSession, args: &[String])
         // `git verify-tag` with no tag operand is a usage error (exit 129),
         // distinct from the verification-failure exit code (1).
         eprint!("{VERIFY_TAG_USAGE}");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
 
     let repo = cli_session.open_repository()?;
@@ -69,7 +69,7 @@ pub(crate) fn cmd_verify_tag(cli_session: &session::CliSession, args: &[String])
         }
     }
     if failed {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -254,7 +254,7 @@ fn verify_one_tag(
 fn write_verify_tag_format(format: &str, body: &[u8]) -> Result<()> {
     if format.contains("%(rest)") {
         eprintln!("fatal: unknown field name: rest");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let format = format.replace("%(tag)", &verify_tag_name(body));
     println!("{format}");
@@ -305,27 +305,27 @@ fn verify_tag_unknown_short_switch(value: &str) -> Option<char> {
 fn verify_tag_unknown_option_error(option: &str) -> Result<VerifyTagInvocation> {
     eprintln!("error: unknown option `{option}'");
     eprint!("{VERIFY_TAG_USAGE}");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn verify_tag_unknown_switch_error(switch: char) -> Result<VerifyTagInvocation> {
     eprintln!("error: unknown switch `{switch}'");
     eprint!("{VERIFY_TAG_USAGE}");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 /// git's parse-options prints only this one line (no usage block) when an option
 /// that takes no value is given one, e.g. `--verbose=1`.
 fn verify_tag_option_takes_no_value_error(option: &str) -> Result<VerifyTagInvocation> {
     eprintln!("error: option `{option}' takes no value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 /// git's parse-options prints only this one line (no usage block) when an option
 /// that requires a value is given none, e.g. a trailing `--format`.
 fn verify_tag_option_requires_value_error(option: &str) -> Result<VerifyTagInvocation> {
     eprintln!("error: option `{option}' requires a value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 /// The exact usage block git prints for `verify-tag` (stdout for `-h`, stderr for
@@ -472,7 +472,7 @@ mod tests {
     fn trailing_format_without_value_is_exit_129() {
         let args = vec!["--format".to_string()];
         match parse_verify_tag_args(&args) {
-            Err(GitError::Exit(129)) => {}
+            Err(error) if crate::cli_reported_status(&error) == Some(129) => {}
             other => panic!("expected exit 129, got {other:?}"),
         }
     }
@@ -502,7 +502,7 @@ mod tests {
     fn unknown_long_option_is_exit_129() {
         let args = vec!["--bogus".to_string()];
         match parse_verify_tag_args(&args) {
-            Err(GitError::Exit(129)) => {}
+            Err(error) if crate::cli_reported_status(&error) == Some(129) => {}
             other => panic!("expected exit 129, got {other:?}"),
         }
     }
@@ -511,7 +511,7 @@ mod tests {
     fn unknown_short_switch_is_exit_129() {
         let args = vec!["-z".to_string()];
         match parse_verify_tag_args(&args) {
-            Err(GitError::Exit(129)) => {}
+            Err(error) if crate::cli_reported_status(&error) == Some(129) => {}
             other => panic!("expected exit 129, got {other:?}"),
         }
     }
@@ -520,7 +520,7 @@ mod tests {
     fn verbose_with_value_is_exit_129() {
         let args = vec!["--verbose=1".to_string()];
         match parse_verify_tag_args(&args) {
-            Err(GitError::Exit(129)) => {}
+            Err(error) if crate::cli_reported_status(&error) == Some(129) => {}
             other => panic!("expected exit 129, got {other:?}"),
         }
     }

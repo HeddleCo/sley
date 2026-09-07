@@ -486,8 +486,14 @@ pub fn parse_am_patch_format(value: &str) -> Result<AmPatchFormat> {
         "hg" => Ok(AmPatchFormat::Hg),
         "mboxrd" => Ok(AmPatchFormat::Mboxrd),
         other => {
-            eprintln!("error: invalid value for '--patch-format': '{other}'");
-            Err(GitError::Exit(129))
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "error: invalid value for '--patch-format': '{other}'"
+            );
+            Err(GitError::Rejected(
+                sley_core::RejectionKind::InvalidArguments,
+            ))
         }
     }
 }
@@ -607,8 +613,12 @@ fn parse_foreign_patches(
 
 fn parse_stgit_series(options: &AmOptions, input: &[u8]) -> Result<Vec<AmPatch>> {
     if options.mboxes.len() != 1 || options.mboxes[0] == "-" {
-        eprintln!("Only one StGIT patch series can be applied at once");
-        return Err(GitError::Exit(128));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "Only one StGIT patch series can be applied at once"
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     let series_path = Path::new(&options.mboxes[0]);
     let series_dir = series_path.parent().unwrap_or_else(|| Path::new("."));
@@ -1099,15 +1109,23 @@ fn am_do_interactive(message: &[u8]) -> Result<AmInteractiveDecision> {
     use std::io::Write;
     let message = String::from_utf8_lossy(message);
     loop {
-        println!("Commit Body is:");
-        println!("--------------------------");
-        print!("{message}");
+        sley_core::diagnostic!(Stdout, true, "Commit Body is:");
+        sley_core::diagnostic!(Stdout, true, "--------------------------");
+        sley_core::diagnostic!(Stdout, false, "{message}");
         if !message.ends_with('\n') {
-            println!();
+            sley_core::diagnostic!(Stdout, true, "");
         }
-        println!("--------------------------");
-        print!("Apply? [y]es/[n]o/[e]dit/[v]iew patch/[a]ccept all: ");
-        std::io::stdout().flush().ok();
+        sley_core::diagnostic!(Stdout, true, "--------------------------");
+        sley_core::diagnostic!(
+            Stdout,
+            false,
+            "Apply? [y]es/[n]o/[e]dit/[v]iew patch/[a]ccept all: "
+        );
+        sley_core::diagnostics::DiagnosticWriter::new(
+            sley_core::diagnostics::DiagnosticStream::Stdout,
+        )
+        .flush()
+        .ok();
         let mut reply = String::new();
         if std::io::stdin().read_line(&mut reply)? == 0 {
             return Err(GitError::Command(
@@ -1222,12 +1240,12 @@ fn run_am_series(
             match empty_action {
                 AmEmptyAction::Stop => {
                     am_print_empty_patch_hints();
-                    println!("Patch is empty.");
-                    return Err(GitError::Exit(128));
+                    sley_core::diagnostic!(Stdout, true, "Patch is empty.");
+                    return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
                 }
                 AmEmptyAction::Drop => {
                     if !quiet {
-                        println!("Skipping: {}", patch.subject);
+                        sley_core::diagnostic!(Stdout, true, "Skipping: {}", patch.subject);
                     }
                     number += 1;
                     continue;
@@ -1235,7 +1253,12 @@ fn run_am_series(
                 AmEmptyAction::Keep => {
                     patch.message = prepare_am_commit_message(ctx, hosts, &patch, commit_opts)?;
                     if !quiet {
-                        println!("Creating an empty commit: {}", patch.subject);
+                        sley_core::diagnostic!(
+                            Stdout,
+                            true,
+                            "Creating an empty commit: {}",
+                            patch.subject
+                        );
                     }
                     let new_oid = create_am_commit(ctx, hosts, &patch, commit_opts)?;
                     record_rebase_rewrite(state_dir, format, number, &new_oid)?;
@@ -1253,7 +1276,7 @@ fn run_am_series(
         patch.message = prepare_am_commit_message(ctx, hosts, &patch, commit_opts)?;
 
         if !quiet {
-            println!("Applying: {}", patch.subject);
+            sley_core::diagnostic!(Stdout, true, "Applying: {}", patch.subject);
         }
 
         match apply_one_patch(
@@ -1280,13 +1303,18 @@ fn run_am_series(
             }
             ApplyResult::Conflict => {
                 am_print_conflict_hints();
-                println!("Patch failed at {number:04} {}", patch.subject);
+                sley_core::diagnostic!(
+                    Stdout,
+                    true,
+                    "Patch failed at {number:04} {}",
+                    patch.subject
+                );
                 // Record the stop tip as the abort-safety point (git's am_next)
                 // so `am --abort` can tell whether the user moved HEAD after the
                 // failure. The rebase apply backend owns this file when it
                 // drives am (see `update_am_abort_safety`).
                 update_am_abort_safety(ctx, state_dir)?;
-                return Err(GitError::Exit(128));
+                return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
             }
         }
     }
@@ -1321,7 +1349,7 @@ fn prepare_am_commit_message(
         // A failing applypatch-msg hook aborts the series; git exits 1 and leaves
         // the state dir in place so the user can fix the hook and resume.
         if (hosts.run_hook)("applypatch-msg", vec![arg], None).is_err() {
-            return Err(GitError::Exit(1));
+            return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
         }
     }
     // Re-read: the hook may have rewritten the message in `final-commit`.
@@ -1423,7 +1451,11 @@ fn apply_one_patch(
         None => {
             if three_way {
                 if !quiet {
-                    println!("Using index info to reconstruct a base tree...");
+                    sley_core::diagnostic!(
+                        Stdout,
+                        true,
+                        "Using index info to reconstruct a base tree..."
+                    );
                 }
                 return apply_three_way(
                     original_cwd,
@@ -1443,8 +1475,15 @@ fn apply_one_patch(
                     .as_deref()
                     .or(file.old_path.as_deref())
                     .unwrap_or(b"");
-                eprintln!("error: patch failed: {}:1", String::from_utf8_lossy(name));
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "error: patch failed: {}:1",
+                    String::from_utf8_lossy(name)
+                );
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "error: {}: patch does not apply",
                     String::from_utf8_lossy(name)
                 );
@@ -2394,12 +2433,16 @@ fn create_am_commit(
         message = am_append_signoff(message, &commit_signoff_from_env(config)?);
     }
     if encoding_is_utf8(&target_encoding) && commit_message_has_invalid_utf8(&message) {
-        eprintln!("Warning: commit message did not conform to UTF-8.");
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "Warning: commit message did not conform to UTF-8."
+        );
     }
     // pre-applypatch runs after staging, before the commit; a failure aborts the
     // run (git exits 1). `--no-verify` skips it.
     if !commit_opts.no_verify && (hosts.run_hook)("pre-applypatch", Vec::new(), None).is_err() {
-        return Err(GitError::Exit(1));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     }
 
     let mut db = FileObjectDatabase::from_git_dir(common_git_dir, format);
@@ -2734,8 +2777,12 @@ fn apply_three_way(
             bytes
         } else {
             // We cannot reconstruct a base for this path: fail the 3-way.
-            eprintln!("error: repository lacks the necessary blob to fall back on 3-way merge.");
-            eprintln!("error: Failed to merge in the changes.");
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "error: repository lacks the necessary blob to fall back on 3-way merge."
+            );
+            sley_core::diagnostic!(Stderr, true, "error: Failed to merge in the changes.");
             return Ok(ApplyResult::Conflict);
         };
 
@@ -2769,7 +2816,7 @@ fn apply_three_way(
                 }
             }
             sley_diff_merge::ApplyOutcome::Rejected => {
-                eprintln!("error: Failed to merge in the changes.");
+                sley_core::diagnostic!(Stderr, true, "error: Failed to merge in the changes.");
                 return Ok(ApplyResult::Conflict);
             }
         }
@@ -2782,7 +2829,11 @@ fn apply_three_way(
     }
 
     if !quiet {
-        println!("Falling back to patching base and 3-way merge...");
+        sley_core::diagnostic!(
+            Stdout,
+            true,
+            "Falling back to patching base and 3-way merge..."
+        );
     }
     // git's apply/am 3-way uses a synthesized base, labelled "constructed fake
     // ancestor" in diff3 conflict markers (builtin/am.c sets o.ancestor). Honour
@@ -2857,15 +2908,17 @@ fn apply_three_way(
             }
         }
         if !overwritten.is_empty() {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "error: The following untracked working tree files would be overwritten by merge:"
             );
             for path in &overwritten {
-                eprintln!("\t{}", String::from_utf8_lossy(path));
+                sley_core::diagnostic!(Stderr, true, "\t{}", String::from_utf8_lossy(path));
             }
-            eprintln!("Please move or remove them before you merge.");
-            eprintln!("Aborting");
-            eprintln!("error: Failed to merge in the changes.");
+            sley_core::diagnostic!(Stderr, true, "Please move or remove them before you merge.");
+            sley_core::diagnostic!(Stderr, true, "Aborting");
+            sley_core::diagnostic!(Stderr, true, "error: Failed to merge in the changes.");
             return Ok(ApplyResult::Conflict);
         }
     }
@@ -2873,7 +2926,12 @@ fn apply_three_way(
     // git prints "Auto-merging <path>" for every file changed on both sides.
     if !quiet {
         for path in three_way_auto_merged_paths(&base_map, &ours_map, &theirs_map) {
-            println!("Auto-merging {}", String::from_utf8_lossy(&path));
+            sley_core::diagnostic!(
+                Stdout,
+                true,
+                "Auto-merging {}",
+                String::from_utf8_lossy(&path)
+            );
         }
     }
 
@@ -2897,7 +2955,7 @@ fn apply_three_way(
             && !am_index_is_dirty(ctx, head_oid)?
         {
             if !quiet {
-                println!("No changes -- Patch already applied.");
+                sley_core::diagnostic!(Stdout, true, "No changes -- Patch already applied.");
             }
             record_rebase_rewrite(state_dir, format, number, head_oid)?;
             return Ok(ApplyResult::Skipped);
@@ -2907,7 +2965,9 @@ fn apply_three_way(
         Ok(ApplyResult::Committed)
     } else {
         for path in &conflicts {
-            println!(
+            sley_core::diagnostic!(
+                Stdout,
+                true,
                 "CONFLICT (content): Merge conflict in {}",
                 String::from_utf8_lossy(path)
             );
@@ -2917,7 +2977,7 @@ fn apply_three_way(
         // earlier, replays it into the worktree (t4150 "am -3 works with
         // rerere"). A no-op unless rerere.enabled.
         (hosts.rerere_now)(read_am_rerere_autoupdate(state_dir))?;
-        eprintln!("error: Failed to merge in the changes.");
+        sley_core::diagnostic!(Stderr, true, "error: Failed to merge in the changes.");
         Ok(ApplyResult::Conflict)
     }
 }
@@ -2945,7 +3005,7 @@ fn print_three_way_base_status(
             _ => None,
         };
         if let Some(status) = status {
-            println!("{status}\t{}", String::from_utf8_lossy(path));
+            sley_core::diagnostic!(Stdout, true, "{status}\t{}", String::from_utf8_lossy(path));
         }
     }
 }
@@ -3217,36 +3277,96 @@ fn am_conflict_marker_size_from_attr(state: Option<&sley_worktree::AttributeStat
     match raw.parse::<isize>() {
         Ok(size) if size > 0 => size as usize,
         _ => {
-            eprintln!("warning: invalid marker-size '{raw}', expecting an integer");
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "warning: invalid marker-size '{raw}', expecting an integer"
+            );
             AM_DEFAULT_CONFLICT_MARKER_SIZE
         }
     }
 }
 
 fn am_print_conflict_hints() {
-    eprintln!("hint: Use 'git am --show-current-patch=diff' to see the failed patch");
-    eprintln!("hint: When you have resolved this problem, run \"git am --continue\".");
-    eprintln!("hint: If you prefer to skip this patch, run \"git am --skip\" instead.");
-    eprintln!("hint: To restore the original branch and stop patching, run \"git am --abort\".");
-    eprintln!("hint: Disable this message with \"git config set advice.mergeConflict false\"");
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "hint: Use 'git am --show-current-patch=diff' to see the failed patch"
+    );
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "hint: When you have resolved this problem, run \"git am --continue\"."
+    );
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "hint: If you prefer to skip this patch, run \"git am --skip\" instead."
+    );
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "hint: To restore the original branch and stop patching, run \"git am --abort\"."
+    );
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "hint: Disable this message with \"git config set advice.mergeConflict false\""
+    );
 }
 
 /// The hint block git's `die_user_resolve` prints to stderr when `am
 /// --continue`/`--resolved` refuses (no staged changes, or unmerged paths).
 /// Same lines as the conflict hints minus the "--show-current-patch" pointer.
 fn am_print_resolve_hints() {
-    eprintln!("hint: When you have resolved this problem, run \"git am --continue\".");
-    eprintln!("hint: If you prefer to skip this patch, run \"git am --skip\" instead.");
-    eprintln!("hint: To restore the original branch and stop patching, run \"git am --abort\".");
-    eprintln!("hint: Disable this message with \"git config set advice.mergeConflict false\"");
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "hint: When you have resolved this problem, run \"git am --continue\"."
+    );
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "hint: If you prefer to skip this patch, run \"git am --skip\" instead."
+    );
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "hint: To restore the original branch and stop patching, run \"git am --abort\"."
+    );
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "hint: Disable this message with \"git config set advice.mergeConflict false\""
+    );
 }
 
 fn am_print_empty_patch_hints() {
-    eprintln!("hint: When you have resolved this problem, run \"git am --continue\".");
-    eprintln!("hint: If you prefer to skip this patch, run \"git am --skip\" instead.");
-    eprintln!("hint: To record the empty patch as an empty commit, run \"git am --allow-empty\".");
-    eprintln!("hint: To restore the original branch and stop patching, run \"git am --abort\".");
-    eprintln!("hint: Disable this message with \"git config set advice.mergeConflict false\"");
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "hint: When you have resolved this problem, run \"git am --continue\"."
+    );
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "hint: If you prefer to skip this patch, run \"git am --skip\" instead."
+    );
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "hint: To record the empty patch as an empty commit, run \"git am --allow-empty\"."
+    );
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "hint: To restore the original branch and stop patching, run \"git am --abort\"."
+    );
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "hint: Disable this message with \"git config set advice.mergeConflict false\""
+    );
 }
 
 /// Render the state directory path the way git reports it in the
@@ -3405,7 +3525,7 @@ fn apply_rebase_autostash(ctx: &AmContext, hosts: &AmHosts<'_>, state_dir: &Path
         if let Ok(oid) = ObjectId::from_hex(format, text.trim()) {
             let applied = (hosts.stash_apply_quietly)(&oid).unwrap_or(false);
             if applied {
-                eprintln!("Applied autostash.");
+                sley_core::diagnostic!(Stderr, true, "Applied autostash.");
             } else if (hosts.stash_store)(&oid, "autostash").is_ok() {
                 print_rebase_autostash_conflict_advice();
             }
@@ -3415,11 +3535,31 @@ fn apply_rebase_autostash(ctx: &AmContext, hosts: &AmHosts<'_>, state_dir: &Path
 }
 
 fn print_rebase_autostash_conflict_advice() {
-    eprintln!("Your local changes are stashed, however applying them");
-    eprintln!("resulted in conflicts.  You can either resolve the conflicts");
-    eprintln!("and then discard the stash with \"git stash drop\", or, if you");
-    eprintln!("do not want to resolve them now, run \"git reset --hard\" and");
-    eprintln!("apply the local changes later by running \"git stash pop\".");
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "Your local changes are stashed, however applying them"
+    );
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "resulted in conflicts.  You can either resolve the conflicts"
+    );
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "and then discard the stash with \"git stash drop\", or, if you"
+    );
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "do not want to resolve them now, run \"git reset --hard\" and"
+    );
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "apply the local changes later by running \"git stash pop\"."
+    );
 }
 
 // ===========================================================================
@@ -3428,8 +3568,12 @@ fn print_rebase_autostash_conflict_advice() {
 
 fn am_require_in_progress(state_dir: &Path) -> Result<()> {
     if !state_dir.exists() {
-        eprintln!("fatal: Resolve operation not in progress, we are not resuming.");
-        return Err(GitError::Exit(128));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "fatal: Resolve operation not in progress, we are not resuming."
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     Ok(())
 }
@@ -3601,7 +3745,9 @@ fn am_clean_index(
                 &cleanup_paths,
             )?
         {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "error: Updating '{}' would lose untracked files in it",
                 path.display()
             );
@@ -3609,7 +3755,7 @@ fn am_clean_index(
         }
     }
     if df_conflict {
-        return Err(GitError::Exit(128));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
 
     // The resulting index is exactly orig_head's tree.
@@ -3810,7 +3956,9 @@ pub fn am_abort(
     // after the failure: do not rewind (git's safe_to_abort warning). Keep their
     // local commits / dirty index intact and just drop the state.
     if curr_head != safety_oid {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "warning: You seem to have moved HEAD since the last 'am' failure.\n\
              Not rewinding to ORIG_HEAD"
         );
@@ -3835,8 +3983,8 @@ pub fn am_abort(
     if am_clean_index(original_cwd, ctx, curr_head.as_ref(), orig_head.as_ref()).is_err() {
         // git's `am_abort`: `if (clean_index(...)) die("failed to clean index")`.
         // HEAD is not moved and the state dir is left in place.
-        eprintln!("fatal: failed to clean index");
-        return Err(GitError::Exit(128));
+        sley_core::diagnostic!(Stderr, true, "fatal: failed to clean index");
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
 
     match &orig_head {
@@ -3960,7 +4108,7 @@ pub fn am_continue(
     let patch = read_patch_file(state_dir, next)?;
 
     if !quiet {
-        println!("Applying: {}", patch.subject);
+        sley_core::diagnostic!(Stdout, true, "Applying: {}", patch.subject);
     }
 
     // git's `am_resolve` validates two preconditions before committing the
@@ -3980,11 +4128,19 @@ pub fn am_continue(
     // the no-changes test below — git's `repo_index_has_changes` reports such an
     // index as *changed*, so it reaches the same unmerged branch.)
     if has_unmerged {
-        println!("You still have unmerged paths in your index.");
-        println!("You should 'git add' each file with resolved conflicts to mark them as such.");
-        println!("You might run `git rm` on a file to accept \"deleted by them\" for it.");
+        sley_core::diagnostic!(Stdout, true, "You still have unmerged paths in your index.");
+        sley_core::diagnostic!(
+            Stdout,
+            true,
+            "You should 'git add' each file with resolved conflicts to mark them as such."
+        );
+        sley_core::diagnostic!(
+            Stdout,
+            true,
+            "You might run `git rm` on a file to accept \"deleted by them\" for it."
+        );
         am_print_resolve_hints();
-        return Err(GitError::Exit(128));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
 
     // (2) Nothing staged: the index matches HEAD, so there is nothing to commit.
@@ -3993,11 +4149,23 @@ pub fn am_continue(
     if let Some(head_oid) = head_commit_oid(&refs)?
         && !am_index_is_dirty(ctx, &head_oid)?
     {
-        println!("No changes - did you forget to use 'git add'?");
-        println!("If there is nothing left to stage, chances are that something else");
-        println!("already introduced the same changes; you might want to skip this patch.");
+        sley_core::diagnostic!(
+            Stdout,
+            true,
+            "No changes - did you forget to use 'git add'?"
+        );
+        sley_core::diagnostic!(
+            Stdout,
+            true,
+            "If there is nothing left to stage, chances are that something else"
+        );
+        sley_core::diagnostic!(
+            Stdout,
+            true,
+            "already introduced the same changes; you might want to skip this patch."
+        );
         am_print_resolve_hints();
-        return Err(GitError::Exit(128));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
 
     // git's `am_resolve`: in interactive mode, prompt before committing the
@@ -4069,7 +4237,7 @@ pub fn am_continue_allow_empty(
     let next = read_state_usize(state_dir, "next")?;
     let mut patch = read_patch_file(state_dir, next)?;
     if !patch.diff.is_empty() {
-        return Err(GitError::Exit(128));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
 
     let index = sley_worktree::read_repository_index(git_dir, format)?;
@@ -4106,12 +4274,12 @@ pub fn am_continue_allow_empty(
     let quiet = read_state_bool(state_dir, "quiet");
     patch.message = prepare_am_commit_message(ctx, hosts, &patch, commit_opts)?;
     if !quiet {
-        println!("Applying: {}", patch.subject);
+        sley_core::diagnostic!(Stdout, true, "Applying: {}", patch.subject);
     }
     let new_oid = create_am_commit(ctx, hosts, &patch, commit_opts)?;
     record_rebase_rewrite(state_dir, format, next, &new_oid)?;
     if !quiet {
-        println!("No changes - recorded it as an empty commit.");
+        sley_core::diagnostic!(Stdout, true, "No changes - recorded it as an empty commit.");
     }
     run_am_series(
         original_cwd,
@@ -4152,11 +4320,13 @@ pub fn start_am(
 
     // Starting a new run while one is unfinished is an error in git.
     if state_dir.exists() {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "fatal: previous rebase directory {} still exists but mbox given.",
             display_state_dir(worktree_root, &state_dir)
         );
-        return Err(GitError::Exit(128));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
 
     let mut input_files = read_am_input_files(&options.mboxes)?;
@@ -4177,8 +4347,8 @@ pub fn start_am(
     // a silent no-op.
     let from_files = !options.mboxes.is_empty();
     if from_files && patch_format == AmPatchFormat::Auto {
-        eprintln!("Patch format detection failed.");
-        return Err(GitError::Exit(128));
+        sley_core::diagnostic!(Stderr, true, "Patch format detection failed.");
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
 
     let patches = parse_am_patches(options, patch_format, &input_files, &combined)?;
@@ -4200,8 +4370,8 @@ pub fn start_am(
         && am_index_is_dirty(ctx, head_oid)?
     {
         fs::write(state_dir.join("dirtyindex"), b"t\n")?;
-        eprintln!("Dirty index: cannot apply patches (dirty: )");
-        return Err(GitError::Exit(128));
+        sley_core::diagnostic!(Stderr, true, "Dirty index: cannot apply patches (dirty: )");
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
 
     // Record ORIG_HEAD (git's am_setup) so `am --abort` knows where to rewind.

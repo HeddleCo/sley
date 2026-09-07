@@ -143,7 +143,10 @@ impl From<ConfigFileWriteError> for sley_core::GitError {
             ConfigFileWriteError::ExistingLock(_) => std::io::ErrorKind::AlreadyExists,
             ConfigFileWriteError::Io { source, .. } => source.kind(),
         };
-        Self::IoKind { kind, message: error.to_string() }
+        Self::IoKind {
+            kind,
+            message: error.to_string(),
+        }
     }
 }
 

@@ -2466,7 +2466,10 @@ mod tests {
         )
         .expect_err("UTF-16 without a BOM must be rejected when writing an object");
 
-        assert!(matches!(err, GitError::Exit(128)));
+        assert!(matches!(
+            err,
+            GitError::Rejected(sley_core::RejectionKind::Refused)
+        ));
     }
 
     #[test]
@@ -2528,7 +2531,10 @@ mod tests {
             SafeCrlfIndexBlob::None,
         )
         .expect_err("die must error");
-        assert!(matches!(err, GitError::Exit(128)));
+        assert!(matches!(
+            err,
+            GitError::Rejected(sley_core::RejectionKind::Refused)
+        ));
     }
 
     #[test]
@@ -2546,7 +2552,10 @@ mod tests {
             SafeCrlfIndexBlob::None,
         )
         .expect_err("die must error");
-        assert!(matches!(err, GitError::Exit(128)));
+        assert!(matches!(
+            err,
+            GitError::Rejected(sley_core::RejectionKind::Refused)
+        ));
     }
 
     #[test]
@@ -2896,7 +2905,10 @@ mod tests {
         }];
         let err = apply_clean_filter_with_attributes(&config, &checks, b"f", b"data")
             .expect_err("required filter without a clean command must error");
-        assert!(matches!(err, GitError::Exit(128)), "got {err:?}");
+        assert!(
+            matches!(err, GitError::Rejected(sley_core::RejectionKind::Refused)),
+            "got {err:?}"
+        );
     }
 
     #[test]

@@ -161,7 +161,7 @@ pub(crate) fn write_repo_config(git_dir: &Path, config: &GitConfig) -> Result<()
             "error: could not lock config file {}: File exists",
             git_dir.join("config").display()
         );
-        return Err(GitError::Exit(255));
+        return Err(crate::cli_exit(255));
     }
     fs::write(git_dir.join("config"), config.to_canonical_bytes())?;
     Ok(())
@@ -200,7 +200,7 @@ pub(crate) fn validate_remote_name(name: &str) -> Result<()> {
         // Upstream `builtin/remote.c` (add / rename): `die("'%s' is not a valid
         // remote name")` — a `fatal:` line and exit 128.
         eprintln!("fatal: '{name}' is not a valid remote name");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(())
 }

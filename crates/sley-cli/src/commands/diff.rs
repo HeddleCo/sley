@@ -39,7 +39,7 @@ pub(crate) fn diff_resolve_commit_arg(
                     "error: object {oid} is a {}, not a commit",
                     object.object_type.as_str()
                 );
-                Err(GitError::Exit(128))
+                Err(crate::cli_exit(128))
             } else {
                 Err(err)
             }
@@ -58,12 +58,12 @@ pub(crate) fn diff_single_merge_base(
     match bases.as_slice() {
         [] => {
             eprintln!("fatal: no merge base found");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
         [base] => Ok(*base),
         _ => {
             eprintln!("fatal: multiple merge bases found");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -128,7 +128,7 @@ fn diff_split_revisions(
             let bases = sley_rev::merge_bases(git_dir, format, db, &left_oid, &right_oid)?;
             let Some(base) = bases.first() else {
                 eprintln!("fatal: {first}: no merge base");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             };
             if bases.len() > 1 {
                 eprintln!("warning: {first}: multiple merge bases, using {base}");
@@ -195,7 +195,7 @@ fn diff_split_merge_base(
     for token in iter.by_ref() {
         if diff_arg_is_revision_range(git_dir, format, db, &token) {
             eprintln!("fatal: --merge-base does not work with ranges");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if commits.len() < 2
             && sley_rev::RevisionResolver::new(git_dir, format, db)
@@ -336,7 +336,7 @@ fn diff_direct_blob_pair(
             eprintln!(
                 "Use 'git <command> -- <path>...' to specify paths that do not exist locally."
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         (left, right)
     } else {
@@ -406,7 +406,7 @@ fn resolve_direct_blob_source(
     let file_type = metadata.file_type();
     if !file_type.is_file() && !file_type.is_symlink() {
         eprintln!("fatal: '{spec}': not a regular file or symlink");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let content = if file_type.is_symlink() {
         #[cfg(unix)]
@@ -545,7 +545,7 @@ fn abbreviate_index_blob_oid(
 
 fn diff_usage_error<T>() -> Result<T> {
     eprintln!("usage: git diff [<options>] [<commit>] [--] [<path>...]");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 /// The `whitespace` attribute + `core.whitespace` config, resolved into the
@@ -663,7 +663,7 @@ impl WhitespaceRuleResolver {
 /// git's fatal error for an unenforceable whitespace rule pair.
 fn whitespace_conflict_error() -> GitError {
     eprintln!("fatal: cannot enforce both tab-in-indent and indent-with-non-tab");
-    GitError::Exit(128)
+    crate::cli_exit(128)
 }
 
 fn conflict_marker_size_from_attr(state: Option<&sley_worktree::AttributeState>) -> usize {
@@ -1002,7 +1002,7 @@ fn run_external_diff_entries(
             _ => {
                 let path = String::from_utf8_lossy(&entry.path);
                 eprintln!("fatal: external diff died, stopping at {path}");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
     }
@@ -1333,7 +1333,7 @@ pub(crate) fn resolve_diff_interhunk_context(
             eprintln!(
                 "fatal: bad numeric config value '{value}' for 'diff.interhunkcontext'{location}: {kind}"
             );
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
         Err(sley_diff_merge::render::InterHunkContextError::NegativeValue) => {
             let entry = diff_interhunk_config_entry(repository, cli_session)?;
@@ -1349,7 +1349,7 @@ pub(crate) fn resolve_diff_interhunk_context(
                     "fatal: unable to parse 'diff.interhunkcontext' from command-line config"
                 ),
             }
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -1523,7 +1523,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
         resolve_diff_interhunk_context(interhunk, repository.as_ref().ok(), cli_session)?;
     if !find_object_values.is_empty() && outside_repository {
         eprintln!("fatal: --find-object requires a git repository");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if !find_object_values.is_empty() && !name_status && !name_only {
         return Err(GitError::Unsupported(
@@ -1699,7 +1699,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
             write_index_blob_raw_diff(&left, &right, abbrev, format, z)?;
         }
         if (quiet || exit_code) && has_differences {
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         return Ok(());
     }
@@ -1824,7 +1824,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
         }
         if error_count > 0 {
             eprint!("fatal: Failed to parse --dirstat/-X option parameter:\n{errors}");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         *opts = base;
     }
@@ -1859,7 +1859,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
     {
         if reverse && right.file {
             eprintln!("fatal: unable to read {}", ObjectId::null(format));
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if reverse {
             std::mem::swap(&mut left, &mut right);
@@ -1901,7 +1901,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
         )
         .map_err(GitError::from)?;
         if exit_code && (left.oid != right.oid || left.mode != right.mode) {
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         return Ok(());
     }
@@ -2010,7 +2010,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
             },
         )?;
         if (quiet || exit_code) && has_differences {
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         return Ok(());
     }
@@ -2417,7 +2417,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
             code |= 0o1;
         }
         if code != 0 {
-            return Err(GitError::Exit(code));
+            return Err(crate::cli_exit(code));
         }
         return Ok(());
     }
@@ -2459,7 +2459,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
             lazy_fetch,
         )? {
             if code != 0 {
-                return Err(GitError::Exit(code));
+                return Err(crate::cli_exit(code));
             }
             return Ok(());
         }
@@ -2881,7 +2881,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
         let output: &mut dyn Write = if let Some(path) = output.as_deref() {
             file_output = fs::File::create(path).map_err(|err| {
                 eprintln!("fatal: cannot open '{path}': {err}");
-                GitError::Exit(128)
+                crate::cli_exit(128)
             })?;
             &mut file_output
         } else {
@@ -2895,7 +2895,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
         }
     }
     if (quiet || exit_code) && has_differences {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -3389,14 +3389,14 @@ fn sort_diff_entries_by_path(
 
 fn diff_find_object_unable_to_resolve_error(value: &str) -> GitError {
     eprintln!("error: unable to resolve '{value}'");
-    GitError::Exit(129)
+    crate::cli_exit(129)
 }
 
 fn diff_find_object_pickaxe_all_conflict_error() -> Result<()> {
     eprintln!(
         "fatal: options '--pickaxe-all' and '--find-object' cannot be used together, use '--pickaxe-all' with '-G' and '-S'"
     );
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn diff_relative_prefix(
@@ -3939,7 +3939,7 @@ fn cmd_diff_no_index(
 ) -> Result<()> {
     if paths.len() < 2 {
         eprintln!("usage: git diff --no-index [<options>] <path> <path>");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     let format = repository
         .map(RepositoryContext::format)
@@ -4069,7 +4069,7 @@ fn cmd_diff_no_index(
             },
         )? {
             if code != 0 {
-                return Err(GitError::Exit(code));
+                return Err(crate::cli_exit(code));
             }
             return Ok(());
         }
@@ -4144,10 +4144,10 @@ fn cmd_diff_no_index(
             || selection.numstat
             || no_output
         {
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         if !selection.patch {
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         for entry in &entries {
             let lazy_fetch_adapter_19 = crate::diff_lazy_fetch(policy, params.lazy_fetch);
@@ -4205,7 +4205,7 @@ fn cmd_diff_no_index(
             write_diff_patch_entry(&mut stdout, &entry.entry, options)?;
         }
     }
-    Err(GitError::Exit(1))
+    Err(crate::cli_exit(1))
 }
 
 fn no_index_entries(
@@ -4243,7 +4243,7 @@ fn no_index_entries(
             || !(old_is_dir && new_is_dir))
     {
         eprintln!("usage: git diff --no-index [<options>] <path> <path>");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     if old_is_dir || new_is_dir {
         let old_files = no_index_collect_path(old_spec, old_path, old_is_dir, format)?;
@@ -4337,13 +4337,13 @@ fn no_index_reject_stream_directory_pair(
         || (old_kind == NoIndexPathKind::Directory && new_kind == NoIndexPathKind::Stdin)
     {
         eprintln!("fatal: cannot compare stdin to a directory");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     if (old_kind == NoIndexPathKind::Fifo && new_kind == NoIndexPathKind::Directory)
         || (old_kind == NoIndexPathKind::Directory && new_kind == NoIndexPathKind::Fifo)
     {
         eprintln!("fatal: cannot compare a named pipe to a directory");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -4702,7 +4702,7 @@ fn run_external_diff_no_index_entries(
             _ => {
                 let path = String::from_utf8_lossy(&entry.entry.path);
                 eprintln!("fatal: external diff died, stopping at {path}");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
     }
@@ -4813,7 +4813,7 @@ fn no_index_read_stdin_side(format: ObjectFormat) -> Result<NoIndexSide> {
 
 fn no_index_access_error(spec: &str) -> GitError {
     eprintln!("error: Could not access '{spec}'");
-    GitError::Exit(1)
+    crate::cli_exit(1)
 }
 
 fn no_index_entry_from_sides(old: Option<&NoIndexSide>, new: Option<&NoIndexSide>) -> NoIndexEntry {

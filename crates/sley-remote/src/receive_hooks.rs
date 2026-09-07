@@ -59,7 +59,10 @@ pub fn run_update_hooks(
             remote_stderr,
             capture_stderr,
         ) {
-            if matches!(err, GitError::Exit(_)) {
+            if matches!(
+                err,
+                GitError::Rejected(_) | GitError::ChildProcessFailed { .. } | GitError::Callback(_)
+            ) {
                 return Ok(Some(command.name.clone()));
             }
             return Err(err);
@@ -148,9 +151,10 @@ pub fn run_push_to_checkout_hook(
         capture_stderr,
     ) {
         Ok(()) => Ok(true),
-        Err(GitError::Command(_)) | Err(GitError::Exit(_)) => {
-            Err(GitError::Command("push-to-checkout hook declined".into()))
-        }
+        Err(GitError::Command(_))
+        | Err(
+            GitError::Rejected(_) | GitError::ChildProcessFailed { .. } | GitError::Callback(_),
+        ) => Err(GitError::Command("push-to-checkout hook declined".into())),
         Err(err) => Err(err),
     }
 }
@@ -423,9 +427,10 @@ fn spawn_hook(
     for (key, value) in env {
         command.env(key, value);
     }
-    let mut child = command
-        .spawn()
-        .map_err(|err| GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!("cannot spawn hook {}: {err}", path.display()) })?;
+    let mut child = command.spawn().map_err(|err| GitError::IoKind {
+        kind: std::io::ErrorKind::Other,
+        message: format!("cannot spawn hook {}: {err}", path.display()),
+    })?;
     if let Some(input) = stdin
         && let Some(mut hook_stdin) = child.stdin.take()
     {
@@ -443,7 +448,9 @@ fn spawn_hook(
     if status.success() {
         Ok(())
     } else {
-        Err(GitError::Exit(status.code().unwrap_or(1)))
+        Err(GitError::ChildProcessFailed {
+            status: status.code(),
+        })
     }
 }
 

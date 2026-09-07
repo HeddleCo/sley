@@ -49,7 +49,7 @@ fn read_capped_packfile<R: Read>(reader: &mut R, max_input_size: Option<u64>) ->
                     "fatal: pack exceeds maximum allowed size ({})",
                     crate::commands::pack::humanise_byte_count(limit)
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
         None => {
@@ -393,7 +393,7 @@ pub(crate) fn cmd_send_pack(
     // it works outside a git repo too (the `nongit` case in t5400).
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
         println!("{SEND_PACK_USAGE}");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
 
     let remote_context = RemoteCommandContext::require_repository(cli_session)?;
@@ -419,7 +419,7 @@ pub(crate) fn cmd_send_pack(
         match arg.as_str() {
             "-h" | "--help" => {
                 println!("{SEND_PACK_USAGE}");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             "-f" | "--force" => force = true,
             "-n" | "--dry-run" => dry_run = true,
@@ -467,7 +467,7 @@ pub(crate) fn cmd_send_pack(
             value if value.starts_with('-') => {
                 eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
                 eprintln!("{SEND_PACK_USAGE}");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             value => positional.push(value.to_string()),
         }
@@ -479,7 +479,7 @@ pub(crate) fn cmd_send_pack(
 
     let Some((dest, refs)) = positional.split_first() else {
         eprintln!("{SEND_PACK_USAGE}");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     };
     let mut refs = refs.to_vec();
     if from_stdin {
@@ -495,11 +495,11 @@ pub(crate) fn cmd_send_pack(
     }
     if refs.is_empty() && !all_refs && !mirror {
         eprintln!("{SEND_PACK_USAGE}");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     if !refs.is_empty() && (all_refs || mirror) {
         eprintln!("{SEND_PACK_USAGE}");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
 
     let remote_git_dir = ls_remote_git_dir(&remote_context, dest)?;
@@ -611,7 +611,7 @@ fn reject_duplicate_push_destinations(refspecs: &[String]) -> Result<()> {
         }
         if !seen.insert(dst.to_string()) {
             eprintln!("error: multiple updates for ref '{dst}' not allowed");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     Ok(())
@@ -736,7 +736,7 @@ pub(crate) fn cmd_push(cli_session: &crate::session::CliSession, args: &[String]
             value if value.starts_with('-') => {
                 eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
                 eprintln!("usage: git push [<options>] [<repository> [<refspec>...]]");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             value => positional.push(value.to_string()),
         }
@@ -1644,7 +1644,7 @@ fn push_options_from_config(config: &GitConfig) -> Result<Vec<String>> {
             Some(value) => out.push(value.to_string()),
             None => {
                 eprintln!("fatal: push.pushOption must have a value");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
     }
@@ -1707,7 +1707,7 @@ fn check_one_submodule_target(
             "fatal: submodule path '{}' contains changes that are not found on any remote",
             submodule.path
         );
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -1851,14 +1851,14 @@ fn push_on_demand_submodules(
             .map_err(GitError::from)?;
         if !status.success() {
             eprintln!("fatal: failed to push all needed submodules");
-            return Err(GitError::Exit(status.code().unwrap_or(1)));
+            return Err(crate::cli_exit(status.code().unwrap_or(1)));
         }
         if submodule_commit_needs_push(&submodule, Some(&child_remote))? {
             eprintln!(
                 "fatal: submodule path '{}' contains changes that could not be pushed",
                 submodule.path
             );
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
     }
     Ok(())
@@ -1908,7 +1908,7 @@ fn ensure_push_submodule_commit_oid(submodule: &PushSubmodule, oid: &ObjectId) -
             "fatal: submodule path '{}' does not contain commit {}",
             submodule.path, oid
         );
-        GitError::Exit(1)
+        crate::cli_exit(1)
     })?;
     if object.object_type != sley_object::ObjectType::Commit {
         eprintln!(
@@ -1917,7 +1917,7 @@ fn ensure_push_submodule_commit_oid(submodule: &PushSubmodule, oid: &ObjectId) -
             oid,
             object.object_type.as_str()
         );
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -1977,7 +1977,7 @@ fn submodule_push_remote(
             "fatal: remote '{}' not found in submodule path '{}'",
             parent_remote, submodule.path
         );
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(Some(default_push_remote_name(
         &submodule.git_dir,
@@ -2037,7 +2037,7 @@ fn validate_submodule_push_refspecs(submodule: &PushSubmodule, refspecs: &[Strin
                 "fatal: cannot propagate object-id refspec into submodule path '{}'",
                 submodule.path
             );
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         if src == "HEAD"
             && let Some(branch) = dst.strip_prefix("refs/heads/")
@@ -2047,7 +2047,7 @@ fn validate_submodule_push_refspecs(submodule: &PushSubmodule, refspecs: &[Strin
                 "fatal: HEAD refspec does not match current branch in submodule path '{}'",
                 submodule.path
             );
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
     }
     Ok(())
@@ -2106,11 +2106,11 @@ fn parse_push_recurse_submodules(value: &str) -> Result<PushRecurseSubmodules> {
         "no" | "false" | "off" => Ok(PushRecurseSubmodules::Off),
         "yes" | "true" | "on" => {
             eprintln!("fatal: unsupported --recurse-submodules mode '{value}'");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
         other => {
             eprintln!("fatal: bad --recurse-submodules argument: {other}");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -2123,7 +2123,7 @@ fn parse_push_recurse_submodules_config(value: &str) -> Result<PushRecurseSubmod
         "no" | "false" | "off" => Ok(PushRecurseSubmodules::Off),
         "yes" | "true" | "on" => {
             eprintln!("fatal: unsupported push.recurseSubmodules mode '{value}'");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
         _ => Ok(PushRecurseSubmodules::Default),
     }
@@ -2299,11 +2299,11 @@ fn run_push(
     let plan = match sley_remote::plan_push(request, &mut services) {
         Err(GitError::InvalidFormat(message)) if message.contains("push-options") => {
             eprintln!("fatal: the receiving end does not support push options");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         Err(GitError::InvalidFormat(message)) if message.contains("atomic") => {
             eprintln!("fatal: the receiving end does not support --atomic push");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         result => result?,
     };
@@ -2358,7 +2358,7 @@ fn run_push(
         }
         if had_errors {
             eprintln!("error: failed to push some refs to '{url}'");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         return Ok(());
     }
@@ -2447,7 +2447,7 @@ fn run_push(
     }
     if had_errors {
         eprintln!("error: failed to push some refs to '{url}'");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -2496,7 +2496,7 @@ fn run_push_local_report(
             .unwrap_or(true)
     {
         eprintln!("fatal: the receiving end does not support --atomic push");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if !req.push_options.is_empty()
         && !remote_config
@@ -2504,7 +2504,7 @@ fn run_push_local_report(
             .unwrap_or(false)
     {
         eprintln!("fatal: the receiving end does not support push options");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     // First pass: classify every ref WITHOUT applying anything (a dry-run plan).
@@ -2548,7 +2548,7 @@ fn run_push_local_report(
             eprintln!("Perhaps you should specify a branch.");
             eprintln!("fatal: the remote end hung up unexpectedly");
             eprintln!("error: failed to push some refs to '{url}'");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         return Ok(());
     }
@@ -2789,14 +2789,14 @@ fn run_push_local_report(
 
     if had_errors {
         eprintln!("error: failed to push some refs to '{url}'");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     if let Some(command) = req.receive_pack_command
         && !custom_receive_pack_command_is_native_git(command)
         && !custom_receive_pack_command_exits_successfully(command, req.remote_git_dir)?
     {
         eprintln!("error: failed to push some refs to '{url}'");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -4061,7 +4061,7 @@ fn reject_empty_branch_config(config: &GitConfig) -> Result<()> {
                 .map(|entry| entry.key.as_str())
                 .unwrap_or("");
             eprintln!("fatal: bad config variable 'branch..{key}' in file '.git/config'");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     Ok(())
@@ -4206,7 +4206,7 @@ fn default_push_refspecs(
             eprintln!(
                 "fatal: You didn't specify any refspecs to push, and push.default is \"nothing\"."
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         _ => {}
     }
@@ -4218,7 +4218,7 @@ To push the history leading to the current (detached HEAD)\n\
 state now, use\n\n\
     git push {remote} HEAD:<name-of-remote-branch>"
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
 
     let mode = push_default_mode(config);
@@ -4246,7 +4246,7 @@ state now, use\n\n\
 your current branch '{branch}', without telling me what to push\n\
 to update which remote branch."
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             dst = push_upstream_ref(config, branch, remote, auto_setup)?;
         }
@@ -4304,7 +4304,7 @@ Either specify the URL from the command-line or configure a remote repository us
 and then push using the remote name\n\n\
     git push <name>"
     );
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn default_fetch_remote_for_branch(config: &GitConfig, branch: &str) -> String {
@@ -4347,13 +4347,13 @@ To push the current branch and set the remote as upstream, use\n\n\
     git push --set-upstream {remote} {branch}\n\
 {advice}"
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if merges.len() != 1 {
         eprintln!(
             "fatal: The current branch {branch} has multiple upstream branches, refusing to push."
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(merges[0].to_string())
 }
@@ -4374,7 +4374,7 @@ To push to the branch of the same name on the remote, use\n\n\
     git push {remote} HEAD\n\
 {advice_pushdefault}"
     );
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn configure_push_upstreams_from_report(
@@ -4498,8 +4498,8 @@ mod receive_max_input_size_tests {
         let err = read_capped_packfile(&mut &data[..], Some(16))
             .expect_err("over the cap must error rather than buffer it all");
         match err {
-            GitError::Exit(128) => {}
-            other => panic!("expected GitError::Exit(128), got {other:?}"),
+            error if crate::cli_reported_status(&error) == Some(128) => {}
+            other => panic!("expected reported CLI status 128, got {other:?}"),
         }
     }
 }

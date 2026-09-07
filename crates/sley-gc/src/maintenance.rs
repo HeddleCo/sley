@@ -83,8 +83,12 @@ pub fn maintenance_select_tasks(
             "rerere-gc",
         ],
         other => {
-            eprintln!("fatal: unknown maintenance strategy: '{other}'");
-            return Err(GitError::Exit(128));
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "fatal: unknown maintenance strategy: '{other}'"
+            );
+            return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
         }
     }
     .into_iter()
@@ -131,8 +135,12 @@ pub fn validate_maintenance_schedule(value: &str) -> Result<String> {
     ) {
         Ok(value.to_string())
     } else {
-        eprintln!("fatal: unrecognized --schedule argument '{value}'");
-        Err(GitError::Exit(128))
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "fatal: unrecognized --schedule argument '{value}'"
+        );
+        Err(GitError::Rejected(sley_core::RejectionKind::Refused))
     }
 }
 
@@ -214,8 +222,12 @@ pub fn maintenance_run_selected(
         if auto {
             return Ok(());
         }
-        eprintln!("fatal: 'maintenance' lock held by another process");
-        return Err(GitError::Exit(128));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "fatal: 'maintenance' lock held by another process"
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     if detach {
         trace2::region("region_enter", "maintenance", "detach");
@@ -283,7 +295,9 @@ fn maintenance_run_one(
         "incremental-repack" => {
             if config.get_bool("core", None, "multiPackIndex") == Some(false) {
                 if !quiet {
-                    eprintln!(
+                    sley_core::diagnostic!(
+                        Stderr,
+                        true,
                         "warning: skipping incremental-repack task because core.multiPackIndex is disabled"
                     );
                 }
@@ -480,7 +494,9 @@ pub fn run_sley_child(args: &[&str], stdin_data: Option<&str>) -> Result<()> {
     if status.success() {
         Ok(())
     } else {
-        Err(GitError::Exit(status.code().unwrap_or(1)))
+        Err(GitError::ChildProcessFailed {
+            status: status.code(),
+        })
     }
 }
 
@@ -803,8 +819,8 @@ pub fn maintenance_global_config_path() -> Result<PathBuf> {
         return Ok(PathBuf::from(path));
     }
     let Some(home) = sley_config::home_dir() else {
-        eprintln!("fatal: $HOME not set");
-        return Err(GitError::Exit(128));
+        sley_core::diagnostic!(Stderr, true, "fatal: $HOME not set");
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     };
     let user = PathBuf::from(&home).join(".gitconfig");
     if !user.exists() {
@@ -826,7 +842,7 @@ pub fn report_missing_maintenance_repo(common_git_dir: &Path) -> bool {
     if let Ok(config) = GitConfig::read(common_git_dir.join("config")) {
         for value in config.get_all("maintenance", None, "repo") {
             if value.is_none() {
-                eprintln!("error: missing value for 'maintenance.repo'");
+                sley_core::diagnostic!(Stderr, true, "error: missing value for 'maintenance.repo'");
                 missing = true;
             }
         }
@@ -945,8 +961,12 @@ pub fn resolve_maintenance_scheduler(
         if scheduler_available(MaintenanceScheduler::Cron) {
             return Ok(MaintenanceScheduler::Cron);
         }
-        eprintln!("fatal: neither systemd timers nor crontab are available");
-        return Err(GitError::Exit(128));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "fatal: neither systemd timers nor crontab are available"
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     #[allow(unreachable_code)]
     Ok(MaintenanceScheduler::Cron)
@@ -956,11 +976,13 @@ pub fn validate_scheduler_available(scheduler: MaintenanceScheduler) -> Result<(
     if scheduler_available(scheduler) {
         Ok(())
     } else {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "fatal: {} scheduler is not available",
             scheduler_name(scheduler)
         );
-        Err(GitError::Exit(128))
+        Err(GitError::Rejected(sley_core::RejectionKind::Refused))
     }
 }
 
@@ -1016,7 +1038,9 @@ fn run_scheduler_command(scheduler: MaintenanceScheduler, args: &[&str]) -> Resu
     if status.success() {
         Ok(())
     } else {
-        Err(GitError::Exit(status.code().unwrap_or(1)))
+        Err(GitError::ChildProcessFailed {
+            status: status.code(),
+        })
     }
 }
 
@@ -1026,8 +1050,12 @@ pub fn update_background_schedule(
 ) -> Result<()> {
     let lock = repository_objects_dir(common_git_dir).join("schedule.lock");
     if !acquire_lock_with_stale_recovery(&lock) {
-        eprintln!("error: Another scheduled git-maintenance(1) process seems to be running");
-        return Err(GitError::Exit(128));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "error: Another scheduled git-maintenance(1) process seems to be running"
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     let run = (|| -> Result<()> {
         if let Some(scheduler) = enable

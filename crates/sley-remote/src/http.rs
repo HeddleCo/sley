@@ -1053,17 +1053,29 @@ pub fn negotiate_only_http<C: HttpClient + ?Sized>(
 ) -> Result<Vec<ObjectId>> {
     let discovery = http_discover_upload_pack(client, remote, credentials, config)?;
     let Some(handshake) = discovery.advertisements.handshake.as_ref() else {
-        eprintln!("warning: --negotiate-only requires protocol v2");
-        return Err(GitError::Exit(1));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "warning: --negotiate-only requires protocol v2"
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     };
     if handshake.protocol != ProtocolVersion::V2 {
-        eprintln!("warning: --negotiate-only requires protocol v2");
-        return Err(GitError::Exit(1));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "warning: --negotiate-only requires protocol v2"
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     }
     let features = parse_protocol_v2_fetch_features(&handshake.capabilities)?.unwrap_or_default();
     if !features.wait_for_done {
-        eprintln!("warning: server does not support wait-for-done");
-        return Err(GitError::Exit(1));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "warning: server does not support wait-for-done"
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     }
     let local_db = FileObjectDatabase::from_git_dir(git_dir, format);
     let mut seen = std::collections::HashSet::new();

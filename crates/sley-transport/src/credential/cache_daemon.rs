@@ -138,13 +138,13 @@ fn serve_cache(socket_file: &Path, _debug: bool) -> Result<()> {
     // This mirrors Git's poll(2) loop without unsafe platform calls and avoids
     // adding up to 50ms of latency to every credential-cache request.
     let (sender, clients) = mpsc::channel();
-    thread::spawn(move || {
+    thread::spawn(sley_core::diagnostics::inherit(move || {
         for client in listener.incoming() {
             if sender.send(client).is_err() {
                 break;
             }
         }
-    });
+    }));
     let mut entries: Vec<CacheEntry> = Vec::new();
     let mut wait_for_entry_until = 0_i64;
     loop {
@@ -154,10 +154,13 @@ fn serve_cache(socket_file: &Path, _debug: bool) -> Result<()> {
         }
         match clients.recv_timeout(Duration::from_secs(wakeup as u64)) {
             Ok(Ok(stream)) => serve_one_client(stream, socket_file, &mut entries)?,
-            Ok(Err(err)) => eprintln!("warning: accept failed: {err}"),
+            Ok(Err(err)) => sley_core::diagnostic!(Stderr, true, "warning: accept failed: {err}"),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: "credential cache listener stopped".into() });
+                return Err(GitError::IoKind {
+                    kind: std::io::ErrorKind::Other,
+                    message: "credential cache listener stopped".into(),
+                });
             }
         }
     }
@@ -207,11 +210,7 @@ fn serve_one_client(
     socket_file: &Path,
     entries: &mut Vec<CacheEntry>,
 ) -> Result<()> {
-    let mut reader = io::BufReader::new(
-        stream
-            .try_clone()
-            .map_err(GitError::from)?,
-    );
+    let mut reader = io::BufReader::new(stream.try_clone().map_err(GitError::from)?);
     let mut writer = stream;
     let mut credential = GitCredential::default();
     let mut action = String::new();
@@ -232,19 +231,31 @@ fn serve_one_client(
         "erase" => remove_credential(entries, &credential, true),
         "store" => {
             if timeout < 0 {
-                eprintln!("warning: cache client didn't specify a timeout");
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "warning: cache client didn't specify a timeout"
+                );
             } else if (!credential.username.is_some() || !credential.password.is_some())
                 && (!credential.authtype.is_some() || !credential.credential.is_some())
             {
-                eprintln!("warning: cache client gave us a partial credential");
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "warning: cache client gave us a partial credential"
+                );
             } else if credential.ephemeral {
-                eprintln!("warning: not storing ephemeral credential");
+                sley_core::diagnostic!(Stderr, true, "warning: not storing ephemeral credential");
             } else {
                 remove_credential(entries, &credential, false);
                 cache_credential(entries, credential, timeout);
             }
         }
-        other => eprintln!("warning: cache client sent unknown action: {other}"),
+        other => sley_core::diagnostic!(
+            Stderr,
+            true,
+            "warning: cache client sent unknown action: {other}"
+        ),
     }
     Ok(())
 }
@@ -276,8 +287,7 @@ fn write_get_response(
             .map_err(GitError::from)?;
     }
     if let Some(token) = &item.oauth_refresh_token {
-        writeln!(writer, "oauth_refresh_token={token}")
-            .map_err(GitError::from)?;
+        writeln!(writer, "oauth_refresh_token={token}").map_err(GitError::from)?;
     }
     Ok(())
 }

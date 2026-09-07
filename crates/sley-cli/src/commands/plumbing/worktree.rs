@@ -26,7 +26,7 @@ pub(crate) fn cmd_rm(cli_session: &crate::session::CliSession, args: &[String]) 
                 eprintln!(
                     "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             paths.push(PathBuf::from(arg));
             continue;
@@ -53,7 +53,7 @@ pub(crate) fn cmd_rm(cli_session: &crate::session::CliSession, args: &[String]) 
                     eprintln!(
                         "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 let value = iter.next().ok_or_else(|| {
                     GitError::Command("--pathspec-from-file requires a value".into())
@@ -66,7 +66,7 @@ pub(crate) fn cmd_rm(cli_session: &crate::session::CliSession, args: &[String]) 
                     eprintln!(
                         "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 let value = value.strip_prefix("--pathspec-from-file=").ok_or_else(|| {
                     GitError::Command("--pathspec-from-file requires a value".into())
@@ -98,7 +98,7 @@ pub(crate) fn cmd_rm(cli_session: &crate::session::CliSession, args: &[String]) 
                     eprintln!(
                         "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 paths.push(PathBuf::from(value));
             }
@@ -106,20 +106,20 @@ pub(crate) fn cmd_rm(cli_session: &crate::session::CliSession, args: &[String]) 
     }
     if pathspec_file_nul && pathspec_from_file.is_none() {
         eprintln!("fatal: the option '--pathspec-file-nul' requires '--pathspec-from-file'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if let Some(pathspec_file) = pathspec_from_file {
         paths.extend(read_pathspecs_from_file(&pathspec_file, pathspec_file_nul)?);
     }
     if paths.is_empty() {
         eprintln!("fatal: No pathspec was given. Which files should I remove?");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if paths.iter().any(|path| path.as_os_str().is_empty()) {
         eprintln!(
             "fatal: empty string is not a valid pathspec. please use . instead if you meant to match all paths"
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let cwd = cli_session.cwd().to_path_buf();
     let git_dir = cli_session.git_dir()?;
@@ -235,7 +235,7 @@ pub(crate) fn cmd_mv(cli_session: &crate::session::CliSession, args: &[String]) 
             "fatal: destination '{}' is not a directory",
             destination.display()
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if paths.len() > 2 {
         validate_mv_sources_do_not_overlap(&cwd, &worktree_root, &paths[..paths.len() - 1])?;
@@ -262,7 +262,7 @@ pub(crate) fn cmd_mv(cli_session: &crate::session::CliSession, args: &[String]) 
         if !rejected_paths.is_empty() {
             advise_on_updating_sparse_paths(&git_dir, &rejected_paths);
             if !skip_errors {
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
         }
         per_source
@@ -311,7 +311,7 @@ pub(crate) fn cmd_mv(cli_session: &crate::session::CliSession, args: &[String]) 
         }
         if let Some(fatal) = results.iter().find_map(|result| result.fatal.as_deref()) {
             eprintln!("{fatal}");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     if dry_run || verbose {
@@ -485,11 +485,11 @@ fn validate_mv_sources_do_not_overlap(
         for right in normalized.iter().skip(left_index + 1) {
             if mv_path_is_parent(left, right) {
                 print_mv_parent_child_error(right, left);
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             if mv_path_is_parent(right, left) {
                 print_mv_parent_child_error(left, right);
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
     }

@@ -377,7 +377,7 @@ pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String
             value if value.starts_with('-') && value != "-" => {
                 eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
                 eprintln!("usage: git fetch [<options>] [<repository> [<refspec>...]]");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             _ if source.is_none() => source = Some(arg.clone()),
             _ => refspecs.push(rewrite_empty_source_refspec(arg)),
@@ -420,7 +420,7 @@ pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String
                 eprintln!(
                     "fatal: options '--porcelain' and '--recurse-submodules' cannot be used together"
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
     }
@@ -439,16 +439,16 @@ pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String
     let fetch_all_remotes = fetch_all_remotes.unwrap_or(false) || all_from_config;
     if fetch_multiple && fetch_all_remotes {
         eprintln!("fatal: --multiple and --all cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if fetch_all_remotes {
         if source.is_some() {
             eprintln!("fatal: fetch --all does not take a repository argument");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if !refspecs.is_empty() {
             eprintln!("fatal: fetch --all does not make sense with refspecs");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         let remotes = fetch_all_remote_names(config);
         fetch_multiple_remotes(
@@ -550,11 +550,11 @@ pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String
     if unshallow {
         if options.depth.is_some() {
             eprintln!("fatal: --depth and --unshallow cannot be used together");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if !git_dir.join("shallow").exists() {
             eprintln!("fatal: --unshallow on a complete repository does not make sense");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         options.depth = Some(sley_remote::INFINITE_DEPTH);
     }
@@ -602,7 +602,7 @@ pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String
     if server_options_from_cli && configured_legacy_protocol(Some(config)) {
         eprintln!("fatal: server options require protocol version 2 or later");
         eprintln!("fatal: see protocol.version in 'git help config' for more details");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let result = fetch_one_source_with_outcome(
         git_dir,
@@ -635,7 +635,7 @@ pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String
     // run_fetch but the outcome is still returned so set-upstream can run.
     if let Some(reason) = outcome.rejection.as_ref() {
         if active_fetch_display().format == FetchDisplayFormat::Porcelain {
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         return Err(GitError::Command(reason.clone()));
     }
@@ -704,7 +704,7 @@ fn fetch_multiple_remotes(
     if req.server_options_from_cli && configured_legacy_protocol(Some(req.config)) {
         eprintln!("fatal: server options require protocol version 2 or later");
         eprintln!("fatal: see protocol.version in 'git help config' for more details");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     trace_fetch_parallel_jobs(req.jobs.unwrap_or(1));
     let parallel_fetch = req.jobs.is_some_and(|jobs| jobs > 1) && req.remotes.len() > 1;
@@ -803,7 +803,7 @@ fn fetch_multiple_remotes(
         )?;
     }
     if failed {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     trace_fetch_maintenance();
     Ok(())
@@ -820,8 +820,9 @@ fn print_fetch_failure(remote: &str, err: &GitError, parallel_fetch: bool) {
 
 fn print_fetch_failure_detail(err: &GitError) {
     match err {
-        GitError::Exit(_) => {}
-        GitError::Cli(_, message) | GitError::Command(message) => eprintln!("{message}"),
+        _ if crate::cli_reported_status(&err).is_some() => {}
+        GitError::Command(message) => eprintln!("{message}"),
+        _ if crate::cli_message(&err).is_some() => eprintln!("{err}"),
         other => eprintln!("{other}"),
     }
 }
@@ -849,7 +850,7 @@ fn resolve_remote_or_group_names(config: &GitConfig, names: &[String]) -> Result
         if remotes.len() == before {
             if !remote_exists(config, name) {
                 eprintln!("fatal: no such remote or remote group: {name}");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             push_unique_remote(&mut remotes, name.clone());
         }
@@ -1318,7 +1319,7 @@ fn ensure_submodule_object_store(git_dir: &Path) -> Result<()> {
         return Ok(());
     }
     eprintln!("fatal: not a git repository: {}", git_dir.display());
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn configured_submodule_fetch_jobs(config: &GitConfig) -> Option<usize> {
@@ -1853,10 +1854,10 @@ fn reject_raw_oid_wants_if_disallowed(
                 continue;
             }
             eprintln!("error: upload-pack: not our ref {oid}");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         eprintln!("error: Server does not allow request for unadvertised object {oid}");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -2004,7 +2005,7 @@ fn fetch_repository_not_found(repository: &str) -> Result<sley_remote::FetchOutc
     eprintln!();
     eprintln!("Please make sure you have the correct access rights");
     eprintln!("and the repository exists.");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn maybe_write_fetch_commit_graph(
@@ -2078,7 +2079,7 @@ pub(super) fn configured_server_options(config: &GitConfig, remote: &str) -> Res
             Some(value) => options.push(value.to_string()),
             None => {
                 eprintln!("error: missing value for 'remote.{remote}.serveroption'");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
     }
@@ -2536,14 +2537,14 @@ fn resolve_fetch_display(
     if fetch_output_missing_value(config) {
         eprintln!("error: missing value for 'fetch.output'");
         eprintln!("fatal: unable to parse 'fetch.output' from command-line config");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let mut format = FetchDisplayFormat::Full;
     match config.get("fetch", None, "output") {
         None => {}
         Some("") => {
             eprintln!("fatal: invalid value for 'fetch.output': ''");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         Some(value) if value.eq_ignore_ascii_case("full") => format = FetchDisplayFormat::Full,
         Some(value) if value.eq_ignore_ascii_case("compact") => {
@@ -2551,7 +2552,7 @@ fn resolve_fetch_display(
         }
         Some(value) => {
             eprintln!("fatal: invalid value for 'fetch.output': '{value}'");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     if porcelain == Some(true) {
@@ -3157,7 +3158,7 @@ pub(super) fn check_transport_allowed_url(
         Ok(()) => Ok(()),
         Err(err) => {
             eprintln!("fatal: {err}");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -3188,7 +3189,7 @@ fn run_negotiate_only(
             eprintln!(
                 "fatal: options '--negotiate-only' and '--recurse-submodules' cannot be used together"
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
 
@@ -3198,7 +3199,7 @@ fn run_negotiate_only(
     };
     if restrict.is_empty() {
         eprintln!("fatal: --negotiate-only needs one or more --negotiation-restrict=*");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     // Protocol v0/v1 cannot express wait-for-done; fail like transport.c.
@@ -3207,7 +3208,7 @@ fn run_negotiate_only(
         Some(ProtocolVersion::V0 | ProtocolVersion::V1)
     ) {
         eprintln!("warning: --negotiate-only requires protocol v2");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
 
     let mut tip_oids = Vec::new();
@@ -3215,7 +3216,7 @@ fn run_negotiate_only(
     for value in &restrict {
         let oid = resolve_revision(req.git_dir, req.format, value, true).map_err(|_| {
             eprintln!("fatal: bad revision '{value}'");
-            GitError::Exit(128)
+            crate::cli_exit(128)
         })?;
         if seen.insert(oid) {
             tip_oids.push(oid);
@@ -3255,7 +3256,7 @@ fn run_negotiate_only(
     } else {
         let _ = req.cwd;
         eprintln!("warning: protocol does not support --negotiate-only, exiting");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     };
 
     for oid in acked {

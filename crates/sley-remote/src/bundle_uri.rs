@@ -176,7 +176,9 @@ pub fn parse_bundle_uri_line(list: &mut BundleUriList, line: &str) -> Result<()>
         "creationtoken" => match value.parse() {
             Ok(token) => entry.creation_token = token,
             Err(_) => {
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "warning: could not parse bundle list key creationToken with value '{value}'"
                 );
             }
@@ -345,7 +347,11 @@ pub fn prefetch_advertised_bundle_uris_with_client(
         match download_bundle_uri_to_temp(client, uri) {
             Ok(temp) => downloaded.push((entry.id.clone(), temp)),
             Err(_) => {
-                eprintln!("warning: failed to download bundle from URI '{uri}'");
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "warning: failed to download bundle from URI '{uri}'"
+                );
             }
         }
     }
@@ -502,11 +508,8 @@ fn download_http_bundle_uri(client: &dyn HttpClient, uri: &str, dest: &Path) -> 
         let mut response = client.get(uri, &[])?;
         http_check_status(&response, uri)?;
         let mut output = fs::File::create(dest).map_err(GitError::from)?;
-        std::io::copy(&mut response.body, &mut output)
-            .map_err(GitError::from)?;
-        output
-            .flush()
-            .map_err(GitError::from)?;
+        std::io::copy(&mut response.body, &mut output).map_err(GitError::from)?;
+        output.flush().map_err(GitError::from)?;
         Ok(())
     })();
     if result.is_err() {

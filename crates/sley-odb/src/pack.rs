@@ -113,7 +113,10 @@ impl ObjectWriter for ObjectDatabase {
         let oid = object.object_id(self.format)?;
         self.objects
             .lock()
-            .map_err(|_| GitError::IoKind { kind: std::io::ErrorKind::Other, message: "object cache lock poisoned".into() })?
+            .map_err(|_| GitError::IoKind {
+                kind: std::io::ErrorKind::Other,
+                message: "object cache lock poisoned".into(),
+            })?
             .entry(oid)
             .or_insert_with(|| Arc::new(object));
         Ok(oid)
@@ -1317,7 +1320,9 @@ impl FileObjectDatabase {
                     ObjectFormat::Sha1 => 1,
                     ObjectFormat::Sha256 => 2,
                 };
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "error: multi-pack-index hash version {actual} does not match version {expected}"
                 );
                 return Ok(None);
@@ -1354,7 +1359,9 @@ impl FileObjectDatabase {
                     ObjectFormat::Sha1 => 1,
                     ObjectFormat::Sha256 => 2,
                 };
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "error: multi-pack-index hash version {actual} does not match version {expected}"
                 );
                 return Ok(None);
@@ -1417,7 +1424,12 @@ impl FileObjectDatabase {
                     }
                 }
                 Err(_) => {
-                    eprintln!("error: packfile {} index unavailable", pack.pack.display());
+                    sley_core::diagnostic!(
+                        Stderr,
+                        true,
+                        "error: packfile {} index unavailable",
+                        pack.pack.display()
+                    );
                 }
             }
         }
@@ -1428,7 +1440,12 @@ impl FileObjectDatabase {
             let index = match pack.index(self.format) {
                 Ok(index) => index,
                 Err(_) => {
-                    eprintln!("error: packfile {} index unavailable", pack.pack.display());
+                    sley_core::diagnostic!(
+                        Stderr,
+                        true,
+                        "error: packfile {} index unavailable",
+                        pack.pack.display()
+                    );
                     continue;
                 }
             };

@@ -326,7 +326,7 @@ impl<'a> FetchServices<'a> {
 /// from (used for `FETCH_HEAD` descriptions and to look up `remote.<name>.*`).
 ///
 /// Emits prune notices through `progress` and returns the structured
-/// [`FetchOutcome`]; never prints or returns `GitError::Exit`.
+/// [`FetchOutcome`]; never prints or returns a process exit request.
 ///
 /// The smart-HTTP transport constructs a default [`UreqHttpClient`]. Hosts that
 /// must enforce network policy on the dial (e.g. SSRF-guard a public mirror URL)
@@ -2171,8 +2171,12 @@ fn validate_incoming_fetch_objects(
     let report = sley_fsck::fsck_objects_with_options(db, format, roots, [], options);
     for issue in &report.issues {
         match issue.stream {
-            sley_fsck::IssueStream::Stdout => println!("{}", issue.message),
-            sley_fsck::IssueStream::Stderr => eprintln!("{}", issue.message),
+            sley_fsck::IssueStream::Stdout => {
+                sley_core::diagnostic!(Stdout, true, "{}", issue.message)
+            }
+            sley_fsck::IssueStream::Stderr => {
+                sley_core::diagnostic!(Stderr, true, "{}", issue.message)
+            }
         }
     }
     if report.is_ok() {
@@ -2444,7 +2448,9 @@ fn report_fetch_ref_apply_error(
         || detail.contains("non-empty directory");
     if is_name_conflict {
         if !*conflict_msg_shown {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "error: some local refs could not be updated; try running\n \
                  'git remote prune {remote_name}' to remove any old, conflicting branches"
             );
@@ -2456,9 +2462,9 @@ fn report_fetch_ref_apply_error(
     // Lock failures already use git's `error: cannot lock ref '…': …` form when
     // raised as InvalidFormat; print them as-is. Otherwise wrap.
     if detail.starts_with("error: ") {
-        eprintln!("{detail}");
+        sley_core::diagnostic!(Stderr, true, "{detail}");
     } else {
-        eprintln!("error: cannot lock ref '{dst}': {detail}");
+        sley_core::diagnostic!(Stderr, true, "error: cannot lock ref '{dst}': {detail}");
     }
 }
 
@@ -2609,8 +2615,12 @@ fn reject_shallow_clone_fetch(
     let deepening =
         options.depth.is_some() || options.deepen_since.is_some() || !options.deepen_not.is_empty();
     if options.reject_shallow && options.cloning && !deepening && !shallow_info.is_empty() {
-        eprintln!("fatal: source repository is shallow, reject to clone.");
-        return Err(GitError::Exit(128));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "fatal: source repository is shallow, reject to clone."
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     Ok(())
 }

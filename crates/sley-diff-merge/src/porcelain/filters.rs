@@ -299,8 +299,14 @@ pub fn compile_ignore_matching_regexes(patterns: &[String]) -> Result<Vec<Regex>
         match Regex::compile(pattern, sley_grep::RegexMode::Ere, false, false) {
             Ok(regex) => compiled.push(regex),
             Err(_) => {
-                eprintln!("error: invalid regex given to -I: '{pattern}'");
-                return Err(GitError::Exit(129));
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "error: invalid regex given to -I: '{pattern}'"
+                );
+                return Err(GitError::Rejected(
+                    sley_core::RejectionKind::InvalidArguments,
+                ));
             }
         }
     }
@@ -454,8 +460,12 @@ pub fn apply_diff_max_depth(
 
 pub fn parse_diff_max_depth(value: &str) -> Result<i64> {
     value.parse::<i64>().map_err(|_| {
-        eprintln!("error: option `max-depth' expects a numerical value");
-        GitError::Exit(129)
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "error: option `max-depth' expects a numerical value"
+        );
+        GitError::Rejected(sley_core::RejectionKind::InvalidArguments)
     })
 }
 
@@ -549,8 +559,12 @@ pub fn validate_diff_rename_limit(value: &str) -> Result<()> {
 }
 
 pub fn diff_rename_limit_requires_integer_error() -> GitError {
-    eprintln!("error: switch `l' expects an integer value with an optional k/m/g suffix");
-    GitError::Exit(129)
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "error: switch `l' expects an integer value with an optional k/m/g suffix"
+    );
+    GitError::Rejected(sley_core::RejectionKind::InvalidArguments)
 }
 
 /// Pathspec matching over diff entries (`LsFilesPathFilter`-backed). Hosts

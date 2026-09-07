@@ -36,7 +36,7 @@ pub(crate) fn cmd_mergetool(
         select_tool_name(config, ToolMode::Merge, options.cli_tool.as_deref(), gui)
     else {
         eprintln!("No merge tool configured");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     };
     let tool = resolve_tool_command(config, ToolMode::Merge, &tool_name, None)?;
     let mut conflicts = collect_unmerged_paths(repo.git_dir(), repo.format())?;
@@ -66,7 +66,7 @@ pub(crate) fn cmd_mergetool(
         }
     }
     if failed {
-        Err(GitError::Exit(1))
+        Err(crate::cli_exit(1))
     } else {
         Ok(())
     }
@@ -86,7 +86,7 @@ fn parse_mergetool_args(args: &[String]) -> Result<MergetoolOptions> {
         match arg.as_str() {
             "-h" | "--help" => {
                 println!("usage: git mergetool [--tool=tool] [file to merge] ...");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             "--tool-help" => {
                 print_tool_help(ToolMode::Merge);

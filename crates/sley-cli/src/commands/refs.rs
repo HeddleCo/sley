@@ -48,7 +48,7 @@ pub(crate) fn cmd_reflog(cli_session: &crate::session::CliSession, args: &[Strin
         .is_some_and(|arg| arg == "-h" || arg == "--help")
     {
         print_reflog_usage_stdout();
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     if args
         .get(1)
@@ -64,7 +64,7 @@ pub(crate) fn cmd_reflog(cli_session: &crate::session::CliSession, args: &[Strin
             Some("expire") => print_reflog_expire_usage_stdout(),
             _ => print_reflog_usage_stdout(),
         }
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     if args.first().is_some_and(|arg| arg == "exists") {
         return cmd_reflog_exists(cli_session, &args[1..]);
@@ -268,13 +268,13 @@ fn cmd_reflog_exists(cli_session: &crate::session::CliSession, args: &[String]) 
     let Some(reference) = args.first() else {
         eprintln!("usage: git reflog exists <ref>");
         eprintln!();
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     };
     let git_dir = cli_session.git_dir()?;
     if reflog_path_for_ref(&git_dir, reference)?.is_file() {
         Ok(())
     } else {
-        Err(GitError::Exit(1))
+        Err(crate::cli_exit(1))
     }
 }
 
@@ -291,14 +291,14 @@ fn cmd_reflog_list(cli_session: &crate::session::CliSession, args: &[String]) ->
             eprintln!("error: unknown option `{}'", arg.trim_start_matches('-'));
             eprintln!("usage: git reflog list");
             eprintln!();
-            return Err(GitError::Exit(129));
+            return Err(crate::cli_exit(129));
         }
         refs.push(arg.clone());
         index += 1;
     }
     if let Some(reference) = refs.first() {
         eprintln!("error: list does not accept arguments: '{reference}'");
-        return Err(GitError::Exit(255));
+        return Err(crate::cli_exit(255));
     }
 
     let git_dir = cli_session.git_dir()?;
@@ -484,7 +484,7 @@ fn cmd_reflog_delete(cli_session: &crate::session::CliSession, args: &[String]) 
     }
     if specs.is_empty() {
         eprintln!("error: no reflog specified to delete");
-        return Err(GitError::Exit(255));
+        return Err(crate::cli_exit(255));
     }
 
     let git_dir = cli_session.git_dir()?;
@@ -492,8 +492,8 @@ fn cmd_reflog_delete(cli_session: &crate::session::CliSession, args: &[String]) 
     let store = FileRefStore::new(&git_dir, format);
     let mut exit_code = 0;
     for spec in specs {
-        if let Err(GitError::Exit(code)) =
-            delete_reflog_entry(&store, &git_dir, format, &spec, options)
+        if let Err(error) = delete_reflog_entry(&store, &git_dir, format, &spec, options)
+            && let Some(code) = crate::cli_reported_status(&error)
         {
             exit_code = code;
         }
@@ -501,7 +501,7 @@ fn cmd_reflog_delete(cli_session: &crate::session::CliSession, args: &[String]) 
     if exit_code == 0 {
         Ok(())
     } else {
-        Err(GitError::Exit(exit_code))
+        Err(crate::cli_exit(exit_code))
     }
 }
 
@@ -518,7 +518,7 @@ fn reflog_delete_usage<T>() -> Result<T> {
     );
     eprintln!("    --[no-]verbose        print extra information on screen");
     eprintln!();
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn delete_reflog_entry(
@@ -530,12 +530,12 @@ fn delete_reflog_entry(
 ) -> Result<()> {
     let Some((reference, selector)) = parse_reflog_delete_spec(store, git_dir, format, spec) else {
         eprintln!("error: not a reflog: {spec}");
-        return Err(GitError::Exit(255));
+        return Err(crate::cli_exit(255));
     };
     let mut entries = store.read_reflog(&reference)?;
     if entries.is_empty() {
         eprintln!("error: no reflog for '{spec}'");
-        return Err(GitError::Exit(255));
+        return Err(crate::cli_exit(255));
     }
     let Some(delete_index) = entries.len().checked_sub(selector + 1) else {
         return Ok(());
@@ -645,7 +645,7 @@ fn cmd_reflog_drop(cli_session: &crate::session::CliSession, args: &[String]) ->
     }
     if options.all && !refs.is_empty() {
         eprintln!("usage: references specified along with --all");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
 
     let git_dir = cli_session.git_dir()?;
@@ -680,7 +680,7 @@ fn cmd_reflog_drop(cli_session: &crate::session::CliSession, args: &[String]) ->
     if exit_code == 0 {
         Ok(())
     } else {
-        Err(GitError::Exit(exit_code))
+        Err(crate::cli_exit(exit_code))
     }
 }
 
@@ -706,19 +706,19 @@ fn reflog_drop_usage<T>() -> Result<T> {
     eprintln!("    --[no-]single-worktree");
     eprintln!("                          drop reflogs from the current worktree only");
     eprintln!();
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn cmd_reflog_write(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     if args.len() != 4 {
         eprintln!("usage: git reflog write <ref> <old-oid> <new-oid> <message>");
         eprintln!();
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     let reference = &args[0];
     if !reflog_write_refname_is_valid(reference) {
         eprintln!("fatal: invalid reference name: {reference}");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let git_dir = cli_session.git_dir()?;
@@ -760,7 +760,7 @@ fn normalize_reflog_write_message(message: &str) -> Vec<u8> {
 fn parse_reflog_write_oid(format: ObjectFormat, value: &str, role: &str) -> Result<ObjectId> {
     ObjectId::from_hex(format, value).map_err(|_| {
         eprintln!("fatal: invalid {role} object ID: '{value}'");
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })
 }
 
@@ -774,7 +774,7 @@ fn validate_reflog_write_object(
         return Ok(());
     }
     eprintln!("fatal: {role} object '{oid}' does not exist");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn cmd_reflog_expire(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
@@ -888,15 +888,15 @@ fn expire_reflogs_at(
     for original in refs {
         if is_reflog_selector(&original) {
             eprintln!("error: reflog could not be found: '{original}'");
-            return Err(GitError::Exit(255));
+            return Err(crate::cli_exit(255));
         }
         let reference = resolve_reflog_name(&store, git_dir, format, &original).map_err(|_| {
             eprintln!("error: reflog could not be found: '{original}'");
-            GitError::Exit(255)
+            crate::cli_exit(255)
         })?;
         if store.read_reflog(&reference)?.is_empty() {
             eprintln!("error: reflog could not be found: '{original}'");
-            return Err(GitError::Exit(255));
+            return Err(crate::cli_exit(255));
         }
         targets.insert((git_dir.to_path_buf(), reference));
     }
@@ -920,7 +920,7 @@ fn expire_reflogs_at(
         }
         let mut target_options = options;
         apply_reflog_expire_pattern_config_from(&context.config, &reference, &mut target_options)?;
-        if let Err(GitError::Exit(code)) = expire_reflog_entries(
+        if let Err(error) = expire_reflog_entries(
             &target_store,
             &db,
             &target_git_dir,
@@ -930,14 +930,15 @@ fn expire_reflogs_at(
             replace_objects,
             &mut context,
             discovered,
-        ) {
+        ) && let Some(code) = crate::cli_reported_status(&error)
+        {
             exit_code = code;
         }
     }
     if exit_code == 0 {
         Ok(())
     } else {
-        Err(GitError::Exit(exit_code))
+        Err(crate::cli_exit(exit_code))
     }
 }
 
@@ -965,7 +966,7 @@ fn expire_reflog_entries(
     };
     if entries.is_empty() {
         eprintln!("error: reflog could not be found: '{reference}'");
-        return Err(GitError::Exit(255));
+        return Err(crate::cli_exit(255));
     }
     let zero = ObjectId::null(format);
     let mut retained = Vec::new();
@@ -1282,7 +1283,7 @@ fn reflog_tree_is_complete(
 
 fn reflog_expire_option_requires_value<T>(option: &str) -> Result<T> {
     eprintln!("error: option `{option}' requires a value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn reflog_expire_usage<T>() -> Result<T> {
@@ -1312,7 +1313,7 @@ fn reflog_expire_usage<T>() -> Result<T> {
         "                          limits processing to reflogs from the current worktree only"
     );
     eprintln!();
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn reflog_show_pathspecs_match(cwd: &Path, pathspecs: &[String]) -> bool {
@@ -1383,7 +1384,7 @@ fn setup_update_server_info_options(args: &[String]) -> Result<bool> {
             if let Some(message) = error.message() {
                 if message.contains("takes no value") {
                     eprintln!("error: {message}");
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 }
                 if message.starts_with("unknown option `") {
                     let option = message
@@ -1489,7 +1490,7 @@ fn update_server_info_usage<T>() -> Result<T> {
     eprintln!();
     eprintln!("    -f, --[no-]force      update the info files from scratch");
     eprintln!();
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 pub(crate) fn cmd_update_ref(
@@ -1580,7 +1581,7 @@ pub(crate) fn cmd_update_ref(
     }
     if batch_updates {
         eprintln!("fatal: --batch-updates can only be used with --stdin");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if nul {
         return update_ref_usage();
@@ -1603,7 +1604,7 @@ pub(crate) fn cmd_update_ref(
                     "error: refusing to update ref with bad name '{}'",
                     positional[0]
                 );
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
             // A name whose stored content does not parse as a ref (an arbitrary
             // file such as `.git/my-private-file`) is not a symref we can follow;
@@ -1626,7 +1627,7 @@ pub(crate) fn cmd_update_ref(
                 "error: refusing to update ref with bad name '{}'",
                 effective.effective
             );
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         if deref
             && effective.requested == effective.effective
@@ -1639,7 +1640,7 @@ pub(crate) fn cmd_update_ref(
                 "error: multiple updates for '{}' (including one via symref '{}') are not allowed",
                 effective.requested, effective.requested
             );
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         return update_ref_delete(
             &store,
@@ -1664,7 +1665,7 @@ pub(crate) fn cmd_update_ref(
             eprintln!(
                 "fatal: update_ref failed for ref '{requested_name}': refusing to update ref with bad name '{requested_name}'"
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         Err(err) => return Err(err),
     };
@@ -1672,7 +1673,7 @@ pub(crate) fn cmd_update_ref(
         eprintln!(
             "fatal: update_ref failed for ref '{requested_name}': refusing to update ref with bad name '{name}'"
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let new_oid = parse_update_ref_new_oid(&git_dir, format, &store, &positional[1])?;
     let expected_oid = if let Some(old) = positional.get(2) {
@@ -1683,7 +1684,7 @@ pub(crate) fn cmd_update_ref(
     check_update_ref_new_value(&git_dir, format, &name, &requested_name, &new_oid).map_err(
         |reason| {
             eprintln!("fatal: update_ref failed for ref '{requested_name}': {reason}");
-            GitError::Exit(128)
+            crate::cli_exit(128)
         },
     )?;
     let current = store.read_ref(&name)?;
@@ -1759,7 +1760,7 @@ pub(crate) fn cmd_update_ref(
             eprintln!(
                 "fatal: update_ref failed for ref '{tx_name}': reftable: transaction failure: entry too large"
             );
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
         Err(err) => Err(err),
     }
@@ -1769,7 +1770,7 @@ fn update_ref_usage() -> Result<()> {
     eprintln!(
         "usage: git update-ref [<options>] -d <refname> [<old-oid>]\n   or: git update-ref [<options>]    <refname> <new-oid> [<old-oid>]\n   or: git update-ref [<options>] --stdin [-z] [--batch-updates]\n\n    -m <reason>           reason of the update\n    -d                    delete the reference\n    --no-deref            update <refname> not the one it points to\n    --deref               opposite of --no-deref\n    -z                    stdin has NUL-terminated arguments\n    --[no-]stdin          read updates from stdin\n    --[no-]create-reflog  create a reflog\n    -0, --[no-]batch-updates\n                          batch reference updates"
     );
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn reftable_lock_timeout_override() -> Result<Option<u64>> {
@@ -2493,7 +2494,7 @@ fn dispatch_ref_stdin_command(
                                     eprintln!(
                                         "fatal: symref-update {raw_name}: invalid oid: {old_value}"
                                     );
-                                    return Err(GitError::Exit(128));
+                                    return Err(crate::cli_exit(128));
                                 }
                             },
                         )),
@@ -2706,7 +2707,7 @@ impl UpdateRefStdinTransaction {
                 "fatal: cannot lock ref '{requested}': '{other}' exists; cannot create '{name}'"
             );
         }
-        GitError::Exit(128)
+        crate::cli_exit(128)
     }
 
     fn effective_ref(
@@ -2739,7 +2740,7 @@ impl UpdateRefStdinTransaction {
                     eprintln!(
                         "fatal: cannot lock ref '{requested}': unable to resolve reference '{current}': reference broken"
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 Err(GitError::NotFound(sley::NotFoundKind::BrokenReference { name, .. }))
                     if name == current =>
@@ -2747,7 +2748,7 @@ impl UpdateRefStdinTransaction {
                     eprintln!(
                         "fatal: cannot lock ref '{requested}': unable to resolve reference '{current}': reference broken"
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 Err(err) => return Err(err),
             }
@@ -2808,7 +2809,7 @@ impl UpdateRefStdinTransaction {
             eprintln!(
                 "fatal: cannot lock ref '{requested}': there is a non-empty directory '{path}' blocking reference '{new_ref}'"
             );
-            return GitError::Exit(128);
+            return crate::cli_exit(128);
         }
         // Backend message: "cannot lock ref '<new>': '<existing>' exists; cannot create '<new>'".
         let Some((new_ref, existing_ref)) = parse_df_conflict_message(message) else {
@@ -2827,7 +2828,7 @@ impl UpdateRefStdinTransaction {
                 "fatal: cannot lock ref '{requested}': '{existing_ref}' exists; cannot create '{new_ref}'"
             );
         }
-        GitError::Exit(128)
+        crate::cli_exit(128)
     }
 
     fn capture(&mut self, store: &FileRefStore, requested: &str, name: &str) -> Result<bool> {
@@ -2950,14 +2951,14 @@ impl UpdateRefStdinTransaction {
                 .or_else(|| self.infer_duplicate_message(store, &name).ok().flatten());
             self.restore(store)?;
             update_ref_stdin_duplicate_failure("prepare", &name, message.as_deref());
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if self.explicit
             && let Some((name, message)) = self.staged_duplicate()
         {
             self.restore(store)?;
             update_ref_stdin_duplicate_failure("prepare", &name, message.as_deref());
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if self.explicit {
             self.run_explicit_hook(context, RefTransactionPhase::Preparing)?;
@@ -2985,14 +2986,14 @@ impl UpdateRefStdinTransaction {
             });
             self.restore(context.store)?;
             update_ref_stdin_duplicate_failure("commit", &name, message.as_deref());
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if self.explicit
             && let Some((name, message)) = self.staged_duplicate()
         {
             self.restore(context.store)?;
             update_ref_stdin_duplicate_failure("commit", &name, message.as_deref());
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         let staged = mem::take(&mut self.staged);
         if !staged.is_empty() {
@@ -3047,7 +3048,7 @@ impl UpdateRefStdinTransaction {
             });
             self.restore(context.store)?;
             update_ref_stdin_duplicate_failure("", &name, message.as_deref());
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if !self.staged.is_empty() {
             let staged = mem::take(&mut self.staged);
@@ -3224,7 +3225,7 @@ impl UpdateRefStdinTransaction {
                 Err(err) => {
                     self.release_locks();
                     eprintln!("fatal: prepare: cannot lock ref '{name}': {err}");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
             }
         }
@@ -3256,22 +3257,22 @@ fn prune_empty_ref_lock_dirs(lock_path: &Path) {
 
 fn update_ref_stdin_prepared_transaction() -> Result<()> {
     eprintln!("fatal: prepared transactions can only be closed");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn update_ref_stdin_restart_transaction() -> Result<()> {
     eprintln!("fatal: cannot restart ongoing transaction");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn update_ref_stdin_closed_transaction() -> Result<()> {
     eprintln!("fatal: transaction is closed");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn update_ref_stdin_invalid_ref_format(name: &str) -> Result<EffectiveRefName> {
     eprintln!("fatal: invalid ref format: {name}");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn update_ref_stdin_duplicate_failure(phase: &str, name: &str, message: Option<&str>) {
@@ -3500,7 +3501,7 @@ fn update_ref_stdin_commit_staged(
                 )
                 .map_err(|reason| {
                     eprintln!("fatal: {reason}");
-                    GitError::Exit(128)
+                    crate::cli_exit(128)
                 })?;
                 let old_oid = match current {
                     Some(RefTarget::Direct(oid)) => oid,
@@ -3669,7 +3670,7 @@ fn update_ref_stdin_commit_staged(
             } else {
                 eprintln!("fatal: {message}");
             }
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
         result => result,
     };
@@ -3693,26 +3694,26 @@ fn warn_prefer_symlink_refs_deprecated() {
 
 fn update_ref_stdin_bad_command(command: &str) -> Result<()> {
     eprintln!("fatal: unknown command: {command}");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 /// git's `<cmd>: missing <ref>` (e.g. `create: missing <ref>`).
 fn update_ref_stdin_missing_ref(command: &str) -> Result<()> {
     eprintln!("fatal: {command}: missing <ref>");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 /// git's `<cmd> <ref>: missing <new-oid>` for create/update.
 fn update_ref_stdin_missing_new_oid(command: &str, refname: &str) -> Result<()> {
     eprintln!("fatal: {command} {refname}: missing <new-oid>");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 /// git's `<cmd> <ref>: unexpected end of input when reading <field>` (only the
 /// `-z` path can hit this; the `\n` path treats a short line as `missing`).
 fn update_ref_stdin_eof(command: &str, refname: &str, field: &str) -> Result<()> {
     eprintln!("fatal: {command} {refname}: unexpected end of input when reading {field}");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 /// git's `<cmd> <ref>: missing <new-target>` for symref-create.
@@ -3721,7 +3722,7 @@ fn update_ref_stdin_symref_update_missing_new_target_for(
     refname: &str,
 ) -> Result<()> {
     eprintln!("fatal: {command} {refname}: missing <new-target>");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn update_ref_stdin_unknown_option(option: &str, terminator: u8) -> Result<()> {
@@ -3734,17 +3735,17 @@ fn update_ref_stdin_unknown_option(option: &str, terminator: u8) -> Result<()> {
     } else {
         eprintln!("fatal: option unknown: {option}");
     }
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn update_ref_stdin_create_zero(name: &str) -> Result<()> {
     eprintln!("fatal: create {name}: zero <new-oid>");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn update_ref_stdin_delete_zero(name: &str) -> Result<()> {
     eprintln!("fatal: delete {name}: zero <old-oid>");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn update_ref_stdin_symref_create(
@@ -3890,7 +3891,7 @@ fn update_ref_stdin_symref_verify_current(
             eprintln!(
                 "fatal: cannot lock ref '{name}': expected symref with target '{expected}': but is a regular ref"
             );
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
         (Some(RefTarget::Direct(_)), None) => update_ref_stdin_symref_exists(name, false),
         (Some(RefTarget::Symbolic(_)), None) => update_ref_stdin_symref_exists(name, true),
@@ -3899,7 +3900,7 @@ fn update_ref_stdin_symref_verify_current(
             eprintln!(
                 "fatal: verifying symref target: '{name}': is at {actual} but expected {expected}"
             );
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -3940,7 +3941,7 @@ fn update_ref_stdin_symref_verify_oid(
         eprintln!(
             "fatal: cannot lock ref '{requested}': reference is missing but expected {expected}"
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     check_update_ref_stdin_expected_named(store, format, requested, name, current, expected)
 }
@@ -3969,12 +3970,12 @@ fn update_ref_stdin_symref_delete(
 
 fn update_ref_stdin_symref_verify_deref_mode() -> Result<()> {
     eprintln!("fatal: symref-verify: cannot operate with deref mode");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn update_ref_stdin_symref_delete_deref_mode() -> Result<()> {
     eprintln!("fatal: symref-delete: cannot operate with deref mode");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn update_ref_stdin_symref_exists(name: &str, symbolic: bool) -> Result<()> {
@@ -3984,27 +3985,27 @@ fn update_ref_stdin_symref_exists(name: &str, symbolic: bool) -> Result<()> {
         "reference already exists"
     };
     eprintln!("fatal: cannot lock ref '{name}': {reason}");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn update_ref_stdin_symref_unresolved(name: &str) -> Result<()> {
     eprintln!("fatal: cannot lock ref '{name}': unable to resolve reference '{name}'");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn update_ref_stdin_symref_update_missing_new_target(name: &str) -> Result<()> {
     eprintln!("fatal: symref-update {name}: missing <new-target>");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn update_ref_stdin_symref_update_missing_old_value(name: &str) -> Result<()> {
     eprintln!("fatal: symref-update {name}: expected old value");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn update_ref_stdin_symref_update_invalid_old_kind(name: &str, kind: &str) -> Result<()> {
     eprintln!("fatal: symref-update {name}: invalid arg '{kind}' for old value");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 #[derive(Debug)]
@@ -4349,7 +4350,7 @@ fn update_ref_stdin_write(
     check_update_ref_new_value_cached(context, &request.name, &request.requested, &request.new_oid)
         .map_err(|reason| {
             eprintln!("fatal: {reason}");
-            GitError::Exit(128)
+            crate::cli_exit(128)
         })?;
     let old_oid = match current {
         Some(RefTarget::Direct(oid)) => oid,
@@ -4629,7 +4630,7 @@ fn parse_update_ref_new_oid(
         format.name(),
         value.len()
     );
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn parse_update_ref_oidish(
@@ -4691,7 +4692,7 @@ fn resolve_stdin_oid(
         Some(oid) => Ok(oid),
         None => {
             eprintln!("fatal: {command} {refname}: invalid {field}: {value}");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
     .inspect(|oid| {
@@ -4788,17 +4789,17 @@ fn check_update_ref_stdin_expected_named(
 
 fn update_ref_lock_failure(name: &str, reason: &str) -> Result<()> {
     eprintln!("fatal: update_ref failed for ref '{name}': cannot lock ref '{name}': {reason}");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn update_ref_stdin_lock_failure(name: &str, reason: &str) -> Result<()> {
     eprintln!("fatal: cannot lock ref '{name}': {reason}");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn update_ref_delete_lock_failure(name: &str, reason: &str) -> Result<()> {
     eprintln!("error: cannot lock ref '{name}': {reason}");
-    Err(GitError::Exit(1))
+    Err(crate::cli_exit(1))
 }
 
 pub(crate) fn cmd_show_ref(
@@ -4898,7 +4899,7 @@ pub(crate) fn cmd_show_ref(
             return Ok(());
         }
         eprintln!("error: reference does not exist");
-        return Err(GitError::Exit(2));
+        return Err(crate::cli_exit(2));
     }
     if verify {
         if filters.is_empty() {
@@ -4924,20 +4925,20 @@ pub(crate) fn cmd_show_ref(
                     };
                     let Some((oid, _)) = resolve_for_each_ref_target(&store, &reference)? else {
                         if quiet {
-                            return Err(GitError::Exit(1));
+                            return Err(crate::cli_exit(1));
                         }
                         eprintln!("fatal: '{filter}' - not a valid ref");
-                        return Err(GitError::Exit(128));
+                        return Err(crate::cli_exit(128));
                     };
                     if !quiet {
                         print_show_ref(&oid, filter, hash_only, abbrev);
                         print_show_ref_deref(&db, format, &oid, filter, dereference, abbrev)?;
                     }
                 }
-                None if quiet => return Err(GitError::Exit(1)),
+                None if quiet => return Err(crate::cli_exit(1)),
                 _ => {
                     eprintln!("fatal: '{filter}' - not a valid ref");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
             }
         }
@@ -4977,7 +4978,7 @@ pub(crate) fn cmd_show_ref(
         }
     }
     if !matched {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -4992,7 +4993,7 @@ fn show_ref_exists_requires_reference(count: usize) -> Result<()> {
     } else {
         eprintln!("fatal: --exists requires exactly one reference");
     }
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn cmd_show_ref_exclude_existing(refs: &[sley_refs::Ref], pattern: Option<&str>) -> Result<()> {
@@ -5092,7 +5093,7 @@ pub(crate) fn cmd_symbolic_ref(
         .next_back();
     if message_value == Some("") {
         eprintln!("fatal: Refusing to perform update with empty message");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let message = message_value.unwrap_or("").as_bytes().to_vec();
 
@@ -5144,7 +5145,7 @@ fn update_symbolic_ref(
     }
     if validate_symref_target(target).is_err() {
         eprintln!("fatal: Refusing to set '{name}' to invalid ref '{target}'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let old_oid = resolve_symbolic_ref_oid(store, format, name)?;
     let new_oid = if sley_refs::validate_ref_name_for_read(target).is_ok() {
@@ -5178,7 +5179,7 @@ fn commit_symbolic_ref_update(tx: sley_refs::FileRefTransaction<'_>) -> Result<(
                 .and_then(|_| message.split_once(": ").map(|(_, detail)| detail))
                 .unwrap_or(&message);
             eprintln!("error: {detail}");
-            Err(GitError::Exit(1))
+            Err(crate::cli_exit(1))
         }
         Err(err) => Err(err),
     }
@@ -5212,7 +5213,7 @@ fn read_symbolic_ref_target(
     let mut current = name.to_string();
     let mut target = match store.read_ref(&current)? {
         Some(RefTarget::Symbolic(target)) => target,
-        _ if quiet => return Err(GitError::Exit(1)),
+        _ if quiet => return Err(crate::cli_exit(1)),
         _ => return symbolic_ref_not_symbolic(name),
     };
     if !recurse {
@@ -5230,7 +5231,7 @@ fn read_symbolic_ref_target(
 
 fn symbolic_ref_not_symbolic(name: &str) -> Result<String> {
     eprintln!("fatal: ref {name} is not a symbolic ref");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn symbolic_ref_short_name(name: &str) -> &str {
@@ -5248,7 +5249,7 @@ fn symbolic_ref_short_name(name: &str) -> &str {
 
 fn symbolic_ref_refusing_outside_refs() -> Result<()> {
     eprintln!("fatal: Refusing to point HEAD outside of refs/");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn symbolic_ref_usage() -> Result<()> {
@@ -5256,7 +5257,7 @@ fn symbolic_ref_usage() -> Result<()> {
         "{}",
         sley_options::usage_with_options(&symbolic_ref_option_specs(), &symbolic_ref_usage_lines())
     );
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn symbolic_ref_option_specs() -> [OptionSpec<'static>; 5] {
@@ -5309,7 +5310,7 @@ fn symbolic_ref_usage_lines() -> [&'static str; 3] {
 
 fn symbolic_ref_usage_error(error: UsageError) -> GitError {
     eprint!("{}", error.render_stderr());
-    GitError::Exit(error.exit_code())
+    crate::cli_exit(error.exit_code())
 }
 
 /// `git refs` command group (builtin/refs.c, git 2.54). Dispatches to the ref
@@ -5319,7 +5320,7 @@ pub(crate) fn cmd_refs(cli_session: &crate::session::CliSession, args: &[String]
     let Some(subcommand) = args.first().map(String::as_str) else {
         eprintln!("error: need a subcommand");
         print_refs_usage();
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     };
     match subcommand {
         "list" => {
@@ -5339,12 +5340,12 @@ pub(crate) fn cmd_refs(cli_session: &crate::session::CliSession, args: &[String]
         "optimize" => commands::pack::cmd_pack_refs(cli_session, &args[1..]),
         "-h" | "--help" => {
             print_refs_usage();
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
         other => {
             eprintln!("error: unknown subcommand: `{other}'");
             print_refs_usage();
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
     }
 }
@@ -5364,7 +5365,7 @@ fn cmd_refs_migrate(cli_session: &crate::session::CliSession, args: &[String]) -
             "--ref-format" => {
                 let Some(value) = iter.next() else {
                     eprintln!("usage: missing --ref-format=<format>");
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 };
                 target_format = Some(parse_refs_migrate_ref_format(value)?);
             }
@@ -5381,7 +5382,7 @@ fn cmd_refs_migrate(cli_session: &crate::session::CliSession, args: &[String]) -
             value if value.starts_with('-') => {
                 eprintln!("error: unknown option `{}`", value.trim_start_matches('-'));
                 print_refs_usage();
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             value => positionals.push(value.to_string()),
         }
@@ -5389,11 +5390,11 @@ fn cmd_refs_migrate(cli_session: &crate::session::CliSession, args: &[String]) -
 
     if !positionals.is_empty() {
         eprintln!("usage: too many arguments");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     let Some(target_format) = target_format else {
         eprintln!("usage: missing --ref-format=<format>");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     };
 
     let git_dir = cli_session.git_dir()?;
@@ -5412,11 +5413,11 @@ fn cmd_refs_migrate(cli_session: &crate::session::CliSession, args: &[String]) -
         Ok(outcome) => outcome,
         Err(sley_refs::migration::MigrateRefStorageError::AlreadyUses(format)) => {
             eprintln!("error: repository already uses '{}' format", format.name());
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         Err(sley_refs::migration::MigrateRefStorageError::LinkedWorktreesUnsupported) => {
             eprintln!("error: migrating repositories with worktrees is not supported yet");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         Err(sley_refs::migration::MigrateRefStorageError::Storage(err)) => return Err(err),
     };
@@ -5434,7 +5435,7 @@ fn parse_refs_migrate_ref_format(value: &str) -> Result<RefStorageFormat> {
         Ok(format) => Ok(format),
         Err(_) => {
             eprintln!("error: unknown ref storage format '{value}'");
-            Err(GitError::Exit(1))
+            Err(crate::cli_exit(1))
         }
     }
 }
@@ -5465,7 +5466,7 @@ fn cmd_refs_exists(cli_session: &crate::session::CliSession, args: &[String]) ->
     let refs: Vec<&String> = args.iter().filter(|arg| arg.as_str() != "--").collect();
     if refs.len() != 1 {
         eprintln!("fatal: 'git refs exists' requires a reference");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let name = refs[0];
     let git_dir = cli_session.git_dir()?;
@@ -5475,7 +5476,7 @@ fn cmd_refs_exists(cli_session: &crate::session::CliSession, args: &[String]) ->
         Ok(())
     } else {
         eprintln!("error: reference does not exist");
-        Err(GitError::Exit(2))
+        Err(crate::cli_exit(2))
     }
 }
 

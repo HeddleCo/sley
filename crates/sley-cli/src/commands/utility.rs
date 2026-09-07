@@ -15,7 +15,7 @@ pub(crate) fn cmd_imap_send(args: &[String]) -> Result<()> {
             "-v" | "--verbose" => {}
             _ => {
                 eprintln!("usage: git imap-send [-v] [-q] [--[no-]curl]");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
         }
     }
@@ -23,10 +23,10 @@ pub(crate) fn cmd_imap_send(args: &[String]) -> Result<()> {
     io::stdin().read_to_end(&mut input)?;
     if input.is_empty() {
         eprintln!("nothing to send");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     eprintln!("fatal: native imap-send transport is not yet implemented");
-    Err(GitError::Exit(1))
+    Err(crate::cli_exit(1))
 }
 
 pub(crate) fn cmd_version(args: &[String]) -> Result<()> {
@@ -69,7 +69,7 @@ pub(crate) fn cmd_bugreport(
             "-s" | "--suffix" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 };
                 suffix = Some(value.clone());
             }
@@ -82,7 +82,7 @@ pub(crate) fn cmd_bugreport(
             "-o" | "--output-directory" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 };
                 output_dir = PathBuf::from(value);
             }
@@ -172,7 +172,7 @@ pub(crate) fn cmd_repo(cli_session: &crate::session::CliSession, args: &[String]
 fn repo_usage<T>() -> Result<T> {
     eprintln!("usage: git repo info [--format=(lines|nul) | -z] [--all | <key>...]");
     eprintln!("   or: git repo info --keys [--format=(lines|nul) | -z]");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -201,21 +201,21 @@ fn cmd_repo_info(cli_session: &crate::session::CliSession, args: &[String]) -> R
     if parsed.keys {
         if parsed.all || !parsed.fields.is_empty() {
             eprintln!("fatal: --keys cannot be used with a <key> or --all");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if parsed.format == RepoInfoFormat::Table {
             eprintln!("fatal: --keys can only be used with --format=lines or --format=nul");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         return repo_info_print_keys(parsed.format);
     }
     if parsed.all && !parsed.fields.is_empty() {
         eprintln!("fatal: --all and <key> cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if parsed.format == RepoInfoFormat::Table {
         eprintln!("fatal: unsupported output format");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let fields = if parsed.all {
@@ -240,7 +240,7 @@ fn cmd_repo_info(cli_session: &crate::session::CliSession, args: &[String]) -> R
         }
     }
     if had_error {
-        Err(GitError::Exit(1))
+        Err(crate::cli_exit(1))
     } else {
         Ok(())
     }
@@ -262,14 +262,14 @@ fn parse_repo_info_args(args: &[String]) -> Result<ParsedRepoInfo> {
             "--" => positional_only = true,
             "-h" | "--help" => {
                 print_repo_info_usage_stdout();
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             "-z" => format = RepoInfoFormat::Nul,
             "--format" => {
                 let Some(value) = iter.next() else {
                     eprintln!("error: option `format' requires a value");
                     print_repo_info_usage_stderr();
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 };
                 format = parse_repo_info_format(value)?;
             }
@@ -283,7 +283,7 @@ fn parse_repo_info_args(args: &[String]) -> Result<ParsedRepoInfo> {
             value if value.starts_with('-') => {
                 eprintln!("error: unknown option `{}`", value.trim_start_matches('-'));
                 print_repo_info_usage_stderr();
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             value => fields.push(value.to_string()),
         }
@@ -303,7 +303,7 @@ fn parse_repo_info_format(value: &str) -> Result<RepoInfoFormat> {
         "table" => Ok(RepoInfoFormat::Table),
         other => {
             eprintln!("fatal: invalid format '{other}'");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -405,7 +405,7 @@ fn bugreport_usage_error(arg: Option<&str>) -> Result<()> {
     eprintln!(
         "usage: git bugreport [(-o | --output-directory) <path>] [(-s | --suffix) <format> | --no-suffix]"
     );
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn print_version_build_options() {
@@ -547,7 +547,7 @@ fn var_editor(
         return Ok(value);
     }
     if terminal_is_dumb {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok("vi".into())
 }
@@ -594,7 +594,7 @@ fn var_effective_config_value(
 
 fn var_path_values(paths: Vec<PathBuf>) -> Result<Vec<String>> {
     if paths.is_empty() {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(paths
         .into_iter()
@@ -651,13 +651,13 @@ fn var_env_bool(name: &str) -> bool {
 
 fn var_usage<T>() -> Result<T> {
     eprintln!("usage: git var (-l | <variable>)");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 pub(crate) fn cmd_get_tar_commit_id(args: &[String]) -> Result<()> {
     if !args.is_empty() {
         eprintln!("usage: git get-tar-commit-id");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     let mut input = Vec::new();
     io::stdin().read_to_end(&mut input)?;
@@ -666,7 +666,7 @@ pub(crate) fn cmd_get_tar_commit_id(args: &[String]) -> Result<()> {
             println!("{commit_id}");
             Ok(())
         }
-        None => Err(GitError::Exit(1)),
+        None => Err(crate::cli_exit(1)),
     }
 }
 
@@ -677,7 +677,7 @@ fn tar_commit_id(input: &[u8]) -> Result<Option<String>> {
             eprintln!(
                 "fatal: git get-tar-commit-id: EOF before reading tar header: No such file or directory"
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         let header = &input[offset..offset + 512];
         offset += 512;
@@ -690,7 +690,7 @@ fn tar_commit_id(input: &[u8]) -> Result<Option<String>> {
             eprintln!(
                 "fatal: git get-tar-commit-id: EOF before reading tar header: No such file or directory"
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         let body = &input[offset..offset + size];
         if typeflag == b'g'
@@ -703,7 +703,7 @@ fn tar_commit_id(input: &[u8]) -> Result<Option<String>> {
             eprintln!(
                 "fatal: git get-tar-commit-id: EOF before reading tar header: No such file or directory"
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         offset += padded;
     }
@@ -756,20 +756,20 @@ pub(crate) fn cmd_unpack_file(
 ) -> Result<()> {
     let [name] = args else {
         eprintln!("usage: git unpack-file <blob>");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     };
     let repository = crate::repository::RepositoryContext::from_session(cli_session)?;
     let oid = match repository.resolve_revision(name) {
         Ok(oid) => oid,
         Err(_) => {
             eprintln!("fatal: Not a valid object name {name}");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     };
     let object = repository.objects().read_object(&oid)?;
     if object.object_type != ObjectType::Blob {
         eprintln!("fatal: unable to read blob object {oid}");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let path = write_unpack_file_temp(&object.body)?;
     println!("{}", path.display());
@@ -800,7 +800,10 @@ fn write_unpack_file_temp(contents: &[u8]) -> Result<PathBuf> {
             Err(err) => return Err(err),
         }
     }
-    Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: "unable to create temporary unpack file".into() })
+    Err(GitError::IoKind {
+        kind: std::io::ErrorKind::Other,
+        message: "unable to create temporary unpack file".into(),
+    })
 }
 
 pub(crate) fn cmd_show_index(
@@ -814,7 +817,7 @@ pub(crate) fn cmd_show_index(
             "--object-format" => {
                 let Some(value) = iter.next() else {
                     eprintln!("error: option `object-format' requires a value");
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 };
                 explicit_format = Some(parse_show_index_object_format(value)?);
             }
@@ -846,13 +849,13 @@ pub(crate) fn cmd_show_index(
     io::stdin().read_to_end(&mut input)?;
     if input.len() < 8 {
         eprintln!("fatal: unable to read header");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let index = match PackIndex::parse(&input, format) {
         Ok(index) => index,
         Err(_) => {
             eprintln!("fatal: unable to read header");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     };
     for entry in index.entries {
@@ -867,7 +870,7 @@ fn parse_show_index_object_format(value: &str) -> Result<ObjectFormat> {
         "sha256" => Ok(ObjectFormat::Sha256),
         _ => {
             eprintln!("fatal: Unknown hash algorithm");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -878,7 +881,7 @@ fn show_index_usage<T>() -> Result<T> {
     eprintln!("    --[no-]object-format <hash-algorithm>");
     eprintln!("                          specify the hash algorithm to use");
     eprintln!();
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 pub(crate) fn cmd_check_mailmap(
@@ -896,7 +899,7 @@ pub(crate) fn cmd_check_mailmap(
             "--mailmap-file" => {
                 let Some(path) = iter.next() else {
                     eprintln!("error: option `mailmap-file' requires a value");
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 };
                 source_specs.push(MailmapSourceSpec::File(PathBuf::from(path)));
             }
@@ -904,7 +907,7 @@ pub(crate) fn cmd_check_mailmap(
             "--mailmap-blob" => {
                 let Some(rev) = iter.next() else {
                     eprintln!("error: option `mailmap-blob' requires a value");
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 };
                 source_specs.push(MailmapSourceSpec::Blob(rev.to_string()));
             }
@@ -933,7 +936,7 @@ pub(crate) fn cmd_check_mailmap(
     }
     if contacts.is_empty() {
         eprintln!("fatal: no contacts specified");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let repository = crate::repository::RepositoryContext::from_session(cli_session)?;
@@ -960,7 +963,7 @@ fn check_mailmap_usage<T>() -> Result<T> {
     eprintln!("    --[no-]mailmap-blob <blob>");
     eprintln!("                          read additional mailmap entries from blob");
     eprintln!();
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 #[derive(Debug)]
@@ -1423,7 +1426,7 @@ pub(crate) fn cmd_stripspace(
         eprintln!(
             "error: options '--comment-lines' and '--strip-comments' cannot be used together"
         );
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     let comment = stripspace_comment_string(cli_session)?;
     let mut input = Vec::new();
@@ -1451,11 +1454,11 @@ fn stripspace_comment_string(cli_session: &crate::session::CliSession) -> Result
     let comment = comment.unwrap_or_else(|| b"#".to_vec());
     if comment.is_empty() {
         eprintln!("error: core.commentchar must have at least one character");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if comment.iter().any(|byte| matches!(byte, b'\n' | b'\r')) {
         eprintln!("error: core.commentchar cannot contain newline");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(comment)
 }
@@ -1524,7 +1527,7 @@ fn stripspace_usage<T>() -> Result<T> {
     );
     eprintln!("    -c, --comment-lines   prepend comment character and space to each line");
     eprintln!();
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 pub(crate) fn cmd_check_ref_format(
@@ -1567,7 +1570,7 @@ pub(crate) fn cmd_check_ref_format(
             return Ok(());
         }
         eprintln!("fatal: '{name}' is not a valid branch name");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if check_ref_format_name(&name, allow_onelevel, refspec_pattern).is_ok() {
         if normalize {
@@ -1575,7 +1578,7 @@ pub(crate) fn cmd_check_ref_format(
         }
         Ok(())
     } else {
-        Err(GitError::Exit(1))
+        Err(crate::cli_exit(1))
     }
 }
 
@@ -1616,7 +1619,7 @@ fn expand_check_ref_format_branch_name(
 fn check_ref_format_usage<T>() -> Result<T> {
     eprintln!("usage: git check-ref-format [--normalize] [<options>] <refname>");
     eprintln!("   or: git check-ref-format --branch <branchname-shorthand>");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn normalize_check_ref_format_name(name: &str) -> String {

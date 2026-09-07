@@ -2083,11 +2083,13 @@ pub(crate) fn refuse_if_current_working_directory_becomes_file(
 }
 
 pub(crate) fn refuse_remove_current_working_directory(path: &Path) -> Result<()> {
-    eprintln!(
+    sley_core::diagnostic!(
+        Stderr,
+        true,
         "error: Refusing to remove the current working directory:\n{}",
         path.display()
     );
-    Err(GitError::Exit(128))
+    Err(GitError::Rejected(sley_core::RejectionKind::Refused))
 }
 
 pub(crate) fn git_tree_entry_cmp(

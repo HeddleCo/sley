@@ -131,8 +131,12 @@ pub fn report_regex_compile_error(
     detail: RegexDiagnosticDetail,
 ) -> GitError {
     let message = regex_diagnostic_message(detail, verbosity);
-    eprintln!("fatal: {error_context}, '{pattern}': {message}");
-    GitError::Exit(128)
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "fatal: {error_context}, '{pattern}': {message}"
+    );
+    GitError::Rejected(sley_core::RejectionKind::Refused)
 }
 
 pub fn report_regex_error(

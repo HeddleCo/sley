@@ -136,7 +136,7 @@ fn rerere_usage<T>() -> Result<T> {
     eprintln!("    --[no-]rerere-autoupdate");
     eprintln!("                          register clean resolutions in index");
     eprintln!();
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn rerere_usage_stdout<T>() -> Result<T> {
@@ -145,7 +145,7 @@ fn rerere_usage_stdout<T>() -> Result<T> {
     println!("    --[no-]rerere-autoupdate");
     println!("                          register clean resolutions in index");
     println!();
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 pub(crate) fn is_rerere_enabled(git_dir: &Path) -> bool {

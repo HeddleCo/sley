@@ -278,7 +278,7 @@ pub(crate) fn cmd_rev_list(
                      the only allowed format is 'human'",
                     &value["--disk-usage=".len()..]
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             "--object-names" => object_names = true,
             "--no-object-names" => object_names = false,
@@ -395,7 +395,7 @@ pub(crate) fn cmd_rev_list(
     }
     if object_filter != RevListObjectFilter::None && !objects {
         eprintln!("fatal: object filtering requires --objects");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let author_filters = parse_log_filter_patterns(&author_patterns, regexp_mode)?;
     let committer_filters = parse_log_filter_patterns(&committer_patterns, regexp_mode)?;
@@ -539,7 +539,7 @@ pub(crate) fn cmd_rev_list(
     // used together` (revision.c). Graph rendering needs a full parent walk.
     if graph && !matches!(walk_mode, RevListWalkMode::Walk) {
         eprintln!("fatal: options '--no-walk' and '--graph' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let first_parent = revision_options.first_parent;
     let pathspecs = setup.pathspecs;
@@ -700,7 +700,7 @@ pub(crate) fn cmd_rev_list(
         verify_roots.extend(provided_tree_roots.iter().map(|object| object.oid));
         verify_roots.extend(bitmap_object_tips.iter().copied());
         if rev_list_verify_objects(&db, format, verify_roots) {
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
     }
 
@@ -2426,12 +2426,12 @@ fn validate_rev_list_stdin_args(args: &[String]) -> Result<()> {
             "--end-of-options" => end_of_options = true,
             "--glob" | "--exclude" | "--exclude-hidden" => {
                 eprintln!("fatal: Option '{arg}' requires a value");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             value if value.starts_with("--no-walk=") => {
                 eprintln!("error: invalid argument to --no-walk");
                 eprintln!("fatal: invalid option '{value}' in --stdin mode");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             "--all"
             | "--no-all"
@@ -2477,7 +2477,7 @@ fn validate_rev_list_stdin_args(args: &[String]) -> Result<()> {
                     || value.starts_with("--before=") => {}
             value if value.starts_with('-') => {
                 eprintln!("fatal: invalid option '{value}' in --stdin mode");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             _ => {}
         }
@@ -2624,12 +2624,12 @@ impl RevListObjectFilter {
         }
         if spec.starts_with("sparse:path=") {
             eprintln!("fatal: sparse:path filters support has been dropped");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if let Some(value) = spec.strip_prefix("combine:") {
             if value.is_empty() {
                 eprintln!("fatal: expected something after combine:");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             let mut filters = Vec::new();
             for raw in value.split('+') {
@@ -2639,7 +2639,7 @@ impl RevListObjectFilter {
             return Ok(Self::Combine(filters));
         }
         eprintln!("fatal: invalid filter-spec '{spec}'");
-        Err(GitError::Exit(128))
+        Err(crate::cli_exit(128))
     }
 
     fn combine_with(self, other: Self) -> Self {
@@ -2673,7 +2673,7 @@ impl RevListObjectFilter {
                 let object = db.read_object(&oid)?;
                 if object.object_type != ObjectType::Blob {
                     eprintln!("fatal: expected blob for sparse:oid filter");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 Ok(Self::Sparse(
                     object
@@ -2822,7 +2822,7 @@ fn rev_list_decode_sub_filter(raw: &str) -> Result<String> {
                     "fatal: must escape char in sub-filter-spec: '{}'",
                     bytes[idx] as char
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             b'%' => {
                 let Some(high) = bytes
@@ -2830,14 +2830,14 @@ fn rev_list_decode_sub_filter(raw: &str) -> Result<String> {
                     .and_then(|byte| (*byte as char).to_digit(16))
                 else {
                     eprintln!("fatal: invalid filter-spec");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 };
                 let Some(low) = bytes
                     .get(idx + 2)
                     .and_then(|byte| (*byte as char).to_digit(16))
                 else {
                     eprintln!("fatal: invalid filter-spec");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 };
                 out.push((high * 16 + low) as u8);
                 idx += 3;
@@ -3884,11 +3884,11 @@ fn rev_list_test_bitmap(
     let objects_dir = sley_odb::repository_objects_dir(git_dir);
     let Some(bitmap) = sley_odb::load_pack_bitmap(&objects_dir, format)? else {
         eprintln!("fatal: failed to load bitmap indexes");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
     if include_commits.len() != 1 || !exclude_tips.is_empty() {
         eprintln!("fatal: you must specify exactly one commit to test");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let tip = include_commits[0];
     eprintln!(
@@ -3897,7 +3897,7 @@ fn rev_list_test_bitmap(
     );
     let Some(stored) = bitmap.bitmap_for_commit(&tip) else {
         eprintln!("fatal: commit '{tip}' doesn't have an indexed bitmap");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
     let stored = std::sync::Arc::clone(stored);
     eprintln!("Found bitmap for '{tip}'. {} bits", bitmap.object_count());
@@ -3907,6 +3907,6 @@ fn rev_list_test_bitmap(
         Ok(())
     } else {
         eprintln!("fatal: mismatch in bitmap results");
-        Err(GitError::Exit(128))
+        Err(crate::cli_exit(128))
     }
 }

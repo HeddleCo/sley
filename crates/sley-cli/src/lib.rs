@@ -67,6 +67,11 @@ mod commit_message;
 mod diff_render;
 mod discovery;
 mod dispatch;
+mod error;
+pub use error::{
+    CliExit, cli_diagnostic, cli_exit, cli_exit_code, cli_message, cli_reported_status, cli_usage,
+    cli_user_error,
+};
 mod global_options;
 mod init_config;
 mod interrupt_cancel;
@@ -289,6 +294,10 @@ pub(crate) fn collect_short_status_with_options(
 }
 
 pub fn run(args: Vec<String>) -> Result<()> {
+    sley_core::diagnostics::Diagnostics::new(crate::error::CliDiagnostics).scope(|| run_inner(args))
+}
+
+fn run_inner(args: Vec<String>) -> Result<()> {
     let original_cwd = env::current_dir().ok();
     let global = apply_global_options(&args)?;
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));

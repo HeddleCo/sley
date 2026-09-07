@@ -122,7 +122,12 @@ fn count_loose_object_directory(
             let display_path = entry_path
                 .strip_prefix(display_root)
                 .unwrap_or(entry_path.as_path());
-            eprintln!("warning: garbage found: {}", display_path.display());
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "warning: garbage found: {}",
+                display_path.display()
+            );
             stats.garbage += 1;
             stats.size_garbage_bytes += metadata.len();
         }
@@ -222,12 +227,22 @@ fn count_pack_garbage(
     _stats: &mut CountObjectsStats,
 ) {
     let display_path = path.strip_prefix(display_root).unwrap_or(path);
-    eprintln!("warning: garbage found: {}", display_path.display());
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "warning: garbage found: {}",
+        display_path.display()
+    );
 }
 
 fn count_pack_correspondence_warning(message: &str, path: &Path, display_root: &Path) {
     let display_path = path.strip_prefix(display_root).unwrap_or(path);
-    eprintln!("warning: {message}: {}", display_path.display());
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "warning: {message}: {}",
+        display_path.display()
+    );
 }
 
 #[derive(Debug, Clone)]
@@ -372,7 +387,9 @@ pub(crate) fn count_pack_index_summary(
         256 * 4
     };
     if len < prefix_len {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "error: index file {} is too small",
             count_pack_display_path(path).display()
         );

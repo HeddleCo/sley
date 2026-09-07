@@ -56,13 +56,13 @@ pub(crate) fn apply_global_options(args: &[String]) -> Result<GlobalOptions<'_>>
                 let Some(path) = args.get(index + 1) else {
                     eprintln!("no directory given for '-C' option");
                     print_global_usage();
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 };
                 if !path.is_empty()
                     && let Err(err) = env::set_current_dir(path)
                 {
                     eprintln!("fatal: cannot change to '{}': {err}", path);
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 index += 2;
             }
@@ -70,7 +70,7 @@ pub(crate) fn apply_global_options(args: &[String]) -> Result<GlobalOptions<'_>>
                 let Some(assignment) = args.get(index + 1) else {
                     eprintln!("-c expects a configuration string");
                     print_global_usage();
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 };
                 if let Some(entry) = push_config_parameter(assignment) {
                     config.push(entry);
@@ -81,7 +81,7 @@ pub(crate) fn apply_global_options(args: &[String]) -> Result<GlobalOptions<'_>>
                 let Some(spec) = args.get(index + 1) else {
                     eprintln!("no config key given for --config-env");
                     print_global_usage();
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 };
                 config.push(push_config_env(spec)?);
                 index += 2;
@@ -122,7 +122,7 @@ pub(crate) fn apply_global_options(args: &[String]) -> Result<GlobalOptions<'_>>
                 let Some(path) = args.get(index + 1) else {
                     eprintln!("no directory given for '--git-dir' option");
                     print_global_usage();
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 };
                 git_dir = Some(PathBuf::from(path));
                 index += 2;
@@ -131,7 +131,7 @@ pub(crate) fn apply_global_options(args: &[String]) -> Result<GlobalOptions<'_>>
                 let Some(path) = args.get(index + 1) else {
                     eprintln!("no directory given for '--work-tree' option");
                     print_global_usage();
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 };
                 work_tree = Some(PathBuf::from(path));
                 index += 2;
@@ -140,7 +140,7 @@ pub(crate) fn apply_global_options(args: &[String]) -> Result<GlobalOptions<'_>>
                 let Some(value) = args.get(index + 1) else {
                     eprintln!("no namespace given for --namespace");
                     print_global_usage();
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 };
                 namespace = Some(value.clone());
                 index += 2;
@@ -148,7 +148,7 @@ pub(crate) fn apply_global_options(args: &[String]) -> Result<GlobalOptions<'_>>
             "--attr-source" => {
                 let Some(source) = args.get(index + 1) else {
                     eprintln!("error: option `attr-source' requires a value");
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 };
                 attr_source = Some(source.clone());
                 index += 2;
@@ -233,19 +233,19 @@ fn push_config_parameter(text: &str) -> Option<GlobalConfigOverride> {
 fn push_config_env(spec: &str) -> Result<GlobalConfigOverride> {
     let Some(eq) = spec.rfind('=') else {
         eprintln!("fatal: invalid config format: {spec}");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
     let key = &spec[..eq];
     let env_name = &spec[eq + 1..];
     if env_name.is_empty() {
         eprintln!("fatal: missing environment variable name for configuration '{key}'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let env_value = match env::var(env_name) {
         Ok(value) => value,
         Err(_) => {
             eprintln!("fatal: missing environment variable '{env_name}' for configuration '{key}'");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     };
     push_split_parameter(key, Some(&env_value));
@@ -341,7 +341,7 @@ pub(crate) fn core_big_file_threshold(git_dir: Option<&Path>) -> Result<u64> {
             eprintln!(
                 "fatal: bad numeric config value '{value}' for 'core.bigfilethreshold': invalid unit"
             );
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
         // The accessor already printed git's exact fatal line.
         Err(report) => Err(report),
@@ -354,7 +354,7 @@ pub(crate) fn core_big_file_threshold(git_dir: Option<&Path>) -> Result<u64> {
 fn report_config_parameter_error(err: sley_config::ConfigParameterError) -> GitError {
     eprintln!("error: {}", err.message());
     eprintln!("fatal: unable to parse command-line config");
-    GitError::Exit(128)
+    crate::cli_exit(128)
 }
 
 fn print_global_usage() {

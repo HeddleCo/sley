@@ -139,7 +139,7 @@ impl StatusExecutor {
     {
         let handle = std::thread::Builder::new()
             .name(name.to_string())
-            .spawn_scoped(scope, f)
+            .spawn_scoped(scope, sley_core::diagnostics::inherit(f))
             .map_err(|err| {
                 GitError::Command(format!("failed to spawn status worker `{name}`: {err}"))
             })?;
@@ -207,7 +207,9 @@ impl StatusProfileCounters {
     }
 
     fn emit(&self) {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "{{\"schema\":\"sley.status.profile.v1\",\
              \"fast_path_borrowed\":{},\
              \"read_dir_calls\":{},\
@@ -288,7 +290,9 @@ pub(crate) fn status_profile_pause(label: &str) {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(30);
-    eprintln!(
+    sley_core::diagnostic!(
+        Stderr,
+        true,
         "{{\"schema\":\"sley.status.mem.pause.v1\",\"label\":\"{}\",\"pid\":{},\"seconds\":{}}}",
         label,
         std::process::id(),
@@ -302,7 +306,9 @@ pub(crate) fn status_profile_mem(label: &str, details: &[(&str, usize)]) {
         return;
     }
     let (rss_bytes, vsz_bytes) = status_profile_rss_vsz_bytes().unwrap_or((0, 0));
-    eprint!(
+    sley_core::diagnostic!(
+        Stderr,
+        false,
         "{{\"schema\":\"sley.status.mem.v1\",\"label\":\"{}\",\"pid\":{},\"rss_bytes\":{},\"vsz_bytes\":{}",
         label,
         std::process::id(),
@@ -310,9 +316,9 @@ pub(crate) fn status_profile_mem(label: &str, details: &[(&str, usize)]) {
         vsz_bytes
     );
     for (key, value) in details {
-        eprint!(",\"{}\":{}", key, value);
+        sley_core::diagnostic!(Stderr, false, ",\"{}\":{}", key, value);
     }
-    eprintln!("}}");
+    sley_core::diagnostic!(Stderr, true, "}}");
     status_profile_pause(label);
 }
 

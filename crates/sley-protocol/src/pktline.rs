@@ -1277,7 +1277,7 @@ mod packet_trace_identity_tests {
     #[test]
     fn packet_identity_is_isolated_between_threads() {
         set_packet_trace_identity("main-thread");
-        let worker = std::thread::spawn(|| {
+        let worker = std::thread::spawn(sley_core::diagnostics::inherit(|| {
             assert_eq!(packet_trace_prefix(), "git");
             set_packet_trace_identity("worker-thread");
             {
@@ -1285,7 +1285,7 @@ mod packet_trace_identity_tests {
                 assert_eq!(packet_trace_prefix(), "worker-scoped");
             }
             assert_eq!(packet_trace_prefix(), "worker-thread");
-        });
+        }));
         worker.join().expect("packet identity worker");
         assert_eq!(packet_trace_prefix(), "main-thread");
     }

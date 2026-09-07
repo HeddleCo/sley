@@ -28,7 +28,7 @@ pub(crate) fn cmd_filter_branch(args: &[String]) -> Result<()> {
     if status.success() {
         Ok(())
     } else {
-        Err(GitError::Exit(status.code().unwrap_or(1)))
+        Err(crate::cli_exit(status.code().unwrap_or(1)))
     }
 }
 

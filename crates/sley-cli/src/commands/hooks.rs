@@ -124,7 +124,7 @@ mod tests {
             GitConfig::parse(b"[gc]\n\trecentObjectsHook = false\n").expect("parse config");
         assert!(matches!(
             run_recent_objects_hooks(&config, ObjectFormat::Sha1, Path::new(".")),
-            Err(crate::GitError::Exit(128))
+            Err(error) if crate::cli_reported_status(&error) == Some(128)
         ));
     }
 }

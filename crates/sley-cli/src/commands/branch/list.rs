@@ -564,7 +564,7 @@ pub(super) fn branch_peel_filter_oid(
         Ok(commit) => Ok(commit),
         Err(_) => {
             eprintln!("error: object {rev} must point to a commit");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }

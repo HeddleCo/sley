@@ -140,7 +140,7 @@ pub(crate) fn resolve_add_update_actions(
                     display.to_string_lossy()
                 );
             }
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     Ok(actions)
@@ -375,10 +375,10 @@ pub(crate) fn delete_symbolic_ref(store: &FileRefStore, name: &str) -> Result<()
 
 pub(crate) fn symbolic_ref_delete_head() -> Result<()> {
     eprintln!("fatal: deleting 'HEAD' is not allowed");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 pub(crate) fn symbolic_ref_cannot_delete(name: &str) -> Result<()> {
     eprintln!("fatal: Cannot delete {name}, not a symbolic ref");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }

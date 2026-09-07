@@ -393,7 +393,7 @@ pub(crate) fn cmd_rev_parse(
                 if seen_path_arg && sley_rev::split_rev_path_spec(rev).is_some() {
                     println!("{rev}");
                     rev_parse_no_such_worktree_path(rev);
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 let normalized_rev = rev_parse_normalize_revision_arg(
                     cli_session,
@@ -412,10 +412,10 @@ pub(crate) fn cmd_rev_parse(
                         idx += 1;
                         continue;
                     }
-                    Err(_) if verify && quiet => return Err(GitError::Exit(1)),
+                    Err(_) if verify && quiet => return Err(crate::cli_exit(1)),
                     Err(err) if verify && rev_parse_is_selector_error(rev) => {
                         eprintln!("fatal: {}", rev_parse_error_message(&err));
-                        return Err(GitError::Exit(128));
+                        return Err(crate::cli_exit(128));
                     }
                     Err(err) if verify => {
                         rev_parse_maybe_print_ambiguity(&git_dir, format, &normalized_rev, &err)?;
@@ -500,7 +500,7 @@ pub(crate) fn cmd_rev_parse(
             cli_session.replace_objects(),
         ) {
             Ok(oid) => oid,
-            Err(_) if quiet => return Err(GitError::Exit(1)),
+            Err(_) if quiet => return Err(crate::cli_exit(1)),
             Err(_) => return rev_parse_needed_single_revision(false),
         };
         verified_output = Some(oid.to_hex());
@@ -837,7 +837,7 @@ fn rev_parse_normalize_relative_path(
     }
     if !is_inside_work_tree(cli_session, cwd, git_dir, None)? {
         eprintln!("fatal: relative path syntax can't be used outside working tree");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let root = fs::canonicalize(worktree_root_for_git_dir(cli_session, git_dir)?)?;
     let cwd = fs::canonicalize(cwd)?;
@@ -851,7 +851,7 @@ fn rev_parse_normalize_relative_path(
                         "fatal: '{path}' is outside repository at '{}'",
                         root.display()
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 normalized.pop();
             }
@@ -864,7 +864,7 @@ fn rev_parse_normalize_relative_path(
             "fatal: '{path}' is outside repository at '{}'",
             root.display()
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let relative = normalized
         .strip_prefix(&root)
@@ -885,7 +885,7 @@ fn rev_parse_diagnose_arg_failure(
 ) -> Result<()> {
     if before_dashdash {
         eprintln!("fatal: bad revision '{rev}'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if rev_parse_has_unescaped_wildcard(rev) {
         println!("{rev}");
@@ -924,7 +924,7 @@ fn rev_parse_diagnose_arg_failure(
     }
     if rev_parse_is_selector_error(rev) {
         eprintln!("fatal: {}", rev_parse_error_message(&err));
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     rev_parse_maybe_print_ambiguity(git_dir, format, normalized_rev, &err)?;
     println!("{rev}");
@@ -946,7 +946,7 @@ fn rev_parse_maybe_print_ambiguity(
             Ok(hints) => hints,
             Err(GitError::InvalidObject(message)) if message.starts_with("unknown object type") => {
                 eprintln!("fatal: invalid object type");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             Err(err) => return Err(err),
         };
@@ -1020,11 +1020,11 @@ fn rev_parse_tree_path_error(
     rev_parse_maybe_print_ambiguity(git_dir, format, &format!("{base}:{path}"), &err)?;
     if rev_parse_error_message(&err).starts_with("revision ") {
         eprintln!("fatal: invalid object name '{base}'.");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if seen_path_arg {
         rev_parse_no_such_worktree_path(&format!("{base}:{original_path}"));
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if let Some(prefixed) = rev_parse_prefixed_path(cli_session, cwd, git_dir, original_path)?
         && rev_parse_tree_contains(
@@ -1037,7 +1037,7 @@ fn rev_parse_tree_path_error(
     {
         eprintln!("fatal: path '{prefixed}' exists, but not '{original_path}'");
         eprintln!("hint: Did you mean '{base}:{prefixed}' aka '{base}:./{original_path}'?");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if rev_parse_path_exists_on_disk(cli_session, cwd, git_dir, original_path)? {
         eprintln!("fatal: path '{path}' exists on disk, but not in '{base}'");
@@ -1045,7 +1045,7 @@ fn rev_parse_tree_path_error(
         eprintln!("fatal: path '{path}' does not exist in '{base}'");
     }
     let _ = format;
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn rev_parse_index_path_error(
@@ -1062,14 +1062,14 @@ fn rev_parse_index_path_error(
         if stage != 0 {
             eprintln!("hint: Did you mean ':0:{path}'?");
         }
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if let Some(prefixed) = rev_parse_prefixed_path(cli_session, cwd, git_dir, path)?
         && rev_parse_index_contains(git_dir, format, &prefixed)?
     {
         eprintln!("fatal: path '{prefixed}' is in the index, but not '{path}'");
         eprintln!("hint: Did you mean ':0:{prefixed}' aka ':0:./{path}'?");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let in_index = rev_parse_index_contains(git_dir, format, path)?;
     let on_disk = rev_parse_path_exists_on_disk(cli_session, cwd, git_dir, path)?;
@@ -1080,7 +1080,7 @@ fn rev_parse_index_path_error(
         }
         _ => eprintln!("fatal: path '{path}' is not in the index"),
     }
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn rev_parse_no_such_worktree_path(path: &str) {
@@ -1190,10 +1190,13 @@ fn rev_parse_error_message(err: &GitError) -> String {
         | GitError::Unsupported(msg)
         | GitError::Command(msg)
         | GitError::SidebandFatal(msg)
-        | GitError::Transaction(msg)
-        | GitError::Cli(_, msg) => msg.clone(),
+        | GitError::Transaction(msg) => msg.clone(),
         GitError::IoKind { message, .. } => message.clone(),
-        GitError::Exit(code) => format!("exit {code}"),
+        GitError::Callback(_)
+        | GitError::Rejected(_)
+        | GitError::ChildProcessFailed { .. }
+        | GitError::RemoteHelperAborted { .. }
+        | GitError::EmptyPreferredPack { .. } => err.to_string(),
         GitError::Cancelled => "operation cancelled".to_string(),
         GitError::CountMismatch { expected, actual } => {
             format!("count mismatch: expected {expected}, yielded {actual}")
@@ -1282,19 +1285,19 @@ fn rev_parse_parseopt(args: &[String]) -> Result<()> {
             "--stuck-long" => flags.stuck_long = true,
             "-h" | "--help" => {
                 print_rev_parse_parseopt_usage_stdout();
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             other => {
                 eprintln!("error: unknown option `{}`", other.trim_start_matches("--"));
                 print_rev_parse_parseopt_usage_stderr();
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
         }
         idx += 1;
     }
     if idx == 0 || args.get(idx.saturating_sub(1)).map(String::as_str) != Some("--") {
         print_rev_parse_parseopt_usage_stderr();
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
 
     let script_args = &args[idx..];
@@ -1315,7 +1318,7 @@ fn rev_parse_parseopt(args: &[String]) -> Result<()> {
                 "{}",
                 render_rev_parse_parseopt_usage(&usage, &specs, full, true)
             );
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
         Err(RevParseParseOptError::Usage { message }) => {
             eprintln!("error: {message}");
@@ -1323,7 +1326,7 @@ fn rev_parse_parseopt(args: &[String]) -> Result<()> {
                 "{}",
                 render_rev_parse_parseopt_usage(&usage, &specs, false, false)
             );
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
     }
 }
@@ -1348,12 +1351,12 @@ fn read_rev_parse_parseopt_spec() -> Result<(Vec<String>, Vec<RevParseParseOptSp
     loop {
         let Some(line) = lines.next() else {
             eprintln!("fatal: premature end of input");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         };
         if line == "--" {
             if usage.is_empty() {
                 eprintln!("fatal: no usage string given before the `--' separator");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             break;
         }
@@ -1413,7 +1416,7 @@ fn parse_rev_parse_parseopt_spec_line(line: &str) -> Result<RevParseParseOptSpec
     let flags_start = optspec.find(['*', '=', '?', '!']).unwrap_or(optspec.len());
     if flags_start == 0 {
         eprintln!("fatal: missing opt-spec before option flags");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let names = &optspec[..flags_start];
     if names.chars().count() == 1 {
@@ -1837,25 +1840,25 @@ fn print_local_env_vars() {
 
 fn rev_parse_needed_single_revision(quiet: bool) -> Result<()> {
     if quiet {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     eprintln!("fatal: Needed a single revision");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn rev_parse_path_format_requires_argument() -> Result<()> {
     eprintln!("fatal: --path-format requires an argument");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn rev_parse_git_path_requires_argument_error() -> GitError {
     eprintln!("fatal: --git-path requires an argument");
-    GitError::Exit(128)
+    crate::cli_exit(128)
 }
 
 fn rev_parse_resolve_git_dir_requires_argument_error() -> GitError {
     eprintln!("fatal: --resolve-git-dir requires an argument");
-    GitError::Exit(128)
+    crate::cli_exit(128)
 }
 
 fn rev_parse_not_git_repository(cwd: &Path) -> Result<()> {
@@ -1871,27 +1874,27 @@ fn rev_parse_not_git_repository(cwd: &Path) -> Result<()> {
     } else {
         eprintln!("fatal: not a git repository (or any of the parent directories): .git");
     }
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn rev_parse_unknown_path_format(value: &str) -> Result<()> {
     eprintln!("fatal: unknown argument to --path-format: {value}");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn rev_parse_unknown_show_object_format(value: &str) -> Result<()> {
     eprintln!("fatal: unknown mode for --show-object-format: {value}");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn rev_parse_not_gitdir(path: &str) -> Result<String> {
     eprintln!("fatal: not a gitdir '{path}'");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn rev_parse_requires_work_tree() -> Result<()> {
     eprintln!("fatal: this operation must be run in a work tree");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn rev_parse_abbrev_ref(repository: &RevParseRepository<'_>, rev: &str) -> Result<String> {
@@ -1979,7 +1982,7 @@ fn validate_bare_rev_parse_setup(
         && fs::canonicalize(worktree).is_err()
     {
         eprintln!("fatal: cannot chdir to '{}'", worktree.display());
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(())
 }
@@ -2509,7 +2512,7 @@ fn verify_repository_format(
     let version: i64 = version_value.trim().parse().unwrap_or(0);
     if version > 1 {
         eprintln!("fatal: Expected git repo version <= 1, found {version}");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let mut v1_only = Vec::new();
     let mut unknown = Vec::new();
@@ -2543,7 +2546,7 @@ fn verify_repository_format(
             "fatal: unknown repository {plural} found:\n\t{}",
             unknown.join("\n\t")
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if version == 0 && !v1_only.is_empty() {
         let plural = if v1_only.len() == 1 {
@@ -2555,7 +2558,7 @@ fn verify_repository_format(
             "fatal: repo version is 0, but v1-only {plural} found:\n\t{}",
             v1_only.join("\n\t")
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     config.repository_object_format()
 }
@@ -2594,7 +2597,7 @@ fn repository_ref_storage_format(
             "fatal: bad config line {line} in file {}",
             ref_storage_config_display_path(cli_session, git_dir, &common_git_dir)
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(
         match config

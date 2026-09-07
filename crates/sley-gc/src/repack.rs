@@ -49,7 +49,11 @@ pub(crate) fn repack_preferred_bitmap_tips(
         let Some(prefix) = value else {
             // A bare `[pack] preferBitmapTips` key: git reports the missing
             // value but continues the repack (string_list config callback).
-            eprintln!("error: missing value for 'pack.preferbitmaptips'");
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "error: missing value for 'pack.preferbitmaptips'"
+            );
             continue;
         };
         if prefix.ends_with('/') {
@@ -193,14 +197,20 @@ fn load_pseudo_merge_configs(git_dir: &Path) -> Result<Vec<PseudoMergeConfig>> {
     let mut groups = Vec::new();
     for (name, builder) in builders {
         if builder.threshold < builder.stable_threshold {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "fatal: pseudo-merge group '{name}' has unstable threshold before stable one"
             );
-            return Err(GitError::Exit(128));
+            return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
         }
         let Some(pattern) = builder.pattern else {
-            eprintln!("fatal: pseudo-merge group '{name}' missing required pattern");
-            return Err(GitError::Exit(128));
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "fatal: pseudo-merge group '{name}' missing required pattern"
+            );
+            return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
         };
         let anchored = if pattern.starts_with('^') {
             pattern
@@ -748,16 +758,24 @@ pub(crate) fn validate_repack_cruft_numeric_config(config: &GitConfig) -> Result
         match sley_config::typed::classify_config_i32(value) {
             Ok(_) => {}
             Err(sley_config::typed::BadNumericKind::InvalidUnit) => {
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "error: option `{option}' expects an integer value with an optional k/m/g suffix"
                 );
-                return Err(GitError::Exit(129));
+                return Err(GitError::Rejected(
+                    sley_core::RejectionKind::InvalidArguments,
+                ));
             }
             Err(_) => {
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "error: value {value} for option `{option}' not in range [-2147483648,2147483647]"
                 );
-                return Err(GitError::Exit(129));
+                return Err(GitError::Rejected(
+                    sley_core::RejectionKind::InvalidArguments,
+                ));
             }
         }
     }
@@ -825,7 +843,7 @@ pub fn run_geometric(
 
     if geometric.result.is_none() {
         if !quiet {
-            println!("Nothing new to pack.");
+            sley_core::diagnostic!(Stdout, true, "Nothing new to pack.");
         }
         // With no new pack and no previous MIDX, Git conservatively includes
         // cruft because a reachable pack may refer into it. With an existing
@@ -1028,8 +1046,8 @@ pub(crate) fn repack_cruft_or_bad_object(
         Ok(result) => Ok(result),
         Err(GitError::NotFound(kind)) => {
             if let Some(oid) = kind.object_id() {
-                eprintln!("fatal: bad object {oid}");
-                Err(GitError::Exit(128))
+                sley_core::diagnostic!(Stderr, true, "fatal: bad object {oid}");
+                Err(GitError::Rejected(sley_core::RejectionKind::Refused))
             } else {
                 Err(GitError::NotFound(kind))
             }
@@ -1235,8 +1253,12 @@ pub fn run_repack(
     if let Some(version) = name_hash_version
         && !(1..=2).contains(&version)
     {
-        eprintln!("fatal: invalid --name-hash-version option: {version}");
-        return Err(GitError::Exit(128));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "fatal: invalid --name-hash-version option: {version}"
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     let config = read_repo_config(&common_git_dir)?;
     let repack_roots = if all {
@@ -1297,20 +1319,36 @@ pub fn run_repack(
     if write_bitmaps && name_hash_version.is_some_and(|version| version != 1) {
         // Match pack-objects: bitmaps require name-hash version 1; sley always
         // writes the v1 cache and continues after warning (git auto-switches).
-        eprintln!("warning: currently, --write-bitmap-index requires --name-hash-version=1");
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "warning: currently, --write-bitmap-index requires --name-hash-version=1"
+        );
     }
 
     if write_bitmaps && local && object_dir_has_alternates(&common_git_dir) {
-        eprintln!("warning: disabling bitmap writing, as some objects are not being packed");
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "warning: disabling bitmap writing, as some objects are not being packed"
+        );
         write_bitmaps = false;
     }
     if write_bitmaps && pack_filter.is_some() {
-        eprintln!("fatal: cannot write bitmap index with pack filters");
-        return Err(GitError::Exit(128));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "fatal: cannot write bitmap index with pack filters"
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     if write_bitmaps && all && has_promisor_packs {
-        eprintln!("fatal: cannot write bitmap index for a repack with promisor packs");
-        return Err(GitError::Exit(128));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "fatal: cannot write bitmap index for a repack with promisor packs"
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
 
     if let Some(split_factor) = geometric {
@@ -1380,11 +1418,13 @@ pub fn run_repack(
 
     if write_bitmaps && !all && !write_midx {
         // Upstream cmd_repack: bitmaps require an all-into-one repack.
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "fatal: Incremental repacks are incompatible with bitmap indexes.  Use
 --no-write-bitmap-index or disable the pack.writeBitmaps configuration."
         );
-        return Err(GitError::Exit(128));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
 
     // `-A -d` differs from `-a -d`: objects that are no longer reachable must

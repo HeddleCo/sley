@@ -23,7 +23,7 @@ pub(crate) fn parse_reflog_expire_time(value: &str, option: &str) -> Result<i64>
         return Ok(ts);
     }
     eprintln!("fatal: invalid timestamp '{value}' given to '{option}'");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 pub(crate) fn parse_reflog_expire_date(value: &str) -> Option<i64> {
@@ -96,7 +96,7 @@ pub(crate) fn parse_reflog_integer(value: &str) -> Result<i128> {
 
 pub(crate) fn reflog_invalid_integer_error(value: &str) -> GitError {
     eprintln!("fatal: '{value}': not an integer");
-    GitError::Exit(1)
+    crate::cli_exit(1)
 }
 
 pub(crate) fn reflog_reference_name(

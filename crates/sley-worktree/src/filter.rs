@@ -242,7 +242,9 @@ pub(crate) fn trace_roundtrip_encoding_check(name: &[u8]) {
     {
         return;
     }
-    eprintln!(
+    sley_core::diagnostic!(
+        Stderr,
+        true,
         "Checking roundtrip encoding for {}",
         String::from_utf8_lossy(name)
     );
@@ -344,8 +346,12 @@ pub(crate) fn encode_utf32(utf8: &[u8], le: bool, bom: bool) -> Option<Vec<u8>> 
 /// direction.
 pub(crate) fn check_wt_encoding_valid(encoding: &WtEncoding) -> Result<()> {
     if matches!(encoding, WtEncoding::Invalid) {
-        eprintln!("fatal: true/false are no valid working-tree-encodings");
-        return Err(GitError::Exit(128));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "fatal: true/false are no valid working-tree-encodings"
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     Ok(())
 }
@@ -396,7 +402,9 @@ pub(crate) fn encode_to_git<'a>(
         let number = &suffix[..2.min(suffix.len())];
         match problem {
             BomProblem::Prohibited => {
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "hint: The file '{display}' contains a byte order mark (BOM). \
 Please use UTF-{number} as working-tree-encoding."
                 );
@@ -407,7 +415,9 @@ Please use UTF-{number} as working-tree-encoding."
                 return Ok(data);
             }
             BomProblem::Required => {
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "hint: The file '{display}' is missing a byte order mark (BOM). \
 Please use UTF-{number}BE or UTF-{number}LE (depending on the byte order) as \
 working-tree-encoding."
@@ -465,7 +475,11 @@ pub(crate) fn encode_to_worktree<'a>(
         None => {
             let display = String::from_utf8_lossy(path);
             let enc = String::from_utf8_lossy(name);
-            eprintln!("error: failed to encode '{display}' from UTF-8 to {enc}");
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "error: failed to encode '{display}' from UTF-8 to {enc}"
+            );
             Ok(data)
         }
     }
@@ -475,10 +489,10 @@ pub(crate) fn encode_to_worktree<'a>(
 /// otherwise an `error:` diagnostic that lets the caller keep the content as-is.
 pub(crate) fn report_encode_failure(write_object: bool, message: &str) -> Result<()> {
     if write_object {
-        eprintln!("fatal: {message}");
-        Err(GitError::Exit(128))
+        sley_core::diagnostic!(Stderr, true, "fatal: {message}");
+        Err(GitError::Rejected(sley_core::RejectionKind::Refused))
     } else {
-        eprintln!("error: {message}");
+        sley_core::diagnostic!(Stderr, true, "error: {message}");
         Ok(())
     }
 }
@@ -1000,10 +1014,10 @@ pub(crate) fn run_filter_command(command: &str, path: &[u8], content: &[u8]) -> 
         .take()
         .ok_or_else(|| GitError::Command(format!("filter `{command}` stdin unavailable")))?;
     let payload = content.to_vec();
-    let writer = std::thread::spawn(move || {
+    let writer = std::thread::spawn(sley_core::diagnostics::inherit(move || {
         let _ = stdin.write_all(&payload);
         // Dropping `stdin` here closes the pipe so the child sees EOF.
-    });
+    }));
     let output = child
         .wait_with_output()
         .map_err(|err| GitError::Command(format!("filter `{command}` failed: {err}")))?;
@@ -2279,16 +2293,25 @@ pub(crate) fn run_driver_maybe_delayed<'a>(
                 // missing command) is intentionally left as the generic
                 // failure plus the path-specific required-filter fatal below.
                 if err.message.starts_with("Unexpected line") {
-                    eprintln!("error: {}", err.message);
+                    sley_core::diagnostic!(Stderr, true, "error: {}", err.message);
                 }
                 if err.protocol {
-                    eprintln!("error: external filter '{}' failed", process);
+                    sley_core::diagnostic!(
+                        Stderr,
+                        true,
+                        "error: external filter '{}' failed",
+                        process
+                    );
                 }
                 if driver.required {
                     let path = String::from_utf8_lossy(path);
                     let name = String::from_utf8_lossy(&driver.name);
-                    eprintln!("fatal: {path}: {direction} filter '{name}' failed");
-                    return Err(GitError::Exit(128));
+                    sley_core::diagnostic!(
+                        Stderr,
+                        true,
+                        "fatal: {path}: {direction} filter '{name}' failed"
+                    );
+                    return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
                 }
                 return Ok(DriverFilterResult::Content(content));
             }
@@ -2301,11 +2324,11 @@ pub(crate) fn run_driver_maybe_delayed<'a>(
             let path = String::from_utf8_lossy(path);
             let name = String::from_utf8_lossy(&driver.name);
             if direction == "clean" {
-                eprintln!("fatal: {path}: clean filter '{name}' failed");
+                sley_core::diagnostic!(Stderr, true, "fatal: {path}: clean filter '{name}' failed");
             } else {
-                eprintln!("fatal: {path}: smudge filter {name} failed");
+                sley_core::diagnostic!(Stderr, true, "fatal: {path}: smudge filter {name} failed");
             }
-            return Err(GitError::Exit(128));
+            return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
         }
         return Ok(DriverFilterResult::Content(content));
     };
@@ -2619,7 +2642,7 @@ impl ConvFlags {
 /// CRLF/LF content would not survive a clean+smudge cycle, warn (or die under
 /// `core.safecrlf=true`).
 ///
-/// Returns `Err(GitError::Exit(128))` when `flags` is [`ConvFlags::Die`] and the
+/// Returns `Err(GitError::Rejected(sley_core::RejectionKind::Refused))` when `flags` is [`ConvFlags::Die`] and the
 /// round-trip is irreversible (git `die`s with exit 128 here); otherwise prints
 /// the warning to stderr and returns `Ok(())`. This is a pure stderr-side
 /// effect: it never changes the bytes written to the object store.
@@ -2637,11 +2660,17 @@ pub(crate) fn check_safe_crlf(
         // CRLFs would not be restored by checkout.
         match flags {
             ConvFlags::Die => {
-                eprintln!("fatal: CRLF would be replaced by LF in {display}");
-                return Err(GitError::Exit(128));
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "fatal: CRLF would be replaced by LF in {display}"
+                );
+                return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
             }
             ConvFlags::Warn => {
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "warning: in the working copy of '{display}', CRLF will be replaced by LF the next time Git touches it"
                 );
             }
@@ -2651,11 +2680,17 @@ pub(crate) fn check_safe_crlf(
         // CRLFs would be added by checkout.
         match flags {
             ConvFlags::Die => {
-                eprintln!("fatal: LF would be replaced by CRLF in {display}");
-                return Err(GitError::Exit(128));
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "fatal: LF would be replaced by CRLF in {display}"
+                );
+                return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
             }
             ConvFlags::Warn => {
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "warning: in the working copy of '{display}', LF will be replaced by CRLF the next time Git touches it"
                 );
             }

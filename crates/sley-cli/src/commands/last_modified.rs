@@ -160,7 +160,7 @@ fn parse_last_modified_args(args: &[String]) -> Result<LastModifiedOptions> {
             "--max-depth" => {
                 let Some(value) = args.get(i + 1) else {
                     eprintln!("error: option `max-depth' requires a value");
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 };
                 options.max_depth = parse_last_modified_depth(value)?;
                 i += 2;
@@ -182,7 +182,7 @@ fn parse_last_modified_args(args: &[String]) -> Result<LastModifiedOptions> {
             value if value.starts_with('-') => {
                 eprintln!("error: unknown last-modified argument: {value}");
                 print_last_modified_usage();
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             value => {
                 if looks_like_revision_arg(value) && options.pathspecs.is_empty() {
@@ -214,7 +214,7 @@ fn disambiguate_last_modified_positionals(
 fn parse_last_modified_depth(value: &str) -> Result<i64> {
     value.parse::<i64>().map_err(|_| {
         eprintln!("error: option `max-depth' expects a numerical value");
-        GitError::Exit(129)
+        crate::cli_exit(129)
     })
 }
 
@@ -261,14 +261,14 @@ fn peel_last_modified_commit(
                 "error: revision argument '{rev}' is a {}, not a commit-ish",
                 object.object_type.as_str()
             );
-            Err(GitError::Exit(1))
+            Err(crate::cli_exit(1))
         }
     }
 }
 
 fn last_modified_two_commits() -> GitError {
     eprintln!("error: last-modified can only operate on one commit at a time");
-    GitError::Exit(1)
+    crate::cli_exit(1)
 }
 
 fn print_last_modified_usage() {

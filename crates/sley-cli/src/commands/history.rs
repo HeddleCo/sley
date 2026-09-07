@@ -25,7 +25,7 @@ pub(crate) fn cmd_history(cli_session: &crate::session::CliSession, args: &[Stri
         _ => {
             eprintln!("usage: {REWORD_USAGE}");
             eprintln!("   or: {SPLIT_USAGE}");
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
     }
 }
@@ -46,12 +46,12 @@ fn cmd_history_reword(cli_session: &crate::session::CliSession, args: &[String])
             value if value.starts_with('-') => {
                 eprintln!("error: unknown option `{value}`");
                 eprintln!("usage: {REWORD_USAGE}");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             value if commit.is_none() => commit = Some(value.to_string()),
             _ => {
                 eprintln!("usage: {REWORD_USAGE}");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
         }
     }
@@ -150,7 +150,7 @@ fn edit_reword_message(git_dir: &Path, analysis: &HistoryRewordAnalysis) -> Resu
     let message = commands::replay::strip_comment_lines(&fs::read(&path)?, comment);
     if message.is_empty() {
         eprintln!("Aborting commit due to empty commit message.");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(message)
 }
@@ -178,7 +178,7 @@ fn cmd_history_split(cli_session: &crate::session::CliSession, args: &[String]) 
             value if value.starts_with('-') && commit.is_none() => {
                 eprintln!("error: unknown option `{value}`");
                 eprintln!("usage: {SPLIT_USAGE}");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             value if commit.is_none() => commit = Some(value.to_string()),
             value => pathspecs.push(value.to_string()),
@@ -395,12 +395,12 @@ fn edit_split_message(
     );
     if message.is_empty() {
         eprintln!("Aborting commit due to empty commit message.");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(message)
 }
 
 fn history_error<T>(message: &str) -> Result<T> {
     eprintln!("error: {message}");
-    Err(GitError::Exit(1))
+    Err(crate::cli_exit(1))
 }

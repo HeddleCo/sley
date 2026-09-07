@@ -4062,7 +4062,9 @@ fn bitmap_commit_closure(
     let mut pending = roots.to_vec();
     while let Some(oid) = pending.pop() {
         let Some(&pack_pos) = oid_to_pack.get(&oid) else {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "warning: Failed to write bitmap index. Packfile doesn't have full closure (object {oid} is missing)"
             );
             return Ok(None);
@@ -4096,7 +4098,9 @@ fn bitmap_mark_tree(
     acc: &mut [u64],
 ) -> Result<bool> {
     let Some(&pack_pos) = oid_to_pack.get(tree) else {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "warning: Failed to write bitmap index. Packfile doesn't have full closure (object {tree} is missing)"
         );
         return Ok(false);
@@ -4117,7 +4121,9 @@ fn bitmap_mark_tree(
             }
         } else {
             let Some(&blob_pos) = oid_to_pack.get(&entry.oid) else {
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "warning: Failed to write bitmap index. Packfile doesn't have full closure (object {} is missing)",
                     entry.oid
                 );
@@ -4248,9 +4254,13 @@ pub fn load_pack_bitmap(
             Err(err) => {
                 let message = err.to_string();
                 if message.contains("EWAH") {
-                    eprintln!("error: corrupt ewah bitmap: {message}");
+                    sley_core::diagnostic!(Stderr, true, "error: corrupt ewah bitmap: {message}");
                 } else {
-                    eprintln!("error: corrupted bitmap index: {message}");
+                    sley_core::diagnostic!(
+                        Stderr,
+                        true,
+                        "error: corrupted bitmap index: {message}"
+                    );
                 }
                 continue;
             }
@@ -4372,8 +4382,16 @@ fn load_midx_bitmap(pack_dir: &Path, format: ObjectFormat) -> Result<Option<Load
         return Ok(None);
     };
     if midx_has_bad_ridx_chunk(&midx_bytes, format) {
-        eprintln!("error: multi-pack-index reverse-index chunk is the wrong size");
-        eprintln!("warning: multi-pack bitmap is missing required reverse index");
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "error: multi-pack-index reverse-index chunk is the wrong size"
+        );
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "warning: multi-pack bitmap is missing required reverse index"
+        );
         return Ok(None);
     }
     let midx = match MultiPackIndex::parse(&midx_bytes, format) {
@@ -4381,8 +4399,12 @@ fn load_midx_bitmap(pack_dir: &Path, format: ObjectFormat) -> Result<Option<Load
         Err(GitError::InvalidFormat(message))
             if message == "multi-pack-index reverse-index chunk is the wrong size" =>
         {
-            eprintln!("error: {message}");
-            eprintln!("warning: multi-pack bitmap is missing required reverse index");
+            sley_core::diagnostic!(Stderr, true, "error: {message}");
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "warning: multi-pack bitmap is missing required reverse index"
+            );
             return Ok(None);
         }
         Err(_) => return Ok(None),

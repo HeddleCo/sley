@@ -18,7 +18,7 @@ pub(crate) fn cmd_commit_graph(
     let Some(subcommand) = args.first().map(String::as_str) else {
         // No sub-command ⇒ usage error (exit 129) with the usage block.
         eprint!("{COMMIT_GRAPH_USAGE}");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     };
     match subcommand {
         "write" => cmd_commit_graph_write(cli_session, &args[1..]),
@@ -28,7 +28,7 @@ pub(crate) fn cmd_commit_graph(
             // plus the usage block, exit 129.
             eprintln!("error: unknown subcommand: `{other}'");
             eprint!("{COMMIT_GRAPH_USAGE}");
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
     }
 }
@@ -170,7 +170,7 @@ fn cmd_commit_graph_write(cli_session: &crate::session::CliSession, args: &[Stri
             other => {
                 eprintln!("error: unknown option `{}'", other.trim_start_matches('-'));
                 eprint!("{COMMIT_GRAPH_USAGE}");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
         }
     }
@@ -865,11 +865,11 @@ fn commit_graph_stdin_packs_starts(
         let resolved = candidates.iter().find(|path| path.exists());
         let Some(resolved) = resolved else {
             eprintln!("error: error adding pack {line}");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         };
         let oids = commit_graph_commit_oids_in_pack(db, resolved, format).map_err(|_| {
             eprintln!("error: error adding pack {line}");
-            GitError::Exit(1)
+            crate::cli_exit(1)
         })?;
         for oid in oids {
             if seen.insert(oid) {
@@ -923,11 +923,11 @@ fn commit_graph_stdin_commits_starts(
         }
         let Ok(oid) = ObjectId::from_hex(format, line) else {
             eprintln!("error: unexpected non-hex object ID: {line}");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         };
         let Ok(_object) = db.read_object(&oid) else {
             eprintln!("error: invalid object {line}");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         };
         // Peel annotated tags down to the commit they reference; non-commit
         // tree-ish (e.g. a tree oid) is silently skipped, matching git, which
@@ -994,7 +994,7 @@ fn cmd_commit_graph_verify(
                 "fatal: Could not open commit-graph '{}'",
                 graph_path.display()
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         OpenResult::NotFound => {}
     }
@@ -1035,7 +1035,7 @@ fn verify_split_commit_graph_chain(chain_path: &Path, format: ObjectFormat) -> R
     let chain_bytes = fs::read(chain_path)?;
     if chain_bytes.len() < format.hex_len() {
         eprintln!("error: commit-graph chain file too small");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     let text = std::str::from_utf8(&chain_bytes)
         .map_err(|err| GitError::InvalidFormat(err.to_string()))?;
@@ -1046,13 +1046,13 @@ fn verify_split_commit_graph_chain(chain_path: &Path, format: ObjectFormat) -> R
         }
         if line.len() != format.hex_len() || !line.as_bytes().iter().all(u8::is_ascii_hexdigit) {
             eprintln!("error: invalid commit-graph chain");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         graph_hashes.push(ObjectId::from_hex(format, line)?);
     }
     if graph_hashes.is_empty() {
         eprintln!("error: commit-graph chain file too small");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     for (idx, expected_hash) in graph_hashes.iter().enumerate() {
         let graph_path = chain_dir.join(format!("graph-{expected_hash}.graph"));
@@ -1060,7 +1060,7 @@ fn verify_split_commit_graph_chain(chain_path: &Path, format: ObjectFormat) -> R
             Ok(bytes) => bytes,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 eprintln!("error: unable to find all commit-graph files");
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
             Err(err) => return Err(GitError::from(err)),
         };
@@ -1070,27 +1070,27 @@ fn verify_split_commit_graph_chain(chain_path: &Path, format: ObjectFormat) -> R
                 eprintln!("error: commit-graph file is too small");
                 eprintln!("error: incorrect checksum");
                 eprintln!("error: commit-graph chain does not match");
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
         };
         if &graph.checksum != expected_hash {
             eprintln!("error: incorrect checksum");
             eprintln!("error: commit-graph chain does not match");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         if graph.base_graph_count as usize != graph.base_graphs.len() {
             eprintln!("error: commit-graph chain does not match");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         if graph.base_graph_count as usize > idx {
             eprintln!("error: commit-graph chain does not match");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         if !graph.base_graphs.is_empty() {
             let expected_bases = &graph_hashes[idx - graph.base_graphs.len()..idx];
             if graph.base_graphs != expected_bases {
                 eprintln!("error: commit-graph chain does not match");
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
         }
     }
@@ -1178,7 +1178,7 @@ fn parse_commit_graph_for_verify<'a>(
 
     if bytes.len() < graph_min_size(hash_len) {
         eprintln!("error: commit-graph file is too small");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
 
     let signature = read_be32(bytes, 0);
@@ -1186,7 +1186,7 @@ fn parse_commit_graph_for_verify<'a>(
         eprintln!(
             "error: commit-graph signature {signature:X} does not match signature {GRAPH_SIGNATURE:X}"
         );
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
 
     let version = bytes[4];
@@ -1194,7 +1194,7 @@ fn parse_commit_graph_for_verify<'a>(
         eprintln!(
             "error: commit-graph version {version:X} does not match version {GRAPH_VERSION:X}"
         );
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
 
     let hash_version = bytes[5];
@@ -1206,7 +1206,7 @@ fn parse_commit_graph_for_verify<'a>(
         eprintln!(
             "error: commit-graph hash version {hash_version:X} does not match version {expected_hash_version:X}"
         );
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
 
     let num_chunks = bytes[6] as usize;
@@ -1218,7 +1218,7 @@ fn parse_commit_graph_for_verify<'a>(
             + hash_len
     {
         eprintln!("error: commit-graph file is too small to hold {num_chunks} chunks");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
 
     // Read the table of contents (mirrors read_table_of_contents with
@@ -1231,17 +1231,17 @@ fn parse_commit_graph_for_verify<'a>(
         let chunk_offset = read_be64(bytes, toc + 4) as usize;
         if chunk_id == [0, 0, 0, 0] {
             eprintln!("error: terminating chunk id appears earlier than expected");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         let next_toc = toc + GRAPH_CHUNK_TOC_ENTRY_SIZE;
         let next_chunk_offset = read_be64(bytes, next_toc + 4) as usize;
         if next_chunk_offset < chunk_offset || next_chunk_offset > mfile_size - hash_len {
             eprintln!("error: improper chunk offset(s) {chunk_offset:X} and {next_chunk_offset:X}");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         if chunks.iter().any(|chunk| chunk.id == chunk_id) {
             eprintln!("error: duplicate chunk ID {} found", be32_of(&chunk_id));
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         chunks.push(GraphChunk {
             id: chunk_id,
@@ -1253,7 +1253,7 @@ fn parse_commit_graph_for_verify<'a>(
     let terminator_id = read_be32(bytes, toc);
     if terminator_id != 0 {
         eprintln!("error: final chunk has non-zero id {terminator_id:X}");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
 
     let find = |id: [u8; 4]| chunks.iter().find(|chunk| chunk.id == id);
@@ -1269,7 +1269,7 @@ fn parse_commit_graph_for_verify<'a>(
                 if f1 > f2 {
                     eprintln!("error: commit-graph fanout values out of order");
                     eprintln!("error: commit-graph required OID fanout chunk missing or corrupted");
-                    return Err(GitError::Exit(1));
+                    return Err(crate::cli_exit(1));
                 }
             }
             (chunk.start, read_be32(bytes, chunk.start + 255 * 4))
@@ -1277,11 +1277,11 @@ fn parse_commit_graph_for_verify<'a>(
         Some(_) => {
             eprintln!("error: commit-graph oid fanout chunk is wrong size");
             eprintln!("error: commit-graph required OID fanout chunk missing or corrupted");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         None => {
             eprintln!("error: commit-graph required OID fanout chunk missing or corrupted");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
     };
 
@@ -1291,11 +1291,11 @@ fn parse_commit_graph_for_verify<'a>(
         Some(_) => {
             eprintln!("error: commit-graph OID lookup chunk is the wrong size");
             eprintln!("error: commit-graph required OID lookup chunk missing or corrupted");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         None => {
             eprintln!("error: commit-graph required OID lookup chunk missing or corrupted");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
     };
 
@@ -1307,11 +1307,11 @@ fn parse_commit_graph_for_verify<'a>(
         Some(_) => {
             eprintln!("error: commit-graph commit data chunk is wrong size");
             eprintln!("error: commit-graph required commit data chunk missing or corrupted");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         None => {
             eprintln!("error: commit-graph required commit data chunk missing or corrupted");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
     };
 
@@ -1409,7 +1409,7 @@ pub(super) fn verify_commit_graph_bytes(
     // i.e. stop before the per-commit ODB cross-check if any *non-checksum*
     // error fired above.
     if non_checksum_error {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
 
     // Per-commit cross-check against the object database (second verify loop).
@@ -1522,7 +1522,7 @@ pub(super) fn verify_commit_graph_bytes(
     }
 
     if had_error {
-        Err(GitError::Exit(1))
+        Err(crate::cli_exit(1))
     } else {
         Ok(())
     }
@@ -1568,7 +1568,7 @@ fn decode_graph_commit(parsed: &ParsedGraph<'_>, index: usize) -> Result<GraphCo
     let insert = |pos: u32, parents: &mut Vec<u32>| -> Result<()> {
         if pos >= num_total {
             eprintln!("fatal: invalid parent position {pos}");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         parents.push(pos);
         Ok(())
@@ -1610,7 +1610,7 @@ fn decode_graph_commit(parsed: &ParsedGraph<'_>, index: usize) -> Result<GraphCo
     loop {
         if (edge_size / 4) as u32 <= parent_data_pos {
             eprintln!("error: commit-graph extra-edges pointer out of bounds");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         let edge_value = read_be32(bytes, edge_start + parent_data_pos as usize * 4);
         insert(edge_value & GRAPH_EDGE_LAST_MASK, &mut parents)?;
@@ -1696,7 +1696,7 @@ fn commit_graph_from_starts(
         Err(err) => {
             if let Some(oid) = commit_graph_first_unparseable_commit(db, format, &starts) {
                 eprintln!("fatal: unable to parse commit {oid}");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             return Err(err);
         }

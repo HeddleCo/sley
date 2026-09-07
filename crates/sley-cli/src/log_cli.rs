@@ -17,18 +17,18 @@ use std::path::Path;
 
 pub(crate) fn log_option_takes_no_value_error(option: &str) -> Result<()> {
     eprintln!("error: option `{option}' takes no value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 pub(crate) fn log_option_requires_value_error(option: &str) -> GitError {
     eprintln!("error: option `{option}' requires a value");
-    GitError::Exit(129)
+    crate::cli_exit(129)
 }
 
 pub(crate) fn log_parse_age(value: &str) -> Result<i64> {
     value.parse::<i64>().map_err(|_| {
         eprintln!("fatal: '{value}': not a number of seconds since epoch");
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })
 }
 
@@ -46,7 +46,7 @@ pub(crate) fn log_parse_date_cutoff(value: &str) -> Result<i64> {
         }
         return timestamp.parse::<i64>().map_err(|_| {
             eprintln!("fatal: invalid date format: {value}");
-            GitError::Exit(128)
+            crate::cli_exit(128)
         });
     }
     // The timezone may be embedded directly after the time in the `T`-separated
@@ -86,47 +86,47 @@ pub(crate) fn log_parse_date_cutoff(value: &str) -> Result<i64> {
 
 fn log_invalid_date_format<T>(value: &str) -> Result<T> {
     eprintln!("fatal: invalid date format: {value}");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 pub(crate) fn log_date_requires_value_error() -> GitError {
     eprintln!("fatal: Option '--date' requires a value");
-    GitError::Exit(128)
+    crate::cli_exit(128)
 }
 
 pub(crate) fn log_author_requires_value_error() -> GitError {
     eprintln!("fatal: Option '--author' requires a value");
-    GitError::Exit(128)
+    crate::cli_exit(128)
 }
 
 pub(crate) fn log_committer_requires_value_error() -> GitError {
     eprintln!("fatal: Option '--committer' requires a value");
-    GitError::Exit(128)
+    crate::cli_exit(128)
 }
 
 pub(crate) fn log_grep_requires_value_error() -> GitError {
     eprintln!("fatal: Option '--grep' requires a value");
-    GitError::Exit(128)
+    crate::cli_exit(128)
 }
 
 /// `git log -S`/`-G` with no value: parse-options "switch requires a value"
 /// (exit 129). `kind` is the single letter (`S`/`G`).
 pub(crate) fn log_pickaxe_requires_value_error(kind: &str) -> GitError {
     eprintln!("error: switch `{kind}' requires a value");
-    GitError::Exit(129)
+    crate::cli_exit(129)
 }
 
 /// `git log -S ""`/`-G ""` with an empty value (exit 129).
 pub(crate) fn log_pickaxe_empty_error(kind: &str) -> GitError {
     eprintln!("error: -{kind} requires a non-empty argument");
-    GitError::Exit(129)
+    crate::cli_exit(129)
 }
 
 /// Combining multiple pickaxe kinds (`-S`/`-G`/`--find-object`) — git rejects
 /// with exit 128.
 pub(crate) fn log_pickaxe_kinds_conflict_error() -> GitError {
     eprintln!("fatal: options '-G', '-S', and '--find-object' cannot be used together");
-    GitError::Exit(128)
+    crate::cli_exit(128)
 }
 
 /// `-G` with `--pickaxe-regex` (exit 128).
@@ -134,7 +134,7 @@ pub(crate) fn log_pickaxe_g_regex_conflict_error() -> GitError {
     eprintln!(
         "fatal: options '-G' and '--pickaxe-regex' cannot be used together, use '--pickaxe-regex' with '-S'"
     );
-    GitError::Exit(128)
+    crate::cli_exit(128)
 }
 
 /// `--pickaxe-all` with `--find-object` (exit 128).
@@ -142,7 +142,7 @@ pub(crate) fn log_pickaxe_all_objfind_conflict_error() -> GitError {
     eprintln!(
         "fatal: options '--pickaxe-all' and '--find-object' cannot be used together, use '--pickaxe-all' with '-G' and '-S'"
     );
-    GitError::Exit(128)
+    crate::cli_exit(128)
 }
 
 pub(crate) fn log_date_mode(value: &str) -> Result<DateMode> {
@@ -157,7 +157,7 @@ pub(crate) fn log_date_mode(value: &str) -> Result<DateMode> {
 
 fn log_unknown_date_format(value: &str) -> Result<()> {
     eprintln!("fatal: unknown date format {value}");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 pub(crate) fn log_parse_diff_algorithm(value: &str) -> sley_diff_merge::DiffAlgorithm {

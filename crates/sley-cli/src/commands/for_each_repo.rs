@@ -60,7 +60,7 @@ pub(crate) fn cmd_for_each_repo(
         match arg.as_str() {
             "-h" | "--help" => {
                 println!("{USAGE}");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             "--" => {
                 index += 1;
@@ -96,7 +96,7 @@ pub(crate) fn cmd_for_each_repo(
 
     let Some(config_key) = config_key else {
         eprintln!("fatal: missing --config=<config>");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
 
     let values = match read_repo_paths(cli_session, &config_key)? {
@@ -116,7 +116,7 @@ pub(crate) fn cmd_for_each_repo(
         let code = run_command_on_repo(&path, child_args)?;
         if code != 0 {
             if !keep_going {
-                return Err(GitError::Exit(code));
+                return Err(crate::cli_exit(code));
             }
             result = 1;
         }
@@ -125,7 +125,7 @@ pub(crate) fn cmd_for_each_repo(
     if result == 0 {
         Ok(())
     } else {
-        Err(GitError::Exit(result))
+        Err(crate::cli_exit(result))
     }
 }
 
@@ -141,7 +141,7 @@ fn usage_error(message: Option<&str>) -> Result<()> {
     } else {
         eprintln!("{USAGE}");
     }
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 /// The outcome of resolving the `--config` key against the effective config.
@@ -235,9 +235,7 @@ fn run_command_on_repo(path: &str, child_args: &[String]) -> Result<i32> {
     }
     child.arg("-C").arg(&abspath);
     child.args(child_args);
-    let status = child
-        .status()
-        .map_err(GitError::from)?;
+    let status = child.status().map_err(GitError::from)?;
     Ok(status.code().unwrap_or(1))
 }
 

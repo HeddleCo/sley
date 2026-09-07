@@ -151,7 +151,10 @@ fn do_cache(socket: &Path, action: &str, timeout: i32, flags: u8) -> Result<()> 
     }
     if send_request(socket, buf.as_bytes()).is_err() {
         if connection_fatally_broken() {
-            return Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: "unable to connect to cache daemon".into() });
+            return Err(GitError::IoKind {
+                kind: std::io::ErrorKind::Other,
+                message: "unable to connect to cache daemon".into(),
+            });
         }
         if flags & FLAG_SPAWN != 0 {
             spawn_daemon(socket)?;
@@ -161,10 +164,16 @@ fn do_cache(socket: &Path, action: &str, timeout: i32, flags: u8) -> Result<()> 
                     break;
                 }
                 if connection_fatally_broken() {
-                    return Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: "unable to connect to cache daemon".into() });
+                    return Err(GitError::IoKind {
+                        kind: std::io::ErrorKind::Other,
+                        message: "unable to connect to cache daemon".into(),
+                    });
                 }
                 if Instant::now() >= deadline {
-                    return Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: "unable to connect to cache daemon".into() });
+                    return Err(GitError::IoKind {
+                        kind: std::io::ErrorKind::Other,
+                        message: "unable to connect to cache daemon".into(),
+                    });
                 }
                 thread::sleep(Duration::from_millis(25));
             }
@@ -185,9 +194,7 @@ fn send_request(socket: &Path, out: &[u8]) -> Result<bool> {
         let _ = err;
         io::Error::last_os_error()
     })?;
-    stream
-        .write_all(out)
-        .map_err(GitError::from)?;
+    stream.write_all(out).map_err(GitError::from)?;
     stream
         .shutdown(std::net::Shutdown::Write)
         .map_err(GitError::from)?;
@@ -197,9 +204,7 @@ fn send_request(socket: &Path, out: &[u8]) -> Result<bool> {
         match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                io::stdout()
-                    .write_all(&buf[..n])
-                    .map_err(GitError::from)?;
+                io::stdout().write_all(&buf[..n]).map_err(GitError::from)?;
                 got_data = true;
             }
             Err(err) if connection_closed(&err) => break,
@@ -232,19 +237,17 @@ fn spawn_daemon(socket: &Path) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let mut child = command
-        .spawn()
-        .map_err(GitError::from)?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| GitError::IoKind { kind: std::io::ErrorKind::Other, message: "cache daemon stdout was not piped".into() })?;
+    let mut child = command.spawn().map_err(GitError::from)?;
+    let mut stdout = child.stdout.take().ok_or_else(|| GitError::IoKind {
+        kind: std::io::ErrorKind::Other,
+        message: "cache daemon stdout was not piped".into(),
+    })?;
     let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
+    thread::spawn(sley_core::diagnostics::inherit(move || {
         let mut line = Vec::new();
         let _ = io::BufReader::new(&mut stdout).read_until(b'\n', &mut line);
         let _ = tx.send(line);
-    });
+    }));
     let line = match rx.recv_timeout(Duration::from_secs(10)) {
         Ok(line) => line,
         Err(_) => {

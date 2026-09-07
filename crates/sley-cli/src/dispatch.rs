@@ -79,7 +79,7 @@ pub(crate) fn dispatch_with_aliases(
                             eprintln!("fatal: bad config line");
                         }
                     }
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 commands::alias::AliasLookup::Value(alias_string) => {
                     trace2_run_dashed(&command, expanded_aliases.len());
@@ -109,11 +109,11 @@ pub(crate) fn dispatch_with_aliases(
                     let new_args = reapply_global_options(&mut cli_session, &expanded)?;
                     let Some(real_command) = new_args.first().cloned() else {
                         eprintln!("fatal: empty alias for {command}");
-                        return Err(GitError::Exit(128));
+                        return Err(crate::cli_exit(128));
                     };
                     if real_command == command {
                         eprintln!("fatal: recursive alias: {command}");
-                        return Err(GitError::Exit(128));
+                        return Err(crate::cli_exit(128));
                     }
                     if commands::alias::is_builtin_command(&real_command) {
                         trace2_alias_cmd_name("_run_git_alias_", expanded_aliases.len());
@@ -130,7 +130,7 @@ pub(crate) fn dispatch_with_aliases(
                         .position(|name| name == &real_command)
                     {
                         report_alias_loop(&expanded_aliases, seen);
-                        return Err(GitError::Exit(128));
+                        return Err(crate::cli_exit(128));
                     }
                     args = new_args;
                     continue;
@@ -146,7 +146,7 @@ pub(crate) fn dispatch_with_aliases(
     }
     // Backstop: exceeded the expansion-iteration limit without converging.
     eprintln!("fatal: alias loop detected");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn trace2_dashed_hierarchy(alias_depth: usize) -> String {
@@ -263,7 +263,7 @@ fn run_external_or_unknown(
         eprintln!(
             "fatal: 'git-{command}' is a Git core helper without a native Sley implementation"
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let external = format!("git-{command}");
     let mut argv = Vec::with_capacity(args.len());
@@ -286,13 +286,11 @@ fn run_external_or_unknown(
             "SLEY_TRACE2_DEPTH",
             (sley_core::trace2::depth() + 1).to_string(),
         );
-        let status = process
-            .status()
-            .map_err(GitError::from)?;
+        let status = process.status().map_err(GitError::from)?;
         return match status.code() {
             Some(0) => Ok(()),
-            Some(code) => Err(GitError::Exit(code)),
-            None => Err(GitError::Exit(1)),
+            Some(code) => Err(crate::cli_exit(code)),
+            None => Err(crate::cli_exit(1)),
         };
     }
     commands::help::unknown_command(command, 1)
@@ -331,7 +329,7 @@ fn run_dashed_http_fetch_stub(cli_session: &session::CliSession, args: &[String]
     sley_core::trace2::cmd_name_at_depth(1, "http-fetch", Some(&child_hierarchy));
     crate::trace2_emit_def_params_at_depth(cli_session, 1);
     eprintln!("fatal: 'git-http-fetch' is a Git core helper without a native Sley implementation");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn trace2_external_child_metadata(cli_session: &session::CliSession, command: &str) {
@@ -393,7 +391,7 @@ fn dispatch_command(
     }
     let Some(command) = args.first().map(String::as_str) else {
         commands::help::print_common_help();
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     };
     // GIT_TRACE_PACKET identity: git's `packet_trace_identity` is the running
     // program's basename (the subcommand here). The transports' pkt-line traces
@@ -432,7 +430,7 @@ fn dispatch_command(
                     && setup::setup_git_directory(cli_session).is_none()));
         if generic_short_help || generic_full_help {
             crate::command_synopsis::print_command_usage(command);
-            return Err(GitError::Exit(129));
+            return Err(crate::cli_exit(129));
         }
     }
     match command {

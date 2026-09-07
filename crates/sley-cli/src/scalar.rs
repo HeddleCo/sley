@@ -48,6 +48,11 @@ const RECOMMENDED_CONFIG: &[(&str, &str)] = &[
 
 /// Run the native Scalar auxiliary command.
 pub fn run_scalar(args: Vec<String>) -> Result<()> {
+    sley_core::diagnostics::Diagnostics::new(crate::error::CliDiagnostics)
+        .scope(|| run_scalar_inner(args))
+}
+
+fn run_scalar_inner(args: Vec<String>) -> Result<()> {
     let invocation = parse_global_args(&args)?;
     let Some(command) = invocation.command else {
         return usage();
@@ -105,7 +110,7 @@ fn parse_global_args_from(args: &[String], mut base: PathBuf) -> Result<ScalarIn
                         "fatal: cannot change to '{}': No such file or directory",
                         directory
                     );
-                    GitError::Exit(128)
+                    crate::cli_exit(128)
                 })?;
             }
             "-c" => {
@@ -200,7 +205,7 @@ fn delete(args: &[String], base: &Path) -> Result<()> {
     let enlistment = resolve_enlistment(base, Some(&requested))?;
     if base.starts_with(&enlistment.root) {
         eprintln!("error: refusing to delete current working directory");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     unregister_worktree(&enlistment.worktree)?;
     fs::remove_dir_all(enlistment.root)?;
@@ -273,7 +278,7 @@ fn run(args: &[String], base: &Path) -> Result<()> {
     let requested = absolutize(base, Path::new(&args[1]));
     if !requested.is_dir() {
         eprintln!("fatal: '{}' does not exist", args[1]);
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let enlistment = resolve_enlistment(base, Some(&requested))?;
     crate::run(vec![
@@ -291,7 +296,7 @@ fn resolve_enlistment(base: &Path, requested: Option<&Path>) -> Result<Enlistmen
         .unwrap_or_else(|| base.to_path_buf());
     if !requested.is_dir() {
         eprintln!("fatal: '{}' does not exist", requested.display());
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let src = requested.join("src");
@@ -301,7 +306,7 @@ fn resolve_enlistment(base: &Path, requested: Option<&Path>) -> Result<Enlistmen
     } else {
         Repository::open_from_environment(&requested).map_err(|_| {
             eprintln!("fatal: not a git repository (or any of the parent directories): .git");
-            GitError::Exit(128)
+            crate::cli_exit(128)
         })?
     };
     let Some(worktree) = repository.workdir() else {
@@ -312,7 +317,7 @@ fn resolve_enlistment(base: &Path, requested: Option<&Path>) -> Result<Enlistmen
     }
     if !has_src_repository && discovery_blocked_by_ceiling(&requested, &worktree) {
         eprintln!("fatal: not a git repository (or any of the parent directories): .git");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let worktree = fs::canonicalize(worktree)?;
     let root = if has_src_repository {
@@ -409,7 +414,7 @@ fn start_fsmonitor(worktree: &Path) -> Result<()> {
     ])
     .map_err(|_| {
         eprintln!("error: could not start the FSMonitor daemon");
-        GitError::Exit(1)
+        crate::cli_exit(1)
     })
 }
 
@@ -523,7 +528,7 @@ fn global_config_path() -> Result<PathBuf> {
         .filter(|path| !path.is_empty())
         .ok_or_else(|| {
             eprintln!("fatal: $HOME not set");
-            GitError::Exit(128)
+            crate::cli_exit(128)
         })?;
     Ok(PathBuf::from(home).join(".gitconfig"))
 }
@@ -595,7 +600,7 @@ fn clone(args: &[String], base: &Path) -> Result<()> {
     let enlistment_root = absolutize(base, Path::new(&enlistment));
     if enlistment_root.is_dir() {
         eprintln!("fatal: directory '{enlistment}' exists already");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let destination = if parsed.src {
         enlistment_root.join("src")
@@ -746,12 +751,12 @@ fn trace_scalar_fetch(progress: bool, tags: bool) {
 
 fn clone_usage_error(message: &str) -> GitError {
     eprintln!("error: {message}");
-    GitError::Exit(129)
+    crate::cli_exit(129)
 }
 
 fn clone_usage<T>() -> Result<T> {
     eprintln!("{CLONE_USAGE}");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn diagnose(args: &[String], base: &Path) -> Result<()> {
@@ -765,7 +770,7 @@ fn diagnose(args: &[String], base: &Path) -> Result<()> {
         .unwrap_or_else(|| base.to_path_buf());
     if !requested.is_dir() {
         eprintln!("fatal: '{}' does not exist", requested.display());
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let src = requested.join("src");
@@ -774,7 +779,7 @@ fn diagnose(args: &[String], base: &Path) -> Result<()> {
     } else {
         let repository = Repository::discover(&requested).map_err(|_| {
             eprintln!("fatal: not a git repository (or any of the parent directories): .git");
-            GitError::Exit(128)
+            crate::cli_exit(128)
         })?;
         let diagnostics_root = repository.workdir().ok_or_else(scalar_requires_worktree)?;
         (repository, diagnostics_root)
@@ -809,12 +814,12 @@ fn absolutize(cwd: &Path, path: &Path) -> PathBuf {
 
 fn scalar_requires_worktree() -> GitError {
     eprintln!("fatal: Scalar enlistments require a worktree");
-    GitError::Exit(128)
+    crate::cli_exit(128)
 }
 
 fn usage<T>() -> Result<T> {
     eprintln!("{USAGE}");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 #[cfg(test)]

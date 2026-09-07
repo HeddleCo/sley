@@ -53,7 +53,7 @@ pub(crate) fn signing_format(config: Option<&GitConfig>) -> Result<SigningFormat
         Some("x509") => Ok(SigningFormat::X509),
         Some(value) => {
             eprintln!("fatal: unsupported value for gpg.format: {value}");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -124,7 +124,7 @@ fn sign_gpg_payload(
     if !output.status.success() || !signature_has_marker(&output.stdout) {
         io::stderr().write_all(&output.stderr)?;
         eprintln!("error: gpg failed to sign the data");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(output.stdout)
 }
@@ -336,7 +336,7 @@ fn sign_ssh_payload(
 ) -> Result<Vec<u8>> {
     let Some(key) = key.filter(|key| !key.is_empty()) else {
         eprintln!("error: user.signingKey needs to be set for ssh signing");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
     let temp = GpgTempFiles::new(Path::new(".git"))?;
     let (key_path, use_agent) = ssh_signing_key_file(&temp, key)?;
@@ -361,7 +361,7 @@ fn sign_ssh_payload(
     if !output.status.success() {
         io::stderr().write_all(&output.stderr)?;
         eprintln!("error: ssh-keygen failed to sign the data");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let signature = fs::read(&temp.ssh_signature).map_err(|err| {
         GitError::Command(format!(
@@ -372,7 +372,7 @@ fn sign_ssh_payload(
     if !signature_has_marker(&signature) {
         io::stderr().write_all(&output.stderr)?;
         eprintln!("error: ssh-keygen failed to sign the data");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(strip_cr(signature))
 }

@@ -62,7 +62,7 @@ fn add_edit_patch(cli_session: &crate::session::CliSession, paths: &[PathBuf]) -
     if !diff_out.status.success() && diff_out.status.code() != Some(1) {
         let _ = io::stderr().write_all(&diff_out.stderr);
         eprintln!("fatal: could not generate patch for editing");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     fs::write(&patch_path, &diff_out.stdout).map_err(|e| GitError::from(e))?;
 
@@ -70,7 +70,7 @@ fn add_edit_patch(cli_session: &crate::session::CliSession, paths: &[PathBuf]) -
         // Match git's `die(_("editing patch failed"))`.
         eprintln!("fatal: editing patch failed");
         let _ = fs::remove_file(&patch_path);
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let meta = fs::metadata(&patch_path).map_err(|e| {
@@ -80,7 +80,7 @@ fn add_edit_patch(cli_session: &crate::session::CliSession, paths: &[PathBuf]) -
     if meta.len() == 0 {
         eprintln!("fatal: empty patch. aborted");
         let _ = fs::remove_file(&patch_path);
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let apply_status = ProcessCommand::new(&self_bin)
@@ -96,7 +96,7 @@ fn add_edit_patch(cli_session: &crate::session::CliSession, paths: &[PathBuf]) -
     if !apply_status.success() {
         eprintln!("fatal: could not apply '{}'", patch_path.to_string_lossy());
         let _ = fs::remove_file(&patch_path);
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let _ = fs::remove_file(&patch_path);
     Ok(())
@@ -171,41 +171,41 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
             && value < -1
         {
             eprintln!("fatal: '--unified' cannot be negative");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if let Some(value) = interhunk
             && value < -1
         {
             eprintln!("fatal: '--inter-hunk-context' cannot be negative");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if !patch && !interactive {
             if context.is_some() {
                 eprintln!("fatal: the option '--unified' requires '--interactive/--patch'");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             if interhunk.is_some() {
                 eprintln!(
                     "fatal: the option '--inter-hunk-context' requires '--interactive/--patch'"
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             if auto_advance == Some(false) {
                 eprintln!("fatal: the option '--no-auto-advance' requires '--interactive/--patch'");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
         if (patch || interactive) && dry_run {
             eprintln!(
                 "fatal: options '--dry-run' and '--interactive/--patch' cannot be used together"
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if (patch || interactive) && pathspec_from_file {
             eprintln!(
                 "fatal: options '--pathspec-from-file' and '--interactive/--patch' cannot be used together"
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if patch {
             return crate::commands::add_interactive::cmd_add_patch(
@@ -246,7 +246,7 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
                 eprintln!(
                     "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             paths.push(PathBuf::from(arg));
             continue;
@@ -303,7 +303,7 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
                     eprintln!(
                         "fatal: options '--pathspec-from-file' and '--edit' cannot be used together"
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 edit_option = true;
             }
@@ -312,13 +312,13 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
                     eprintln!(
                         "fatal: options '--pathspec-from-file' and '--edit' cannot be used together"
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 if !paths.is_empty() {
                     eprintln!(
                         "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 let value = iter.next().ok_or_else(|| {
                     GitError::Command("--pathspec-from-file requires a value".into())
@@ -331,13 +331,13 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
                     eprintln!(
                         "fatal: options '--pathspec-from-file' and '--edit' cannot be used together"
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 if !paths.is_empty() {
                     eprintln!(
                         "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 let value = value.strip_prefix("--pathspec-from-file=").ok_or_else(|| {
                     GitError::Command("--pathspec-from-file requires a value".into())
@@ -367,7 +367,7 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
                     eprintln!(
                         "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 paths.push(PathBuf::from(value));
             }
@@ -375,14 +375,14 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
     }
     if pathspec_file_nul && pathspec_from_file.is_none() {
         eprintln!("fatal: the option '--pathspec-file-nul' requires '--pathspec-from-file'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if let Some(pathspec_file) = pathspec_from_file {
         paths.extend(read_pathspecs_from_file(&pathspec_file, pathspec_file_nul)?);
     }
     if ignore_missing && !dry_run {
         eprintln!("fatal: the option '--ignore-missing' requires '--dry-run'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     // `git add -e` / `--edit`: edit the unstaged patch then apply it to the index.
     // Upstream returns early from edit_patch before the empty-pathspec "Nothing
@@ -610,7 +610,7 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
                 if verbose {
                     print_add_actions(worktree_root, &verbose_actions)?;
                 }
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
         }
         if do_refresh {
@@ -659,7 +659,7 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
         validate_add_chmod_dry_run(worktree_root, &actions, chmod)?;
         if !ignored_paths.is_empty() {
             print_add_ignored_paths(&context.config, &ignored_paths);
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         return Ok(());
     }
@@ -777,7 +777,7 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
             if verbose {
                 print_add_actions(worktree_root, &verbose_actions)?;
             }
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         // Reuse filtered list for the post-success verbose print below.
         if verbose {
@@ -798,7 +798,7 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
         }
         if !ignored_paths.is_empty() {
             print_add_ignored_paths(&context.config, &ignored_paths);
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         commands::hooks::run_post_index_change_hook(cli_session, false, false)?;
         return Ok(());
@@ -820,7 +820,7 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
     }
     if !ignored_paths.is_empty() {
         print_add_ignored_paths(&context.config, &ignored_paths);
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     commands::hooks::run_post_index_change_hook(cli_session, false, false)?;
     Ok(())
@@ -1085,7 +1085,7 @@ fn refresh_index_after_add(
                         path.to_string_lossy()
                     );
                 }
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             return Ok(());
         };
@@ -1124,7 +1124,7 @@ fn refresh_index_after_add(
         }
         if strict_pathspec && let Some(spec) = compiled.unmatched_includes().next() {
             eprintln!("fatal: pathspec '{}' did not match any files", spec.display);
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if selected.is_empty() {
             return Ok(());
@@ -1217,7 +1217,7 @@ fn die_in_unpopulated_submodule_with_prefix(relative: &Path, index: &Index) -> R
             "fatal: in unpopulated submodule '{}'",
             String::from_utf8_lossy(ce)
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(())
 }
@@ -1258,7 +1258,7 @@ fn die_on_pathspec_inside_submodule(
                 path.to_string_lossy(),
                 String::from_utf8_lossy(link)
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     Ok(())
@@ -1354,7 +1354,7 @@ fn die_on_pathspec_inside_submodule_by_scan(
                     path.to_string_lossy(),
                     String::from_utf8_lossy(link)
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
     }
@@ -1454,7 +1454,7 @@ fn parse_add_chmod(value: &str) -> Result<bool> {
         "-x" => Ok(false),
         _ => {
             eprintln!("fatal: --chmod param '{value}' must be either -x or +x");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -1603,7 +1603,7 @@ fn resolve_add_renormalize_paths(
     }
     if let Some(spec) = compiled.unmatched_includes().next() {
         eprintln!("fatal: pathspec '{}' did not match any files", spec.display);
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(selected)
 }
@@ -1891,7 +1891,7 @@ fn resolve_add_regular_actions(
                     .to_string_lossy()
                     .replace('\\', "/");
                 eprintln!("fatal: unable to stat '{display}': No such file or directory");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             if seen.insert(abs.clone()) {
                 actions.push(AddAction::Remove(abs));
@@ -1999,7 +1999,7 @@ fn resolve_add_regular_actions(
     for spec in compiled_pathspecs.unmatched_includes() {
         if !options.ignore_missing {
             eprintln!("fatal: pathspec '{}' did not match any files", spec.display);
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     Ok(AddRegularResolution {
@@ -2495,7 +2495,7 @@ fn reject_add_skip_worktree_paths(
         return Ok(());
     }
     advise_on_updating_sparse_paths_with_config(config, &rejected);
-    Err(GitError::Exit(1))
+    Err(crate::cli_exit(1))
 }
 
 /// git's `advise_on_updating_sparse_paths`: the "outside of your sparse-checkout
@@ -2776,7 +2776,7 @@ fn validate_add_chmod_dry_run(
                 "fatal: git update-index: cannot chmod {}x '{display}'",
                 if executable { '+' } else { '-' }
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     Ok(())

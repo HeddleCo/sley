@@ -26,11 +26,11 @@ pub(super) fn log_parse_diff_merges(value: &str) -> Result<LogDiffMerges> {
         "remerge" | "r" => Ok(LogDiffMerges::Remerge),
         "" => {
             eprintln!("fatal: invalid value for '--diff-merges': '{value}'");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
         _ => {
             eprintln!("fatal: invalid value for '--diff-merges': '{value}'");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -47,7 +47,7 @@ pub(super) fn log_parse_diff_merges_config(value: &str) -> Result<LogDiffMerges>
         "dense-combined" | "cc" => Ok(LogDiffMerges::Combined { dense: true }),
         _ => {
             eprintln!("fatal: bad config variable 'log.diffMerges'");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }

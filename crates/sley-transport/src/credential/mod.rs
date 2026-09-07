@@ -239,7 +239,7 @@ pub(crate) fn apply_credential_line(
     op_type: CredentialOpType,
 ) -> Result<()> {
     let Some((key, value)) = line.split_once('=') else {
-        eprintln!("warning: invalid credential line: {line}");
+        sley_core::diagnostic!(Stderr, true, "warning: invalid credential line: {line}");
         return Err(GitError::InvalidFormat(
             "credential line is missing = delimiter".into(),
         ));

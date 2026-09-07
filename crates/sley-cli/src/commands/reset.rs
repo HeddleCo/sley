@@ -38,7 +38,7 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
                 eprintln!(
                     "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             positionals.push(arg.to_string());
             continue;
@@ -144,14 +144,14 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
                     .unwrap_or(value);
                 eprintln!("error: unknown option `{name}'");
                 eprint!("{RESET_USAGE}");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             value => {
                 if pathspec_from_file.is_some() {
                     eprintln!(
                         "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 positionals.push(value.to_string());
             }
@@ -159,19 +159,19 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
     }
     if pathspec_file_nul && pathspec_from_file.is_none() {
         eprintln!("fatal: the option '--pathspec-file-nul' requires '--pathspec-from-file'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if no_auto_advance && !patch {
         eprintln!("fatal: the option '--no-auto-advance' requires '--interactive/--patch'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if unified_context.is_some() && !patch {
         eprintln!("fatal: the option '--unified' requires '--interactive/--patch'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if inter_hunk_context.is_some() && !patch {
         eprintln!("fatal: the option '--inter-hunk-context' requires '--interactive/--patch'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if patch {
         let mut stdin = io::stdin().lock();
@@ -218,23 +218,23 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
     if mode == ResetMode::Soft {
         if pathspec_from_file_provided {
             eprintln!("fatal: Cannot do soft reset with paths.");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if has_separator_paths {
             eprintln!("fatal: Cannot do soft reset with paths.");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         let target = match positionals.as_slice() {
             [] => "HEAD",
             [target] => target.as_str(),
             _ => {
                 eprintln!("fatal: Cannot do soft reset with paths.");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         };
         if reset_soft_blocked_by_merge(&git_dir, format)? {
             eprintln!("fatal: Cannot do a soft reset in the middle of a merge.");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         let db = FileObjectDatabase::from_git_dir(&git_dir, format);
         let old_head =
@@ -261,14 +261,14 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
     if mode == ResetMode::Merge {
         if pathspec_from_file_provided || has_separator_paths {
             eprintln!("fatal: Cannot do merge reset with paths.");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         let target = match positionals.as_slice() {
             [] => "HEAD",
             [target] => target.as_str(),
             _ => {
                 eprintln!("fatal: Cannot do merge reset with paths.");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         };
         let db = FileObjectDatabase::from_git_dir(&git_dir, format);
@@ -288,7 +288,7 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
         .map_err(|err| match err {
             GitError::Command(message) => {
                 eprintln!("fatal: {message}");
-                GitError::Exit(128)
+                crate::cli_exit(128)
             }
             other => other,
         });
@@ -301,27 +301,27 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
         // local changes. It never accepts paths.
         if pathspec_from_file_provided || has_separator_paths {
             eprintln!("fatal: Cannot do keep reset with paths.");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         let target = match positionals.as_slice() {
             [] => "HEAD",
             [target] => target.as_str(),
             _ => {
                 eprintln!("fatal: Cannot do keep reset with paths.");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         };
         // git's `die_if_unmerged_cache(KEEP)`: a pending merge (MERGE_HEAD) or
         // unmerged index entries forbid `--keep` (same gate as `--soft`).
         if reset_soft_blocked_by_merge(&git_dir, format)? {
             eprintln!("fatal: Cannot do a keep reset in the middle of a merge.");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         let db = FileObjectDatabase::from_git_dir(&git_dir, format);
         let head_oid = resolve_revision(&git_dir, format, "HEAD", cli_session.replace_objects())
             .map_err(|_| {
                 eprintln!("fatal: You do not have a valid HEAD.");
-                GitError::Exit(128)
+                crate::cli_exit(128)
             })?;
         let old_head = head_oid;
         let head_tree = commands::merge_rebase::commit_tree_oid(&db, format, &head_oid)?;
@@ -373,18 +373,18 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
     if mode == ResetMode::Hard {
         if pathspec_from_file_provided {
             eprintln!("fatal: Cannot do {} reset with paths.", mode.as_str());
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if has_separator_paths {
             eprintln!("fatal: Cannot do {} reset with paths.", mode.as_str());
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         let target = match positionals.as_slice() {
             [] => "HEAD",
             [target] => target.as_str(),
             _ => {
                 eprintln!("fatal: Cannot do {} reset with paths.", mode.as_str());
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         };
         let db = FileObjectDatabase::from_git_dir(&git_dir, format);
@@ -631,7 +631,7 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
             }
             _ => {
                 eprintln!("fatal: Cannot do mixed reset with multiple trees.");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
         after_separator

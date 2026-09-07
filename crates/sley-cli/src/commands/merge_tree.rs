@@ -111,7 +111,7 @@ usage: git merge-tree [--write-tree] [<options>] <branch1> <branch2>
 /// argument parser in upstream `git`.
 fn usage_error() -> GitError {
     eprint!("{MERGE_TREE_USAGE}");
-    GitError::Exit(129)
+    crate::cli_exit(129)
 }
 
 /// `git merge-tree` entry point.
@@ -135,7 +135,7 @@ pub(crate) fn cmd_merge_tree(
 fn reject_trivial_incompatible_options(options: &MergeTreeOptions) -> Result<()> {
     if options.mode == MergeTreeMode::TrivialMerge && options.trivial_incompatible_option {
         eprintln!("fatal: --trivial-merge is incompatible with all other options");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(())
 }
@@ -352,7 +352,7 @@ fn run_real_merge(
         return if outcome.clean {
             Ok(())
         } else {
-            Err(GitError::Exit(1))
+            Err(crate::cli_exit(1))
         };
     }
 
@@ -360,7 +360,7 @@ fn run_real_merge(
     if outcome.clean {
         Ok(())
     } else {
-        Err(GitError::Exit(1))
+        Err(crate::cli_exit(1))
     }
 }
 
@@ -459,7 +459,7 @@ fn compute_real_merge(
                     if !options.allow_unrelated_histories {
                         // This hard error is printed even under --quiet.
                         eprintln!("fatal: refusing to merge unrelated histories");
-                        return Err(GitError::Exit(128));
+                        return Err(crate::cli_exit(128));
                     }
                     None
                 }
@@ -594,7 +594,7 @@ fn ensure_merge_tree_inputs_readable(
                     "error: collecting merge info failed for trees {base}, {ours_tree}, {theirs_tree}"
                 );
                 eprintln!("fatal: failure to merge");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             return Err(err);
         }
@@ -605,7 +605,7 @@ fn ensure_merge_tree_inputs_readable(
 fn merge_tree_merge_error(err: GitError) -> GitError {
     if let Some(oid) = merge_tree_missing_oid(&err) {
         eprintln!("error: unable to read blob object {oid}");
-        return GitError::Exit(128);
+        return crate::cli_exit(128);
     }
     err
 }
@@ -631,7 +631,7 @@ fn run_stdin_merges(
 ) -> Result<()> {
     if options.merge_base.is_some() {
         eprintln!("fatal: --merge-base and --stdin cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if !options.positionals.is_empty() {
         return Err(usage_error());
@@ -708,7 +708,7 @@ fn stdin_record_options(
                 "fatal: malformed input line: {}",
                 String::from_utf8_lossy(record)
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     Ok(Some(batch))
@@ -805,7 +805,7 @@ fn dereferenced_type(db: &FileObjectDatabase, oid: &ObjectId) -> &'static str {
 /// sentinel.
 fn not_something_we_can_merge(rev: &str) -> GitError {
     eprintln!("merge-tree: {rev} - not something we can merge");
-    GitError::Exit(1)
+    crate::cli_exit(1)
 }
 
 /// Render a [`sley_diff_merge::MergeTreesResult`] into the `merge-tree

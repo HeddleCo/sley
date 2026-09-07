@@ -1946,7 +1946,9 @@ impl MultiPackIndex {
                 ));
             }
             if chunk_offset % 4 != 0 && !reported_unaligned {
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "error: chunk id {:08x} not 4-byte aligned",
                     u32::from_be_bytes(id)
                 );
@@ -2090,7 +2092,9 @@ impl MultiPackIndexOidLookup {
                 ));
             }
             if chunk_offset % 4 != 0 && !reported_unaligned {
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "error: chunk id {:08x} not 4-byte aligned",
                     u32::from_be_bytes(id)
                 );

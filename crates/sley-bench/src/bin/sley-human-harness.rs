@@ -1,4 +1,4 @@
-use sley_core::{GitError, ObjectFormat, ObjectId, cli_exit_code};
+use sley_core::{GitError, ObjectFormat, ObjectId};
 use sley_object::{Commit, ObjectType};
 use sley_odb::{FileObjectDatabase, ObjectReader, repository_objects_dir};
 use sley_refs::{FileRefStore, RefTarget, RefUpdate, ReflogEntry};
@@ -31,7 +31,7 @@ fn main() {
         Ok(()) => {}
         Err(err) => {
             eprintln!("sley-human-harness: {err}");
-            process::exit(cli_exit_code(&err));
+            process::exit(if err.is_cancelled() { 130 } else { 1 });
         }
     }
 }
@@ -206,8 +206,7 @@ impl HarnessRepo {
     }
 
     fn rev_parse_short_head(&self, out: &mut impl Write) -> Result<(), GitError> {
-        writeln!(out, "{}", self.abbrev_oid(&self.head_oid()?)?)
-            .map_err(GitError::from)
+        writeln!(out, "{}", self.abbrev_oid(&self.head_oid()?)?).map_err(GitError::from)
     }
 
     fn branch_force_write(&self, branch: &str, start: &str) -> Result<(), GitError> {
@@ -394,7 +393,7 @@ fn parse_options(args: Vec<String>) -> Result<Options, GitError> {
             }
             "-h" | "--help" => {
                 print_usage();
-                return Err(GitError::Exit(0));
+                process::exit(0);
             }
             value => {
                 return Err(GitError::Command(format!(

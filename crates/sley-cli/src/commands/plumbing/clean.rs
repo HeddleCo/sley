@@ -97,7 +97,7 @@ pub(crate) fn cmd_clean(cli_session: &crate::session::CliSession, args: &[String
                 "fatal: clean.requireForce defaults to true and neither -i, -n, nor -f given; refusing to clean"
             );
         }
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
     let format = repository_object_format(&git_dir)?;

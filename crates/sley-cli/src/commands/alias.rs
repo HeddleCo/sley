@@ -318,14 +318,12 @@ pub(crate) fn run_shell_alias(
     if let Some(params) = crate::effective_config_parameters_env() {
         process.env("GIT_CONFIG_PARAMETERS", params);
     }
-    let status = process
-        .status()
-        .map_err(GitError::from)?;
+    let status = process.status().map_err(GitError::from)?;
     if status.success() {
         Ok(())
     } else {
         let code = status.code().unwrap_or(1);
-        Err(GitError::Exit(code))
+        Err(crate::cli_exit(code))
     }
 }
 

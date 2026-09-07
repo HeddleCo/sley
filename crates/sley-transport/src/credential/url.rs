@@ -186,7 +186,7 @@ pub(crate) fn credential_from_url_gently(
     let proto_end = url.find("://");
     if !allow_partial_url && (proto_end.is_none() || proto_end == Some(0)) {
         if !quiet {
-            eprintln!("warning: url has no scheme: {url}");
+            sley_core::diagnostic!(Stderr, true, "warning: url has no scheme: {url}");
         }
         return Err(GitError::InvalidFormat("url has no scheme".into()));
     }
@@ -247,7 +247,11 @@ pub(crate) fn credential_from_url_gently(
     ] {
         if value.is_some_and(|value| value.contains('\n')) {
             if !quiet {
-                eprintln!("warning: url contains a newline in its {name} component: {url}");
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "warning: url contains a newline in its {name} component: {url}"
+                );
             }
             return Err(GitError::InvalidFormat(format!(
                 "url contains a newline in its {name} component"
@@ -296,7 +300,11 @@ pub(crate) fn collect_credential_config_stack(
                 .is_some_and(|want| credential_match(&want, credential, false));
         if !matched {
             if credential_from_potentially_partial_url(partial).is_err() {
-                eprintln!("warning: skipping credential lookup for key: credential.{partial}");
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "warning: skipping credential lookup for key: credential.{partial}"
+                );
             }
             continue;
         }
@@ -348,7 +356,11 @@ pub(crate) fn collect_credential_config(
                 .is_some_and(|want| credential_match(&want, credential, false));
         if !matched {
             if credential_from_potentially_partial_url(partial).is_err() {
-                eprintln!("warning: skipping credential lookup for key: credential.{partial}");
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "warning: skipping credential lookup for key: credential.{partial}"
+                );
             }
             continue;
         }

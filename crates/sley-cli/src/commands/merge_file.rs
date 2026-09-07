@@ -82,7 +82,7 @@ pub(crate) fn cmd_merge_file(
 /// Parse the command line the way git's parse-options front-end does. Returns
 /// `Ok(None)` only when nothing further should run (currently unused, reserved
 /// for help output); usage/option errors are reported here and surface as
-/// `GitError::Exit(129)`.
+/// `crate::cli_exit(129)`.
 fn parse_merge_file_args(args: &[String]) -> Result<Option<MergeFileOptions>> {
     let mut to_stdout = false;
     let mut quiet = false;
@@ -168,7 +168,7 @@ fn parse_merge_file_args(args: &[String]) -> Result<Option<MergeFileOptions>> {
 
     if operands.len() != 3 {
         print_merge_file_usage();
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
 
     Ok(Some(MergeFileOptions {
@@ -191,7 +191,7 @@ fn check_label_capacity(labels: &[String]) -> Result<()> {
     if labels.len() >= 3 {
         // git prints only this line (no usage block) for a fourth label.
         eprintln!("error: too many labels on the command line");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     Ok(())
 }
@@ -207,7 +207,7 @@ fn parse_marker_size(value: &str) -> Result<usize> {
             eprintln!(
                 "error: option `marker-size' expects an integer value with an optional k/m/g suffix"
             );
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
     }
 }
@@ -241,7 +241,7 @@ fn parse_diff_algorithm(value: &str) -> Result<sley_diff_merge::DiffAlgorithm> {
             eprintln!(
                 "error: option diff-algorithm accepts \"myers\", \"minimal\", \"patience\" and \"histogram\""
             );
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
     }
 }
@@ -256,19 +256,19 @@ fn merge_file_unknown_option(option: &str) -> Result<Option<MergeFileOptions>> {
         eprintln!("error: unknown option `{option}'");
     }
     print_merge_file_usage();
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn merge_file_option_requires_value(option: &str) -> Result<Option<MergeFileOptions>> {
     // A missing option value prints only the diagnostic, no usage block.
     eprintln!("error: option `{option}' requires a value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 fn merge_file_switch_requires_value(short: &str) -> Result<Option<MergeFileOptions>> {
     // A missing switch value prints only the diagnostic, no usage block.
     eprintln!("error: switch `{short}' requires a value");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 
 /// Print git's exact `merge-file` usage block to stderr. Built from adjacent
@@ -332,7 +332,7 @@ fn run_merge_file(
             if !options.quiet {
                 eprintln!("error: Cannot merge binary files: {name}");
             }
-            return Err(GitError::Exit(255));
+            return Err(crate::cli_exit(255));
         }
     }
 
@@ -353,7 +353,7 @@ fn run_merge_file(
     if merged.conflicts == 0 {
         Ok(())
     } else {
-        Err(GitError::Exit(
+        Err(crate::cli_exit(
             i32::try_from(merged.conflicts)
                 .unwrap_or(MAX_CONFLICT_EXIT)
                 .min(MAX_CONFLICT_EXIT),
@@ -427,7 +427,7 @@ fn read_merge_input_file(path: &str) -> Result<Vec<u8>> {
         Ok(bytes) => Ok(bytes),
         Err(err) => {
             eprintln!("error: Could not stat {path}: {}", stat_error_text(&err));
-            Err(GitError::Exit(255))
+            Err(crate::cli_exit(255))
         }
     }
 }
@@ -487,7 +487,7 @@ fn read_object_id_blob(
         }
         _ => {
             print_merge_file_usage();
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
     }
 }
@@ -514,7 +514,7 @@ fn resolve_object_id(
         Ok(ObjectPrefixResolution::Unique(oid)) => Ok(oid),
         _ => {
             print_merge_file_usage();
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
     }
 }
@@ -750,7 +750,7 @@ mod tests {
         let two = vec!["a".to_string(), "b".to_string()];
         assert!(matches!(
             parse_merge_file_args(&two),
-            Err(GitError::Exit(129))
+            Err(error) if crate::cli_reported_status(&error) == Some(129)
         ));
         let four = vec![
             "a".to_string(),
@@ -760,7 +760,7 @@ mod tests {
         ];
         assert!(matches!(
             parse_merge_file_args(&four),
-            Err(GitError::Exit(129))
+            Err(error) if crate::cli_reported_status(&error) == Some(129)
         ));
     }
 
@@ -807,7 +807,7 @@ mod tests {
         ];
         assert!(matches!(
             parse_merge_file_args(&args),
-            Err(GitError::Exit(129))
+            Err(error) if crate::cli_reported_status(&error) == Some(129)
         ));
     }
 

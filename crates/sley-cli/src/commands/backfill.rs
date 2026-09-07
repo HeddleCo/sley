@@ -527,7 +527,7 @@ fn parse_backfill_options(args: &[String]) -> Result<BackfillOptions> {
         match arg.as_str() {
             "-h" | "--help" => {
                 println!("{USAGE}");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             "--" => {
                 saw_dashdash = true;

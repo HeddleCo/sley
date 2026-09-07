@@ -5,7 +5,7 @@ use crate::*;
 pub(crate) fn cmd_bundle(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let Some(subcommand) = args.first().map(String::as_str) else {
         print_bundle_usage();
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     };
     match subcommand {
         "create" => cmd_bundle_create(cli_session, &args[1..]),
@@ -14,7 +14,7 @@ pub(crate) fn cmd_bundle(cli_session: &crate::session::CliSession, args: &[Strin
         "unbundle" => cmd_bundle_unbundle(cli_session, &args[1..]),
         _ => {
             print_bundle_usage();
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
     }
 }
@@ -35,7 +35,7 @@ fn print_bundle_usage() {
 fn bundle_usage_error(usage: &str) -> Result<()> {
     eprintln!("fatal: need a <file> argument");
     eprint!("{usage}");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }
 fn cmd_bundle_create(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut quiet = false;
@@ -88,13 +88,13 @@ fn cmd_bundle_create(cli_session: &crate::session::CliSession, args: &[String]) 
     )?;
     if selection.references.is_empty() {
         eprintln!("fatal: Refusing to create empty bundle.");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let Some(pack) =
         build_reachable_pack(&db, format, selection.starts, &selection.excluded_objects)?
     else {
         eprintln!("fatal: Refusing to create empty bundle.");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
     let version = version.unwrap_or(
         if format == ObjectFormat::Sha1 && options.filter.is_none() {
@@ -169,7 +169,7 @@ fn cmd_bundle_verify(cli_session: &crate::session::CliSession, args: &[String]) 
         Ok(git_dir) => git_dir,
         Err(_) => {
             eprintln!("error: need a repository to verify a bundle");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
     };
     let format = repository_object_format(&git_dir)?;
@@ -213,7 +213,7 @@ fn cmd_bundle_unbundle(cli_session: &crate::session::CliSession, args: &[String]
         Ok(git_dir) => git_dir,
         Err(_) => {
             eprintln!("fatal: Need a repository to unbundle.");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     };
     let format = repository_object_format(&git_dir)?;
@@ -284,7 +284,7 @@ fn verify_bundle_prerequisites_for_cli(bundle: &Bundle, db: &FileObjectDatabase)
     for prerequisite in missing {
         eprintln!("error: {} ", prerequisite.oid);
     }
-    Err(GitError::Exit(1))
+    Err(crate::cli_exit(1))
 }
 
 fn print_bundle_prerequisites(bundle: &Bundle) -> Result<()> {

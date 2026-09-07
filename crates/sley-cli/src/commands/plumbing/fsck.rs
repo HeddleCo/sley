@@ -310,7 +310,7 @@ pub(crate) fn cmd_fsck(cli_session: &crate::session::CliSession, args: &[String]
     }
 
     if exit_bits != 0 {
-        Err(GitError::Exit(exit_bits))
+        Err(crate::cli_exit(exit_bits))
     } else {
         Ok(())
     }

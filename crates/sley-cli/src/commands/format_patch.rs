@@ -534,7 +534,7 @@ fn format_patch_plan_error(error: sley_rev::format_patch::FormatPatchPlanError) 
         }
         sley_rev::format_patch::FormatPatchPlanError::BaseNotAncestor { .. } => {
             eprintln!("fatal: base commit should be the ancestor of revision list");
-            GitError::Exit(128)
+            crate::cli_exit(128)
         }
         sley_rev::format_patch::FormatPatchPlanError::Engine(error) => error,
     }
@@ -557,7 +557,7 @@ pub(crate) fn cmd_format_patch(
         || (options.output.is_some() && options.output_directory.is_some())
     {
         eprintln!("fatal: multiple output options?");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     // Resolve diff path prefixes: `--no-prefix`/`--default-prefix` win over the
@@ -756,7 +756,7 @@ pub(crate) fn cmd_format_patch(
                 "--range-diff"
             };
             eprintln!("fatal: {option} requires --cover-letter for multi-patch series");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         cover_letter = true;
     }
@@ -1654,7 +1654,7 @@ fn write_commit_list_cover(
         write_commit_list_pretty(out, format, commits)?;
     } else {
         eprintln!("fatal: '{format}' is not a valid format string");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(())
 }
@@ -3292,7 +3292,7 @@ fn parse_format_noprefix_bool(value: &str) -> Result<bool> {
             eprintln!("fatal: bad boolean config value '{value}' for 'format.noprefix'");
             eprintln!("hint: 'format.noprefix' used to accept any value and treat that as 'true'.");
             eprintln!("hint: Now it only accepts boolean values, like what 'diff.noprefix' does.");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -3660,7 +3660,7 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
             value if let Some(mode) = value.strip_prefix("--ignore-submodules=") => {
                 if !matches!(mode, "" | "all" | "dirty" | "untracked" | "none") {
                     eprintln!("fatal: bad --ignore-submodules argument: {mode}");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
             }
             "--full-index" => options.full_index = true,
@@ -3951,7 +3951,7 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
                     "deep" => ThreadLevel::Deep,
                     other => {
                         eprintln!("fatal: Unknown value for --thread: {other}");
-                        return Err(GitError::Exit(128));
+                        return Err(crate::cli_exit(128));
                     }
                 });
             }
@@ -4033,7 +4033,7 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
             // (`builtin/log.c`: "--%s does not make sense").
             "--name-only" | "--name-status" | "--check" => {
                 eprintln!("fatal: {arg} does not make sense");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             value if value.starts_with('-') && value != "-" => {
                 return Err(GitError::Command(format!(
@@ -4053,7 +4053,7 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
         // stderr text byte-for-byte, so print it here rather than routing through
         // the generic `sley: command failed:` formatter.
         eprintln!("fatal: options '--subject-prefix/--rfc' and '-k' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(options)
 }
@@ -4085,7 +4085,7 @@ fn parse_cover_from_description(arg: &str) -> Result<CoverFromDescription> {
         "auto" => Ok(CoverFromDescription::Auto),
         other => {
             eprintln!("fatal: {other}: invalid cover from description mode");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }

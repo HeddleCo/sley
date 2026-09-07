@@ -105,7 +105,7 @@ fn setup_am_options(args: &[String]) -> Result<AmOptions> {
             "--empty" => {
                 let value = args.get(index + 1).map(String::as_str).unwrap_or("");
                 eprintln!("error: invalid value for '--empty': '{value}'");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             "--empty=drop" => options.empty_action = AmEmptyAction::Drop,
             "--empty=keep" => options.empty_action = AmEmptyAction::Keep,
@@ -137,7 +137,7 @@ fn setup_am_options(args: &[String]) -> Result<AmOptions> {
             "--no-reject" => options.git_apply_opts.push("--no-reject".to_string()),
             value if let Some(invalid) = value.strip_prefix("--empty=") => {
                 eprintln!("error: invalid value for '--empty': '{invalid}'");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             value if let Some(rest) = value.strip_prefix("--exclude=") => {
                 options.git_apply_opts.push(format!("--exclude={rest}"));
@@ -176,7 +176,7 @@ fn setup_am_options(args: &[String]) -> Result<AmOptions> {
             value if value.starts_with('-') && value != "-" => {
                 eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
                 am_usage();
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             value => options.mboxes.push(value.to_string()),
         }
@@ -221,7 +221,7 @@ fn am_usage() {
 
 fn am_incompatible_resume_error(existing: &str, new: &str) -> Result<()> {
     eprintln!("fatal: options '{existing}' and '{new}' cannot be used together");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 // ---------------------------------------------------------------------------
@@ -249,7 +249,7 @@ fn set_show_patch_mode(slot: &mut Option<ShowPatchMode>, mode: ShowPatchMode) ->
                 show_patch_arg(mode),
                 show_patch_arg(*existing),
             );
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
         _ => {
             *slot = Some(mode);
@@ -272,7 +272,7 @@ fn show_patch_arg(mode: ShowPatchMode) -> &'static str {
 fn am_show_current_patch(state_dir: &Path, mode: ShowPatchMode) -> Result<()> {
     if !state_dir.exists() {
         eprintln!("fatal: Resolve operation not in progress, we are not resuming.");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let path = match mode {
         ShowPatchMode::Raw => {
@@ -286,7 +286,7 @@ fn am_show_current_patch(state_dir: &Path, mode: ShowPatchMode) -> Result<()> {
     };
     let data = fs::read(&path).map_err(|err| {
         eprintln!("fatal: failed to read '{}': {err}", path.display());
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })?;
     io::stdout().write_all(&data)?;
     Ok(())
@@ -465,7 +465,7 @@ pub(crate) fn cmd_am(cli_session: &crate::session::CliSession, args: &[String]) 
             value if value.starts_with("--show-current-patch=") => {
                 let arg = &value["--show-current-patch=".len()..];
                 eprintln!("error: invalid value for '--show-current-patch': '{arg}'");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             "--allow-empty" => {
                 allow_empty_resume = true;

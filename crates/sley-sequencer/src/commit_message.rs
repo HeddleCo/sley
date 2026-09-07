@@ -14,8 +14,10 @@ use sley_object::{Commit, ObjectType};
 use sley_odb::{FileObjectDatabase, ObjectReader};
 
 pub fn commit_message_requires_value_error() -> Result<()> {
-    eprintln!("error: switch `m' requires a value");
-    Err(GitError::Exit(129))
+    sley_core::diagnostic!(Stderr, true, "error: switch `m' requires a value");
+    Err(GitError::Rejected(
+        sley_core::RejectionKind::InvalidArguments,
+    ))
 }
 
 /// Decode a C-style quoted string per git's `quote.c` (`unquote_c_style`).
@@ -100,11 +102,13 @@ pub fn read_commit_pathspecs_from_file(path: &Path, nul: bool) -> Result<Vec<Pat
                     io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
                     _ => err.to_string(),
                 };
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "fatal: could not open '{}' for reading: {message}",
                     path.display()
                 );
-                return Err(GitError::Exit(128));
+                return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
             }
         };
     }
@@ -136,16 +140,24 @@ pub fn read_commit_pathspecs_from_file(path: &Path, nul: bool) -> Result<Vec<Pat
 
 pub fn commit_unified_requires_value_error(short: bool) -> Result<()> {
     if short {
-        eprintln!("error: switch `U' requires a value");
+        sley_core::diagnostic!(Stderr, true, "error: switch `U' requires a value");
     } else {
-        eprintln!("error: option `unified' requires a value");
+        sley_core::diagnostic!(Stderr, true, "error: option `unified' requires a value");
     }
-    Err(GitError::Exit(129))
+    Err(GitError::Rejected(
+        sley_core::RejectionKind::InvalidArguments,
+    ))
 }
 
 pub fn commit_inter_hunk_context_requires_value_error() -> Result<()> {
-    eprintln!("error: option `inter-hunk-context' requires a value");
-    Err(GitError::Exit(129))
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "error: option `inter-hunk-context' requires a value"
+    );
+    Err(GitError::Rejected(
+        sley_core::RejectionKind::InvalidArguments,
+    ))
 }
 
 pub fn commit_validate_unified_context(value: &str, short: bool) -> Result<()> {
@@ -156,29 +168,45 @@ pub fn commit_validate_unified_context(value: &str, short: bool) -> Result<()> {
         return Ok(());
     }
     if short {
-        eprintln!("error: switch `U' expects an integer value with an optional k/m/g suffix");
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "error: switch `U' expects an integer value with an optional k/m/g suffix"
+        );
     } else {
-        eprintln!("error: option `unified' expects an integer value with an optional k/m/g suffix");
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "error: option `unified' expects an integer value with an optional k/m/g suffix"
+        );
     }
-    Err(GitError::Exit(129))
+    Err(GitError::Rejected(
+        sley_core::RejectionKind::InvalidArguments,
+    ))
 }
 
 pub fn patch_validate_unified_context(value: &str, short: bool) -> Result<()> {
     commit_validate_unified_context(value, short)?;
     if git_count_value_is_negative(value) {
-        eprintln!("fatal: '--unified' cannot be negative");
-        return Err(GitError::Exit(128));
+        sley_core::diagnostic!(Stderr, true, "fatal: '--unified' cannot be negative");
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     Ok(())
 }
 
 pub fn commit_unified_expects_numerical_value_error(short: bool) -> Result<()> {
     if short {
-        eprintln!("error: switch `U' expects a numerical value");
+        sley_core::diagnostic!(Stderr, true, "error: switch `U' expects a numerical value");
     } else {
-        eprintln!("error: option `unified' expects a numerical value");
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "error: option `unified' expects a numerical value"
+        );
     }
-    Err(GitError::Exit(129))
+    Err(GitError::Rejected(
+        sley_core::RejectionKind::InvalidArguments,
+    ))
 }
 
 pub fn commit_validate_inter_hunk_context(value: &str) -> Result<()> {
@@ -188,24 +216,38 @@ pub fn commit_validate_inter_hunk_context(value: &str) -> Result<()> {
     if git_count_value_is_valid(value) {
         return Ok(());
     }
-    eprintln!(
+    sley_core::diagnostic!(
+        Stderr,
+        true,
         "error: option `inter-hunk-context' expects an integer value with an optional k/m/g suffix"
     );
-    Err(GitError::Exit(129))
+    Err(GitError::Rejected(
+        sley_core::RejectionKind::InvalidArguments,
+    ))
 }
 
 pub fn patch_validate_inter_hunk_context(value: &str) -> Result<()> {
     commit_validate_inter_hunk_context(value)?;
     if git_count_value_is_negative(value) {
-        eprintln!("fatal: '--inter-hunk-context' cannot be negative");
-        return Err(GitError::Exit(128));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "fatal: '--inter-hunk-context' cannot be negative"
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     Ok(())
 }
 
 pub fn commit_inter_hunk_context_expects_numerical_value_error() -> Result<()> {
-    eprintln!("error: option `inter-hunk-context' expects a numerical value");
-    Err(GitError::Exit(129))
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "error: option `inter-hunk-context' expects a numerical value"
+    );
+    Err(GitError::Rejected(
+        sley_core::RejectionKind::InvalidArguments,
+    ))
 }
 
 pub fn git_count_value_is_negative(value: &str) -> bool {
@@ -229,8 +271,10 @@ pub fn git_count_value_is_valid(value: &str) -> bool {
 }
 
 pub fn commit_tree_file_requires_value_error() -> Result<()> {
-    eprintln!("error: switch `F' requires a value");
-    Err(GitError::Exit(129))
+    sley_core::diagnostic!(Stderr, true, "error: switch `F' requires a value");
+    Err(GitError::Rejected(
+        sley_core::RejectionKind::InvalidArguments,
+    ))
 }
 
 pub fn read_commit_message_file(path: &str) -> Result<Vec<u8>> {
@@ -424,8 +468,8 @@ pub fn read_reused_commit_from_db(
     match result {
         Ok(commit) => Ok(commit),
         Err(_) => {
-            eprintln!("fatal: could not lookup commit '{rev}'");
-            Err(GitError::Exit(128))
+            sley_core::diagnostic!(Stderr, true, "fatal: could not lookup commit '{rev}'");
+            Err(GitError::Rejected(sley_core::RejectionKind::Refused))
         }
     }
 }

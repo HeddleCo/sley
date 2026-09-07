@@ -309,14 +309,14 @@ fn map_read_tree_transition_result<T>(
 ) -> Result<T> {
     match result {
         Ok(outcome) => Ok(outcome),
-        Err(sley_worktree::ReadTreeTransitionError::InvalidPath(_)) => Err(GitError::Exit(128)),
+        Err(sley_worktree::ReadTreeTransitionError::InvalidPath(_)) => Err(crate::cli_exit(128)),
         Err(sley_worktree::ReadTreeTransitionError::BindOverlap { incoming, existing }) => {
             eprintln!(
                 "error: Entry '{}' overlaps with '{}'.  Cannot bind.",
                 String::from_utf8_lossy(&incoming),
                 String::from_utf8_lossy(&existing)
             );
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
         Err(sley_worktree::ReadTreeTransitionError::Engine(error)) => Err(error),
     }
@@ -419,7 +419,7 @@ fn parse_read_tree_args(args: &[String]) -> Result<ReadTreeArgs> {
             "--prefix" => {
                 let value = iter.next().ok_or_else(|| {
                     eprintln!("error: option `prefix' requires a value");
-                    GitError::Exit(129)
+                    crate::cli_exit(129)
                 })?;
                 set_mode(ReadTreeMode::Prefix(parse_prefix(value)?), &mut mode)?;
             }
@@ -438,7 +438,7 @@ fn parse_read_tree_args(args: &[String]) -> Result<ReadTreeArgs> {
                     // Unknown option: git's parse-options prints usage and exits
                     // 129. We surface the same exit code with a focused message.
                     eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 } else {
                     trees.push(value.to_string());
                 }
@@ -451,7 +451,7 @@ fn parse_read_tree_args(args: &[String]) -> Result<ReadTreeArgs> {
     if empty {
         if !trees.is_empty() {
             eprintln!("fatal: passing trees as arguments contradicts --empty");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         return Ok(ReadTreeArgs {
             mode,
@@ -484,7 +484,7 @@ fn parse_read_tree_args(args: &[String]) -> Result<ReadTreeArgs> {
 fn set_mode(candidate: ReadTreeMode, current: &mut Option<ReadTreeMode>) -> Result<()> {
     if current.is_some() {
         eprintln!("fatal: Which one? -m, --reset, or --prefix?");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     *current = Some(candidate);
     Ok(())
@@ -499,7 +499,7 @@ fn validate_read_tree_arity(
     // `-u` is only meaningful alongside a merge-style mode.
     if update_worktree && matches!(mode, ReadTreeMode::Read) {
         eprintln!("fatal: -u is meaningless without -m, --reset, or --prefix");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     match mode {
@@ -516,20 +516,20 @@ fn validate_read_tree_arity(
         ReadTreeMode::Reset | ReadTreeMode::Prefix(_) => {
             if trees.is_empty() {
                 eprintln!("fatal: you must specify at least one tree to merge");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
         ReadTreeMode::Merge => {
             if trees.is_empty() {
                 eprintln!("fatal: you must specify at least one tree to merge");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             if trees.len() > sley_unpack_trees::MAX_UNPACK_TREES {
                 eprintln!(
                     "fatal: I cannot read more than {} trees",
                     sley_unpack_trees::MAX_UNPACK_TREES
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
     }
@@ -541,7 +541,7 @@ fn validate_read_tree_arity(
 fn parse_prefix(value: &str) -> Result<Vec<u8>> {
     if value.starts_with('/') {
         eprintln!("fatal: Invalid prefix, prefix cannot start with '/'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(normalize_prefix(value))
 }
@@ -571,7 +571,7 @@ fn resolve_tree_ish(repo: &RepositoryContext, spec: &str) -> Result<ObjectId> {
         Ok(oid) => oid,
         Err(_) => {
             eprintln!("fatal: Not a valid object name {spec}");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     };
     // The empty tree is valid even when it is not physically stored.
@@ -582,7 +582,7 @@ fn resolve_tree_ish(repo: &RepositoryContext, spec: &str) -> Result<ObjectId> {
         Ok(tree) => Ok(tree),
         Err(_) => {
             eprintln!("fatal: Not a valid object name {spec}");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -766,14 +766,14 @@ fn merge_trees(
         3..=sley_unpack_trees::MAX_UNPACK_TREES => MergeFn::ThreeWay,
         0 => {
             eprintln!("fatal: you must specify at least one tree to merge");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         _ => {
             eprintln!(
                 "fatal: I cannot read more than {} trees",
                 sley_unpack_trees::MAX_UNPACK_TREES
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     };
 
@@ -1048,11 +1048,11 @@ pub(crate) fn checkout_submodule_to_commit(
         && meta.file_type().is_symlink()
     {
         eprintln!("error: expected submodule path '{path_str}' not to be a symbolic link");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if sley_submodule::submodule_path_has_symlink_parent(worktree_root, Path::new(&*path_str))? {
         eprintln!("error: expected submodule path '{path_str}' not to be a symbolic link");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let (submodule_name, submodule_url) = submodule_name_and_url_for_path(worktree_root, &path_str)
         .unwrap_or_else(|| (path_str.to_string(), None));
@@ -1074,7 +1074,7 @@ pub(crate) fn checkout_submodule_to_commit(
             clone_submodule_for_checkout(worktree_root, git_dir, &sub_root, &sub_git_dir, &url)?;
         } else {
             eprintln!("fatal: could not get a repository handle for submodule '{path_str}'");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
 
@@ -1095,7 +1095,7 @@ pub(crate) fn checkout_submodule_to_commit(
         oid,
     ) {
         eprintln!("fatal: Unable to checkout '{oid}' in submodule path '{path_str}'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     fs::write(sub_git_dir.join("HEAD"), format!("{oid}\n"))?;
 
@@ -1231,7 +1231,7 @@ fn remove_submodule_worktree(
             .unwrap_or(false)
     {
         eprintln!("fatal: refusing to remove submodule path '{path_str}' through a symlink");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let sub_git_dir = submodule_admin_git_dir(git_dir, &path_str);
     if sub_root.join(".git").is_dir() && !sub_git_dir.is_dir() {

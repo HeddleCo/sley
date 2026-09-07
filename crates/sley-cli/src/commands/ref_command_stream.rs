@@ -341,7 +341,7 @@ pub(crate) fn classify_line(line: &[u8]) -> Result<()> {
 
 fn die(message: String) -> GitError {
     eprintln!("fatal: {message}");
-    GitError::Exit(128)
+    crate::cli_exit(128)
 }
 
 /// Faithful port of git's `unquote_c_style` (quote.c). The canonical

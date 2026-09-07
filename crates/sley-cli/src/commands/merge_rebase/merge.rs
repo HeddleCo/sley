@@ -492,7 +492,7 @@ fn merge_octopus(
             "Error: Your local changes to the following files would be overwritten by merge\n    {}",
             String::from_utf8_lossy(&entry.path)
         );
-        return Err(GitError::Exit(2));
+        return Err(crate::cli_exit(2));
     }
 
     let reduced = reduce_merge_targets(git_dir, format, db, refs, targets)?;
@@ -519,7 +519,7 @@ fn merge_octopus(
             eprintln!("Automated merge did not work.");
             eprintln!("Should not be doing an octopus.");
             eprintln!("fatal: merge program failed");
-            return Err(GitError::Exit(2));
+            return Err(crate::cli_exit(2));
         }
         let mut base_args = vec![*oid];
         base_args.extend(merged_commits.iter().copied());
@@ -549,13 +549,13 @@ fn merge_octopus(
         }
         if common.is_empty() {
             eprintln!("Unable to find common commit with {name}");
-            return Err(GitError::Exit(2));
+            return Err(crate::cli_exit(2));
         }
         // `--ff-only`: a real (non-fast-forward) octopus step is needed, which
         // an ff-only merge cannot satisfy. git refuses before merging.
         if options.ff_only() {
             eprintln!("fatal: Not possible to fast-forward, aborting.");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         non_ff = true;
         // git-merge-octopus's "Trying simple merge with <name>" line precedes
@@ -611,7 +611,7 @@ fn merge_octopus(
         eprintln!("Automated merge did not work.");
         eprintln!("Should not be doing an octopus.");
         eprintln!("fatal: merge program failed");
-        return Err(GitError::Exit(2));
+        return Err(crate::cli_exit(2));
     }
 
     if !non_ff && merged_commits.len() == 1 && reduced.len() == 1 {
@@ -1693,9 +1693,10 @@ pub(crate) fn cmd_fmt_merge_msg(
             io::stdin().read_to_end(&mut input)?;
             input
         }
-        Some(path) => {
-            fs::read(path).map_err(|err| GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!("cannot open '{}': {err}", path) })?
-        }
+        Some(path) => fs::read(path).map_err(|err| GitError::IoKind {
+            kind: std::io::ErrorKind::Other,
+            message: format!("cannot open '{}': {err}", path),
+        })?,
     };
 
     let mut shortlog_len = options.shortlog_len;
@@ -1774,7 +1775,7 @@ fn parse_fmt_merge_msg_args(args: &[String]) -> Result<FmtMergeMsgOptions> {
                 println!(
                     "usage: git fmt-merge-msg [-m <message>] [--log[=<n>] | --no-log] [--file <file>]"
                 );
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             "-m" | "--message" => {
                 options.message = Some(
@@ -1835,7 +1836,7 @@ fn parse_fmt_merge_msg_args(args: &[String]) -> Result<FmtMergeMsgOptions> {
                 eprintln!(
                     "usage: git fmt-merge-msg [-m <message>] [--log[=<n>] | --no-log] [--file <file>]"
                 );
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
         }
     }
@@ -2451,7 +2452,7 @@ fn prepare_merge_commit_message(
         if let Err(err) = commands::replay::launch_editor(git_dir, &path) {
             eprintln!("error: {err}");
             eprintln!("Please supply the message using either -m or -F option.");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         let edited = fs::read(&path)?;
         let _ = fs::remove_file(&path);
@@ -2462,7 +2463,7 @@ fn prepare_merge_commit_message(
 
 fn merge_option_takes_no_value_error(option: &str) -> GitError {
     eprintln!("error: option `{option}' takes no value");
-    GitError::Exit(129)
+    crate::cli_exit(129)
 }
 
 /// git's `git_parse_maybe_bool` for config values: recognises the textual
@@ -2489,7 +2490,7 @@ fn accept_merge_strategy(value: &str, options: &mut MergeOptions) -> Result<()> 
         "help" => {
             eprintln!("Could not find merge strategy 'help'.");
             eprintln!("Available strategies are: ours recursive subtree.");
-            Err(GitError::Exit(1))
+            Err(crate::cli_exit(1))
         }
         "recursive" | "ort" => {
             options.ours_strategy = false;
@@ -2719,7 +2720,7 @@ fn split_branch_merge_options(raw: &str, branch: &str) -> Result<Vec<String>> {
             "fatal: Bad branch.{branch}.mergeoptions string: {}",
             err.message()
         );
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })
 }
 
@@ -2745,7 +2746,7 @@ fn parse_merge_args(args: &[String], options: &mut MergeOptions) -> Result<Parse
         match token.as_str() {
             "-h" | "--help" => {
                 merge_usage_stdout();
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             "--abort" => parsed.abort = true,
             "--quit" => parsed.quit = true,
@@ -2922,7 +2923,7 @@ fn parse_merge_args(args: &[String], options: &mut MergeOptions) -> Result<Parse
     if options.squash {
         if explicit_commit {
             eprintln!("fatal: options '--squash' and '--commit.' cannot be used together");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         options.no_commit = true;
     }
@@ -3067,7 +3068,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
     if abort {
         if !positional.is_empty() {
             eprintln!("fatal: --abort expects no arguments");
-            return Err(GitError::Exit(129));
+            return Err(crate::cli_exit(129));
         }
         return cmd_merge_abort(
             cli_session.original_cwd.as_deref(),
@@ -3078,7 +3079,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
     if quit {
         if !positional.is_empty() {
             eprintln!("fatal: --quit expects no arguments");
-            return Err(GitError::Exit(129));
+            return Err(crate::cli_exit(129));
         }
         // git's `--quit` (remove_merge_branch_state): drop the in-progress merge
         // bookkeeping, leaving the index and worktree exactly as they are.
@@ -3095,7 +3096,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
     if continue_merge {
         if !positional.is_empty() {
             eprintln!("fatal: --continue expects no arguments");
-            return Err(GitError::Exit(129));
+            return Err(crate::cli_exit(129));
         }
         return cmd_merge_continue(
             cli_session.original_cwd.as_deref(),
@@ -3112,7 +3113,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
     // `--squash` is incompatible with `--no-ff` (git refuses both orders).
     if options.squash && options.no_ff() {
         eprintln!("fatal: You cannot combine --squash with --no-ff.");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     if git_dir.join("MERGE_HEAD").exists() {
@@ -3125,7 +3126,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
             "fatal: Unable to create '{}': File exists.",
             git_dir.join("index.lock").display()
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let mut merge_autostash = false;
@@ -3185,7 +3186,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
                                 context.lazy_fetch,
                             );
                         }
-                        return Err(GitError::Exit(2));
+                        return Err(crate::cli_exit(2));
                     }
                     let result = merge_octopus(
                         cli_session.original_cwd.as_deref(),
@@ -3311,7 +3312,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
     // a virtual ancestor, so it must reject before touching index/worktree state.
     if options.resolve_strategy && bases.len() > 1 {
         eprintln!("fatal: merge program failed");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
 
     // `-s ours`: keep HEAD's tree verbatim, recording `other` only as a second
@@ -3322,7 +3323,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
     if options.ours_strategy {
         if options.ff_only() {
             eprintln!("fatal: Not possible to fast-forward, aborting.");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         fs::write(git_dir.join("ORIG_HEAD"), format!("{head_oid}\n"))?;
         let head_tree = commit_tree_oid(db, format, &head_oid)?;
@@ -3558,13 +3559,13 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
 
     if options.ff_only() {
         eprintln!("fatal: Not possible to fast-forward, aborting.");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     // True 3-way merge.
     if topology.has_unrelated_histories() && !options.allow_unrelated_histories {
         eprintln!("fatal: refusing to merge unrelated histories");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let head_tree = commit_tree_oid(db, format, &head_oid)?;
     let other_tree = commit_tree_oid(db, format, &other_oid)?;
@@ -4147,7 +4148,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
             save_squash_conflict_autostash(git_dir, format);
         }
         println!("Automatic merge failed; fix conflicts and then commit the result.");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
 
     let mut merge_state_message = message;
@@ -4163,7 +4164,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
     print_merge_info_messages(&info_messages);
     print_merge_conflict_messages(&worktree_root, format, &results);
     println!("Automatic merge failed; fix conflicts and then commit the result.");
-    Err(GitError::Exit(1))
+    Err(crate::cli_exit(1))
 }
 
 /// Return the leaf paths whose current index entries are marked skip-worktree.
@@ -4346,7 +4347,7 @@ pub(crate) fn cmd_merge_recursive(
             {
                 let Some(threshold) = parse_rename_score_threshold(value) else {
                     eprintln!("error: unknown option `{}'", &arg[2..]);
-                    return Err(GitError::Exit(129));
+                    return Err(crate::cli_exit(129));
                 };
                 detect_renames = true;
                 rename_threshold = threshold;
@@ -4371,7 +4372,7 @@ pub(crate) fn cmd_merge_recursive(
                 // Accepted for compatibility; not material to the merge result here.
             } else {
                 eprintln!("error: unknown option `{}'", &arg[2..]);
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
         } else {
             base_revs.push(arg);
@@ -4450,7 +4451,7 @@ pub(crate) fn cmd_merge_recursive(
     if conflicts.is_empty() {
         Ok(())
     } else {
-        Err(GitError::Exit(1))
+        Err(crate::cli_exit(1))
     }
 }
 
@@ -5230,7 +5231,7 @@ fn verify_merge_uptodate(
             );
             eprintln!("Please move or remove them before you merge.");
             eprintln!("Aborting");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         // A staged change anywhere (index column non-blank, not untracked/ignored)
         // makes the index an unclean merge base.
@@ -5250,7 +5251,7 @@ fn verify_merge_uptodate(
             );
             eprintln!("Please commit your changes or stash them before you merge.");
             eprintln!("Aborting");
-            return Err(GitError::Exit(2));
+            return Err(crate::cli_exit(2));
         }
         // An unstaged worktree modification to a path the merge would change.
         if entry.worktree != b' '
@@ -5265,7 +5266,7 @@ fn verify_merge_uptodate(
             );
             eprintln!("Please commit your changes or stash them before you merge.");
             eprintln!("Aborting");
-            return Err(GitError::Exit(2));
+            return Err(crate::cli_exit(2));
         }
     }
     Ok(())
@@ -5349,7 +5350,7 @@ pub(crate) fn verify_fast_forward_untracked_safe(
             );
             eprintln!("Please move or remove them before you merge.");
             eprintln!("Aborting");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
     }
     Ok(())
@@ -5514,7 +5515,7 @@ fn verify_no_populated_gitlink_directory_overwrite(
         }
         eprintln!("Please move or remove them before you merge.");
         eprintln!("Aborting");
-        return Err(GitError::Exit(2));
+        return Err(crate::cli_exit(2));
     }
     Ok(())
 }
@@ -5598,7 +5599,7 @@ fn cmd_merge_abort(
     let merge_head_path = git_dir.join("MERGE_HEAD");
     if !merge_head_path.is_file() {
         eprintln!("fatal: There is no merge to abort (MERGE_HEAD missing).");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let worktree_root = context.worktree_root()?;
@@ -5712,7 +5713,7 @@ fn cmd_merge_continue(
     let merge_head_path = git_dir.join("MERGE_HEAD");
     if !merge_head_path.is_file() {
         eprintln!("fatal: There is no merge in progress (MERGE_HEAD missing).");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let format = context.format();
@@ -5774,7 +5775,7 @@ fn conclude_in_progress_merge_with_writer(
     let merge_head_path = git_dir.join("MERGE_HEAD");
     if !merge_head_path.is_file() {
         eprintln!("fatal: There is no merge in progress (MERGE_HEAD missing).");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let index = read_worktree_index(git_dir, format)?;
@@ -5927,7 +5928,7 @@ pub(crate) fn conclude_rebase_step_via_commit(
     let tree = sley_worktree::write_tree_from_index(git_dir, format)?;
     if !allow_empty && tree == parent_tree {
         eprintln!("nothing to commit, working tree clean");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     if let Some(script_author) = read_rebase_author_script_identity(git_dir)? {
         author = script_author;
@@ -6017,7 +6018,7 @@ fn create_merge_autostash(
     )?
     else {
         eprintln!("fatal: Cannot autostash");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
     fs::write(git_dir.join("MERGE_AUTOSTASH"), format!("{oid}\n"))?;
     println!("Created autostash: {}", format_log_abbrev_oid(&oid));
@@ -6200,7 +6201,7 @@ fn report_unmerged_merge_continue(unmerged_paths: &[Vec<u8>]) -> Result<()> {
         stdout.write_all(status_quote_path(path, false).as_bytes())?;
         stdout.write_all(b"\n")?;
     }
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 pub(crate) fn read_merge_message_from_file(git_dir: &Path) -> Result<Vec<u8>> {

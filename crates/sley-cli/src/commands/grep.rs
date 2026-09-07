@@ -229,7 +229,7 @@ fn parse_pattern_type_arg(arg: &str) -> Result<PatternTypeOption> {
         "perl" => PatternTypeOption::Pcre,
         other => {
             eprintln!("fatal: bad grep.patternType argument: {other}");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     })
 }
@@ -488,7 +488,7 @@ pub(crate) fn cmd_grep(cli_session: &crate::session::CliSession, args: &[String]
     if !have_pattern {
         if positionals.is_empty() {
             eprintln!("fatal: no pattern given");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         opts.push_pattern(positionals.remove(0));
     }
@@ -508,7 +508,7 @@ pub(crate) fn cmd_grep(cli_session: &crate::session::CliSession, args: &[String]
     // dies as soon as the default attr source is computed (attr.c).
     if repo.is_none() && std::env::var_os("GIT_ATTR_SOURCE").is_some() {
         eprintln!("fatal: cannot use --attr-source or GIT_ATTR_SOURCE without repo");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     // Resolve `--recurse-submodules` (CLI override beats the `submodule.recurse`
@@ -524,7 +524,7 @@ pub(crate) fn cmd_grep(cli_session: &crate::session::CliSession, args: &[String]
     }
     if recurse && opts.untracked {
         eprintln!("fatal: --untracked not supported with --recurse-submodules");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     opts.recurse_submodules = recurse;
 
@@ -563,7 +563,7 @@ pub(crate) fn cmd_grep(cli_session: &crate::session::CliSession, args: &[String]
         {
             run_open_pager(pager, &opts, &collector.borrow())?;
         }
-        return if any { Ok(()) } else { Err(GitError::Exit(1)) };
+        return if any { Ok(()) } else { Err(crate::cli_exit(1)) };
     }
 
     let repo = repo.expect("repository discovery succeeded above");
@@ -646,7 +646,7 @@ pub(crate) fn cmd_grep(cli_session: &crate::session::CliSession, args: &[String]
     // `-O` works only on the worktree, never against `--cached` or a tree-ish.
     if pager_cmd.is_some() && (opts.cached || !opts.revs.is_empty()) {
         eprintln!("fatal: --open-files-in-pager only works on the worktree");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let pattern_bytes = grep_pattern_bytes(&opts.patterns);
@@ -753,7 +753,7 @@ pub(crate) fn cmd_grep(cli_session: &crate::session::CliSession, args: &[String]
     if any_match {
         Ok(())
     } else {
-        Err(GitError::Exit(1))
+        Err(crate::cli_exit(1))
     }
 }
 
@@ -836,14 +836,14 @@ fn is_negative_number(value: &str) -> bool {
 fn parse_int_arg(value: &str, flag: &str) -> Result<i64> {
     value.parse::<i64>().map_err(|_| {
         eprintln!("fatal: invalid number for '{flag}': {value}");
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })
 }
 
 fn parse_context_arg(value: &str) -> Result<usize> {
     let n: i64 = value.parse().map_err(|_| {
         eprintln!("fatal: invalid context length argument: {value}");
-        GitError::Exit(128)
+        crate::cli_exit(128)
     })?;
     Ok(n.max(0) as usize)
 }
@@ -861,7 +861,7 @@ fn load_pattern_file(file: &str, opts: &mut GrepOptions) -> Result<()> {
             Ok(bytes) => bytes,
             Err(_) => {
                 eprintln!("fatal: cannot open '{file}'");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
     };
@@ -882,7 +882,7 @@ fn reject_nul_pattern_without_pcre(opts: &GrepOptions) -> Result<()> {
         eprintln!(
             "fatal: given pattern contains NULL byte (This is only supported with -P under PCRE v2)"
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(())
 }
@@ -1040,13 +1040,13 @@ fn grep_option_requires_value(flag: &str) -> Result<()> {
         "fatal: switch `{}' requires a value",
         flag.trim_start_matches('-')
     );
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn grep_unknown_option(flag: &str) -> Result<()> {
     eprintln!("error: unknown option `{flag}'");
     eprintln!("usage: git grep [<options>] [-e] <pattern> [<rev>...] [[--] <path>...]");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn grep_fallback_to_no_index() -> Result<bool> {
@@ -1156,7 +1156,7 @@ fn run_open_pager(pager: &str, opts: &GrepOptions, files: &[Vec<u8>]) -> Result<
         .args(&extra)
         .status()?;
     if !status.success() {
-        return Err(GitError::Exit(status.code().unwrap_or(1)));
+        return Err(crate::cli_exit(status.code().unwrap_or(1)));
     }
     Ok(())
 }
@@ -1286,7 +1286,7 @@ fn no_index_paths(positionals: &[String], dashdash: &str) -> Result<Vec<String>>
         };
         if split > 0 {
             eprintln!("fatal: option '--no-index' cannot be used with revs");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         let paths: Vec<String> = positionals[split + 1..].to_vec();
         return Ok(if paths.is_empty() {
@@ -1363,12 +1363,12 @@ fn collect_no_index_path(
     let path = cwd.join(raw);
     if !path.exists() {
         eprintln!("fatal: {raw}: no such path in the working tree");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let canon = fs::canonicalize(&path)?;
     if !canon.starts_with(cwd_canon) {
         eprintln!("fatal: {raw}: '{raw}' is outside the directory tree");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if path.is_dir() {
         collect_no_index_dir(cwd, &path, ignore, match_root, out)?;
@@ -2951,7 +2951,7 @@ impl GrepPathspec {
         }
         if unmatched {
             eprintln!("Did you forget to 'git add'?");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         Ok(())
     }

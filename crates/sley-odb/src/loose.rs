@@ -195,7 +195,7 @@ fn inflate_header_diagnostic(input: &[u8]) -> Option<&'static str> {
 /// `inflate()` fails, when the failure is classifiable from the stream header.
 fn emit_inflate_diagnostic(input: &[u8]) {
     if let Some(diagnostic) = inflate_header_diagnostic(input) {
-        eprintln!("error: {diagnostic}");
+        sley_core::diagnostic!(Stderr, true, "error: {diagnostic}");
     }
 }
 
@@ -449,17 +449,29 @@ impl LooseObjectStore {
             // `unable to unpack contents of <path>`. If inflation died before the
             // header materialized, only the header message fires.
             if framed_loose_header_terminated(&framed) {
-                eprintln!("error: corrupt loose object '{oid}'");
-                eprintln!("error: unable to unpack contents of {display_path}");
+                sley_core::diagnostic!(Stderr, true, "error: corrupt loose object '{oid}'");
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "error: unable to unpack contents of {display_path}"
+                );
             } else {
-                eprintln!("error: unable to unpack header of {display_path}");
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "error: unable to unpack header of {display_path}"
+                );
             }
             return Ok(Some(LooseObjectIntegrity::Corrupt));
         }
         if !framed_loose_header_terminated(&framed) {
             // ULHR_TOO_LONG collapses into the same path-form message here: C's
             // `read_loose_object` treats every non-OK `unpack_loose_header` alike.
-            eprintln!("error: unable to unpack header of {display_path}");
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "error: unable to unpack header of {display_path}"
+            );
             return Ok(Some(LooseObjectIntegrity::Corrupt));
         }
         // git's `unpack_loose_rest`/`check_stream_oid` reject trailing bytes after
@@ -472,8 +484,16 @@ impl LooseObjectStore {
             // git's `unpack_loose_rest` prints `garbage at end of loose object`
             // then returns NULL, so `read_loose_object` also prints `unable to
             // unpack contents of <path>`.
-            eprintln!("error: garbage at end of loose object '{oid}'");
-            eprintln!("error: unable to unpack contents of {display_path}");
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "error: garbage at end of loose object '{oid}'"
+            );
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "error: unable to unpack contents of {display_path}"
+            );
             return Ok(Some(LooseObjectIntegrity::Corrupt));
         }
         // A truncated object can inflate to a clean stream end yet yield fewer
@@ -486,8 +506,12 @@ impl LooseObjectStore {
             let nul = framed.iter().position(|&b| b == 0).unwrap_or(framed.len());
             let body_len = framed.len() - (nul + 1).min(framed.len());
             if body_len < declared {
-                eprintln!("error: corrupt loose object '{oid}'");
-                eprintln!("error: unable to unpack contents of {display_path}");
+                sley_core::diagnostic!(Stderr, true, "error: corrupt loose object '{oid}'");
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "error: unable to unpack contents of {display_path}"
+                );
                 return Ok(Some(LooseObjectIntegrity::Corrupt));
             }
         }
@@ -497,9 +521,17 @@ impl LooseObjectStore {
             // type yields `unable to parse type from header '<header>'`, while a
             // genuinely malformed header yields `unable to parse header`.
             if let Some(header) = loose_header_with_unknown_type(&framed) {
-                eprintln!("error: unable to parse type from header '{header}' of {display_path}");
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "error: unable to parse type from header '{header}' of {display_path}"
+                );
             } else {
-                eprintln!("error: unable to parse header of {display_path}");
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "error: unable to parse header of {display_path}"
+                );
             }
             return Ok(Some(LooseObjectIntegrity::Corrupt));
         };

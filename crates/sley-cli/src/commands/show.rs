@@ -2319,7 +2319,7 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
             "--no-decorate" | "--decorate=no" => options.decorate = LogDecorationMode::Off,
             value if let Some(rest) = value.strip_prefix("--decorate=") => {
                 eprintln!("fatal: invalid --decorate option: {rest}");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             // --- accepted-but-inert diff knobs ----------------------------------
             // These influence rendering details sley does not yet model; accept
@@ -2357,7 +2357,7 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
                     "none" => None,
                     _ => {
                         eprintln!("error: bad --word-diff argument: {mode}");
-                        return Err(GitError::Exit(129));
+                        return Err(crate::cli_exit(129));
                     }
                 };
             }
@@ -2451,7 +2451,7 @@ fn show_parse_diff_merges(value: &str) -> Result<ShowMergeMode> {
         "remerge" | "r" => Ok(ShowMergeMode::Remerge),
         _ => {
             eprintln!("fatal: invalid value for '--diff-merges': '{value}'");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }
@@ -2497,7 +2497,7 @@ fn parse_pretty_value(value: &str) -> Result<ShowCommitFormat> {
         }),
         other => {
             eprintln!("fatal: invalid --pretty format: {other}");
-            Err(GitError::Exit(128))
+            Err(crate::cli_exit(128))
         }
     }
 }

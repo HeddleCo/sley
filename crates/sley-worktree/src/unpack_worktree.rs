@@ -339,7 +339,9 @@ impl ReadTreeWorktree<'_> {
                         // read-tree keeps its historic per-path wording and dies.
                         UnpackPorcelain::ReadTree => {
                             let display = String::from_utf8_lossy(dir_git_path);
-                            eprintln!(
+                            sley_core::diagnostic!(
+                                Stderr,
+                                true,
                                 "error: Updating '{display}' would lose untracked files in it"
                             );
                         }
@@ -347,15 +349,17 @@ impl ReadTreeWorktree<'_> {
                         // block from setup_unpack_trees_porcelain and exits 1.
                         UnpackPorcelain::Checkout => {
                             let display = String::from_utf8_lossy(dir_git_path);
-                            eprintln!(
+                            sley_core::diagnostic!(
+                                Stderr,
+                                true,
                                 "error: Updating the following directories would lose untracked files in them:"
                             );
-                            eprintln!("\t{display}");
-                            eprintln!();
-                            eprintln!("Aborting");
+                            sley_core::diagnostic!(Stderr, true, "\t{display}");
+                            sley_core::diagnostic!(Stderr, true, "");
+                            sley_core::diagnostic!(Stderr, true, "Aborting");
                         }
                     }
-                    return Err(GitError::Exit(unpack_rejection_exit(self.porcelain)));
+                    return Err(GitError::Rejected(unpack_rejection_kind(self.porcelain)));
                 }
             }
         }
@@ -373,8 +377,8 @@ fn move_head_verdict_to_result(
     match verdict {
         sley_submodule::MoveHeadVerdict::Ok => Ok(()),
         sley_submodule::MoveHeadVerdict::WouldLose => {
-            eprintln!("error: Cannot update submodule:\n{path_str}");
-            Err(GitError::Exit(128))
+            sley_core::diagnostic!(Stderr, true, "error: Cannot update submodule:\n{path_str}");
+            Err(GitError::Rejected(sley_core::RejectionKind::Refused))
         }
     }
 }
@@ -559,14 +563,18 @@ pub fn checkout_two_way_engine(
     refuse_if_unpack_result_removes_current_directory(original_cwd, worktree_root, plan.result())?;
     let result = plan.apply(&mut wt)?;
     if !result.sparse_checkout_present_paths.is_empty() {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "warning: The following paths were already present and thus not updated despite sparse patterns:"
         );
         for path in &result.sparse_checkout_present_paths {
-            eprintln!("\t{}", String::from_utf8_lossy(path));
+            sley_core::diagnostic!(Stderr, true, "\t{}", String::from_utf8_lossy(path));
         }
-        eprintln!();
-        eprintln!(
+        sley_core::diagnostic!(Stderr, true, "");
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "After fixing the above paths, you may want to run `git sparse-checkout reapply`."
         );
     }
@@ -743,20 +751,30 @@ pub fn verify_uptodate_path(
         match porcelain {
             UnpackPorcelain::ReadTree => {
                 let display = String::from_utf8_lossy(path);
-                eprintln!("error: Entry '{display}' not uptodate. Cannot merge.");
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "error: Entry '{display}' not uptodate. Cannot merge."
+                );
             }
             UnpackPorcelain::Checkout => {
                 // git's ERROR_NOT_UPTODATE_FILE under the "checkout" porcelain:
                 // the collected-path "local changes would be overwritten" block.
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "error: Your local changes to the following files would be overwritten by checkout:"
                 );
-                eprintln!("\t{}", String::from_utf8_lossy(path));
-                eprintln!("Please commit your changes or stash them before you switch branches.");
-                eprintln!("Aborting");
+                sley_core::diagnostic!(Stderr, true, "\t{}", String::from_utf8_lossy(path));
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "Please commit your changes or stash them before you switch branches."
+                );
+                sley_core::diagnostic!(Stderr, true, "Aborting");
             }
         }
-        return Err(GitError::Exit(128));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     Ok(())
 }
@@ -1026,10 +1044,10 @@ fn leading_nondir_component(worktree_root: &Path, git_path: &[u8]) -> Result<Opt
 /// Process exit status for an unpack-trees rejection. Upstream dies with 128
 /// from the read-tree plumbing, but the checkout/switch porcelain reports the
 /// collected "Aborting" block through its normal error return (exit 1).
-fn unpack_rejection_exit(porcelain: UnpackPorcelain) -> i32 {
+fn unpack_rejection_kind(porcelain: UnpackPorcelain) -> sley_core::RejectionKind {
     match porcelain {
-        UnpackPorcelain::ReadTree => 128,
-        UnpackPorcelain::Checkout => 1,
+        UnpackPorcelain::ReadTree => sley_core::RejectionKind::Refused,
+        UnpackPorcelain::Checkout => sley_core::RejectionKind::Incomplete,
     }
 }
 
@@ -1037,20 +1055,28 @@ fn reject_untracked_would_be_overwritten(porcelain: UnpackPorcelain, path: &[u8]
     match porcelain {
         UnpackPorcelain::ReadTree => {
             let display = String::from_utf8_lossy(path);
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "error: Untracked working tree file '{display}' would be overwritten by merge."
             );
         }
         UnpackPorcelain::Checkout => {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "error: The following untracked working tree files would be overwritten by checkout:"
             );
-            eprintln!("\t{}", String::from_utf8_lossy(path));
-            eprintln!("Please move or remove them before you switch branches.");
-            eprintln!("Aborting");
+            sley_core::diagnostic!(Stderr, true, "\t{}", String::from_utf8_lossy(path));
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "Please move or remove them before you switch branches."
+            );
+            sley_core::diagnostic!(Stderr, true, "Aborting");
         }
     }
-    Err(GitError::Exit(unpack_rejection_exit(porcelain)))
+    Err(GitError::Rejected(unpack_rejection_kind(porcelain)))
 }
 
 /// git's `write_entry` D/F-removal preamble: remove whatever currently occupies
@@ -1158,7 +1184,9 @@ pub fn remove_worktree_path(
                 if err.kind() == io::ErrorKind::DirectoryNotEmpty
                     || err.raw_os_error() == Some(39) =>
             {
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "warning: unable to rmdir '{}': Directory not empty",
                     String::from_utf8_lossy(path)
                 );
@@ -1207,19 +1235,23 @@ fn original_cwd_relative_to(
 }
 
 fn refuse_remove_current_working_directory(path: &[u8]) -> Result<()> {
-    eprintln!(
+    sley_core::diagnostic!(
+        Stderr,
+        true,
         "error: Refusing to remove the current working directory:\n{}",
         String::from_utf8_lossy(path)
     );
-    Err(GitError::Exit(128))
+    Err(GitError::Rejected(sley_core::RejectionKind::Refused))
 }
 
 fn refuse_remove_current_working_directory_absolute(path: &Path) -> Result<()> {
-    eprintln!(
+    sley_core::diagnostic!(
+        Stderr,
+        true,
         "error: Refusing to remove the current working directory:\n{}",
         path.display()
     );
-    Err(GitError::Exit(128))
+    Err(GitError::Rejected(sley_core::RejectionKind::Refused))
 }
 
 fn path_to_git_bytes_lossy(path: &Path) -> Vec<u8> {
@@ -1350,7 +1382,10 @@ mod tests {
     fn would_lose_maps_to_exit_128() {
         let err = move_head_verdict_to_result(MoveHeadVerdict::WouldLose, "sub1")
             .expect_err("WouldLose must be an error");
-        assert!(matches!(err, GitError::Exit(128)));
+        assert!(matches!(
+            err,
+            GitError::Rejected(sley_core::RejectionKind::Refused)
+        ));
     }
 
     #[test]
@@ -1481,7 +1516,7 @@ mod tests {
         assert_eq!(verdict, MoveHeadVerdict::WouldLose);
         assert!(matches!(
             move_head_verdict_to_result(verdict, "sub1"),
-            Err(GitError::Exit(128))
+            Err(GitError::Rejected(sley_core::RejectionKind::Refused))
         ));
     }
 

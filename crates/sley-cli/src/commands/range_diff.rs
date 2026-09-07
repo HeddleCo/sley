@@ -67,7 +67,7 @@ pub(crate) fn cmd_range_diff(
     let parsed = parse_range_diff_args(&repo, args, &mut options)?;
     if options.left_only && options.right_only {
         eprintln!("error: options '--left-only' and '--right-only' cannot be used together");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     let notes_refs = resolve_notes_refs(&repo, &options.notes)?;
     let rendered = render_range_diff(
@@ -286,7 +286,7 @@ fn parse_range_diff_args(
         1 => {
             let Some((left, right)) = positionals[0].split_once("...") else {
                 eprintln!("fatal: need two commit ranges");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             };
             let left = if left.is_empty() { "HEAD" } else { left };
             let right = if right.is_empty() { "HEAD" } else { right };
@@ -301,7 +301,7 @@ fn parse_range_diff_args(
             )?;
             if bases.is_empty() {
                 eprintln!("fatal: no merge base between '{left}' and '{right}'");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             let mut range1 = bases
                 .iter()
@@ -331,7 +331,7 @@ fn parse_range_diff_args(
                 _ => {
                     eprintln!("fatal: need two commit ranges");
                     eprintln!("fatal: not a commit range");
-                    Err(GitError::Exit(129))
+                    Err(crate::cli_exit(129))
                 }
             }
         }
@@ -342,7 +342,7 @@ fn parse_range_diff_args(
         }),
         _ => {
             eprintln!("fatal: need two commit ranges");
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
     }
 }

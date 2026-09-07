@@ -58,11 +58,11 @@ pub(crate) fn cmd_merge_base(
     }
     if independent && all {
         eprintln!("fatal: options '--independent' and '--all' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if independent && is_ancestor {
         eprintln!("error: options '--independent' and '--is-ancestor' cannot be used together");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     if !fork_point && !octopus && !independent && revs.len() < 2 {
         return Err(GitError::Command(
@@ -90,7 +90,7 @@ pub(crate) fn cmd_merge_base(
             println!("{base}");
             return Ok(());
         }
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     let mut commits = Vec::with_capacity(revs.len());
     for rev in &revs {
@@ -103,7 +103,7 @@ pub(crate) fn cmd_merge_base(
         if sley_rev::is_ancestor(&git_dir, format, &db, &commits[0], &commits[1])? {
             return Ok(());
         }
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     if independent {
         for commit in merge_base_independent(&git_dir, &db, format, &commits)? {
@@ -121,7 +121,7 @@ pub(crate) fn cmd_merge_base(
         sley_rev::merge_bases(&git_dir, format, &db, &commits[0], &commits[1])?
     };
     if bases.is_empty() {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     if all {
         for base in bases {

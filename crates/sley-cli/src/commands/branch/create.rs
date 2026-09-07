@@ -50,7 +50,7 @@ pub(super) fn run_branch_create_options(
         eprintln!(
             "fatal: branch with --recurse-submodules can only be used if submodule.propagateBranches is enabled"
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let recurse_submodules = (options.recurse_submodules || config_recurse) && propagate;
     if options.edit_description {
@@ -60,7 +60,7 @@ pub(super) fn run_branch_create_options(
         eprintln!(
             "fatal: the '--set-upstream' option is no longer supported. Please use '--track' or '--set-upstream-to' instead"
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     match options.positionals.as_slice() {
         [] => print_branch_list(store, BranchListMode::Local),
@@ -433,7 +433,7 @@ fn validate_branch_create_here(store: &FileRefStore, branch: &str, force: bool) 
     let refname = validate_branch_creation_name(branch)?;
     if !force && store.read_ref(&refname)?.is_some() {
         eprintln!("fatal: a branch named '{branch}' already exists");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(())
 }
@@ -467,7 +467,7 @@ fn create_branch_in_submodule(
                 "fatal: submodule '{}': unable to find submodule",
                 child.name
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         };
         return create_branch_in_submodule_at(
             &sub_git_dir,
@@ -531,7 +531,7 @@ fn create_branch_in_submodule_at(
             "submodule '{}': fatal: a branch named '{branch}' already exists",
             child.name
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     // Pass the gitlink oid as the start-point so the branch tip matches the
@@ -596,12 +596,12 @@ pub(super) fn branch_edit_description(
                 let refname = branch_ref_name(&branch)?;
                 if store.read_ref(&refname)?.is_none() {
                     eprintln!("fatal: cannot give description to unborn branch '{branch}'");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 branch
             } else {
                 eprintln!("fatal: cannot give description to detached HEAD");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         }
         [branch] => {
@@ -614,13 +614,13 @@ pub(super) fn branch_edit_description(
             )?;
             if store.read_ref(&refname)?.is_none() {
                 eprintln!("error: no branch named '{branch}'");
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
             branch
         }
         _ => {
             eprintln!("fatal: cannot edit description of more than one branch");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     };
 
@@ -813,7 +813,7 @@ pub(super) fn resolve_remote_tracking_upstream(
     if matches.len() > 1 {
         let remote_ref = branch_tracking_ref_candidate(start);
         branch_tracking_ambiguous(&remote_ref, &matches);
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(matches.into_iter().next())
 }
@@ -912,7 +912,7 @@ pub(super) fn set_branch_upstream_quiet(
     let format = repository_object_format(git_dir)?;
     let Some(upstream) = resolve_branch_upstream(git_dir, format, store, &config, upstream)? else {
         eprintln!("fatal: the requested upstream branch '{upstream}' does not exist");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     };
     if upstream.remote == "." && upstream.merge == branch_ref_name(branch)? {
         eprintln!("warning: not setting branch '{branch}' as its own upstream");
@@ -1076,7 +1076,7 @@ pub(super) fn resolve_branch_start(
                         && store.read_ref(&target)?.is_none()
                     {
                         eprintln!("fatal: dangling symref {remote_head}");
-                        return Err(GitError::Exit(128));
+                        return Err(crate::cli_exit(128));
                     }
                     Err(err)
                 }
@@ -1119,7 +1119,7 @@ pub(super) fn create_branch_from_start_with_reflog(
     let refname = validate_branch_creation_name(branch)?;
     if store.read_ref(&refname)?.is_some() {
         eprintln!("fatal: a branch named '{branch}' already exists");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let start_rev = start.map_or("HEAD", String::as_str);
     let start_oid = resolve_branch_start(git_dir, format, store, replace_objects, start_rev)?;

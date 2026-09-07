@@ -1123,12 +1123,14 @@ fn die_if_commit_graph_only_missing(
     let in_graph = sley_rev::commit_graph_tree_oid(git_dir, format, oid)?.is_some();
     let in_odb = db.contains(oid)?;
     if in_graph && !in_odb {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "fatal: You are attempting to fetch {oid}, which is in the commit graph file but not in the object database.\n\
 This is probably due to repo corruption.\n\
 If you are attempting to repair this repo corruption by refetching the missing object, use 'git fetch --refetch' with the missing object."
         );
-        return Err(GitError::Exit(128));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     Ok(())
 }

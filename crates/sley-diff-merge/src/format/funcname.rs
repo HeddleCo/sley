@@ -42,11 +42,13 @@ impl CompiledFuncname {
                 // die("Last expression must not be negated: %s", value) —
                 // `value` is the remaining suffix of the spec at that point.
                 let suffix: Vec<u8> = lines[idx..].join(&b'\n');
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "fatal: Last expression must not be negated: {}",
                     String::from_utf8_lossy(&suffix)
                 );
-                return Err(GitError::Exit(128));
+                return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
             }
             let expression = if negate { &line[1..] } else { line };
             let mode = if extended {
@@ -55,11 +57,13 @@ impl CompiledFuncname {
                 RegexMode::Bre
             };
             let regex = Regex::compile_bytes(expression, mode, icase, false).map_err(|_| {
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "fatal: Invalid regexp to look for hunk header: {}",
                     String::from_utf8_lossy(expression)
                 );
-                GitError::Exit(128)
+                GitError::Rejected(sley_core::RejectionKind::Refused)
             })?;
             patterns.push((negate, regex));
         }

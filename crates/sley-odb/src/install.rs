@@ -182,7 +182,10 @@ fn create_incoming_object_dir(objects_dir: &Path) -> Result<PathBuf> {
             Err(err) => return Err(GitError::from(err)),
         }
     }
-    Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: "could not create incoming object quarantine".into() })
+    Err(GitError::IoKind {
+        kind: std::io::ErrorKind::Other,
+        message: "could not create incoming object quarantine".into(),
+    })
 }
 
 fn incoming_object_files(object_dir: &Path) -> Result<Vec<PathBuf>> {
@@ -390,11 +393,14 @@ where
     for _ in 0..PACK_RECEIVE_QUEUE_DEPTH {
         empty_sender
             .send(vec![0u8; PACK_RECEIVE_BUFFER_BYTES])
-            .map_err(|_| GitError::IoKind { kind: std::io::ErrorKind::Other, message: "could not initialize pack receive buffers".into() })?;
+            .map_err(|_| GitError::IoKind {
+                kind: std::io::ErrorKind::Other,
+                message: "could not initialize pack receive buffers".into(),
+            })?;
     }
 
     std::thread::scope(|scope| {
-        let writer = scope.spawn(move || -> Result<()> {
+        let writer = scope.spawn(sley_core::diagnostics::inherit(move || -> Result<()> {
             for mut chunk in filled_receiver {
                 #[cfg(feature = "fetch-profile")]
                 let _profile_span = sley_core::fetch_profile::Span::enter(
@@ -422,7 +428,7 @@ where
             #[cfg(feature = "fetch-profile")]
             sley_core::fetch_profile::add_fsync();
             Ok(())
-        });
+        }));
 
         let receive_result = (|| -> Result<PackReceiveSummary> {
             let mut bytes = 0u64;
@@ -431,8 +437,9 @@ where
             let mut total_objects = 0u64;
             loop {
                 cancel.check()?;
-                let mut chunk = empty_receiver.recv().map_err(|_| {
-                    GitError::IoKind { kind: std::io::ErrorKind::Other, message: "pack staging writer stopped before receive completed".into() }
+                let mut chunk = empty_receiver.recv().map_err(|_| GitError::IoKind {
+                    kind: std::io::ErrorKind::Other,
+                    message: "pack staging writer stopped before receive completed".into(),
                 })?;
                 let read = reader.read(&mut chunk)?;
                 if read == 0 {
@@ -465,8 +472,9 @@ where
                         cancel.check()?;
                     }
                 }
-                filled_sender.send(chunk).map_err(|_| {
-                    GitError::IoKind { kind: std::io::ErrorKind::Other, message: "pack staging writer stopped before receive completed".into() }
+                filled_sender.send(chunk).map_err(|_| GitError::IoKind {
+                    kind: std::io::ErrorKind::Other,
+                    message: "pack staging writer stopped before receive completed".into(),
                 })?;
                 if bytes.saturating_sub(last_progress) >= PACK_RECEIVE_PROGRESS_BYTES {
                     last_progress = bytes;
@@ -489,7 +497,10 @@ where
         drop(filled_sender);
         let write_result = match writer.join() {
             Ok(result) => result,
-            Err(_) => Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: "pack staging writer panicked".into() }),
+            Err(_) => Err(GitError::IoKind {
+                kind: std::io::ErrorKind::Other,
+                message: "pack staging writer panicked".into(),
+            }),
         };
         let summary = receive_result?;
         write_result?;

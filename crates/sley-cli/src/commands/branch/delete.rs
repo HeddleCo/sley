@@ -66,7 +66,7 @@ pub(super) fn force_delete_branches(
 ) -> Result<()> {
     if branches.is_empty() {
         eprintln!("fatal: branch name required");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let mut failed = false;
     for branch in branches {
@@ -96,7 +96,7 @@ pub(super) fn force_delete_branches(
         }
     }
     if failed {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -127,7 +127,7 @@ pub(super) fn delete_remote_tracking_branches(
 ) -> Result<()> {
     if branches.is_empty() {
         eprintln!("fatal: branch name required");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let mut failed = false;
     for branch in branches {
@@ -146,7 +146,7 @@ pub(super) fn delete_remote_tracking_branches(
         }
     }
     if failed {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -160,11 +160,11 @@ pub(super) fn branch_delete_resolve_remote_branch_arg(
         let Some(refname) = sley_rev::resolve_revision_symbolic_full_name(git_dir, format, branch)?
         else {
             eprintln!("error: remote-tracking branch '{branch}' not found");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         };
         let Some(remote) = refname.strip_prefix("refs/remotes/") else {
             eprintln!("error: remote-tracking branch '{branch}' not found");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         };
         return Ok((remote.to_string(), refname));
     }
@@ -192,7 +192,7 @@ pub(super) fn force_update_branch(
             "fatal: cannot force update the branch '{branch}' used by worktree at '{}'",
             worktree_root
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let start_rev = start.map_or("HEAD", String::as_str);
     let new_oid = resolve_branch_start(git_dir, format, store, replace_objects, start_rev)?;
@@ -243,7 +243,7 @@ pub(super) fn delete_merged_branches(
 ) -> Result<()> {
     if branches.is_empty() {
         eprintln!("fatal: branch name required");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
 
     let config = read_repo_config(git_dir)?;
@@ -312,7 +312,7 @@ pub(super) fn delete_merged_branches(
     }
 
     if failed {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }

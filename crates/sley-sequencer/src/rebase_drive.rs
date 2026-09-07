@@ -285,19 +285,37 @@ fn warn_comment_char_auto(ctx: &RebaseContext) {
     {
         return;
     }
-    eprintln!(
+    sley_core::diagnostic!(
+        Stderr,
+        true,
         "warning: Support for 'core.commentChar=auto' is deprecated and will be removed in Git 3.0"
     );
-    eprintln!("hint: ");
-    eprintln!("hint: To use the default comment string (#) please run");
-    eprintln!("hint: ");
-    eprintln!("hint:     git config unset core.commentChar");
-    eprintln!("hint: ");
-    eprintln!("hint: To set a custom comment string please run");
-    eprintln!("hint: ");
-    eprintln!("hint:     git config set core.commentChar <comment string>");
-    eprintln!("hint: ");
-    eprintln!("hint: where '<comment string>' is the string you wish to use.");
+    sley_core::diagnostic!(Stderr, true, "hint: ");
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "hint: To use the default comment string (#) please run"
+    );
+    sley_core::diagnostic!(Stderr, true, "hint: ");
+    sley_core::diagnostic!(Stderr, true, "hint:     git config unset core.commentChar");
+    sley_core::diagnostic!(Stderr, true, "hint: ");
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "hint: To set a custom comment string please run"
+    );
+    sley_core::diagnostic!(Stderr, true, "hint: ");
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "hint:     git config set core.commentChar <comment string>"
+    );
+    sley_core::diagnostic!(Stderr, true, "hint: ");
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "hint: where '<comment string>' is the string you wish to use."
+    );
 }
 
 #[derive(PartialEq, Eq)]
@@ -495,10 +513,14 @@ fn read_populate_todo(ctx: &RebaseContext, db: &FileObjectDatabase) -> Result<To
         LoadTodoListOutcome::Ready(todo) => Ok(todo),
         LoadTodoListOutcome::Invalid { messages } => {
             for message in messages {
-                eprintln!("{message}");
+                sley_core::diagnostic!(Stderr, true, "{message}");
             }
-            eprintln!("error: please fix this using 'git rebase --edit-todo'.");
-            Err(GitError::Exit(1))
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "error: please fix this using 'git rebase --edit-todo'."
+            );
+            Err(GitError::Rejected(sley_core::RejectionKind::Incomplete))
         }
     }
 }
@@ -603,13 +625,23 @@ fn do_update_refs(ctx: &RebaseContext, quiet: bool) -> Result<()> {
         let current = match resolve_ref_peeled(refs, &rec.refname) {
             Ok(oid) => oid.unwrap_or(zero),
             Err(_) => {
-                eprintln!("error: update_ref failed for ref '{}': ", rec.refname);
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "error: update_ref failed for ref '{}': ",
+                    rec.refname
+                );
                 failed.push(rec.refname.clone());
                 continue;
             }
         };
         if current != rec.before {
-            eprintln!("error: update_ref failed for ref '{}': ", rec.refname);
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "error: update_ref failed for ref '{}': ",
+                rec.refname
+            );
             failed.push(rec.refname.clone());
             continue;
         }
@@ -633,27 +665,40 @@ fn do_update_refs(ctx: &RebaseContext, quiet: bool) -> Result<()> {
         match tx.commit() {
             Ok(()) => updated.push(rec.refname.clone()),
             Err(_) => {
-                eprintln!("error: update_ref failed for ref '{}': ", rec.refname);
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "error: update_ref failed for ref '{}': ",
+                    rec.refname
+                );
                 failed.push(rec.refname.clone());
             }
         }
     }
     if !quiet && (!updated.is_empty() || !failed.is_empty()) {
-        eprintln!("Updated the following refs with --update-refs:");
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "Updated the following refs with --update-refs:"
+        );
         for refname in &updated {
-            eprintln!("\t{refname}");
+            sley_core::diagnostic!(Stderr, true, "\t{refname}");
         }
         if !failed.is_empty() {
-            eprintln!("Failed to update the following refs with --update-refs:");
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "Failed to update the following refs with --update-refs:"
+            );
             for refname in &failed {
-                eprintln!("\t{refname}");
+                sley_core::diagnostic!(Stderr, true, "\t{refname}");
             }
         }
     }
     if failed.is_empty() {
         Ok(())
     } else {
-        Err(GitError::Exit(1))
+        Err(GitError::Rejected(sley_core::RejectionKind::Incomplete))
     }
 }
 
@@ -786,12 +831,16 @@ fn would_overwrite_untracked(
 }
 
 fn print_merge_would_overwrite_untracked(paths: &[Vec<u8>]) {
-    eprintln!("error: The following untracked working tree files would be overwritten by merge:");
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "error: The following untracked working tree files would be overwritten by merge:"
+    );
     for path in paths {
-        eprintln!("\t{}", String::from_utf8_lossy(path));
+        sley_core::diagnostic!(Stderr, true, "\t{}", String::from_utf8_lossy(path));
     }
-    eprintln!("Please move or remove them before you merge.");
-    eprintln!("Aborting");
+    sley_core::diagnostic!(Stderr, true, "Please move or remove them before you merge.");
+    sley_core::diagnostic!(Stderr, true, "Aborting");
 }
 
 fn checkout_onto(
@@ -818,26 +867,32 @@ fn checkout_onto_base(
     let base_tree = commit_tree_oid(&db, ctx.format, base)?;
     let overwritten = would_overwrite_untracked(ctx, &db, &base_tree)?;
     if !overwritten.is_empty() {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "error: The following untracked working tree files would be overwritten by checkout:"
         );
         for path in &overwritten {
-            eprintln!("\t{}", String::from_utf8_lossy(path));
+            sley_core::diagnostic!(Stderr, true, "\t{}", String::from_utf8_lossy(path));
         }
-        eprintln!("Please move or remove them before you switch branches.");
-        eprintln!("Aborting");
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "Please move or remove them before you switch branches."
+        );
+        sley_core::diagnostic!(Stderr, true, "Aborting");
         apply_autostash(ctx, hosts);
         sheet::remove_merge_state(&ctx.git_dir);
-        eprintln!("error: could not detach HEAD");
-        return Err(GitError::Exit(1));
+        sley_core::diagnostic!(Stderr, true, "error: could not detach HEAD");
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     }
     if let Err(err) = reset_index_and_worktree_to_commit_for_rebase(original_cwd, ctx, hosts, base)
     {
         apply_autostash(ctx, hosts);
         sheet::remove_merge_state(&ctx.git_dir);
-        eprintln!("error: could not detach HEAD");
+        sley_core::diagnostic!(Stderr, true, "error: could not detach HEAD");
         let _ = err;
-        return Err(GitError::Exit(1));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     }
     let committer = committer_identity_for_reflog(&ctx.config)?;
     detach_head_with_reflog(
@@ -928,8 +983,8 @@ pub fn complete_action(
         if stripped.trim().is_empty() {
             apply_autostash(ctx, hosts);
             sheet::remove_merge_state(&ctx.git_dir);
-            eprintln!("error: nothing to do");
-            return Err(GitError::Exit(1));
+            sley_core::diagnostic!(Stderr, true, "error: nothing to do");
+            return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
         }
         let db = ctx.db();
         let mut resolver = make_resolver(ctx, &db);
@@ -941,16 +996,16 @@ pub fn complete_action(
         );
         if !messages.is_empty() {
             for message in messages {
-                eprintln!("{message}");
+                sley_core::diagnostic!(Stderr, true, "{message}");
             }
             print_edit_todo_recovery_advice();
             checkout_onto(original_cwd, ctx, hosts, &opts, onto_name)?;
-            return Err(GitError::Exit(1));
+            return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
         }
         // Missing-commit check against the original list.
         if check_todo_dropped_commits(ctx, hosts, &new_items, &parsed)? {
             checkout_onto(original_cwd, ctx, hosts, &opts, onto_name)?;
-            return Err(GitError::Exit(1));
+            return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
         }
         new_items = parsed;
     }
@@ -1087,21 +1142,43 @@ fn check_todo_dropped_commits(
     if missing.is_empty() {
         return Ok(false);
     }
-    eprintln!("Warning: some commits may have been dropped accidentally.");
-    eprintln!("Dropped commits (newer to older):");
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "Warning: some commits may have been dropped accidentally."
+    );
+    sley_core::diagnostic!(Stderr, true, "Dropped commits (newer to older):");
     for line in &missing {
-        eprintln!("{line}");
+        sley_core::diagnostic!(Stderr, true, "{line}");
     }
-    eprintln!("To avoid this message, use \"drop\" to explicitly remove a commit.");
-    eprintln!();
-    eprintln!("Use 'git config rebase.missingCommitsCheck' to change the level of warnings.");
-    eprintln!("The possible behaviours are: ignore, warn, error.");
-    eprintln!();
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "To avoid this message, use \"drop\" to explicitly remove a commit."
+    );
+    sley_core::diagnostic!(Stderr, true, "");
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "Use 'git config rebase.missingCommitsCheck' to change the level of warnings."
+    );
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "The possible behaviours are: ignore, warn, error."
+    );
+    sley_core::diagnostic!(Stderr, true, "");
     if level == MissingCommitCheck::Error {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "You can fix this with 'git rebase --edit-todo' and then run 'git rebase --continue'."
         );
-        eprintln!("Or you can abort the rebase with 'git rebase --abort'.");
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "Or you can abort the rebase with 'git rebase --abort'."
+        );
         write_state_atomic(ctx.state_path("dropped"), b"")?;
         return Ok(true);
     }
@@ -1109,10 +1186,16 @@ fn check_todo_dropped_commits(
 }
 
 fn print_edit_todo_recovery_advice() {
-    eprintln!(
+    sley_core::diagnostic!(
+        Stderr,
+        true,
         "You can fix this with 'git rebase --edit-todo' and then run 'git rebase --continue'."
     );
-    eprintln!("Or you can abort the rebase with 'git rebase --abort'.");
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "Or you can abort the rebase with 'git rebase --abort'."
+    );
 }
 
 fn check_todo_dropped_commits_against_backup(
@@ -1158,7 +1241,13 @@ pub fn pick_commits(
             write_state_atomic(ctx.state_path("msgnum"), format!("{}\n", todo.done_nr))?;
             if !opts.quiet {
                 let terminator = if opts.verbose { "\n" } else { "\r" };
-                eprint!("Rebasing ({}/{}){terminator}", todo.done_nr, todo.total_nr);
+                sley_core::diagnostic!(
+                    Stderr,
+                    false,
+                    "Rebasing ({}/{}){terminator}",
+                    todo.done_nr,
+                    todo.total_nr
+                );
             }
         }
         let _ = fs::remove_file(ctx.state_path("author-script"));
@@ -1180,7 +1269,7 @@ pub fn pick_commits(
                 match stop {
                     PickOutcome::Continue => {}
                     PickOutcome::EditStop => return Ok(()),
-                    PickOutcome::Fail(code) => return Err(GitError::Exit(code)),
+                    PickOutcome::Fail(error) => return Err(error),
                 }
             }
             TodoCommand::Exec => {
@@ -1190,7 +1279,9 @@ pub fn pick_commits(
                         // Re-insert the exec at the current position.
                         reschedule_current(ctx, hosts, todo, &item)?;
                     }
-                    return Err(GitError::Exit(if status == 127 { 1 } else { status }));
+                    return Err(GitError::ChildProcessFailed {
+                        status: Some(if status == 127 { 1 } else { status }),
+                    });
                 }
                 reread_todo_if_changed(ctx, hosts, todo)?;
             }
@@ -1208,7 +1299,7 @@ pub fn pick_commits(
                 match stop {
                     PickOutcome::Continue => {}
                     PickOutcome::EditStop => return Ok(()),
-                    PickOutcome::Fail(code) => return Err(GitError::Exit(code)),
+                    PickOutcome::Fail(error) => return Err(error),
                 }
             }
             TodoCommand::UpdateRef => {
@@ -1234,9 +1325,11 @@ fn reschedule_current(
     todo: &mut TodoList,
     item: &RebaseTodoItem,
 ) -> Result<()> {
-    eprintln!("hint: Could not execute the todo command");
-    eprintln!("hint: ");
-    eprintln!(
+    sley_core::diagnostic!(Stderr, true, "hint: Could not execute the todo command");
+    sley_core::diagnostic!(Stderr, true, "hint: ");
+    sley_core::diagnostic!(
+        Stderr,
+        true,
         "hint:     {}",
         sheet::render_todo_item(
             &ctx.db(),
@@ -1244,12 +1337,16 @@ fn reschedule_current(
             todo_render_options(ctx, hosts, false, false)
         )
     );
-    eprintln!("hint: ");
-    eprintln!("hint: It has been rescheduled; To edit the command before continuing, please");
-    eprintln!("hint: edit the todo list first:");
-    eprintln!("hint: ");
-    eprintln!("hint:     git rebase --edit-todo");
-    eprintln!("hint:     git rebase --continue");
+    sley_core::diagnostic!(Stderr, true, "hint: ");
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "hint: It has been rescheduled; To edit the command before continuing, please"
+    );
+    sley_core::diagnostic!(Stderr, true, "hint: edit the todo list first:");
+    sley_core::diagnostic!(Stderr, true, "hint: ");
+    sley_core::diagnostic!(Stderr, true, "hint:     git rebase --edit-todo");
+    sley_core::diagnostic!(Stderr, true, "hint:     git rebase --continue");
     // Rewrite the todo file with the current item back at the head.
     save_todo(ctx, todo, &ctx.db(), true)?;
     // Trim the duplicated done line: the item was appended to done by the
@@ -1285,15 +1382,17 @@ fn stopped_at_head(ctx: &RebaseContext, hosts: &RebaseHosts<'_>) {
     match head_commit_oid(refs) {
         Ok(Some(oid)) => match read_rev_list_commit_record(&db, ctx.format, oid) {
             Ok(record) => {
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "Stopped at {}...  {}",
                     find_unique_abbrev_hex(hosts, &db, &oid),
                     commit_subject(&record.commit.message)
                 );
             }
-            Err(_) => eprintln!("Stopped at HEAD"),
+            Err(_) => sley_core::diagnostic!(Stderr, true, "Stopped at HEAD"),
         },
-        _ => eprintln!("Stopped at HEAD"),
+        _ => sley_core::diagnostic!(Stderr, true, "Stopped at HEAD"),
     }
 }
 
@@ -1304,7 +1403,7 @@ fn do_exec(
     quiet: bool,
 ) -> Result<i32> {
     if !quiet {
-        eprintln!("Executing: {command}");
+        sley_core::diagnostic!(Stderr, true, "Executing: {command}");
     }
     let status = std::process::Command::new("sh")
         .arg("-c")
@@ -1321,7 +1420,9 @@ fn do_exec(
         })
         .unwrap_or(false);
     if code != 0 {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "warning: execution failed: {command}\n{}You can fix the problem, and then run\n\n  git rebase --continue\n",
             if dirty {
                 "and made changes to the index and/or the working tree.\n"
@@ -1330,7 +1431,9 @@ fn do_exec(
             }
         );
     } else if dirty {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "warning: execution succeeded: {command}\nbut left changes to the index and/or the working tree.\nCommit or stash your changes, and then run\n\n  git rebase --continue\n"
         );
         return Ok(1);
@@ -1389,8 +1492,8 @@ fn do_reset(
                     resolve_reset_target(ctx, name)?
                 }
                 _ => {
-                    eprintln!("error: could not resolve '{name}'");
-                    return Err(GitError::Exit(1));
+                    sley_core::diagnostic!(Stderr, true, "error: could not resolve '{name}'");
+                    return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
                 }
             }
         }
@@ -1399,14 +1502,16 @@ fn do_reset(
     let target_tree = commit_tree_oid(&db, ctx.format, &target)?;
     let overwritten = would_overwrite_untracked(ctx, &db, &target_tree)?;
     if !overwritten.is_empty() {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "error: The following untracked working tree files would be overwritten by reset:"
         );
         for path in &overwritten {
-            eprintln!("\t{}", String::from_utf8_lossy(path));
+            sley_core::diagnostic!(Stderr, true, "\t{}", String::from_utf8_lossy(path));
         }
-        eprintln!("Please move or remove them before you reset.");
-        return Err(GitError::Exit(1));
+        sley_core::diagnostic!(Stderr, true, "Please move or remove them before you reset.");
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     }
     reset_index_and_worktree_to_commit_for_rebase(original_cwd, ctx, hosts, &target)?;
     let refs = ctx.refs();
@@ -1456,8 +1561,10 @@ fn do_merge(
 ) -> Result<PickOutcome> {
     let (labels, oneline) = parse_merge_todo_arg(&item.arg);
     if labels.is_empty() {
-        eprintln!("error: nothing to merge: '{}'", item.arg);
-        return Ok(PickOutcome::Fail(1));
+        sley_core::diagnostic!(Stderr, true, "error: nothing to merge: '{}'", item.arg);
+        return Ok(PickOutcome::Fail(GitError::Rejected(
+            sley_core::RejectionKind::Incomplete,
+        )));
     }
     let db = ctx.db();
     let mut merge_heads = Vec::new();
@@ -1465,8 +1572,10 @@ fn do_merge(
         match resolve_merge_label(ctx, &db, label)? {
             Some(oid) => merge_heads.push((label.clone(), oid)),
             None => {
-                eprintln!("error: unable to parse '{label}'");
-                return Ok(PickOutcome::Fail(1));
+                sley_core::diagnostic!(Stderr, true, "error: unable to parse '{label}'");
+                return Ok(PickOutcome::Fail(GitError::Rejected(
+                    sley_core::RejectionKind::Incomplete,
+                )));
             }
         }
     }
@@ -1485,8 +1594,14 @@ fn do_merge(
     // that too rather than just `opts.squash_onto`.
     if effective_squash_onto(ctx, opts) == Some(head) {
         if merge_heads.len() > 1 {
-            eprintln!("error: octopus merge cannot be executed on top of a [new root]");
-            return Ok(PickOutcome::Fail(1));
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "error: octopus merge cannot be executed on top of a [new root]"
+            );
+            return Ok(PickOutcome::Fail(GitError::Rejected(
+                sley_core::RejectionKind::Incomplete,
+            )));
         }
         let target = merge_heads[0].1;
         reset_index_and_worktree_to_commit_for_rebase(original_cwd, ctx, hosts, &target)?;
@@ -1582,7 +1697,9 @@ fn do_merge(
             write_state_atomic(ctx.git_dir.join("REBASE_HEAD"), format!("{}\n", record.oid))?;
         }
         reschedule_current(ctx, hosts, todo, item)?;
-        return Ok(PickOutcome::Fail(1));
+        return Ok(PickOutcome::Fail(GitError::Rejected(
+            sley_core::RejectionKind::Incomplete,
+        )));
     }
 
     let bases = merge_bases(&ctx.common_git_dir, ctx.format, &db, &head, merge_head)?;
@@ -1635,34 +1752,76 @@ fn do_merge(
         for path in &conflicts {
             let display = String::from_utf8_lossy(path);
             if let Some(advice) = rebase_submodule_conflict_advice(&results, path) {
-                eprintln!("Failed to merge submodule {display}");
-                eprintln!("CONFLICT (submodule): Merge conflict in {display}");
-                eprintln!(
+                sley_core::diagnostic!(Stderr, true, "Failed to merge submodule {display}");
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "CONFLICT (submodule): Merge conflict in {display}"
+                );
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "Recursive merging with submodules currently only supports trivial cases."
                 );
-                eprintln!("Please manually handle the merging of each conflicted submodule.");
-                eprintln!("This can be accomplished with the following steps:");
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "Please manually handle the merging of each conflicted submodule."
+                );
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "This can be accomplished with the following steps:"
+                );
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     " - go to submodule ({display}), and either merge commit {}",
                     advice.theirs
                 );
-                eprintln!("   or update to an existing commit which has merged those changes");
-                eprintln!(" - come back to superproject and run:");
-                eprintln!("      git add {display}");
-                eprintln!("   to record the above merge or update");
-                eprintln!(" - resolve any other conflicts in the superproject");
-                eprintln!(" - commit the resulting index in the superproject");
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "   or update to an existing commit which has merged those changes"
+                );
+                sley_core::diagnostic!(Stderr, true, " - come back to superproject and run:");
+                sley_core::diagnostic!(Stderr, true, "      git add {display}");
+                sley_core::diagnostic!(Stderr, true, "   to record the above merge or update");
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    " - resolve any other conflicts in the superproject"
+                );
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    " - commit the resulting index in the superproject"
+                );
             } else {
-                println!("Auto-merging {display}");
-                println!("CONFLICT (content): Merge conflict in {display}");
+                sley_core::diagnostic!(Stdout, true, "Auto-merging {display}");
+                sley_core::diagnostic!(
+                    Stdout,
+                    true,
+                    "CONFLICT (content): Merge conflict in {display}"
+                );
             }
         }
         let _ = (hosts.rerere_now)(opts.rerere_autoupdate);
         print_conflict_hints();
         if let Some(record) = &original {
-            return stop_with_patch(ctx, hosts, opts, record, item, 1, false);
+            return stop_with_patch(
+                ctx,
+                hosts,
+                opts,
+                record,
+                item,
+                Some(GitError::Rejected(sley_core::RejectionKind::Incomplete)),
+                false,
+            );
         }
-        return Ok(PickOutcome::Fail(1));
+        return Ok(PickOutcome::Fail(GitError::Rejected(
+            sley_core::RejectionKind::Incomplete,
+        )));
     }
 
     let tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
@@ -1787,7 +1946,17 @@ fn pick_one_commit_with_custom_strategy(
     if status != 0 {
         let _ = (hosts.rerere_now)(opts.rerere_autoupdate);
         print_conflict_hints();
-        return stop_with_patch(ctx, hosts, opts, record, item, status, false);
+        return stop_with_patch(
+            ctx,
+            hosts,
+            opts,
+            record,
+            item,
+            Some(GitError::ChildProcessFailed {
+                status: Some(status),
+            }),
+            false,
+        );
     }
 
     let tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
@@ -1800,7 +1969,9 @@ fn pick_one_commit_with_custom_strategy(
         if originally_empty || opts.keep_redundant_commits {
             allow_empty = true;
         } else if opts.drop_redundant_commits {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "dropping {} {} -- patch contents already upstream",
                 record.oid,
                 commit_subject(&record.commit.message)
@@ -1813,15 +1984,25 @@ fn pick_one_commit_with_custom_strategy(
                 ctx.git_dir.join("CHERRY_PICK_HEAD"),
                 format!("{}\n", record.oid),
             )?;
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "The previous cherry-pick is now empty, possibly due to conflict resolution."
             );
-            eprintln!("If you wish to commit it anyway, use:");
-            eprintln!();
-            eprintln!("    git commit --allow-empty");
-            eprintln!();
-            eprintln!("Otherwise, please use 'git rebase --skip'");
-            return stop_with_patch(ctx, hosts, opts, record, item, 1, false);
+            sley_core::diagnostic!(Stderr, true, "If you wish to commit it anyway, use:");
+            sley_core::diagnostic!(Stderr, true, "");
+            sley_core::diagnostic!(Stderr, true, "    git commit --allow-empty");
+            sley_core::diagnostic!(Stderr, true, "");
+            sley_core::diagnostic!(Stderr, true, "Otherwise, please use 'git rebase --skip'");
+            return stop_with_patch(
+                ctx,
+                hosts,
+                opts,
+                record,
+                item,
+                Some(GitError::Rejected(sley_core::RejectionKind::Incomplete)),
+                false,
+            );
         }
     }
 
@@ -1862,7 +2043,7 @@ fn pick_one_commit_with_custom_strategy(
                 write_state_atomic(ctx.state_path("message"), &squash)?;
                 write_state_atomic(ctx.git_dir.join("MERGE_MSG"), &squash)?;
             }
-            return stop_with_patch(ctx, hosts, opts, record, item, code, false);
+            return stop_with_patch(ctx, hosts, opts, record, item, Some(code), false);
         }
     }
 
@@ -1872,12 +2053,14 @@ fn pick_one_commit_with_custom_strategy(
         let _ = fs::remove_file(ctx.state_path("current-fixups"));
     }
     if item.command == TodoCommand::Edit {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "Stopped at {}...  {}",
             find_unique_abbrev_hex(hosts, &db, &record.oid),
             item.arg
         );
-        return stop_with_patch(ctx, hosts, opts, record, item, 0, true);
+        return stop_with_patch(ctx, hosts, opts, record, item, None, true);
     }
     if item.command == TodoCommand::Reword || edit {
         reread_todo_if_changed(ctx, hosts, todo)?;
@@ -1911,7 +2094,9 @@ fn do_custom_strategy_merge(
         .ok_or_else(|| GitError::Command("custom rebase merge strategy needs a base".into()))?;
     let status = run_custom_rebase_strategy(ctx, opts, strategy, *base, head, merge_head)?;
     if status != 0 {
-        return Ok(PickOutcome::Fail(status));
+        return Ok(PickOutcome::Fail(GitError::ChildProcessFailed {
+            status: Some(status),
+        }));
     }
 
     let tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
@@ -1973,8 +2158,13 @@ fn resolve_reset_target(ctx: &RebaseContext, name: &str) -> Result<ObjectId> {
         Ok(commit) => Ok(commit),
         Err(_) => {
             if let Ok(object) = db.read_object(&oid) {
-                eprintln!("error: object {oid} is a {}", object.object_type.as_str());
-                return Err(GitError::Exit(1));
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "error: object {oid} is a {}",
+                    object.object_type.as_str()
+                );
+                return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
             }
             Err(GitError::InvalidObject(format!(
                 "{name} does not point to a commit"
@@ -2162,7 +2352,9 @@ fn do_octopus_merge_commit(
             !conflicts.is_empty(),
         )?;
         if !conflicts.is_empty() {
-            return Ok(PickOutcome::Fail(1));
+            return Ok(PickOutcome::Fail(GitError::Rejected(
+                sley_core::RejectionKind::Incomplete,
+            )));
         }
         merged_tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
         parents.push(*oid);
@@ -2186,7 +2378,7 @@ fn do_octopus_merge_commit(
 enum PickOutcome {
     Continue,
     EditStop,
-    Fail(i32),
+    Fail(GitError),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2211,8 +2403,10 @@ fn pick_one_commit(
     let final_fixup = is_fixup && !next_is_fixup(todo);
     let create_root = effective_squash_onto(ctx, opts) == Some(head);
     if create_root && is_fixup {
-        eprintln!("error: cannot fixup root commit");
-        return Ok(PickOutcome::Fail(1));
+        sley_core::diagnostic!(Stderr, true, "error: cannot fixup root commit");
+        return Ok(PickOutcome::Fail(GitError::Rejected(
+            sley_core::RejectionKind::Incomplete,
+        )));
     }
 
     let target_encoding = commit_encoding_config(&ctx.git_dir);
@@ -2238,7 +2432,9 @@ fn pick_one_commit(
             print_merge_would_overwrite_untracked(&overwritten);
             write_state_atomic(ctx.git_dir.join("REBASE_HEAD"), format!("{oid}\n"))?;
             reschedule_current(ctx, hosts, todo, item)?;
-            return Ok(PickOutcome::Fail(1));
+            return Ok(PickOutcome::Fail(GitError::Rejected(
+                sley_core::RejectionKind::Incomplete,
+            )));
         }
         reset_index_and_worktree_to_commit_for_rebase(original_cwd, ctx, hosts, &oid)?;
         let committer = committer_identity_for_reflog(&ctx.config)?;
@@ -2268,19 +2464,21 @@ fn pick_one_commit(
                     },
                 )?;
                 if let CommitOutcome::Failed(code) = res {
-                    return stop_with_patch(ctx, hosts, opts, &record, item, code, false);
+                    return stop_with_patch(ctx, hosts, opts, &record, item, Some(code), false);
                 }
                 record_rewritten(ctx, &record.oid, next_command_after_current(todo))?;
                 reread_todo_if_changed(ctx, hosts, todo)?;
                 return Ok(PickOutcome::Continue);
             }
             TodoCommand::Edit => {
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "Stopped at {}...  {}",
                     find_unique_abbrev_hex(hosts, &db, &oid),
                     item.arg
                 );
-                return stop_with_patch(ctx, hosts, opts, &record, item, 0, true);
+                return stop_with_patch(ctx, hosts, opts, &record, item, None, true);
             }
             _ => {
                 record_rewritten(ctx, &record.oid, next_command_after_current(todo))?;
@@ -2301,7 +2499,9 @@ fn pick_one_commit(
         print_merge_would_overwrite_untracked(&overwritten);
         write_state_atomic(ctx.git_dir.join("REBASE_HEAD"), format!("{oid}\n"))?;
         reschedule_current(ctx, hosts, todo, item)?;
-        return Ok(PickOutcome::Fail(1));
+        return Ok(PickOutcome::Fail(GitError::Rejected(
+            sley_core::RejectionKind::Incomplete,
+        )));
     }
     if let Some(strategy) = opts.strategy.as_deref().filter(|strategy| {
         custom_rebase_strategy_needs_external_driver(strategy) && parent.is_some()
@@ -2398,32 +2598,69 @@ fn pick_one_commit(
         let conflict_set: BTreeSet<Vec<u8>> = conflicts.iter().cloned().collect();
         for path in &auto_merged_paths {
             if !conflict_set.contains(path) {
-                println!("Auto-merging {}", String::from_utf8_lossy(path));
+                sley_core::diagnostic!(
+                    Stdout,
+                    true,
+                    "Auto-merging {}",
+                    String::from_utf8_lossy(path)
+                );
             }
         }
         for path in &conflicts {
             let display = String::from_utf8_lossy(path);
             if let Some(advice) = rebase_submodule_conflict_advice(&results, path) {
-                eprintln!("Failed to merge submodule {display}");
-                eprintln!("CONFLICT (submodule): Merge conflict in {display}");
-                eprintln!(
+                sley_core::diagnostic!(Stderr, true, "Failed to merge submodule {display}");
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "CONFLICT (submodule): Merge conflict in {display}"
+                );
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "Recursive merging with submodules currently only supports trivial cases."
                 );
-                eprintln!("Please manually handle the merging of each conflicted submodule.");
-                eprintln!("This can be accomplished with the following steps:");
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "Please manually handle the merging of each conflicted submodule."
+                );
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "This can be accomplished with the following steps:"
+                );
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     " - go to submodule ({display}), and either merge commit {}",
                     advice.theirs
                 );
-                eprintln!("   or update to an existing commit which has merged those changes");
-                eprintln!(" - come back to superproject and run:");
-                eprintln!("      git add {display}");
-                eprintln!("   to record the above merge or update");
-                eprintln!(" - resolve any other conflicts in the superproject");
-                eprintln!(" - commit the resulting index in the superproject");
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "   or update to an existing commit which has merged those changes"
+                );
+                sley_core::diagnostic!(Stderr, true, " - come back to superproject and run:");
+                sley_core::diagnostic!(Stderr, true, "      git add {display}");
+                sley_core::diagnostic!(Stderr, true, "   to record the above merge or update");
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    " - resolve any other conflicts in the superproject"
+                );
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    " - commit the resulting index in the superproject"
+                );
             } else {
-                println!("Auto-merging {display}");
-                println!("CONFLICT (content): Merge conflict in {display}");
+                sley_core::diagnostic!(Stdout, true, "Auto-merging {display}");
+                sley_core::diagnostic!(
+                    Stdout,
+                    true,
+                    "CONFLICT (content): Merge conflict in {display}"
+                );
             }
         }
 
@@ -2458,17 +2695,32 @@ fn pick_one_commit(
         // autoupdate is in effect).
         let _ = (hosts.rerere_now)(opts.rerere_autoupdate);
 
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "error: could not apply {}... {}",
             find_unique_abbrev_hex(hosts, &db, &oid),
             commit_subject(&record.commit.message)
         );
         print_conflict_hints();
-        return stop_with_patch(ctx, hosts, opts, &record, item, 1, false);
+        return stop_with_patch(
+            ctx,
+            hosts,
+            opts,
+            &record,
+            item,
+            Some(GitError::Rejected(sley_core::RejectionKind::Incomplete)),
+            false,
+        );
     }
 
     for path in &auto_merged_paths {
-        println!("Auto-merging {}", String::from_utf8_lossy(path));
+        sley_core::diagnostic!(
+            Stdout,
+            true,
+            "Auto-merging {}",
+            String::from_utf8_lossy(path)
+        );
     }
 
     let merged_tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
@@ -2483,7 +2735,9 @@ fn pick_one_commit(
         } else if opts.keep_redundant_commits {
             allow_empty = true;
         } else if opts.drop_redundant_commits {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "dropping {} {} -- patch contents already upstream",
                 oid,
                 commit_subject(&record.commit.message)
@@ -2495,15 +2749,25 @@ fn pick_one_commit(
             // the "previous cherry-pick is now empty" advice.
             write_state_atomic(ctx.git_dir.join("CHERRY_PICK_HEAD"), format!("{oid}\n"))?;
             write_message_files(ctx, &message, is_fixup, final_fixup)?;
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "The previous cherry-pick is now empty, possibly due to conflict resolution."
             );
-            eprintln!("If you wish to commit it anyway, use:");
-            eprintln!();
-            eprintln!("    git commit --allow-empty");
-            eprintln!();
-            eprintln!("Otherwise, please use 'git rebase --skip'");
-            return stop_with_patch(ctx, hosts, opts, &record, item, 1, false);
+            sley_core::diagnostic!(Stderr, true, "If you wish to commit it anyway, use:");
+            sley_core::diagnostic!(Stderr, true, "");
+            sley_core::diagnostic!(Stderr, true, "    git commit --allow-empty");
+            sley_core::diagnostic!(Stderr, true, "");
+            sley_core::diagnostic!(Stderr, true, "Otherwise, please use 'git rebase --skip'");
+            return stop_with_patch(
+                ctx,
+                hosts,
+                opts,
+                &record,
+                item,
+                Some(GitError::Rejected(sley_core::RejectionKind::Incomplete)),
+                false,
+            );
         }
     }
 
@@ -2537,7 +2801,7 @@ fn pick_one_commit(
             },
         )?;
         if let CommitOutcome::Failed(code) = result {
-            return stop_with_patch(ctx, hosts, opts, &record, item, code, false);
+            return stop_with_patch(ctx, hosts, opts, &record, item, Some(code), false);
         }
         let result = machine_commit(
             ctx,
@@ -2561,7 +2825,7 @@ fn pick_one_commit(
                 return Ok(PickOutcome::Continue);
             }
             CommitOutcome::Failed(code) => {
-                return stop_with_patch(ctx, hosts, opts, &record, item, code, false);
+                return stop_with_patch(ctx, hosts, opts, &record, item, Some(code), false);
             }
         }
     }
@@ -2591,7 +2855,7 @@ fn pick_one_commit(
                 write_state_atomic(ctx.state_path("message"), &squash)?;
                 write_state_atomic(ctx.git_dir.join("MERGE_MSG"), &squash)?;
             }
-            return stop_with_patch(ctx, hosts, opts, &record, item, code, false);
+            return stop_with_patch(ctx, hosts, opts, &record, item, Some(code), false);
         }
     }
 
@@ -2602,12 +2866,14 @@ fn pick_one_commit(
     }
 
     if item.command == TodoCommand::Edit {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "Stopped at {}...  {}",
             find_unique_abbrev_hex(hosts, &db, &oid),
             item.arg
         );
-        return stop_with_patch(ctx, hosts, opts, &record, item, 0, true);
+        return stop_with_patch(ctx, hosts, opts, &record, item, None, true);
     }
 
     if item.command == TodoCommand::Reword || edit {
@@ -2837,13 +3103,31 @@ fn index_entry_stage(entry: &IndexEntry) -> u16 {
 }
 
 fn print_conflict_hints() {
-    eprintln!("hint: Resolve all conflicts manually, mark them as resolved with");
-    eprintln!("hint: \"git add/rm <conflicted_files>\", then run \"git rebase --continue\".");
-    eprintln!("hint: You can instead skip this commit: run \"git rebase --skip\".");
-    eprintln!(
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "hint: Resolve all conflicts manually, mark them as resolved with"
+    );
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "hint: \"git add/rm <conflicted_files>\", then run \"git rebase --continue\"."
+    );
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "hint: You can instead skip this commit: run \"git rebase --skip\"."
+    );
+    sley_core::diagnostic!(
+        Stderr,
+        true,
         "hint: To abort and get back to the state before \"git rebase\", run \"git rebase --abort\"."
     );
-    eprintln!("hint: Disable this message with \"git config set advice.mergeConflict false\"");
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "hint: Disable this message with \"git config set advice.mergeConflict false\""
+    );
 }
 
 fn intend_to_amend(ctx: &RebaseContext) -> Result<()> {
@@ -2861,7 +3145,7 @@ fn stop_with_patch(
     opts: &MachineOpts,
     record: &sley_rev::CommitRecord,
     _item: &RebaseTodoItem,
-    exit_code: i32,
+    failure: Option<GitError>,
     to_amend: bool,
 ) -> Result<PickOutcome> {
     write_state_atomic(ctx.state_path("stopped-sha"), format!("{}\n", record.oid))?;
@@ -2908,25 +3192,36 @@ fn stop_with_patch(
                 format!(" '-S{key}'")
             }
         });
-        eprintln!("You can amend the commit now, with");
-        eprintln!();
-        eprintln!("  git commit --amend{} ", sign_opt.as_deref().unwrap_or(""));
-        eprintln!();
-        eprintln!("Once you are satisfied with your changes, run");
-        eprintln!();
-        eprintln!("  git rebase --continue");
+        sley_core::diagnostic!(Stderr, true, "You can amend the commit now, with");
+        sley_core::diagnostic!(Stderr, true, "");
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "  git commit --amend{} ",
+            sign_opt.as_deref().unwrap_or("")
+        );
+        sley_core::diagnostic!(Stderr, true, "");
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "Once you are satisfied with your changes, run"
+        );
+        sley_core::diagnostic!(Stderr, true, "");
+        sley_core::diagnostic!(Stderr, true, "  git rebase --continue");
         return Ok(PickOutcome::EditStop);
     }
-    if exit_code != 0 {
+    if let Some(error) = failure {
         // git error_with_patch prints the parsed commit subject (`%.*s`,
         // subject_len/subject), not the raw todo arg (which carries the `# `
         // prefix `pick <oid> # <subject>`).
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "Could not apply {}... {}",
             find_unique_abbrev_hex(hosts, &ctx.db(), &record.oid),
             commit_subject(&record.commit.message)
         );
-        return Ok(PickOutcome::Fail(exit_code));
+        return Ok(PickOutcome::Fail(error));
     }
     Ok(PickOutcome::EditStop)
 }
@@ -3269,7 +3564,7 @@ struct MachineCommit<'a> {
 
 enum CommitOutcome {
     Committed,
-    Failed(i32),
+    Failed(GitError),
 }
 
 fn machine_commit(
@@ -3334,8 +3629,10 @@ fn machine_commit(
     // machine picks, however, preserve an original empty message without
     // requiring an explicit --allow-empty-message option.
     if commit.edit && message.iter().all(|b| b.is_ascii_whitespace()) {
-        eprintln!("Aborting commit due to empty commit message.");
-        return Ok(CommitOutcome::Failed(1));
+        sley_core::diagnostic!(Stderr, true, "Aborting commit due to empty commit message.");
+        return Ok(CommitOutcome::Failed(GitError::Rejected(
+            sley_core::RejectionKind::Incomplete,
+        )));
     }
 
     let tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
@@ -3379,7 +3676,9 @@ fn machine_commit(
     if !commit.amend && !commit.create_root && !commit.allow_empty {
         let parent_tree = commit_tree_oid(&db, ctx.format, &head)?;
         if tree == parent_tree {
-            return Ok(CommitOutcome::Failed(1));
+            return Ok(CommitOutcome::Failed(GitError::Rejected(
+                sley_core::RejectionKind::Incomplete,
+            )));
         }
     }
 
@@ -3585,7 +3884,11 @@ fn finish_rebase(ctx: &RebaseContext, hosts: &RebaseHosts<'_>, opts: &MachineOpt
     cleanup_rewritten_refs(ctx);
 
     if !opts.quiet {
-        eprintln!("Successfully rebased and updated {head_name_display}.");
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "Successfully rebased and updated {head_name_display}."
+        );
     }
 
     let update_refs_result = do_update_refs(ctx, opts.quiet);
@@ -3655,7 +3958,7 @@ fn run_post_rewrite_hook(ctx: &RebaseContext, hosts: &RebaseHosts<'_>) -> Result
     // not fail the (already-finished) rebase.
     let pairs = parse_rewritten_list(ctx, &input);
     if let Err(err) = (hosts.copy_notes_for_rewrite)(&pairs) {
-        eprintln!("warning: failed to copy notes: {err}");
+        sley_core::diagnostic!(Stderr, true, "warning: failed to copy notes: {err}");
     }
     let _ = (hosts.run_hook)("post-rewrite", vec!["rebase".to_string()], Some(input));
     Ok(())
@@ -3722,22 +4025,22 @@ pub fn rebase_continue(
         entry.worktree != b' ' && entry.worktree != b'?' && !is_submodule_only_status(entry)
     });
     if unmerged || has_unstaged {
-        println!("You must edit all merge conflicts and then");
-        println!("mark them as resolved using git add");
-        return Err(GitError::Exit(1));
+        sley_core::diagnostic!(Stdout, true, "You must edit all merge conflicts and then");
+        sley_core::diagnostic!(Stdout, true, "mark them as resolved using git add");
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     }
 
     let mut todo = read_populate_todo(ctx, &db)?;
     filter_update_refs(ctx, &todo.items)?;
     if ctx.state_path("dropped").exists() {
         if check_todo_dropped_commits_against_backup(ctx, hosts, &todo.items)? {
-            return Err(GitError::Exit(1));
+            return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
         }
         let _ = fs::remove_file(ctx.state_path("dropped"));
     }
 
     if commit_staged_changes(ctx, hosts, &db, &opts, &todo)? {
-        return Err(GitError::Exit(1));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     }
 
     record_stopped_sha_rewritten(ctx, &todo)?;
@@ -3772,7 +4075,9 @@ fn commit_staged_changes(
 
     let message_path = ctx.state_path("message");
     if !is_clean && !message_path.exists() {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "error: you have staged changes in your working tree\nIf these changes are meant to be squashed into the previous commit, run:\n\n  git commit --amend \n\nIf they are meant to go into a new commit, run:\n\n  git commit \n\nIn both cases, once you're done, continue with:\n\n  git rebase --continue\n"
         );
         return Ok(true);
@@ -3788,7 +4093,9 @@ fn commit_staged_changes(
         let to_amend = ObjectId::from_hex(ctx.format, raw.trim())
             .map_err(|_| GitError::InvalidObject("invalid contents: amend".into()))?;
         if !is_clean && head != to_amend {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "error: \nYou have uncommitted changes in your working tree. Please, commit them\nfirst and then run 'git rebase --continue' again."
             );
             return Ok(true);
@@ -3874,7 +4181,7 @@ fn commit_staged_changes(
         },
     )?;
     if matches!(result, CommitOutcome::Failed(_)) {
-        eprintln!("error: could not commit staged changes.");
+        sley_core::diagnostic!(Stderr, true, "error: could not commit staged changes.");
         return Ok(true);
     }
 
@@ -3915,7 +4222,7 @@ pub fn rebase_skip(
 
     let mut todo = read_populate_todo(ctx, &db)?;
     if commit_staged_changes(ctx, hosts, &db, &opts, &todo)? {
-        return Err(GitError::Exit(1));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     }
     record_stopped_sha_rewritten(ctx, &todo)?;
     let _ = fs::remove_file(ctx.state_path("stopped-sha"));
@@ -4037,21 +4344,21 @@ pub fn rebase_edit_todo(ctx: &RebaseContext, hosts: &RebaseHosts<'_>) -> Result<
     drop(resolver);
     if !messages.is_empty() {
         for message in messages {
-            eprintln!("{message}");
+            sley_core::diagnostic!(Stderr, true, "{message}");
         }
         print_edit_todo_recovery_advice();
-        return Err(GitError::Exit(1));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     }
     if incorrect {
         for message in old_messages {
-            eprintln!("{message}");
+            sley_core::diagnostic!(Stderr, true, "{message}");
         }
         if check_todo_dropped_commits_against_backup(ctx, hosts, &new_items)? {
-            return Err(GitError::Exit(1));
+            return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
         }
         let _ = fs::remove_file(ctx.state_path("dropped"));
     } else if check_todo_dropped_commits(ctx, hosts, &items, &new_items)? {
-        return Err(GitError::Exit(1));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     }
     // Reconcile the update-refs state with the edited todo (drop removed
     // update-ref lines, add new ones).
@@ -4100,8 +4407,8 @@ pub fn create_autostash(
     }
     let created = (hosts.stash_create)()?;
     let Some(oid) = created else {
-        eprintln!("fatal: Cannot autostash");
-        return Err(GitError::Exit(128));
+        sley_core::diagnostic!(Stderr, true, "fatal: Cannot autostash");
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     };
     // git records the autostash inside the active backend's state dir
     // (`rebase-apply/` for the apply backend, `rebase-merge/` for the merge
@@ -4115,7 +4422,9 @@ pub fn create_autostash(
     };
     fs::create_dir_all(&dir)?;
     write_state_atomic(dir.join("autostash"), oid.to_hex())?;
-    println!(
+    sley_core::diagnostic!(
+        Stdout,
+        true,
         "Created autostash: {}",
         find_unique_abbrev_hex(hosts, &ctx.db(), &oid)
     );
@@ -4174,28 +4483,56 @@ pub fn apply_save_autostash_text(
     };
     let applied = attempt_apply && (hosts.stash_apply_quietly)(&oid).unwrap_or(false);
     if applied {
-        eprintln!("Applied autostash.");
+        sley_core::diagnostic!(Stderr, true, "Applied autostash.");
         return;
     }
     // Store the stash for later.
     let stored = (hosts.stash_store)(&oid, "autostash").is_ok();
     if !stored {
-        eprintln!("error: cannot store {oid_text}");
+        sley_core::diagnostic!(Stderr, true, "error: cannot store {oid_text}");
     } else if attempt_apply {
         print_autostash_conflict_advice();
     } else {
-        eprintln!("Autostash exists; creating a new stash entry.");
-        eprintln!("Your changes are safe in the stash.");
-        eprintln!("You can run \"git stash pop\" or \"git stash drop\" at any time.");
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "Autostash exists; creating a new stash entry."
+        );
+        sley_core::diagnostic!(Stderr, true, "Your changes are safe in the stash.");
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "You can run \"git stash pop\" or \"git stash drop\" at any time."
+        );
     }
 }
 
 fn print_autostash_conflict_advice() {
-    eprintln!("Your local changes are stashed, however applying them");
-    eprintln!("resulted in conflicts.  You can either resolve the conflicts");
-    eprintln!("and then discard the stash with \"git stash drop\", or, if you");
-    eprintln!("do not want to resolve them now, run \"git reset --hard\" and");
-    eprintln!("apply the local changes later by running \"git stash pop\".");
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "Your local changes are stashed, however applying them"
+    );
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "resulted in conflicts.  You can either resolve the conflicts"
+    );
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "and then discard the stash with \"git stash drop\", or, if you"
+    );
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "do not want to resolve them now, run \"git reset --hard\" and"
+    );
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "apply the local changes later by running \"git stash pop\"."
+    );
 }
 
 /// Restore an autostash for a completed apply-backend rebase and clean up the

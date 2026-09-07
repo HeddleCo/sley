@@ -230,7 +230,7 @@ impl<'a> CloneServices<'a> {
 ///
 /// Emits any library-side progress through `progress` and returns the structured
 /// [`CloneOutcome`]; never prints, mutates the process CWD, or returns
-/// `GitError::Exit`. A missing `refs/remotes/<origin>/<checkout_branch>` after the
+/// a process exit request. A missing `refs/remotes/<origin>/<checkout_branch>` after the
 /// fetch is reported as [`GitError::NotFound`] for the caller to map (the CLI
 /// turns an explicit `--branch` miss into its own message).
 pub fn clone(

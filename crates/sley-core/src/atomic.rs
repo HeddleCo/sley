@@ -88,7 +88,10 @@ impl LockFile {
     /// Write the full payload through the lock handle.
     pub fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
         let Some(file) = self.file.as_mut() else {
-            return Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: "lock file is already closed".into() });
+            return Err(GitError::IoKind {
+                kind: std::io::ErrorKind::Other,
+                message: "lock file is already closed".into(),
+            });
         };
         file.write_all(bytes)?;
         Ok(())
@@ -103,7 +106,10 @@ impl LockFile {
         component: fsync::FsyncComponents,
     ) -> Result<()> {
         let Some(file) = self.file.as_mut() else {
-            return Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: "lock file is already closed".into() });
+            return Err(GitError::IoKind {
+                kind: std::io::ErrorKind::Other,
+                message: "lock file is already closed".into(),
+            });
         };
         policy.apply(file, component)?;
         Ok(())
@@ -113,10 +119,13 @@ impl LockFile {
     /// lock over it, removing the lock file if the rename fails.
     pub fn persist(self) -> Result<()> {
         let Some(target) = self.target.clone() else {
-            return Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!(
-                "lock file {} has no publication target",
-                self.path.display()
-            ) });
+            return Err(GitError::IoKind {
+                kind: std::io::ErrorKind::Other,
+                message: format!(
+                    "lock file {} has no publication target",
+                    self.path.display()
+                ),
+            });
         };
         self.persist_into(&target)
     }
@@ -194,7 +203,12 @@ pub fn atomic_write_with(
     let mut lock = LockFile::acquire(path)?;
     match lock.file_mut() {
         Some(file) => write(file)?,
-        None => return Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: "lock file is already closed".into() }),
+        None => {
+            return Err(GitError::IoKind {
+                kind: std::io::ErrorKind::Other,
+                message: "lock file is already closed".into(),
+            });
+        }
     }
     lock.persist()
 }

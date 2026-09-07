@@ -49,7 +49,7 @@ pub(crate) fn cmd_merge_index(
     }
     let Some(program) = args.get(idx).cloned() else {
         eprintln!("usage: git merge-index [-o] [-q] <merge-program> (-a | [--] [<filename>...])");
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     };
     idx += 1;
 
@@ -76,7 +76,7 @@ pub(crate) fn cmd_merge_index(
                 }
                 other => {
                     eprintln!("git merge-index: unknown option {other}");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
             }
             continue;
@@ -113,7 +113,7 @@ pub(crate) fn cmd_merge_index(
                     eprintln!("fatal: merge program failed");
                 }
                 write_merge_index(&git_dir, format, &index)?;
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
         }
     }
@@ -123,7 +123,7 @@ pub(crate) fn cmd_merge_index(
         if !quiet {
             eprintln!("fatal: merge program failed");
         }
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }

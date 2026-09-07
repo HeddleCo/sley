@@ -106,11 +106,11 @@ impl BadNumericValue {
         )
     }
 
-    /// Print git's exact fatal line and return its exit status, matching how
-    /// the CLI surfaces config fatals (`eprintln!` + exit 128).
+    /// Send Git's exact fatal line to the caller's diagnostic sink and return
+    /// a typed rejection. The CLI chooses its corresponding process status.
     pub fn report(&self) -> GitError {
-        eprintln!("fatal: {}", self.diagnostic());
-        GitError::Exit(128)
+        sley_core::diagnostic!(Stderr, true, "fatal: {}", self.diagnostic());
+        GitError::Rejected(sley_core::RejectionKind::Refused)
     }
 }
 
@@ -132,10 +132,10 @@ impl BadBooleanValue {
         )
     }
 
-    /// Print git's exact fatal line and return its exit status.
+    /// Send Git's exact fatal line to the caller's sink and return a typed rejection.
     pub fn report(&self) -> GitError {
-        eprintln!("fatal: {}", self.diagnostic());
-        GitError::Exit(128)
+        sley_core::diagnostic!(Stderr, true, "fatal: {}", self.diagnostic());
+        GitError::Rejected(sley_core::RejectionKind::Refused)
     }
 }
 
@@ -152,10 +152,10 @@ impl BadPathValue {
         format!("failed to expand user dir in: '{}'", self.value)
     }
 
-    /// Print git's exact fatal line and return its exit status.
+    /// Send Git's exact fatal line to the caller's sink and return a typed rejection.
     pub fn report(&self) -> GitError {
-        eprintln!("fatal: {}", self.diagnostic());
-        GitError::Exit(128)
+        sley_core::diagnostic!(Stderr, true, "fatal: {}", self.diagnostic());
+        GitError::Rejected(sley_core::RejectionKind::Refused)
     }
 }
 
@@ -172,10 +172,10 @@ impl MissingValueError {
         format!("missing value for '{}'", self.name)
     }
 
-    /// Print git's exact fatal line and return its exit status.
+    /// Send Git's exact fatal line to the caller's sink and return a typed rejection.
     pub fn report(&self) -> GitError {
-        eprintln!("fatal: {}", self.diagnostic());
-        GitError::Exit(128)
+        sley_core::diagnostic!(Stderr, true, "fatal: {}", self.diagnostic());
+        GitError::Rejected(sley_core::RejectionKind::Refused)
     }
 }
 
@@ -761,8 +761,14 @@ mod tests {
         let err = config
             .get_int("foo", None, "bar")
             .expect_err("bad value must be a fatal");
-        assert!(matches!(err, GitError::Exit(128)));
-        assert_eq!(err.cli_exit_code(), GitError::Exit(128).cli_exit_code());
+        assert!(matches!(
+            err,
+            GitError::Rejected(sley_core::RejectionKind::Refused)
+        ));
+        assert!(matches!(
+            err,
+            GitError::Rejected(sley_core::RejectionKind::Refused)
+        ));
 
         let overflowed = config_with(&[("bar", Some("99999999999999999999999"))]);
         assert!(overflowed.get_int("foo", None, "bar").is_err());

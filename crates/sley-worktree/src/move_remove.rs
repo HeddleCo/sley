@@ -235,8 +235,13 @@ pub fn remove_index_and_worktree_paths(
                 }
                 let sparse_only = only_match_sparse.iter().any(|d| d == &spec.display);
                 if !spec.matched && !sparse_only {
-                    eprintln!("fatal: pathspec '{}' did not match any files", spec.display);
-                    return Err(GitError::Exit(128));
+                    sley_core::diagnostic!(
+                        Stderr,
+                        true,
+                        "fatal: pathspec '{}' did not match any files",
+                        spec.display
+                    );
+                    return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
                 }
             }
         }
@@ -308,11 +313,13 @@ pub fn remove_index_and_worktree_paths(
                 if options.ignore_unmatch {
                     continue;
                 }
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "fatal: pathspec '{}' did not match any files",
                     String::from_utf8_lossy(&git_path)
                 );
-                return Err(GitError::Exit(128));
+                return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
             }
             let matched = index_paths
                 .iter()
@@ -326,11 +333,13 @@ pub fn remove_index_and_worktree_paths(
                 if options.ignore_unmatch {
                     continue;
                 }
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "fatal: pathspec '{}' did not match any files",
                     String::from_utf8_lossy(&git_path)
                 );
-                return Err(GitError::Exit(128));
+                return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
             }
             let (dense, had_sparse) = partition_sparse(matched);
             if dense.is_empty() && had_sparse {
@@ -343,43 +352,65 @@ pub fn remove_index_and_worktree_paths(
                 if options.ignore_unmatch {
                     continue;
                 }
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "fatal: pathspec '{}' did not match any files",
                     String::from_utf8_lossy(&git_path)
                 );
-                return Err(GitError::Exit(128));
+                return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
             }
             if !options.recursive {
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "fatal: not removing '{}' recursively without -r",
                     String::from_utf8_lossy(&git_path)
                 );
-                return Err(GitError::Exit(128));
+                return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
             }
             selected.extend(dense);
         }
     }
 
     if !only_match_sparse.is_empty() {
-        eprintln!("The following paths and/or pathspecs matched paths that exist");
-        eprintln!("outside of your sparse-checkout definition, so will not be");
-        eprintln!("updated in the index:");
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "The following paths and/or pathspecs matched paths that exist"
+        );
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "outside of your sparse-checkout definition, so will not be"
+        );
+        sley_core::diagnostic!(Stderr, true, "updated in the index:");
         for path in &only_match_sparse {
-            eprintln!("{path}");
+            sley_core::diagnostic!(Stderr, true, "{path}");
         }
         let show_hints = sley_config::read_repo_config(git_dir, config_parameters_env)
             .ok()
             .and_then(|config| config.get_bool("advice", None, "updateSparsePath"))
             .unwrap_or(true);
         if show_hints {
-            eprintln!("hint: If you intend to update such entries, try one of the following:");
-            eprintln!("hint: * Use the --sparse option.");
-            eprintln!("hint: * Disable or modify the sparsity rules.");
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "hint: If you intend to update such entries, try one of the following:"
+            );
+            sley_core::diagnostic!(Stderr, true, "hint: * Use the --sparse option.");
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "hint: * Disable or modify the sparsity rules."
+            );
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "hint: Disable this message with \"git config set advice.updateSparsePath false\""
             );
         }
-        return Err(GitError::Exit(1));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     }
 
     let display_removed_paths = || {
@@ -544,7 +575,7 @@ pub fn remove_index_and_worktree_paths(
             &mut errs,
         );
         if errs {
-            return Err(GitError::Exit(1));
+            return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
         }
     }
 
@@ -591,11 +622,13 @@ pub fn remove_index_and_worktree_paths(
             )? {
                 true => removed_any = true,
                 false if !removed_any => {
-                    eprintln!(
+                    sley_core::diagnostic!(
+                        Stderr,
+                        true,
                         "fatal: git rm: '{}': Is a directory",
                         String::from_utf8_lossy(path)
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
                 }
                 false => {}
             }
@@ -882,7 +915,9 @@ pub(crate) fn remove_tracked_worktree_path(
                     return Ok(false);
                 }
                 if contains_nested_git_dir(&file) {
-                    eprintln!(
+                    sley_core::diagnostic!(
+                        Stderr,
+                        true,
                         "Migrating git directory of '{}' from",
                         String::from_utf8_lossy(path)
                     );
@@ -981,7 +1016,11 @@ pub(crate) fn remove_submodule_sections_from_gitmodules(
         .collect::<BTreeSet<_>>();
     for path in &selected {
         if !selected_with_sections.contains(path) {
-            eprintln!("warning: Could not find section in .gitmodules where path={path}");
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "warning: Could not find section in .gitmodules where path={path}"
+            );
         }
     }
     if sections.is_empty() {
@@ -995,10 +1034,18 @@ pub(crate) fn remove_submodule_sections_from_gitmodules(
         &original,
         config_parameters_env,
     )? {
-        eprintln!("error: the following file has local modifications:");
-        eprintln!("    .gitmodules");
-        eprintln!("(use --cached to keep the file, or -f to force removal)");
-        return Err(GitError::Exit(1));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "error: the following file has local modifications:"
+        );
+        sley_core::diagnostic!(Stderr, true, "    .gitmodules");
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "(use --cached to keep the file, or -f to force removal)"
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     }
     let mut edited = original;
     for name in sections {
@@ -1006,7 +1053,11 @@ pub(crate) fn remove_submodule_sections_from_gitmodules(
         match sley_config::raw_edit::rename_or_remove_section(&edited, &section_name, None) {
             sley_config::raw_edit::SectionEditOutcome::Changed(out) => edited = out,
             sley_config::raw_edit::SectionEditOutcome::NotFound => {
-                eprintln!("warning: Could not find section in .gitmodules where path={name}");
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "warning: Could not find section in .gitmodules where path={name}"
+                );
             }
             sley_config::raw_edit::SectionEditOutcome::LineTooLong(line) => {
                 return Err(GitError::InvalidFormat(format!(
@@ -1069,10 +1120,18 @@ pub(crate) fn ensure_gitmodules_clean_for_submodule_rm(
         &original,
         config_parameters_env,
     )? {
-        eprintln!("error: the following file has local modifications:");
-        eprintln!("    .gitmodules");
-        eprintln!("(use --cached to keep the file, or -f to force removal)");
-        return Err(GitError::Exit(1));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "error: the following file has local modifications:"
+        );
+        sley_core::diagnostic!(Stderr, true, "    .gitmodules");
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "(use --cached to keep the file, or -f to force removal)"
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     }
     Ok(())
 }
@@ -1176,7 +1235,11 @@ pub(crate) fn prepare_gitmodules_for_moved_gitlinks(
             }
         }
         if !matched {
-            eprintln!("warning: Could not find section in .gitmodules where path={source}");
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "warning: Could not find section in .gitmodules where path={source}"
+            );
         }
     }
     if edits.is_empty() {
@@ -1190,8 +1253,12 @@ pub(crate) fn prepare_gitmodules_for_moved_gitlinks(
         &original,
         &None,
     )? {
-        eprintln!("fatal: Please stage your changes to .gitmodules or stash them to proceed");
-        return Err(GitError::Exit(128));
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "fatal: Please stage your changes to .gitmodules or stash them to proceed"
+        );
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     let mut edited = original;
     for (name, destination) in edits {
@@ -1200,7 +1267,11 @@ pub(crate) fn prepare_gitmodules_for_moved_gitlinks(
         match editor.set_multivar(Some(&destination), None, None, false) {
             sley_config::raw_edit::RawEditOutcome::Changed => {}
             sley_config::raw_edit::RawEditOutcome::NothingSet => {
-                eprintln!("warning: Could not find section in .gitmodules where path={name}");
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "warning: Could not find section in .gitmodules where path={name}"
+                );
             }
         }
         edited = editor.into_bytes();
@@ -1335,7 +1406,7 @@ pub(crate) fn print_rm_error_files(
     if show_hints {
         message.push_str(hint);
     }
-    eprintln!("error: {message}");
+    sley_core::diagnostic!(Stderr, true, "error: {message}");
     *errs = true;
 }
 
@@ -1476,11 +1547,13 @@ pub fn move_index_and_worktree_path(
                 details: Vec::new(),
             });
         }
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "fatal: destination directory does not exist, source={}, destination={destination}",
             String::from_utf8_lossy(&source_path),
         );
-        return Err(GitError::Exit(128));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     let directory_prefix = {
         let mut prefix = source_path.clone();
@@ -1522,12 +1595,14 @@ pub fn move_index_and_worktree_path(
                 details: Vec::new(),
             });
         }
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "fatal: conflicted, source={}, destination={}",
             String::from_utf8_lossy(&source_path),
             String::from_utf8_lossy(&destination_path)
         );
-        return Err(GitError::Exit(128));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     let source_position = index
         .entries
@@ -1563,12 +1638,14 @@ pub fn move_index_and_worktree_path(
                 details: Vec::new(),
             });
         }
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "fatal: {source_kind}, source={}, destination={}",
             String::from_utf8_lossy(&source_path),
             String::from_utf8_lossy(&destination_path)
         );
-        return Err(GitError::Exit(128));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     if destination_absolute.exists() {
         if !options.force {
@@ -1595,12 +1672,14 @@ pub fn move_index_and_worktree_path(
                     details: Vec::new(),
                 });
             }
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "fatal: destination exists, source={}, destination={}",
                 String::from_utf8_lossy(&source_path),
                 String::from_utf8_lossy(&destination_path)
             );
-            return Err(GitError::Exit(128));
+            return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
         }
         if !options.dry_run && destination_absolute.is_dir() {
             fs::remove_dir_all(&destination_absolute)?;
@@ -1778,11 +1857,13 @@ pub fn move_index_and_worktree_path(
                 details: Vec::new(),
             });
         }
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "fatal: renaming '{}' failed: No such file or directory",
             String::from_utf8_lossy(&source_path)
         );
-        return Err(GitError::Exit(128));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     fs::rename(&source_absolute, &destination_absolute)?;
     apply_moved_gitlink_gitdirs(&gitlink_gitdir_moves)?;
@@ -1876,12 +1957,14 @@ fn sparse_single_file_move(
             entry.path.as_bytes() == destination_path.as_slice() && entry.stage() == Stage::Normal
         })
     {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "fatal: destination exists in the index, source={}, destination={}",
             String::from_utf8_lossy(&source_path),
             String::from_utf8_lossy(&destination_path)
         );
-        return Err(GitError::Exit(128));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
     }
     let source_present = fs::symlink_metadata(source_absolute).is_ok();
     // A dirty source moving out-of-cone keeps its worktree file (and stays
@@ -2028,21 +2111,43 @@ fn advise_on_moving_dirty_paths(git_dir: &Path, paths: &[Vec<u8>]) {
     if paths.is_empty() {
         return;
     }
-    eprintln!("The following paths have been moved outside the");
-    eprintln!("sparse-checkout definition but are not sparse due to local");
-    eprintln!("modifications.");
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "The following paths have been moved outside the"
+    );
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "sparse-checkout definition but are not sparse due to local"
+    );
+    sley_core::diagnostic!(Stderr, true, "modifications.");
     for path in paths {
-        eprintln!("{}", String::from_utf8_lossy(path));
+        sley_core::diagnostic!(Stderr, true, "{}", String::from_utf8_lossy(path));
     }
     let show_hint = sley_config::read_repo_config(git_dir, None)
         .ok()
         .and_then(|config| config.get_bool("advice", None, "updateSparsePath"))
         .unwrap_or(true);
     if show_hint {
-        eprintln!("hint: To correct the sparsity of these paths, do the following:");
-        eprintln!("hint: * Use \"git add --sparse <paths>\" to update the index");
-        eprintln!("hint: * Use \"git sparse-checkout reapply\" to apply the sparsity rules");
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "hint: To correct the sparsity of these paths, do the following:"
+        );
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "hint: * Use \"git add --sparse <paths>\" to update the index"
+        );
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "hint: * Use \"git sparse-checkout reapply\" to apply the sparsity rules"
+        );
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "hint: Disable this message with \"git config set advice.updateSparsePath false\""
         );
     }
@@ -2121,12 +2226,14 @@ fn sparse_directory_move(
                     && !existing.path.as_bytes().starts_with(directory_prefix)
             })
         {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "fatal: destination exists in the index, source={}, destination={}",
                 String::from_utf8_lossy(entry.path.as_bytes()),
                 String::from_utf8_lossy(&destination)
             );
-            return Err(GitError::Exit(128));
+            return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
         }
         let mut destination_entry = entry.clone();
         destination_entry.path = destination.clone().into();

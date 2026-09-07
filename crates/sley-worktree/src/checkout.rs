@@ -529,7 +529,9 @@ fn remove_checkout_tracked_path(
     match fs::remove_dir(&file) {
         Ok(()) => prune_empty_parents(original_cwd, worktree_root, file.parent())?,
         Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "warning: unable to rmdir '{}': Directory not empty",
                 String::from_utf8_lossy(path)
             );
@@ -926,7 +928,7 @@ fn materialize_prepared_checkout_entries(
             let queue = std::sync::Arc::clone(&queue);
             let results = std::sync::Arc::clone(&results);
             let locks = std::sync::Arc::clone(&locks);
-            scope.spawn(move || {
+            scope.spawn(sley_core::diagnostics::inherit(move || {
                 loop {
                     let next = queue
                         .lock()
@@ -948,7 +950,7 @@ fn materialize_prepared_checkout_entries(
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())[position] = Some(result);
                 }
-            });
+            }));
         }
     });
 
@@ -1065,7 +1067,7 @@ pub(crate) fn finish_delayed_checkout(
 ) -> Result<BTreeMap<Vec<u8>, IndexEntry>> {
     let outcome = finish_delayed_checkout_outcome(original_cwd, worktree_root, delayed)?;
     if outcome.had_error {
-        return Err(GitError::Exit(1));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     }
     Ok(outcome.updates)
 }
@@ -1100,7 +1102,12 @@ fn finish_delayed_checkout_outcome(
                 Ok(paths) => paths,
                 Err(err) => {
                     if err.protocol {
-                        eprintln!("error: external filter '{}' failed", process);
+                        sley_core::diagnostic!(
+                            Stderr,
+                            true,
+                            "error: external filter '{}' failed",
+                            process
+                        );
                     }
                     had_error = true;
                     continue;
@@ -1115,7 +1122,9 @@ fn finish_delayed_checkout_outcome(
             let mut keep_filter = true;
             for path in available {
                 let Some(delayed_entry) = delayed.pending.remove(path.as_slice()) else {
-                    eprintln!(
+                    sley_core::diagnostic!(
+                        Stderr,
+                        true,
                         "error: external filter '{}' signaled that '{}' is now available although it has not been delayed earlier",
                         process,
                         String::from_utf8_lossy(&path)
@@ -1126,7 +1135,9 @@ fn finish_delayed_checkout_outcome(
                     continue;
                 };
                 if delayed_entry.process != process {
-                    eprintln!(
+                    sley_core::diagnostic!(
+                        Stderr,
+                        true,
                         "error: external filter '{}' signaled that '{}' is now available although it has not been delayed earlier",
                         process,
                         String::from_utf8_lossy(&path)
@@ -1167,13 +1178,20 @@ fn finish_delayed_checkout_outcome(
                         }
                     }
                     Ok(ProcessFilterOutcome::Unsupported) => {
-                        eprintln!("error: external filter '{}' failed", process);
+                        sley_core::diagnostic!(
+                            Stderr,
+                            true,
+                            "error: external filter '{}' failed",
+                            process
+                        );
                         had_error = true;
                         failed_paths.insert(path);
                         keep_filter = false;
                     }
                     Ok(ProcessFilterOutcome::Status(status)) => {
-                        eprintln!(
+                        sley_core::diagnostic!(
+                            Stderr,
+                            true,
                             "error: external filter '{}' returned status {status}",
                             process
                         );
@@ -1183,7 +1201,12 @@ fn finish_delayed_checkout_outcome(
                     }
                     Err(err) => {
                         if err.protocol {
-                            eprintln!("error: external filter '{}' failed", process);
+                            sley_core::diagnostic!(
+                                Stderr,
+                                true,
+                                "error: external filter '{}' failed",
+                                process
+                            );
                         }
                         had_error = true;
                         failed_paths.insert(path);
@@ -1200,7 +1223,9 @@ fn finish_delayed_checkout_outcome(
     }
 
     for path in delayed.pending.keys() {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "error: '{}' was not filtered properly",
             String::from_utf8_lossy(path)
         );
@@ -1268,9 +1293,9 @@ fn warn_checkout_collisions(collided_paths: &BTreeSet<Vec<u8>>) {
     if collided_paths.is_empty() {
         return;
     }
-    eprintln!("warning: the following paths have collided:");
+    sley_core::diagnostic!(Stderr, true, "warning: the following paths have collided:");
     for path in collided_paths {
-        eprintln!("{}", String::from_utf8_lossy(path));
+        sley_core::diagnostic!(Stderr, true, "{}", String::from_utf8_lossy(path));
     }
 }
 
@@ -1603,7 +1628,7 @@ pub(crate) fn restore_worktree_paths_inner(
 ) -> Result<RestoreResult> {
     let index_path = repository_index_path(git_dir);
     if !index_path.exists() {
-        return Err(GitError::Exit(1));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     }
     let mut index = Index::parse(&fs::read(&index_path)?, format)?;
     let stat_cache = IndexStatCache::from_index(&index, &index_path);
@@ -1742,7 +1767,7 @@ pub fn checkout_index_paths_with_database_outcome_sparse(
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
     if !index_path.exists() {
-        return Err(GitError::Exit(1));
+        return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     }
     let mut index = Index::parse(&fs::read(&index_path)?, format)?;
     if options.merge {
@@ -1754,11 +1779,13 @@ pub fn checkout_index_paths_with_database_outcome_sparse(
     if options.stage.is_none() && !options.merge && !options.force {
         for path in &selected {
             if checkout_path_is_unmerged(&index, path) {
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "error: path '{}' is unmerged",
                     String::from_utf8_lossy(path)
                 );
-                return Err(GitError::Exit(1));
+                return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
             }
         }
     }
@@ -1807,7 +1834,9 @@ pub fn checkout_index_paths_with_database_outcome_sparse(
                         restored.insert(path);
                         continue;
                     }
-                    eprintln!(
+                    sley_core::diagnostic!(
+                        Stderr,
+                        true,
                         "error: path '{}' does not have {} version",
                         String::from_utf8_lossy(&path),
                         match stage {
@@ -1815,7 +1844,7 @@ pub fn checkout_index_paths_with_database_outcome_sparse(
                             CheckoutStage::Theirs => "their",
                         }
                     );
-                    return Err(GitError::Exit(1));
+                    return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
                 };
                 if restore_index_entry_maybe_delayed(
                     original_cwd,
@@ -1900,7 +1929,7 @@ pub fn checkout_index_paths_with_database_outcome_sparse(
     for path in delayed_finish.failed_paths {
         failures.push(CheckoutPathFailure {
             path,
-            error: GitError::Exit(1),
+            error: GitError::Rejected(sley_core::RejectionKind::Incomplete),
         });
     }
     let mut delayed_updates = std::mem::take(&mut delayed_finish.updates);
@@ -2034,11 +2063,13 @@ impl CheckoutPathspecs {
             .iter()
             .find(|spec| !spec.element.is_exclude() && !spec.matched)
         {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "error: pathspec '{}' did not match any file(s) known to git",
                 spec.display
             );
-            return Err(GitError::Exit(1));
+            return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
         }
         Ok(())
     }

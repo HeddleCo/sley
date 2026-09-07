@@ -73,7 +73,7 @@ pub(crate) fn cmd_column(args: &[String]) -> Result<()> {
                 .map_err(|_| GitError::Command("column padding must be a number".into()))?;
             if padding < 0 {
                 eprintln!("fatal: --padding must be non-negative");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             options.padding = usize::try_from(padding).unwrap_or(usize::MAX);
         } else if arg == "--indent" || arg.starts_with("--indent=") {
@@ -84,7 +84,7 @@ pub(crate) fn cmd_column(args: &[String]) -> Result<()> {
             options.line_terminator = value.as_bytes().to_vec();
         } else if matches!(arg.as_str(), "-h" | "--help-all") {
             crate::command_synopsis::print_command_usage("column");
-            return Err(GitError::Exit(129));
+            return Err(crate::cli_exit(129));
         } else {
             return column_usage_error(&format!("unknown option '{arg}'"));
         }
@@ -138,5 +138,5 @@ where
 fn column_usage_error<T>(message: &str) -> Result<T> {
     eprintln!("error: {message}");
     crate::command_synopsis::print_command_usage("column");
-    Err(GitError::Exit(129))
+    Err(crate::cli_exit(129))
 }

@@ -48,7 +48,7 @@ impl LsFilesPathspec {
                 eprintln!(
                     "fatal: empty string is not a valid pathspec. please use . instead if you meant to match all paths"
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             let parse_arg = normalize_absolute_cli_pathspec(&root, pathspec_cwd, arg)?;
             let element = parse_normalized_pathspec_element(&prefix, &parse_arg, magic)?;
@@ -155,7 +155,7 @@ impl LsFilesPathspec {
         }
         if has_unmatched {
             eprintln!("Did you forget to 'git add'?");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         Ok(())
     }

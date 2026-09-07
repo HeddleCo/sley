@@ -175,13 +175,13 @@ fn run(
     for name in &ref_names {
         if selected.len() >= MAX_REVS {
             eprintln!("fatal: cannot handle more than {MAX_REVS} revs.");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         let oid = match resolve_to_commit(git_dir, format, db, refs, name) {
             Some(oid) => oid,
             None => {
                 eprintln!("fatal: bad sha1 reference {name}");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         };
         selected.push(SelectedRef {
@@ -684,7 +684,7 @@ fn show_merge_base(state: &mut TraversalState, num_rev: usize) -> Result<()> {
     if found {
         Ok(())
     } else {
-        Err(GitError::Exit(1))
+        Err(crate::cli_exit(1))
     }
 }
 
@@ -957,7 +957,7 @@ fn append_one_rev(
         return Ok(());
     }
     eprintln!("fatal: bad sha1 reference {rev}");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 /// git's `append_ref`: append a ref name unless it is already present (no
@@ -1278,14 +1278,14 @@ fn parse_args(args: &[String]) -> Result<ShowBranchOptions> {
 fn parse_more(value: &str) -> Result<i64> {
     value.parse::<i64>().map_err(|_| {
         eprintln!("error: option `more' expects an integer value with an optional k/m/g suffix");
-        GitError::Exit(129)
+        crate::cli_exit(129)
     })
 }
 
 /// `-h`/`--help`: git prints the usage block to *stdout* and exits 129.
 fn print_help() -> GitError {
     print!("{SHOW_BRANCH_USAGE}");
-    GitError::Exit(129)
+    crate::cli_exit(129)
 }
 
 /// Emit git's `error: unknown option ...` line followed by the usage text, both
@@ -1299,7 +1299,7 @@ fn unknown_option(name: &str) -> GitError {
 /// exit-129 sentinel (the error path: unknown options and parse errors).
 fn usage_error() -> GitError {
     eprint!("{SHOW_BRANCH_USAGE}");
-    GitError::Exit(129)
+    crate::cli_exit(129)
 }
 
 /// git's verbatim usage text for `git show-branch`.

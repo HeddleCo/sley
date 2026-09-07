@@ -1,5 +1,5 @@
 use sley::GitError;
-use sley_core::cli_exit_code;
+use sley_cli::cli_exit_code;
 
 fn main() {
     let args = std::env::args_os()
@@ -14,13 +14,13 @@ fn main() {
 
 fn report_cli_error(err: &GitError) {
     match err {
-        GitError::Exit(_) => {}
+        _ if sley_cli::cli_reported_status(err).is_some() => {}
         GitError::InvalidFormat(msg)
             if msg.starts_with("fatal: ") || msg.starts_with("error: ") =>
         {
             eprintln!("{msg}")
         }
-        GitError::Cli(_, msg) => eprintln!("scalar: {msg}"),
+        _ if sley_cli::cli_message(err).is_some() => eprintln!("scalar: {err}"),
         _ => eprintln!("scalar: {err}"),
     }
 }

@@ -119,7 +119,7 @@ fn remote_usage_error(synopsis: &str, options: &str) -> GitError {
         eprintln!();
         eprint!("{options}");
     }
-    GitError::Exit(129)
+    crate::cli_exit(129)
 }
 
 fn remote_add_usage_error() -> GitError {
@@ -287,23 +287,23 @@ pub(crate) fn cmd_remote_add(context: &RemoteCommandContext, args: &[String]) ->
         Ok(outcome) => outcome,
         Err(sley_remote::RemoteAdminError::MasterWithMirror) => {
             eprintln!("fatal: specifying a master branch makes no sense with --mirror");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         Err(sley_remote::RemoteAdminError::TrackingWithPushMirror) => {
             eprintln!("fatal: specifying branches to track makes sense only with fetch mirrors");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         Err(sley_remote::RemoteAdminError::NameSubset { existing }) => {
             eprintln!("fatal: remote name '{name}' is a subset of existing remote '{existing}'");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         Err(sley_remote::RemoteAdminError::NameSuperset { existing }) => {
             eprintln!("fatal: remote name '{name}' is a superset of existing remote '{existing}'");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         Err(sley_remote::RemoteAdminError::AlreadyExists) => {
             eprintln!("error: remote {name} already exists.");
-            return Err(GitError::Exit(3));
+            return Err(crate::cli_exit(3));
         }
         Err(sley_remote::RemoteAdminError::NotFound) => {
             return Err(GitError::remote_not_found(name));
@@ -411,7 +411,7 @@ pub(crate) fn cmd_remote_remove(context: &RemoteCommandContext, args: &[String])
             // Upstream `builtin/remote.c::rm`: `error("No such remote: '%s'")`
             // then `exit(2)`.
             eprintln!("error: No such remote: '{name}'");
-            return Err(GitError::Exit(2));
+            return Err(crate::cli_exit(2));
         }
         Err(sley_remote::RemoteAdminError::AlreadyExists) => {
             return Err(GitError::Command(format!("remote {name} already exists")));
@@ -591,11 +591,11 @@ pub(crate) fn cmd_remote_rename(context: &RemoteCommandContext, args: &[String])
         Ok(outcome) => outcome,
         Err(sley_remote::RemoteAdminError::NotFound) => {
             eprintln!("error: No such remote: '{old}'");
-            return Err(GitError::Exit(2));
+            return Err(crate::cli_exit(2));
         }
         Err(sley_remote::RemoteAdminError::RenameCollision) => {
             eprintln!("error: remote {new} already exists.");
-            return Err(GitError::Exit(3));
+            return Err(crate::cli_exit(3));
         }
         Err(error) => {
             return Err(GitError::Command(format!(
@@ -620,7 +620,7 @@ pub(crate) fn cmd_remote_rename(context: &RemoteCommandContext, args: &[String])
             Err(_) => {
                 eprintln!("error: renaming remote references failed");
                 eprintln!("error: The remote you are trying to rename has conflicting references");
-                Err(GitError::Exit(1))
+                Err(crate::cli_exit(1))
             }
         }
     } else {
@@ -967,14 +967,14 @@ pub(crate) fn cmd_remote_set_head(context: &RemoteCommandContext, args: &[String
             Ok(branch) => branch,
             Err(_) => {
                 eprintln!("error: Cannot determine remote HEAD");
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
         };
         validate_remote_branch_name(&branch)?;
         let target = format!("refs/remotes/{name}/{branch}");
         if store.read_ref(&target)?.is_none() {
             eprintln!("error: Not a valid ref: {target}");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         let old_target = store.read_ref(&head)?;
         let old_display = match &old_target {
@@ -992,7 +992,7 @@ pub(crate) fn cmd_remote_set_head(context: &RemoteCommandContext, args: &[String
             .is_err()
         {
             eprintln!("error: Could not set up refs/remotes/{name}/HEAD");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         if config
             .get("remote", Some(name), "followRemoteHEAD")
@@ -1027,7 +1027,7 @@ pub(crate) fn cmd_remote_set_head(context: &RemoteCommandContext, args: &[String
     let target = format!("refs/remotes/{name}/{branch}");
     if store.read_ref(&target)?.is_none() {
         eprintln!("error: Not a valid ref: {target}");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     sley_remote::apply_remote_head(store, &sley_remote::RemoteHeadPlan::set(name, branch))
 }
@@ -1164,23 +1164,23 @@ pub(crate) fn cmd_remote_set_url(context: &RemoteCommandContext, args: &[String]
 
 fn remote_set_url_no_match(url: &str) -> Result<()> {
     eprintln!("fatal: No such URL found: {url}");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn remote_set_url_delete_no_match(name: &str, key: &str) -> Result<()> {
     eprintln!("fatal: could not unset 'remote.{name}.{key}'");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn remote_set_url_delete_all_fetch_urls() -> Result<()> {
     eprintln!("fatal: Will not delete all non-push URLs");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn remote_set_url_multiple_values(name: &str, key: &str, url: &str) -> Result<()> {
     eprintln!("warning: remote.{name}.{key} has multiple values");
     eprintln!("fatal: could not set 'remote.{name}.{key}' to '{url}'");
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 pub(crate) fn cmd_remote_show(context: &RemoteCommandContext, args: &[String]) -> Result<()> {

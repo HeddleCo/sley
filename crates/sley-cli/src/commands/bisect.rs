@@ -39,7 +39,7 @@ fn bisect_exit(code: i32) -> Result<()> {
     if is_bisect_success(code) {
         Ok(())
     } else {
-        Err(GitError::Exit(-code))
+        Err(crate::cli_exit(-code))
     }
 }
 
@@ -126,7 +126,7 @@ pub(crate) fn cmd_bisect(cli_session: &crate::session::CliSession, args: &[Strin
         eprintln!("fatal: need a command");
         eprintln!();
         print_bisect_usage();
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     };
     let rest = &args[1..];
     match subcommand {
@@ -147,7 +147,7 @@ pub(crate) fn cmd_bisect(cli_session: &crate::session::CliSession, args: &[Strin
             eprintln!("error: unknown option `{}'", other.trim_start_matches('-'));
             eprintln!();
             print_bisect_usage();
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
         other => {
             // `bad`/`good`/`new`/`old` and user-defined terms dispatch to the
@@ -162,7 +162,7 @@ pub(crate) fn cmd_bisect(cli_session: &crate::session::CliSession, args: &[Strin
                 eprintln!("fatal: unknown command: '{other}'");
                 eprintln!();
                 print_bisect_usage();
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             let mut out = io::stdout();
             let code = bisect_state(
@@ -282,20 +282,20 @@ fn check_and_set_terms(repo: &BisectRepo, terms: &mut BisectTerms, cmd: &str) ->
             "error: Invalid command: you're currently in a {}/{} bisect",
             terms.bad, terms.good
         );
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     if !has_term_file {
         if cmd == "bad" || cmd == "good" {
             terms.bad = "bad".into();
             terms.good = "good".into();
             if write_terms(repo, "bad", "good")? != 0 {
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
         } else if cmd == "new" || cmd == "old" {
             terms.bad = "new".into();
             terms.good = "old".into();
             if write_terms(repo, "new", "old")? != 0 {
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
         }
     }
@@ -640,7 +640,7 @@ fn bisect_state(
             Ok(commit) => commit,
             Err(_) => {
                 eprintln!("fatal: Bad rev input (not a commit): {arg}");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
         };
         revs.push(commit);
@@ -686,7 +686,7 @@ fn cmd_bisect_skip(cli_session: &crate::session::CliSession, args: &[String]) ->
                     .and_then(|oid| sley_rev::peel_to_commit(&db, repo.format, &oid));
             let (Ok(left_oid), Ok(right_oid)) = (left_oid, right_oid) else {
                 eprintln!("fatal: Bad rev input: {arg}");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             };
             let excluded = sley_rev::reachable_commit_oids(
                 &repo.git_dir,
@@ -724,7 +724,7 @@ fn cmd_bisect_skip(cli_session: &crate::session::CliSession, args: &[String]) ->
 fn cmd_bisect_next(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     if !args.is_empty() {
         eprintln!("error: 'git bisect next' requires 0 arguments");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     let repo = BisectRepo::open(cli_session)?;
     let mut terms = BisectTerms::default();
@@ -894,7 +894,7 @@ fn bisect_start(
             revs.push(oid);
         } else if has_double_dash {
             eprintln!("fatal: '{arg}' does not appear to be a valid revision");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         } else {
             break;
         }
@@ -1037,7 +1037,7 @@ fn bisect_start(
 fn cmd_bisect_reset(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     if args.len() > 1 {
         eprintln!("error: 'git bisect reset' requires either no argument or a commit");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     let repo = BisectRepo::open(cli_session)?;
     bisect_exit(bisect_reset(
@@ -1109,7 +1109,7 @@ fn cmd_bisect_log(cli_session: &crate::session::CliSession, args: &[String]) -> 
         .unwrap_or(true);
     if empty_or_missing {
         eprintln!("error: We are not bisecting.");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     let log = fs::read(&log_path)?;
     let mut stdout = io::stdout();
@@ -1121,7 +1121,7 @@ fn cmd_bisect_log(cli_session: &crate::session::CliSession, args: &[String]) -> 
 fn cmd_bisect_replay(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     if args.len() != 1 {
         eprintln!("error: no logfile given");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     let filename = &args[0];
     let repo = BisectRepo::open(cli_session)?;
@@ -1268,7 +1268,7 @@ fn sq_dequote_args(input: &str) -> Vec<String> {
 fn cmd_bisect_terms(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     if args.len() > 1 {
         eprintln!("error: 'git bisect terms' requires 0 or 1 argument");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     let repo = BisectRepo::open(cli_session)?;
     let mut terms = BisectTerms::default();
@@ -1316,7 +1316,7 @@ fn cmd_bisect_visualize(cli_session: &crate::session::CliSession, args: &[String
     let mut terms = BisectTerms::default();
     get_terms(&repo, &mut terms);
     if bisect_next_check(&repo, &terms, None) != 0 {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
 
     // Faithful port of builtin/bisect.c:bisect_visualize. Choose the viewer, then
@@ -1376,8 +1376,8 @@ fn cmd_bisect_visualize(cli_session: &crate::session::CliSession, args: &[String
     let status = std::process::Command::new(&program).args(rest).status()?;
     match status.code() {
         Some(0) => Ok(()),
-        Some(code) => Err(GitError::Exit(code)),
-        None => Err(GitError::Exit(1)),
+        Some(code) => Err(crate::cli_exit(code)),
+        None => Err(crate::cli_exit(1)),
     }
 }
 
@@ -1406,7 +1406,7 @@ fn exists_in_path(program: &str) -> bool {
 fn cmd_bisect_run(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     if args.is_empty() {
         eprintln!("error: 'git bisect run' failed: no command provided.");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     let repo = BisectRepo::open(cli_session)?;
     let mut terms = BisectTerms::default();

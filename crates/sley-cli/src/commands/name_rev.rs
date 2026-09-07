@@ -116,7 +116,7 @@ pub(crate) fn cmd_name_rev(
     if (options.all || options.annotate_stdin) && !options.revs.is_empty() {
         eprintln!("error: Specify either a list, or --all, not both!");
         print_name_rev_usage();
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
 
     if options.stdin_deprecated {
@@ -149,7 +149,7 @@ pub(crate) fn cmd_name_rev(
 fn setup_name_rev_options(args: &[String]) -> Result<NameRevOptions> {
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
         print_name_rev_help();
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     let parsed = match parse_options(args, name_rev_option_specs(), NAME_REV_USAGE_LINES) {
         Ok(parsed) => parsed,
@@ -180,7 +180,7 @@ fn setup_name_rev_options(args: &[String]) -> Result<NameRevOptions> {
             if print_usage {
                 print_name_rev_usage();
             }
-            return Err(GitError::Exit(129));
+            return Err(crate::cli_exit(129));
         }
     };
     let mut ref_filters = Vec::new();
@@ -571,7 +571,7 @@ fn show_name(
         // the fatal goes to stderr and we exit non-zero without a trailing name.
         out.flush()?;
         eprintln!("fatal: cannot describe '{}'", oid.to_hex());
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(())
 }

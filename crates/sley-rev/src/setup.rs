@@ -470,11 +470,15 @@ where
                 RefSelectorKind::Branches | RefSelectorKind::Tags | RefSelectorKind::Remotes
             )
         {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "error: options '--exclude-hidden' and '{}' cannot be used together",
                 selector_option_name(kind)
             );
-            return Err(GitError::Exit(129));
+            return Err(GitError::Rejected(
+                sley_core::RejectionKind::InvalidArguments,
+            ));
         }
         self.ref_selectors.push(RefSelector {
             kind,
@@ -490,8 +494,12 @@ where
     fn set_pending_hidden(&mut self, section: HiddenRefsSection) -> Result<()> {
         // git dies on a second --exclude-hidden before a consuming pseudo-ref.
         if self.pending_hidden.is_some() {
-            eprintln!("fatal: --exclude-hidden= passed more than once");
-            return Err(GitError::Exit(128));
+            sley_core::diagnostic!(
+                Stderr,
+                true,
+                "fatal: --exclude-hidden= passed more than once"
+            );
+            return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
         }
         self.pending_hidden = Some(section);
         Ok(())
@@ -861,8 +869,8 @@ Use '--' to separate paths from revisions, like this:\n\
 }
 
 pub fn ambiguous_argument_error(value: &str) -> GitError {
-    eprintln!("{}", ambiguous_argument_message(value));
-    GitError::Exit(128)
+    sley_core::diagnostic!(Stderr, true, "{}", ambiguous_argument_message(value));
+    GitError::Rejected(sley_core::RejectionKind::Refused)
 }
 
 fn ambiguous_argument(value: &str) -> Result<()> {
@@ -903,8 +911,8 @@ fn positional_matches_worktree_path<R>(
         sley_pathspec::PathspecMatchMagic::default(),
     )
     .map_err(|error| {
-        eprintln!("fatal: {error} in '{value}'");
-        GitError::Exit(128)
+        sley_core::diagnostic!(Stderr, true, "fatal: {error} in '{value}'");
+        GitError::Rejected(sley_core::RejectionKind::Refused)
     })?;
     // The empty top-level pathspec `:/` denotes the whole tree. It is not a
     // competing filename for revision search's empty-pattern spelling.
@@ -991,24 +999,28 @@ fn parse_skip(value: &str) -> Result<usize> {
 
 fn parse_timestamp(value: &str) -> Result<i64> {
     value.parse::<i64>().map_err(|_| {
-        eprintln!("fatal: '{value}': not a number of seconds since epoch");
-        GitError::Exit(128)
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "fatal: '{value}': not a number of seconds since epoch"
+        );
+        GitError::Rejected(sley_core::RejectionKind::Refused)
     })
 }
 
 fn max_age_requires_value_error() -> GitError {
-    eprintln!("fatal: Option '--max-age' requires a value");
-    GitError::Exit(128)
+    sley_core::diagnostic!(Stderr, true, "fatal: Option '--max-age' requires a value");
+    GitError::Rejected(sley_core::RejectionKind::Refused)
 }
 
 fn min_age_requires_value_error() -> GitError {
-    eprintln!("fatal: Option '--min-age' requires a value");
-    GitError::Exit(128)
+    sley_core::diagnostic!(Stderr, true, "fatal: Option '--min-age' requires a value");
+    GitError::Rejected(sley_core::RejectionKind::Refused)
 }
 
 fn date_cutoff_requires_value_error(option: &str) -> GitError {
-    eprintln!("fatal: Option '{option}' requires a value");
-    GitError::Exit(128)
+    sley_core::diagnostic!(Stderr, true, "fatal: Option '{option}' requires a value");
+    GitError::Rejected(sley_core::RejectionKind::Refused)
 }
 
 fn parse_date_cutoff(value: &str) -> Result<i64> {
@@ -1026,8 +1038,8 @@ fn parse_date_cutoff(value: &str) -> Result<i64> {
             return invalid_date_format(value);
         }
         return timestamp.parse::<i64>().map_err(|_| {
-            eprintln!("fatal: invalid date format: {value}");
-            GitError::Exit(128)
+            sley_core::diagnostic!(Stderr, true, "fatal: invalid date format: {value}");
+            GitError::Rejected(sley_core::RejectionKind::Refused)
         });
     }
     // A bare all-digit number with at least 9 digits is seconds-since-epoch
@@ -1078,8 +1090,8 @@ fn parse_date_cutoff(value: &str) -> Result<i64> {
 }
 
 fn invalid_date_format<T>(value: &str) -> Result<T> {
-    eprintln!("fatal: invalid date format: {value}");
-    Err(GitError::Exit(128))
+    sley_core::diagnostic!(Stderr, true, "fatal: invalid date format: {value}");
+    Err(GitError::Rejected(sley_core::RejectionKind::Refused))
 }
 
 fn parse_exclude_hidden(value: &str) -> Result<HiddenRefsSection> {
@@ -1152,8 +1164,12 @@ impl PseudoRefResolver {
             // git: exclude_hidden_refs() dies if called twice without an
             // intervening pseudo-ref option consuming the pending state.
             if self.pending_hidden.is_some() {
-                eprintln!("fatal: --exclude-hidden= passed more than once");
-                return Err(GitError::Exit(128));
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "fatal: --exclude-hidden= passed more than once"
+                );
+                return Err(GitError::Rejected(sley_core::RejectionKind::Refused));
             }
             self.pending_hidden = Some(parse_exclude_hidden(section)?);
             return Ok(None);
@@ -1187,11 +1203,15 @@ impl PseudoRefResolver {
                 RefSelectorKind::Branches | RefSelectorKind::Tags | RefSelectorKind::Remotes
             )
         {
-            eprintln!(
+            sley_core::diagnostic!(
+                Stderr,
+                true,
                 "error: options '--exclude-hidden' and '{}' cannot be used together",
                 selector_option_name(kind)
             );
-            return Err(GitError::Exit(129));
+            return Err(GitError::Rejected(
+                sley_core::RejectionKind::InvalidArguments,
+            ));
         }
         let selector = RefSelector {
             kind,

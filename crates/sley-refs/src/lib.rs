@@ -2613,10 +2613,13 @@ impl FileRefStore {
             }
             return Ok(tables);
         }
-        Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!(
-            "cannot read stable reftable stack {}",
-            tables_list.display()
-        ) })
+        Err(GitError::IoKind {
+            kind: std::io::ErrorKind::Other,
+            message: format!(
+                "cannot read stable reftable stack {}",
+                tables_list.display()
+            ),
+        })
     }
 
     fn reftable_store_with_storage(&self, storage_dir: PathBuf) -> FileRefStore {
@@ -2851,10 +2854,13 @@ impl FileRefStore {
         if fail_on_locked_table {
             for name in &compact_names {
                 if reftable_dir.join(format!("{name}.lock")).exists() {
-                    return Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!(
-                        "cannot lock references: {}: File exists",
-                        reftable_dir.join(format!("{name}.lock")).display()
-                    ) });
+                    return Err(GitError::IoKind {
+                        kind: std::io::ErrorKind::Other,
+                        message: format!(
+                            "cannot lock references: {}: File exists",
+                            reftable_dir.join(format!("{name}.lock")).display()
+                        ),
+                    });
                 }
             }
         }
@@ -5017,10 +5023,13 @@ impl FileRefStore {
                     }
                     Err(err) => {
                         release_pending_locks(&pending);
-                        return Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!(
-                            "Unable to create '{}': {err}",
-                            packed_new_path.display()
-                        ) });
+                        return Err(GitError::IoKind {
+                            kind: std::io::ErrorKind::Other,
+                            message: format!(
+                                "Unable to create '{}': {err}",
+                                packed_new_path.display()
+                            ),
+                        });
                     }
                 }
                 let packed_bytes = match write_packed_refs(&packed_refs) {
@@ -5379,18 +5388,24 @@ impl ReftableListLock {
                         .elapsed()
                         .unwrap_or_else(|_| Duration::from_millis(timeout_millis + 1));
                     if elapsed.as_millis() as u64 >= timeout_millis {
-                        return Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!(
-                            "cannot lock references: {}: File exists",
-                            lock_path.display()
-                        ) });
+                        return Err(GitError::IoKind {
+                            kind: std::io::ErrorKind::Other,
+                            message: format!(
+                                "cannot lock references: {}: File exists",
+                                lock_path.display()
+                            ),
+                        });
                     }
                     thread::sleep(Duration::from_millis(50));
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    return Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!(
-                        "cannot lock references: {}: File exists",
-                        lock_path.display()
-                    ) });
+                    return Err(GitError::IoKind {
+                        kind: std::io::ErrorKind::Other,
+                        message: format!(
+                            "cannot lock references: {}: File exists",
+                            lock_path.display()
+                        ),
+                    });
                 }
                 Err(err) => return Err(err.into()),
             }
@@ -5399,7 +5414,10 @@ impl ReftableListLock {
 
     fn commit(mut self, bytes: &[u8], fsync_method: Option<ReferenceFsyncMethod>) -> Result<()> {
         let Some(mut file) = self.file.take() else {
-            return Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: "reftable list lock is already closed".into() });
+            return Err(GitError::IoKind {
+                kind: std::io::ErrorKind::Other,
+                message: "reftable list lock is already closed".into(),
+            });
         };
         file.set_len(0)?;
         file.write_all(bytes)?;
@@ -5407,8 +5425,7 @@ impl ReftableListLock {
             sync_reference_file(&file, method)?;
         }
         drop(file);
-        fs::rename(&self.lock_path, &self.list_path)
-            .map_err(GitError::from)?;
+        fs::rename(&self.lock_path, &self.list_path).map_err(GitError::from)?;
         self.active = false;
         Ok(())
     }
@@ -5621,8 +5638,7 @@ fn apply_pending_change(change: &PendingPathChange) -> Result<()> {
                                     GitError::from(err)
                                 }
                             })?;
-                            fs::rename(&change.lock_path, &change.path)
-                                .map_err(GitError::from)
+                            fs::rename(&change.lock_path, &change.path).map_err(GitError::from)
                         }
                         _ => Err(GitError::from(first_err)),
                     }
@@ -5739,9 +5755,10 @@ fn maybe_fail_loose_commit_action(index: usize) -> Result<()> {
     let should_fail = FAIL_LOOSE_COMMIT_ACTION.with(|cell| cell.get() == Some(index));
     if should_fail {
         FAIL_LOOSE_COMMIT_ACTION.with(|cell| cell.set(None));
-        return Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!(
-            "injected loose ref transaction failure at action {index}"
-        ) });
+        return Err(GitError::IoKind {
+            kind: std::io::ErrorKind::Other,
+            message: format!("injected loose ref transaction failure at action {index}"),
+        });
     }
     Ok(())
 }
@@ -6413,10 +6430,10 @@ fn write_locked_with_timeout(
                     .elapsed()
                     .unwrap_or_else(|_| Duration::from_millis(timeout_millis + 1));
                 if elapsed.as_millis() as u64 >= timeout_millis {
-                    return Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!(
-                        "could not lock {}: File exists",
-                        path.display()
-                    ) });
+                    return Err(GitError::IoKind {
+                        kind: std::io::ErrorKind::Other,
+                        message: format!("could not lock {}: File exists", path.display()),
+                    });
                 }
                 thread::sleep(Duration::from_millis(50));
             }
@@ -6449,18 +6466,18 @@ fn acquire_path_lock_with_timeout(path: &Path, timeout_millis: u64) -> Result<()
                     .elapsed()
                     .unwrap_or_else(|_| Duration::from_millis(timeout_millis + 1));
                 if elapsed.as_millis() as u64 >= timeout_millis {
-                    return Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!(
-                        "Unable to create '{}': File exists",
-                        path.display()
-                    ) });
+                    return Err(GitError::IoKind {
+                        kind: std::io::ErrorKind::Other,
+                        message: format!("Unable to create '{}': File exists", path.display()),
+                    });
                 }
                 thread::sleep(Duration::from_millis(50));
             }
             Err(err) => {
-                return Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!(
-                    "Unable to create '{}': {err}",
-                    path.display()
-                ) });
+                return Err(GitError::IoKind {
+                    kind: std::io::ErrorKind::Other,
+                    message: format!("Unable to create '{}': {err}", path.display()),
+                });
             }
         }
     }
@@ -6723,11 +6740,15 @@ fn safe_ref_prefix_for_directory_scan(prefix: &str) -> bool {
 }
 
 fn warn_broken_ref_name(name: &str) {
-    eprintln!("warning: ignoring ref with broken name {name}");
+    sley_core::diagnostic!(
+        Stderr,
+        true,
+        "warning: ignoring ref with broken name {name}"
+    );
 }
 
 fn warn_broken_ref(name: &str) {
-    eprintln!("warning: ignoring broken ref {name}");
+    sley_core::diagnostic!(Stderr, true, "warning: ignoring broken ref {name}");
 }
 
 /// A direct ref resolving to the null OID is broken (git's `REF_ISBROKEN`).

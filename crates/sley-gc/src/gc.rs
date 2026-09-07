@@ -237,7 +237,9 @@ pub fn gc_run_locked(
         (services.commit_graph_write_reachable)(progress == "--progress")?;
     }
     if options.auto && gc_too_many_loose_objects(common_git_dir, format, config)? {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "warning: There are too many unreachable loose objects; run 'git prune' to remove them."
         );
     }
@@ -654,7 +656,9 @@ pub fn gc_recent_log_blocks_auto(common_git_dir: &Path, config: &GitConfig) -> R
         .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
         .unwrap_or(0);
     if modified >= cutoff {
-        eprintln!(
+        sley_core::diagnostic!(
+            Stderr,
+            true,
             "warning: The last gc run reported the following. Please correct the root cause\nand remove {}\nAutomatic cleanup will not be performed until the file is removed.\n\n{}",
             path.display(),
             fs::read_to_string(&path).unwrap_or_default()
@@ -981,14 +985,16 @@ pub fn validate_gc_prune_expire(config: &GitConfig, git_dir: &Path) -> Result<()
     if crate::repack::parse_cruft_expiration(value).is_ok() {
         return Ok(());
     }
-    eprintln!("error: Invalid gc.pruneexpire: '{value}'");
+    sley_core::diagnostic!(Stderr, true, "error: Invalid gc.pruneexpire: '{value}'");
     let config_path = git_dir.join("config");
     let line = config_line_number(&config_path, "pruneExpire").unwrap_or(0);
-    eprintln!(
+    sley_core::diagnostic!(
+        Stderr,
+        true,
         "fatal: bad config variable 'gc.pruneexpire' in file '{}' at line {line}",
         display_git_config_path(git_dir, &config_path)
     );
-    Err(GitError::Exit(128))
+    Err(GitError::Rejected(sley_core::RejectionKind::Refused))
 }
 
 fn config_line_number(path: &Path, key: &str) -> Option<usize> {

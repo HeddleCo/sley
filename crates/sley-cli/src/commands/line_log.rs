@@ -20,7 +20,7 @@ pub(crate) struct LineLogArg {
 /// Error type for `-L` parsing failures that should print git's exact message.
 fn line_log_fatal(msg: impl AsRef<str>) -> GitError {
     eprintln!("fatal: {}", msg.as_ref());
-    GitError::Exit(128)
+    crate::cli_exit(128)
 }
 
 /// Outcome of parsing the leading `<range>` portion of a `-L` argument.

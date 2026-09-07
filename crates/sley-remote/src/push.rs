@@ -561,7 +561,7 @@ enum PushExecution {
 /// error messages here).
 ///
 /// Returns the structured [`PushOutcome`]; never prints or returns
-/// `GitError::Exit`. A still-`None` report in the outcome means the remote did
+/// a process exit request. A still-`None` report in the outcome means the remote did
 /// not advertise `report-status`. Set-upstream config and the `To <remote>`
 /// summary are the caller's job, driven from [`PushOutcome::commands`].
 pub fn push(
@@ -1421,12 +1421,12 @@ where
 {
     std::thread::scope(|scope| {
         let (mut reader, writer) = std::io::pipe().map_err(GitError::from)?;
-        let generator = scope.spawn(move || -> Result<()> {
+        let generator = scope.spawn(sley_core::diagnostics::inherit(move || -> Result<()> {
             // `writer` is dropped at the end of this closure, signalling EOF to
             // the reader even on the error path.
             let mut writer = writer;
             write_receive_pack_body_with_cancel(pack_request, &mut writer, cancel)
-        });
+        }));
 
         // Probe up to `post_buffer + 1` bytes to decide buffered vs chunked
         // without first materialising the whole body.
@@ -1468,7 +1468,10 @@ where
 fn join_pack_generator(handle: std::thread::ScopedJoinHandle<'_, Result<()>>) -> Result<()> {
     match handle.join() {
         Ok(result) => result,
-        Err(_) => Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: "receive-pack body generator thread panicked".into() }),
+        Err(_) => Err(GitError::IoKind {
+            kind: std::io::ErrorKind::Other,
+            message: "receive-pack body generator thread panicked".into(),
+        }),
     }
 }
 
@@ -1478,9 +1481,7 @@ fn read_up_to(reader: &mut impl Read, cap: usize, out: &mut Vec<u8>) -> Result<(
     let mut chunk = [0u8; 8192];
     while out.len() < cap {
         let want = (cap - out.len()).min(chunk.len());
-        let read = reader
-            .read(&mut chunk[..want])
-            .map_err(GitError::from)?;
+        let read = reader.read(&mut chunk[..want]).map_err(GitError::from)?;
         if read == 0 {
             break;
         }
@@ -1752,7 +1753,10 @@ fn create_push_quarantine_object_dir(remote_common_git_dir: &Path) -> Result<Pat
             Err(err) => return Err(GitError::from(err)),
         }
     }
-    Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: "could not create push quarantine object directory".into() })
+    Err(GitError::IoKind {
+        kind: std::io::ErrorKind::Other,
+        message: "could not create push quarantine object directory".into(),
+    })
 }
 
 fn remote_excluded_tip_roots(
@@ -3291,7 +3295,12 @@ pub fn read_receive_pack_push_report_with_progress(
                         buf.push(b'\n');
                     }
                 } else {
-                    eprint!("{}", String::from_utf8_lossy(progress_line));
+                    sley_core::diagnostic!(
+                        Stderr,
+                        false,
+                        "{}",
+                        String::from_utf8_lossy(progress_line)
+                    );
                 }
             });
             sideband
@@ -4386,8 +4395,7 @@ mod tests {
             body: &mut dyn Read,
         ) -> Result<HttpResponse> {
             let mut buffered = Vec::new();
-            body.read_to_end(&mut buffered)
-                .map_err(GitError::from)?;
+            body.read_to_end(&mut buffered).map_err(GitError::from)?;
             *self.last.lock().expect("lock") = Some(("post_reader", buffered));
             Self::ok_response()
         }

@@ -444,7 +444,9 @@ pub(crate) fn collect_packed_object_ids(
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| midx_pack_names.contains(name)) =>
             {
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "error: packfile {} index unavailable",
                     path.with_extension("pack").display()
                 );
@@ -575,7 +577,9 @@ pub(crate) fn collect_packed_object_ids_with_prefix(
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| midx_pack_names.contains(name)) =>
             {
-                eprintln!(
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
                     "error: packfile {} index unavailable",
                     path.with_extension("pack").display()
                 );

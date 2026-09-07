@@ -514,12 +514,8 @@ where
         Vec::new(),
         flate2::Compression::new(compression_level.min(9)),
     );
-    encoder
-        .write_all(&tar)
-        .map_err(GitError::from)?;
-    let gz = encoder
-        .finish()
-        .map_err(GitError::from)?;
+    encoder.write_all(&tar).map_err(GitError::from)?;
+    let gz = encoder.finish().map_err(GitError::from)?;
     writer.write_all(&gz)?;
     Ok(())
 }
@@ -579,7 +575,7 @@ struct TarSink<'a, 'w, W: Write + ?Sized> {
 impl<W: Write + ?Sized> ArchiveSink for TarSink<'_, '_, W> {
     fn emit(&mut self, entry: ArchiveEntry<'_>) -> Result<()> {
         if self.verbose {
-            eprintln!("{}", String::from_utf8_lossy(entry.path()));
+            sley_core::diagnostic!(Stderr, true, "{}", String::from_utf8_lossy(entry.path()));
         }
         match entry {
             ArchiveEntry::Directory { path } => {

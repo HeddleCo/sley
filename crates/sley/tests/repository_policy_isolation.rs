@@ -115,19 +115,34 @@ fn two_worktree_mutations_preserve_their_callers_directory() {
     for worktree in [&left_root, &right_root] {
         std::fs::create_dir(worktree.join("dir")).expect("directory");
         std::fs::write(worktree.join("dir/file"), b"content").expect("file");
+        std::fs::create_dir(worktree.join("prunable")).expect("prunable directory");
+        std::fs::write(worktree.join("prunable/file"), b"content").expect("prunable file");
     }
     let preserved_left = left_root.join("dir");
+    let preserved_right = right_root.join("dir");
     let barrier = Barrier::new(2);
     std::thread::scope(|scope| {
         let first = scope.spawn(|| {
             barrier.wait();
             sley_worktree::remove_worktree_path(Some(&preserved_left), &left_root, b"dir/file")
                 .expect("left removal");
+            sley_worktree::remove_worktree_path(
+                Some(&preserved_left),
+                &left_root,
+                b"prunable/file",
+            )
+            .expect("left pruning");
         });
         let second = scope.spawn(|| {
             barrier.wait();
-            sley_worktree::remove_worktree_path(Some(&right_root), &right_root, b"dir/file")
+            sley_worktree::remove_worktree_path(Some(&preserved_right), &right_root, b"dir/file")
                 .expect("right removal");
+            sley_worktree::remove_worktree_path(
+                Some(&preserved_right),
+                &right_root,
+                b"prunable/file",
+            )
+            .expect("right pruning");
         });
         first.join().expect("left operation");
         second.join().expect("right operation");
@@ -138,8 +153,11 @@ fn two_worktree_mutations_preserve_their_callers_directory() {
     );
     assert!(!left_root.join("dir/file").exists());
     assert!(
-        !right_root.join("dir").exists(),
-        "right operation prunes its empty directory"
+        preserved_right.is_dir(),
+        "right caller's current directory must survive independently"
     );
+    assert!(!right_root.join("dir/file").exists());
+    assert!(!left_root.join("prunable").exists());
+    assert!(!right_root.join("prunable").exists());
     std::fs::remove_dir_all(root).expect("remove fixture");
 }

@@ -300,7 +300,11 @@ pub fn merge_remove_worktree_file(
                 Err(_) => {
                     // ENOTEMPTY (populated submodule) and friends: git warns and
                     // continues. Match the warn-and-continue, do not propagate.
-                    eprintln!("warning: unable to rmdir '{rel}': Directory not empty");
+                    sley_core::diagnostic!(
+                        Stderr,
+                        true,
+                        "warning: unable to rmdir '{rel}': Directory not empty"
+                    );
                 }
             }
         }
@@ -363,11 +367,13 @@ fn merge_path_is_original_cwd(original_cwd: Option<&std::path::Path>, path: &Pat
 }
 
 fn merge_refuse_remove_current_working_directory(path: &Path) -> Result<()> {
-    eprintln!(
+    sley_core::diagnostic!(
+        Stderr,
+        true,
         "error: Refusing to remove the current working directory:\n{}",
         path.display()
     );
-    Err(GitError::Exit(128))
+    Err(GitError::Rejected(sley_core::RejectionKind::Refused))
 }
 
 fn merge_prune_empty_dirs(

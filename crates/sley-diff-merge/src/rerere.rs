@@ -38,7 +38,7 @@ pub struct StderrRerereReporter;
 
 impl RerereReporter for StderrRerereReporter {
     fn report(&mut self, message: &str) {
-        eprintln!("{message}");
+        sley_core::diagnostic!(Stderr, true, "{message}");
     }
 }
 

@@ -899,15 +899,15 @@ pub(crate) fn cmd_refs_verify(
             "--no-verbose" => verbose = false,
             "-h" | "--help" => {
                 println!("usage: git refs verify [--strict] [--verbose]");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             other if other.starts_with('-') => {
                 eprintln!("error: unknown option `{}'", other.trim_start_matches('-'));
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             _ => {
                 eprintln!("usage: 'git refs verify' takes no arguments");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
         }
     }
@@ -924,7 +924,7 @@ pub(crate) fn cmd_refs_verify(
     };
 
     if had_error {
-        Err(GitError::Exit(1))
+        Err(crate::cli_exit(1))
     } else {
         Ok(())
     }

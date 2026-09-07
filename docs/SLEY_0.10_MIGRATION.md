@@ -231,3 +231,71 @@ The following take `precompose` before their existing arguments (after `&self` o
 - `sley_worktree::path_matches_standard_ignore`
 - `sley_worktree::standard_attributes_for_path`
 - `sley_worktree::standard_ignore_match`
+
+
+## Library errors and diagnostics (rank 4)
+
+| Removed API / behavior | Replacement and migration |
+| --- | --- |
+| `GitError::Io(String)` | Use `GitError::from(std::io::Error)` for an actual I/O failure, preserving its `ErrorKind`. For a manually described failure construct `GitError::IoKind { kind, message }` with the meaningful kind (`Other` only when no more specific kind applies). Classify with `GitError::io_kind()`, not rendered text. The `io error: …` rendering remains unchanged. |
+| `GitError::{Exit,Cli}` | Library operations return `GitError::Rejected(RejectionKind::{InvalidArguments,Refused,Incomplete})` after sending details to the operation's diagnostic sink. These express validation, refusal, and incomplete-operation semantics, without requesting process termination. Continue to inspect `FetchOutcome`, `PushOutcome`, `CloneOutcome` and their existing typed dispositions for ordinary operation results. |
+| `sley_core::CliExit`, `sley_core::cli_exit_code`, `GitError::{usage,user_error,cli_exit,cli_exit_code}` | Process status belongs to the executable adapter. The compatibility layer exports `sley_cli::{CliExit,cli_exit,cli_usage,cli_user_error,cli_diagnostic,cli_exit_code,cli_message,cli_reported_status}`. Embedders should map typed results to their own application errors, not depend on CLI status helpers. |
+| Numeric library exit codes for child failures, aborted remote helpers, and empty preferred packs | Match `GitError::ChildProcessFailed { status: Option<i32> }`, `GitError::RemoteHelperAborted { name }`, or `GitError::EmptyPreferredPack { path }`, respectively. Child status describes the actual subprocess; it is not a request to exit the host. |
+| Direct library `print!` / `println!` / `eprint!` / `eprintln!` diagnostics and human-facing byte writes | Supply `sley_core::diagnostics::Diagnostics::new(sink)` and execute the synchronous operation inside `diagnostics.scope(|| operation())`. Implement `DiagnosticSink::{write,flush}`; `DiagnosticStream::{Stdout,Stderr}` identifies the original channel, and bytes retain their original newlines/terminators. Default scopes discard diagnostics. This covers ODB corrupt-copy fallback, revision/config validation, remote warnings, worktree operations, and sequencing/maintenance output. |
+
+Caller-provided services can preserve their concrete errors using
+`GitError::Callback(CallbackError::new(error))`. `CallbackError::downcast_ref`
+and the standard `Error::source` chain retain the original type. Clones share
+callback-error identity; separately constructed callbacks do not compare equal
+merely because their messages match. The CLI uses this boundary to carry its
+private command outcome through library-invoked callbacks. No library understands
+that private outcome or calls `process::exit`.
+
+Diagnostics use a thread-local routing scope, **not a process-wide sink setter**.
+A scope owns an `Arc` of the caller's sink, restores the previous scope on return
+or unwind, and allows nested callers to select different sinks. Library workers
+capture the current sink with `diagnostics::inherit`; host-created workers must
+do the same, or explicitly call their own `Diagnostics::scope`. Sinks must accept
+concurrent calls. `DiagnosticWriter::new(stream)` provides a fallible `Write`
+adapter bound to the current sink. Best-effort diagnostic macros do not replace
+an operation's error if the renderer fails; explicit fallible output paths still
+propagate renderer I/O failures.
+
+All affected engines are synchronous. Async hosts must enter the scope **inside**
+the blocking operation; wrapping future creation does not route its later polls.
+Do not hold a diagnostic scope across an await. Per-task async routing is deferred
+until there is an asynchronous engine execution API that needs it.
+
+For example, a host logger can supply a sink without acquiring process stdout or
+stderr:
+
+```rust
+use sley_core::diagnostics::{DiagnosticSink, DiagnosticStream, Diagnostics};
+
+struct HostLog;
+impl DiagnosticSink for HostLog {
+    fn write(&self, stream: DiagnosticStream, bytes: &[u8]) -> std::io::Result<()> {
+        // Forward `(stream, bytes)` to the host's logger or retained report.
+        let _ = (stream, bytes);
+        Ok(())
+    }
+}
+let diagnostics = Diagnostics::new(HostLog);
+let result = diagnostics.scope(|| sley::Repository::open("repository.git"));
+```
+
+`BadNumericValue::report`, `BadBooleanValue::report`, `BadPathValue::report`, and
+`MissingValueError::report` in `sley_config::typed` now use the sink and return
+`Rejected(Refused)`. Their `diagnostic()` accessors remain available when the host
+wants to render those typed validation errors itself. Existing explicit progress,
+warning, event, and `Write` parameters retain their contracts. Protocol bodies,
+credential helper records, configured trace destinations, and subprocess stdio
+are separate compatibility channels, not implicitly captured diagnostics.
+
+Heddle's credential classification must replace its `GitError::Io` match with
+`IoKind` / `io_kind()` and retain typed cancellation and sideband-fatal handling.
+Weft's `weft-base/src/ssrf.rs` constructors must supply an I/O kind, or preserve a
+host-specific error through `CallbackError`; custom HTTP/authentication behavior
+is unchanged. Exhaustive `GitError` matches need the new variants. Neither consumer
+was repinned or built by this change; adopting 0.10 requires their own compilation
+and error-path tests.

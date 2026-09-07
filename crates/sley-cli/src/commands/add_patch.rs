@@ -405,7 +405,7 @@ fn attach_display_diff(files: &mut [FileDiff], text: &str) -> Result<()> {
     for fd in files {
         if index + fd.header.len() > lines.len() {
             eprintln!("error: mismatched output from interactive.diffFilter");
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         fd.display_header = lines[index..index + fd.header.len()].to_vec();
         index += fd.header.len();
@@ -417,14 +417,14 @@ fn attach_display_diff(files: &mut [FileDiff], text: &str) -> Result<()> {
             } else {
                 if index >= lines.len() {
                     eprintln!("error: mismatched output from interactive.diffFilter");
-                    return Err(GitError::Exit(1));
+                    return Err(crate::cli_exit(1));
                 }
                 hunk.display_header = Some(lines[index].clone());
                 index += 1;
             }
             if index + hunk.body.len() > lines.len() {
                 eprintln!("error: mismatched output from interactive.diffFilter");
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
             hunk.display_body = lines[index..index + hunk.body.len()].to_vec();
             index += hunk.body.len();
@@ -432,7 +432,7 @@ fn attach_display_diff(files: &mut [FileDiff], text: &str) -> Result<()> {
     }
     if index != lines.len() {
         eprintln!("error: mismatched output from interactive.diffFilter");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -470,7 +470,7 @@ fn filter_display_diff(filter: &str, input: &str) -> Result<String> {
         .spawn()
         .map_err(|_| {
             eprintln!("error: failed to run '{filter}'");
-            GitError::Exit(1)
+            crate::cli_exit(1)
         })?;
     if let Some(mut stdin) = child.stdin.take() {
         let input = input.as_bytes().to_vec();
@@ -478,12 +478,10 @@ fn filter_display_diff(filter: &str, input: &str) -> Result<String> {
             let _ = stdin.write_all(&input);
         });
     }
-    let output = child
-        .wait_with_output()
-        .map_err(|e| GitError::from(e))?;
+    let output = child.wait_with_output().map_err(|e| GitError::from(e))?;
     if !output.status.success() {
         eprintln!("error: failed to run '{filter}'");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
@@ -876,11 +874,10 @@ fn run_add_patch_with_result(
     let args: Vec<&str> = owned.iter().map(String::as_str).collect();
     // git's `parse_diff` errors with "could not parse diff" (exit 1) when the
     // spawned `diff-files` fails — e.g. an invalid `--diff-algorithm` (t3701 #69).
-    let (diff, diff_ok) =
-        run_capture_status(&args, None).map_err(|e| GitError::from(e))?;
+    let (diff, diff_ok) = run_capture_status(&args, None).map_err(|e| GitError::from(e))?;
     if !diff_ok {
         eprintln!("error: could not parse diff");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     let diff_text = String::from_utf8_lossy(&diff).into_owned();
     let mut files = parse_diff(&diff_text);
@@ -2057,8 +2054,7 @@ fn apply_file_via_patch(fd: &FileDiff, mode: PatchMode, stdin: &mut impl BufRead
     }
     // Worktree-only modes: a single forward `apply` against the working tree.
     let args: Vec<&str> = vec!["apply"];
-    let (_out, ok) =
-        run_capture_status(&args, Some(patch)).map_err(|e| GitError::from(e))?;
+    let (_out, ok) = run_capture_status(&args, Some(patch)).map_err(|e| GitError::from(e))?;
     if !ok {
         eprintln!("error: 'git apply' failed");
     }
@@ -2142,7 +2138,7 @@ fn apply_file_to_index(fd: &FileDiff) -> Result<()> {
             .status()
             .map_err(|e| GitError::from(e))?;
         if !status.success() {
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         return Ok(());
     }
@@ -2168,7 +2164,7 @@ fn apply_file_to_index(fd: &FileDiff) -> Result<()> {
                 .status()
                 .map_err(|e| GitError::from(e))?;
             if !status.success() {
-                return Err(GitError::Exit(1));
+                return Err(crate::cli_exit(1));
             }
         }
         return Ok(());
@@ -2188,7 +2184,7 @@ fn apply_file_to_index(fd: &FileDiff) -> Result<()> {
             .status()
             .map_err(|e| GitError::from(e))?;
         if !status.success() {
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         return Ok(());
     }
@@ -2222,7 +2218,7 @@ fn apply_file_to_index(fd: &FileDiff) -> Result<()> {
         .status()
         .map_err(|e| GitError::from(e))?;
     if !status.success() {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -2237,10 +2233,9 @@ fn apply_file_to_index_reverse(fd: &FileDiff) -> Result<()> {
         && let Some(oid) = gitlink_selected_oid(fd, b'-', fd.old_oid.as_deref())
     {
         let args = ["update-index", "--cacheinfo", "160000", oid, &fd.path];
-        let (_out, ok) =
-            run_capture_status(&args, None).map_err(|e| GitError::from(e))?;
+        let (_out, ok) = run_capture_status(&args, None).map_err(|e| GitError::from(e))?;
         if !ok {
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         return Ok(());
     }
@@ -2256,7 +2251,7 @@ fn apply_file_to_index_reverse(fd: &FileDiff) -> Result<()> {
             .status()
             .map_err(|e| GitError::from(e))?;
         if !status.success() {
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         }
         return Ok(());
     }
@@ -2270,7 +2265,7 @@ fn apply_file_to_index_reverse(fd: &FileDiff) -> Result<()> {
     let args = ["update-index", "--cacheinfo", &mode, &oid, &fd.path];
     let (_out, ok) = run_capture_status(&args, None).map_err(|e| GitError::from(e))?;
     if !ok {
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }

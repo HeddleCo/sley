@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::Arc;
@@ -375,7 +375,8 @@ pub fn prefetch_via_configured_upload_pack(command: &str, repository: &str) -> R
         .arg(command)
         .stdin(std::process::Stdio::null())
         .output()?;
-    io::stderr().write_all(&output.stderr)?;
+    sley_core::diagnostics::DiagnosticWriter::new(sley_core::diagnostics::DiagnosticStream::Stderr)
+        .write_all(&output.stderr)?;
     Ok(output.status.success())
 }
 

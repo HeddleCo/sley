@@ -188,7 +188,7 @@ pub(crate) fn cmd_checkout(
             "-lb" => {
                 if !matches!(branch_mode, CheckoutBranchMode::Existing) {
                     eprintln!("fatal: options '--detach' and '-b' cannot be used together");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 create_reflog = true;
                 let branch = iter
@@ -203,7 +203,7 @@ pub(crate) fn cmd_checkout(
             "-b" => {
                 if !matches!(branch_mode, CheckoutBranchMode::Existing) {
                     eprintln!("fatal: options '--detach' and '-b' cannot be used together");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 let branch = iter
                     .next()
@@ -217,7 +217,7 @@ pub(crate) fn cmd_checkout(
             "-B" => {
                 if !matches!(branch_mode, CheckoutBranchMode::Existing) {
                     eprintln!("fatal: options '--detach' and '-B' cannot be used together");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 let branch = iter
                     .next()
@@ -231,7 +231,7 @@ pub(crate) fn cmd_checkout(
             "--detach" => {
                 if !matches!(branch_mode, CheckoutBranchMode::Existing) {
                     eprintln!("fatal: options '-b' and '--detach' cannot be used together");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 branch_mode = CheckoutBranchMode::Detach;
             }
@@ -255,29 +255,29 @@ pub(crate) fn cmd_checkout(
     }
     if no_auto_advance && !patch {
         eprintln!("fatal: the option '--no-auto-advance' requires '--interactive/--patch'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if unified_context.is_some() && !patch {
         eprintln!("fatal: the option '--unified' requires '--interactive/--patch'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if inter_hunk_context.is_some() && !patch {
         eprintln!("fatal: the option '--inter-hunk-context' requires '--interactive/--patch'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     // `--orphan` cannot set up branch tracking.
     if matches!(branch_mode, CheckoutBranchMode::Create { orphan: true, .. }) && track.is_some() {
         eprintln!("fatal: '--orphan' cannot be used with '-t'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     // `-p --overlay` is forbidden; only the implicit-overlay default pairs with -p.
     if patch && overlay_mode == Some(true) {
         eprintln!("fatal: options '-p' and '--overlay' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if pathspec_file_nul && pathspec_from_file.is_none() {
         eprintln!("fatal: the option '--pathspec-file-nul' requires '--pathspec-from-file'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if pathspec_from_file.is_some() {
         // Git rejects pathspec args, then --detach, then --patch (in that order).
@@ -289,19 +289,19 @@ pub(crate) fn cmd_checkout(
             eprintln!(
                 "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if matches!(branch_mode, CheckoutBranchMode::Detach) {
             eprintln!(
                 "fatal: options '--pathspec-from-file' and '--detach' cannot be used together"
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if patch {
             eprintln!(
                 "fatal: options '--pathspec-from-file' and '--patch' cannot be used together"
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     let context = CheckoutContext::open(cli_session)?;
@@ -485,7 +485,7 @@ pub(crate) fn cmd_checkout(
                         eprintln!(
                             "fatal: '--merge' cannot be used when checking out paths from a tree"
                         );
-                        return Err(GitError::Exit(128));
+                        return Err(crate::cli_exit(128));
                     }
                     let oid =
                         checkout_resolve_start_oid(git_dir, format, rev, context.replace_objects)?;
@@ -764,7 +764,7 @@ pub(crate) fn cmd_checkout(
             let [branch] = positional.as_slice() else {
                 if checkout_stage.is_some() {
                     eprintln!("fatal: '--ours/--theirs' needs the paths to check out");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 if positional.is_empty() {
                     // `git checkout` with no branch and no paths stays on the
@@ -772,7 +772,7 @@ pub(crate) fn cmd_checkout(
                     // succeeds (no error), leaving the index/worktree untouched.
                     let Some(head) = resolve_ref_peeled(store, "HEAD")? else {
                         eprintln!("fatal: You are on a branch yet to be born");
-                        return Err(GitError::Exit(128));
+                        return Err(crate::cli_exit(128));
                     };
                     sley_worktree::reapply_active_sparse_checkout(
                         cli_session.original_cwd.as_deref(),
@@ -789,7 +789,7 @@ pub(crate) fn cmd_checkout(
             };
             if checkout_stage.is_some() {
                 eprintln!("fatal: '--ours/--theirs' cannot be used with switching branches");
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             // A target that is not an existing branch but resolves to a commit-ish
             // (e.g. `A^0`, a tag, a raw oid) is a *detached HEAD* checkout, not a
@@ -963,7 +963,7 @@ pub(crate) fn cmd_checkout(
                     }
                 } else {
                     eprintln!("error: pathspec '{branch}' did not match any file(s) known to git");
-                    return Err(GitError::Exit(1));
+                    return Err(crate::cli_exit(1));
                 }
             } else {
                 CheckoutMessage::Existing {
@@ -983,14 +983,14 @@ pub(crate) fn cmd_checkout(
                     eprintln!(
                         "fatal: Cannot update paths and switch to branch '{branch}' at the same time."
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 // --orphan cannot reuse an existing branch name (there is no
                 // force variant); reject before touching the index or HEAD.
                 let branch_ref = branch_ref_name(&branch)?;
                 if store.read_ref(&branch_ref)?.is_some() {
                     eprintln!("fatal: a branch named '{branch}' already exists");
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 if let Some(start) = positional.first().map(String::as_str) {
                     let Some(start_oid) = resolve_checkout_start_oid(
@@ -1003,7 +1003,7 @@ pub(crate) fn cmd_checkout(
                         eprintln!(
                             "fatal: '{start}' is not a commit and a branch '{branch}' cannot be created from it"
                         );
-                        return Err(GitError::Exit(128));
+                        return Err(crate::cli_exit(128));
                     };
                     // Switch the index + worktree to the start point through the
                     // shared two-way engine (git's merge_working_tree), so local
@@ -1031,7 +1031,7 @@ pub(crate) fn cmd_checkout(
                 eprintln!(
                     "fatal: Cannot update paths and switch to branch '{branch}' at the same time."
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             let start = positional.first().map(String::as_str).unwrap_or("HEAD");
             if matches!(
@@ -1042,14 +1042,14 @@ pub(crate) fn cmd_checkout(
                 eprintln!(
                     "fatal: cannot set up tracking information; starting point '{start}' is not a branch"
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             if resolve_checkout_start_oid(git_dir, format, start, context.replace_objects).is_err()
             {
                 eprintln!(
                     "fatal: '{start}' is not a commit and a branch '{branch}' cannot be created from it"
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             let branch_ref = branch_ref_name(&branch)?;
             branch_update_rollback = Some((branch_ref.clone(), store.read_ref(&branch_ref)?));
@@ -1114,7 +1114,7 @@ pub(crate) fn cmd_checkout(
             worktree.path.display()
         );
         checkout_rollback_branch_update(git_dir, format, &branch_update_rollback);
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let branch_target = if store.read_ref(&branch_ref)?.is_some() {
         sley_refs::resolve_ref_peeled(store, &branch_ref)?
@@ -1370,7 +1370,7 @@ fn checkout_conflict_style(value: &str) -> Result<sley_worktree::CheckoutConflic
         "diff3" | "zdiff3" => Ok(sley_worktree::CheckoutConflictStyle::Diff3),
         other => {
             eprintln!("error: unknown conflict style '{other}'");
-            Err(GitError::Exit(129))
+            Err(crate::cli_exit(129))
         }
     }
 }
@@ -1746,7 +1746,7 @@ fn checkout_dwim_remote_branch(
             eprintln!(
                 "fatal: '{name}' could be both a local file and a tracking branch.\nPlease use -- (and optionally --no-guess) to disambiguate"
             );
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         let remote_ref = matches.remove(0);
         let oid = sley_refs::resolve_ref_peeled(store, &remote_ref)?
@@ -1768,7 +1768,7 @@ fn checkout_dwim_remote_branch(
         "fatal: '{name}' matched multiple ({}) remote tracking branches",
         matches.len()
     );
-    Err(GitError::Exit(128))
+    Err(crate::cli_exit(128))
 }
 
 fn checkout_dwim_remote_candidates(
@@ -1932,7 +1932,7 @@ pub(crate) fn cmd_restore(cli_session: &crate::session::CliSession, args: &[Stri
                 eprintln!(
                     "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
                 );
-                return Err(GitError::Exit(128));
+                return Err(crate::cli_exit(128));
             }
             paths.push(PathBuf::from(arg));
             continue;
@@ -2049,7 +2049,7 @@ pub(crate) fn cmd_restore(cli_session: &crate::session::CliSession, args: &[Stri
                     eprintln!(
                         "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 let value = iter.next().ok_or_else(|| {
                     GitError::Command("restore --pathspec-from-file requires a value".into())
@@ -2062,7 +2062,7 @@ pub(crate) fn cmd_restore(cli_session: &crate::session::CliSession, args: &[Stri
                     eprintln!(
                         "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 let value = value.strip_prefix("--pathspec-from-file=").ok_or_else(|| {
                     GitError::Command("restore --pathspec-from-file requires a value".into())
@@ -2094,7 +2094,7 @@ pub(crate) fn cmd_restore(cli_session: &crate::session::CliSession, args: &[Stri
                     eprintln!(
                         "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
                     );
-                    return Err(GitError::Exit(128));
+                    return Err(crate::cli_exit(128));
                 }
                 paths.push(PathBuf::from(value));
             }
@@ -2102,43 +2102,43 @@ pub(crate) fn cmd_restore(cli_session: &crate::session::CliSession, args: &[Stri
     }
     if pathspec_file_nul && pathspec_from_file.is_none() {
         eprintln!("fatal: the option '--pathspec-file-nul' requires '--pathspec-from-file'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if unified_context.is_some() && !patch {
         eprintln!("fatal: the option '--unified' requires '--interactive/--patch'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if inter_hunk_context.is_some() && !patch {
         eprintln!("fatal: the option '--inter-hunk-context' requires '--interactive/--patch'");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if ignore_unmerged && patch {
         eprintln!("fatal: '--ignore-unmerged' cannot be used with updating paths");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if ignore_unmerged && path_merge {
         eprintln!("fatal: options '--ignore-unmerged' and '-m' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if staged {
         if checkout_stage.is_some() {
             eprintln!("fatal: '--ours' or '--theirs' cannot be used with --staged");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if path_merge || conflict_implies_merge {
             eprintln!("fatal: '--merge' or '--conflict' cannot be used with --staged");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     }
     if source.is_some() && (path_merge || conflict_implies_merge || checkout_stage.is_some()) {
         eprintln!(
             "fatal: '--merge', '--ours', or '--theirs' cannot be used when checking out of a tree"
         );
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if pathspec_from_file.is_some() && patch {
         eprintln!("fatal: options '--pathspec-from-file' and '--patch' cannot be used together");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     if patch {
         let context = CheckoutContext::open(cli_session)?;
@@ -2159,7 +2159,7 @@ pub(crate) fn cmd_restore(cli_session: &crate::session::CliSession, args: &[Stri
     }
     if paths.is_empty() {
         eprintln!("fatal: you must specify path(s) to restore");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     let context = CheckoutContext::open(cli_session)?;
     let cwd = &context.cwd;
@@ -2387,7 +2387,7 @@ fn prefetch_local_promisor_checkout_blobs(
     db.refresh_read_cache();
     if let Some(missing) = wants.iter().find(|oid| !db.contains(oid).unwrap_or(false)) {
         eprintln!("fatal: could not fetch {missing} from promisor remote");
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(true)
 }
@@ -2581,7 +2581,7 @@ fn checkout_merge_autostash_branch_switch(
         Some(oid) => oid,
         None => {
             eprintln!("fatal: Cannot autostash");
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
     };
     let head = resolve_revision(git_dir, format, "HEAD", context.replace_objects)?;
@@ -2649,7 +2649,7 @@ fn checkout_merge_autostash_branch_switch(
         }
     } else {
         eprintln!("error: cannot store {}", stash_oid.to_hex());
-        return Err(GitError::Exit(128));
+        return Err(crate::cli_exit(128));
     }
     Ok(())
 }

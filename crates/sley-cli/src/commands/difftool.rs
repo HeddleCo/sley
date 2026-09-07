@@ -93,10 +93,10 @@ pub(crate) fn cmd_difftool(
         }
         let status = run_difftool_command(&options, &tool, entry, &materialized)?;
         if status >= 126 {
-            return Err(GitError::Exit(128));
+            return Err(crate::cli_exit(128));
         }
         if status != 0 && tool.trust_exit_code {
-            return Err(GitError::Exit(status));
+            return Err(crate::cli_exit(status));
         }
     }
     let _ = git_dir;
@@ -117,11 +117,11 @@ fn parse_difftool_args(args: &[String]) -> Result<DifftoolOptions> {
         match arg.as_str() {
             "-h" | "--help" => {
                 println!("usage: git difftool [<options>] [<commit> [<commit>]] [--] [<path>...]");
-                return Err(GitError::Exit(129));
+                return Err(crate::cli_exit(129));
             }
             "--tool-help" => {
                 print_tool_help(ToolMode::Diff);
-                return Err(GitError::Exit(0));
+                return Err(crate::cli_exit(0));
             }
             "--" => {
                 passthrough = true;
@@ -187,7 +187,7 @@ fn resolve_difftool_tool(
     let Some(tool) = select_tool_name(config, ToolMode::Diff, options.cli_tool.as_deref(), gui)
     else {
         eprintln!("No diff tool configured");
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     };
     resolve_tool_command(config, ToolMode::Diff, &tool, options.trust_exit_code)
 }
@@ -333,7 +333,7 @@ fn order_difftool_entries(
             .iter()
             .position(|entry| String::from_utf8_lossy(&entry.path) == path)
         else {
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         };
         entries.rotate_left(pos);
     }
@@ -342,7 +342,7 @@ fn order_difftool_entries(
             .iter()
             .position(|entry| String::from_utf8_lossy(&entry.path) == path)
         else {
-            return Err(GitError::Exit(1));
+            return Err(crate::cli_exit(1));
         };
         entries = entries.into_iter().skip(pos).collect();
     }
@@ -505,7 +505,7 @@ fn run_dir_difftool(
         run_tool_shell_in_dir(&tool.command, &envs, repo.cwd())?
     };
     if status >= 126 || (status != 0 && tool.trust_exit_code) {
-        return Err(GitError::Exit(status));
+        return Err(crate::cli_exit(status));
     }
     let mut conflict = false;
     for snapshot in &snapshots {
@@ -543,7 +543,7 @@ fn run_dir_difftool(
         );
         eprintln!("warning: you may want to cleanup or recover these.");
         temp.keep();
-        return Err(GitError::Exit(1));
+        return Err(crate::cli_exit(1));
     }
     Ok(())
 }
@@ -657,7 +657,7 @@ fn run_no_index_difftool(
         .filter(|arg| arg.as_str() != "--no-index")
         .collect();
     if paths.len() < 2 {
-        return Err(GitError::Exit(129));
+        return Err(crate::cli_exit(129));
     }
     let config = load_no_index_difftool_config(cli_session)?;
     let tool = resolve_difftool_tool(&config, options, false)?;
@@ -682,9 +682,9 @@ fn run_no_index_difftool(
         &envs,
     )?;
     if status == 0 {
-        Err(GitError::Exit(1))
+        Err(crate::cli_exit(1))
     } else {
-        Err(GitError::Exit(status))
+        Err(crate::cli_exit(status))
     }
 }
 
