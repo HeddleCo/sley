@@ -16,8 +16,6 @@ use crate::log_output_encoding;
 use crate::log_reencode_message;
 use crate::resolve_revision;
 use crate::setup;
-use crate::sley_rev;
-use crate::sley_worktree;
 
 pub(crate) fn update_reset_head_ref(
     git_dir: &Path,

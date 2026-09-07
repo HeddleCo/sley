@@ -1,6 +1,5 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
-use {sley_config, sley_core, sley_worktree};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::commands::cli_options::cli_usage_error;
@@ -1674,7 +1673,7 @@ fn check_ref_format_name(name: &str, allow_onelevel: bool, refspec_pattern: bool
 }
 
 #[cfg(feature = "testkit")]
-pub(crate) fn cmd_testkit(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_testkit(original_cwd: Option<&std::path::Path>, args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("hash-object") => {
             for result in
@@ -1900,12 +1899,12 @@ pub(crate) fn cmd_testkit(args: &[String]) -> Result<()> {
             Ok(())
         }
         Some("checkout") => {
-            let result = sley_testkit::checkout_branch_parity()?;
+            let result = sley_testkit::checkout_branch_parity(original_cwd)?;
             println!("checkout {} {}", result.branch, result.head);
             Ok(())
         }
         Some("checkout-sha256") => {
-            let result = sley_testkit::checkout_branch_parity_sha256()?;
+            let result = sley_testkit::checkout_branch_parity_sha256(original_cwd)?;
             println!("checkout {} {}", result.branch, result.head);
             Ok(())
         }

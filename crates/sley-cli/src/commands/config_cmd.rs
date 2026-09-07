@@ -2,7 +2,6 @@
 #![allow(clippy::expect_used)]
 
 use crate::*;
-use {sley_config, sley_rev};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConfigAction {

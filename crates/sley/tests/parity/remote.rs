@@ -166,6 +166,7 @@ fn serve_pack(mut stream: TcpStream, body: &Mutex<Vec<u8>>) {
 
 fn fetch_options() -> FetchOptions {
     FetchOptions {
+        policy: Default::default(),
         quiet: true,
         progress: None,
         auto_follow_tags: false,

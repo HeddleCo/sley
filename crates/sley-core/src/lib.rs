@@ -6,7 +6,6 @@ use std::fmt;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::OnceLock;
 
 mod cancel;
 
@@ -33,27 +32,10 @@ pub mod paths;
 pub mod precompose;
 pub mod primitives;
 pub mod text;
-pub use precompose::{
-    activate_precompose_unicode, has_non_ascii, precompose_argv_if_needed,
-    precompose_bytes_if_needed, precompose_os_str_bytes_if_needed, precompose_path_if_needed,
-    precompose_string_if_needed, precompose_unicode_enabled, set_precompose_unicode,
-};
+pub use precompose::{PrecomposeUnicode, has_non_ascii};
 
 pub mod namespace;
-pub use namespace::{
-    clear_git_namespace_override, expand_namespace, get_git_namespace, namespace_active,
-    ref_is_hidden, set_git_namespace_override, strip_namespace, trim_hidden_ref_pattern,
-};
-
-static ORIGINAL_CWD: OnceLock<Option<PathBuf>> = OnceLock::new();
-
-pub fn set_original_cwd(path: Option<PathBuf>) {
-    let _ = ORIGINAL_CWD.set(path);
-}
-
-pub fn original_cwd() -> Option<PathBuf> {
-    ORIGINAL_CWD.get()?.clone()
-}
+pub use namespace::{Namespace, ref_is_hidden, trim_hidden_ref_pattern};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub enum DateMode {

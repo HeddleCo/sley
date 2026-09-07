@@ -6,8 +6,7 @@ use std::env;
 use sley::{ObjectId, ReferenceTarget as RefTarget, Result};
 use sley_pathspec::{PathspecAttributeCheck, PathspecAttributeState};
 
-use crate::sley_refs::FileRefStore;
-use crate::sley_worktree;
+use sley_refs::FileRefStore;
 
 /// Effective default pathspec magic, folding in the global options *and* the
 /// `GIT_*_PATHSPECS` environment variables (git reads both). Literal magic

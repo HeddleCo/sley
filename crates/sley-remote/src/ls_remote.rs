@@ -81,6 +81,7 @@ pub struct LsRemoteRecord {
 
 /// Fully resolved inputs for an advertisement listing.
 pub struct LsRemoteRequest<'a> {
+    pub policy: &'a crate::RemotePolicy,
     pub source: &'a LsRemoteSource,
     pub format: ObjectFormat,
     pub filter: &'a LsRemoteFilter,
@@ -109,6 +110,7 @@ pub struct LsRemoteOutcome {
 /// records and that format; never sorts, prints, or returns `GitError::Exit`. The
 /// caller applies `--sort`, `--symref` formatting, and the `--exit-code` mapping.
 pub fn ls_remote(
+    policy: &crate::RemotePolicy,
     source: &LsRemoteSource,
     format: ObjectFormat,
     filter: &LsRemoteFilter,
@@ -118,6 +120,7 @@ pub fn ls_remote(
 ) -> Result<(Vec<LsRemoteRecord>, ObjectFormat)> {
     let outcome = ls_remote_with(
         LsRemoteRequest {
+            policy,
             source,
             format,
             filter,
@@ -168,12 +171,18 @@ fn ls_remote_with_impl(
         format,
         filter,
         config,
+        policy,
     } = request;
-    crate::protocol::check_transport_allowed(scheme_for_ls_remote_source(source), config, None)
-        .map_err(crate::protocol::transport_policy_git_error)?;
+    crate::protocol::check_transport_allowed(
+        scheme_for_ls_remote_source(source),
+        config,
+        &policy.transport,
+    )
+    .map_err(crate::protocol::transport_policy_git_error)?;
     let (records, format) = match source {
         #[cfg(feature = "http")]
         LsRemoteSource::Http(remote) => ls_remote_http(
+            &policy.transport,
             remote,
             format,
             filter,
@@ -195,7 +204,7 @@ fn ls_remote_with_impl(
             config,
         ),
         LsRemoteSource::Local { git_dir } => {
-            ls_remote_local(git_dir, format, filter, matches, config)
+            ls_remote_local(policy, git_dir, format, filter, matches, config)
         }
     }?;
     Ok(LsRemoteOutcome { records, format })
@@ -214,7 +223,9 @@ fn scheme_for_ls_remote_source(source: &LsRemoteSource) -> &'static str {
 /// then apply the class filters and `matches` predicate, attaching the advertised
 /// `HEAD` symref where present.
 #[cfg(feature = "http")]
+#[allow(clippy::too_many_arguments)] // Policy is explicit alongside the existing operation inputs.
 fn ls_remote_http(
+    policy: &crate::TransportPolicy,
     remote: &RemoteUrl,
     format: ObjectFormat,
     filter: &LsRemoteFilter,
@@ -227,7 +238,7 @@ fn ls_remote_http(
     let client = match http_client {
         Some(client) => client,
         None => {
-            default_client = crate::http::HttpOperationBatch::new();
+            default_client = crate::http::HttpOperationBatch::with_config(policy, config);
             default_client.client()
         }
     };
@@ -274,6 +285,7 @@ fn ls_remote_http(
 /// class filter is active), then every ref resolved to its object id, plus a
 /// peeled `^{}` record for each annotated tag (unless `refs_only`).
 fn ls_remote_local(
+    policy: &crate::RemotePolicy,
     git_dir: &Path,
     format: ObjectFormat,
     filter: &LsRemoteFilter,
@@ -288,11 +300,11 @@ fn ls_remote_local(
         !matches!(config.get("protocol", None, "version"), Some("0" | "1"));
     let mut records = Vec::new();
 
-    let namespace = sley_core::get_git_namespace();
-    let head_physical = if namespace.is_empty() {
+    let namespace_prefix = policy.namespace.prefix().to_owned();
+    let head_physical = if namespace_prefix.is_empty() {
         "HEAD".to_string()
     } else {
-        format!("{namespace}HEAD")
+        format!("{namespace_prefix}HEAD")
     };
     if !filter.refs_only
         && !filter.heads
@@ -306,11 +318,8 @@ fn ls_remote_local(
         if matches("HEAD")
             && let Some((oid, symref)) = resolve_for_each_ref_target(&store, &reference)?
         {
-            let logical_symref = symref.map(|s| {
-                sley_core::strip_namespace(&s)
-                    .unwrap_or(s.as_str())
-                    .to_string()
-            });
+            let logical_symref =
+                symref.map(|s| policy.namespace.strip(&s).unwrap_or(s.as_str()).to_string());
             records.push(LsRemoteRecord {
                 oid,
                 name: "HEAD".to_string(),
@@ -321,10 +330,10 @@ fn ls_remote_local(
 
     for reference in store.list_refs()? {
         let physical = reference.name.clone();
-        let logical = if namespace.is_empty() {
+        let logical = if namespace_prefix.is_empty() {
             Some(physical.as_str())
         } else {
-            physical.strip_prefix(namespace.as_str())
+            physical.strip_prefix(namespace_prefix.as_str())
         };
         let Some(logical) = logical else {
             continue;
@@ -342,11 +351,7 @@ fn ls_remote_local(
             continue;
         };
         let logical_symref = if include_non_head_symrefs {
-            symref.map(|s| {
-                sley_core::strip_namespace(&s)
-                    .unwrap_or(s.as_str())
-                    .to_string()
-            })
+            symref.map(|s| policy.namespace.strip(&s).unwrap_or(s.as_str()).to_string())
         } else {
             None
         };

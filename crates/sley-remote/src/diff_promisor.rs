@@ -38,6 +38,7 @@ pub fn promisor_remote_names(config: &GitConfig) -> Vec<String> {
 /// Propagates read/fetch errors; a missing object that no promisor supplied
 /// surfaces the original `NotFound`.
 pub fn read_object_maybe_prefetch_promisor(
+    policy: &crate::RemotePolicy,
     db: &FileObjectDatabase,
     oid: &ObjectId,
     load_repo_config: LoadRepoConfig<'_>,
@@ -45,7 +46,7 @@ pub fn read_object_maybe_prefetch_promisor(
     let object = match db.read_object(oid) {
         Ok(object) => object,
         Err(err @ GitError::NotFound(_)) => {
-            if !prefetch_local_promisor_object(db, oid, load_repo_config)? {
+            if !prefetch_local_promisor_object(policy, db, oid, load_repo_config)? {
                 return Err(err);
             }
             db.read_object(oid)?
@@ -58,6 +59,7 @@ pub fn read_object_maybe_prefetch_promisor(
 /// Batch-prefetch every missing blob referenced by the queued diff entries.
 /// Mirrors git's `diff_queued_diff_prefetch` + `promisor_remote_get_direct`.
 pub fn prefetch_diff_entry_blobs(
+    policy: &crate::RemotePolicy,
     db: &FileObjectDatabase,
     entries: &[NameStatusEntry],
     new_side_is_worktree: bool,
@@ -74,7 +76,7 @@ pub fn prefetch_diff_entry_blobs(
     } else {
         sley_diff_merge::porcelain::collect_diff_entry_blob_oids(entries)
     };
-    prefetch_promisor_objects(db, &oids, load_repo_config)
+    prefetch_promisor_objects(policy, db, &oids, load_repo_config)
 }
 
 /// Materialize the missing subset of `oids` in one request per configured
@@ -82,6 +84,7 @@ pub fn prefetch_diff_entry_blobs(
 /// each negotiation so `GIT_TRACE_PACKET` matches git's child-fetch process
 /// (t4067, t1022).
 pub fn prefetch_promisor_objects(
+    policy: &crate::RemotePolicy,
     db: &FileObjectDatabase,
     oids: &[ObjectId],
     load_repo_config: LoadRepoConfig<'_>,
@@ -143,6 +146,7 @@ pub fn prefetch_promisor_objects(
         let hydrated_ok =
             if let Ok(remote_git_dir) = crate::resolve_local_remote_git_dir(resolution, url) {
                 crate::install_fetch_pack_via_local_upload_pack(
+                    policy,
                     &git_dir,
                     &remote_git_dir,
                     db.object_format(),
@@ -157,8 +161,16 @@ pub fn prefetch_promisor_objects(
                 )
                 .is_ok()
             } else {
-                maybe_hydrate_promisor_via_http(&git_dir, db, url, &missing, filter.clone())
-                    .unwrap_or_default()
+                maybe_hydrate_promisor_via_http(
+                    policy,
+                    &config,
+                    &git_dir,
+                    db,
+                    url,
+                    &missing,
+                    filter.clone(),
+                )
+                .unwrap_or_default()
             };
         if !hydrated_ok {
             continue;
@@ -183,6 +195,7 @@ pub fn prefetch_promisor_objects(
 }
 
 fn prefetch_local_promisor_object(
+    policy: &crate::RemotePolicy,
     db: &FileObjectDatabase,
     oid: &ObjectId,
     load_repo_config: LoadRepoConfig<'_>,
@@ -193,7 +206,7 @@ fn prefetch_local_promisor_object(
     if before {
         return Ok(false);
     }
-    prefetch_promisor_objects(db, &[*oid], load_repo_config)?;
+    prefetch_promisor_objects(policy, db, &[*oid], load_repo_config)?;
     if db.contains(oid).unwrap_or(false) {
         return Ok(true);
     }
@@ -229,6 +242,8 @@ fn prefetch_local_promisor_object(
 /// falls through here.
 #[cfg(feature = "http")]
 fn maybe_hydrate_promisor_via_http(
+    policy: &crate::RemotePolicy,
+    config: &GitConfig,
     git_dir: &Path,
     db: &FileObjectDatabase,
     url: &str,
@@ -240,8 +255,16 @@ fn maybe_hydrate_promisor_via_http(
     }
     let mut any = false;
     for oid in missing {
-        if hydrate_promisor_oid_via_http(git_dir, db.object_format(), url, *oid, filter.clone())
-            .is_ok()
+        if hydrate_promisor_oid_via_http(
+            policy,
+            config,
+            git_dir,
+            db.object_format(),
+            url,
+            *oid,
+            filter.clone(),
+        )
+        .is_ok()
         {
             any = true;
         }
@@ -253,6 +276,8 @@ fn maybe_hydrate_promisor_via_http(
 /// be hydrated over HTTP; always fall through to the caller's next path.
 #[cfg(not(feature = "http"))]
 fn maybe_hydrate_promisor_via_http(
+    _policy: &crate::RemotePolicy,
+    _config: &GitConfig,
     _git_dir: &Path,
     _db: &FileObjectDatabase,
     _url: &str,
@@ -270,6 +295,8 @@ fn maybe_hydrate_promisor_via_http(
 #[cfg(feature = "http")]
 #[allow(clippy::too_many_arguments)]
 fn hydrate_promisor_oid_via_http(
+    policy: &crate::RemotePolicy,
+    config: &GitConfig,
     git_dir: &Path,
     format: sley_core::ObjectFormat,
     url: &str,
@@ -285,7 +312,7 @@ fn hydrate_promisor_oid_via_http(
             "promisor HTTP hydrate requires HTTP(S)".into(),
         ));
     }
-    let client = crate::new_http_client();
+    let client = crate::new_http_client_with_config(&policy.transport, Some(config));
     let mut credentials = crate::CredentialHelperProvider::new(None);
     let discovered = crate::http_service_advertisements(
         &client,
@@ -322,6 +349,7 @@ fn hydrate_promisor_oid_via_http(
     let mut progress = crate::SilentProgress;
     if let Some(handshake) = discovered.handshake.as_ref() {
         crate::install_fetch_pack_via_http_protocol_v2_fetch(
+            policy,
             pack_request,
             handshake,
             &mut credentials,
@@ -330,6 +358,7 @@ fn hydrate_promisor_oid_via_http(
         )?;
     } else {
         crate::install_fetch_pack_via_http_upload_pack(
+            policy,
             pack_request,
             &mut credentials,
             &mut progress,

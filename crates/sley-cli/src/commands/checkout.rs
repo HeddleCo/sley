@@ -1,6 +1,5 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
-use {sley_refs, sley_remote, sley_rev, sley_worktree};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use super::status::{StatusLineSink, status_long_tracking_lines};
@@ -496,6 +495,7 @@ pub(crate) fn cmd_checkout(
                     // `checkout HEAD~1 bar` does one negotiation (t4067 #6).
                     if cli_session.lazy_fetch() {
                         prefetch_pathspec_tree_blobs(
+                            &cli_session.remote_policy,
                             cwd,
                             git_dir,
                             format,
@@ -506,6 +506,7 @@ pub(crate) fn cmd_checkout(
                         )?;
                     }
                     sley_worktree::restore_index_and_worktree_paths_from_tree(
+                        cli_session.original_cwd.as_deref(),
                         worktree_root,
                         git_dir,
                         format,
@@ -532,6 +533,7 @@ pub(crate) fn cmd_checkout(
                         sley_worktree::CheckoutIndexSparsePolicy::Honor
                     };
                     let outcome = sley_worktree::checkout_index_paths_with_database_outcome_sparse(
+                        cli_session.original_cwd.as_deref(),
                         worktree_root,
                         git_dir,
                         format,
@@ -553,6 +555,7 @@ pub(crate) fn cmd_checkout(
                     }
                     if recurse_submodules {
                         commands::read_tree::checkout_submodules_for_paths(
+                            cli_session.original_cwd.as_deref(),
                             worktree_root,
                             git_dir,
                             format,
@@ -599,6 +602,7 @@ pub(crate) fn cmd_checkout(
             if !switches_to_other_branch {
                 if recurse_submodules {
                     commands::read_tree::reset_index_and_worktree_to_commit(
+                        cli_session.original_cwd.as_deref(),
                         worktree_root,
                         git_dir,
                         format,
@@ -607,6 +611,7 @@ pub(crate) fn cmd_checkout(
                     )?;
                 } else {
                     sley_worktree::reset_index_and_worktree_to_commit(
+                        cli_session.original_cwd.as_deref(),
                         worktree_root,
                         git_dir,
                         format,
@@ -632,6 +637,7 @@ pub(crate) fn cmd_checkout(
     if force {
         if let Ok(Some(head_oid)) = resolve_ref_peeled(store, "HEAD") {
             sley_worktree::reset_index_and_worktree_to_commit(
+                cli_session.original_cwd.as_deref(),
                 worktree_root,
                 git_dir,
                 format,
@@ -676,15 +682,30 @@ pub(crate) fn cmd_checkout(
             let target_oid = sley_rev::peel_to_commit(db, format, &target_oid)?;
             let from = checkout_reflog_from_name(store);
             let config = checkout_config;
-            prefetch_local_promisor_checkout_blobs(cwd, git_dir, format, db, config, &target_oid)?;
+            prefetch_local_promisor_checkout_blobs(
+                &cli_session.remote_policy,
+                cwd,
+                git_dir,
+                format,
+                db,
+                config,
+                &target_oid,
+            )?;
             let old_head_direct = checkout_direct_head(store)?;
             let subject = detached_checkout_subject(git_dir, format, &target_oid);
             let message = format!("checkout: moving from {from} to {target}").into_bytes();
             if recurse_submodules {
-                checkout_twoway_dirty(&context, Some(&target_oid), recurse_submodules, force)?;
+                checkout_twoway_dirty(
+                    cli_session.original_cwd.as_deref(),
+                    &context,
+                    Some(&target_oid),
+                    recurse_submodules,
+                    force,
+                )?;
                 detach_head_with_reflog(git_dir, format, &target_oid, message, checkout_config)?;
             } else {
                 match sley_worktree::checkout_detached_filtered(
+                    cli_session.original_cwd.as_deref(),
                     worktree_root,
                     git_dir,
                     format,
@@ -696,6 +717,7 @@ pub(crate) fn cmd_checkout(
                     Ok(_) => {}
                     Err(err) if checkout_is_dirty_tree_error(&err) => {
                         checkout_twoway_dirty(
+                            cli_session.original_cwd.as_deref(),
                             &context,
                             Some(&target_oid),
                             recurse_submodules,
@@ -752,7 +774,12 @@ pub(crate) fn cmd_checkout(
                         eprintln!("fatal: You are on a branch yet to be born");
                         return Err(GitError::Exit(128));
                     };
-                    sley_worktree::reapply_active_sparse_checkout(worktree_root, git_dir, format)?;
+                    sley_worktree::reapply_active_sparse_checkout(
+                        cli_session.original_cwd.as_deref(),
+                        worktree_root,
+                        git_dir,
+                        format,
+                    )?;
                     let _ = checkout_show_local_changes(cli_session, git_dir, &head, quiet, force);
                     return Ok(());
                 }
@@ -803,6 +830,7 @@ pub(crate) fn cmd_checkout(
                 let target_oid = sley_rev::peel_to_commit(db, format, &target_oid)?;
                 let config = checkout_config;
                 prefetch_local_promisor_checkout_blobs(
+                    &cli_session.remote_policy,
                     cwd,
                     git_dir,
                     format,
@@ -815,7 +843,13 @@ pub(crate) fn cmd_checkout(
                 let from = checkout_reflog_from_name(store);
                 let message = format!("checkout: moving from {from} to {branch}").into_bytes();
                 if recurse_submodules {
-                    checkout_twoway_dirty(&context, Some(&target_oid), recurse_submodules, force)?;
+                    checkout_twoway_dirty(
+                        cli_session.original_cwd.as_deref(),
+                        &context,
+                        Some(&target_oid),
+                        recurse_submodules,
+                        force,
+                    )?;
                     detach_head_with_reflog(
                         git_dir,
                         format,
@@ -825,6 +859,7 @@ pub(crate) fn cmd_checkout(
                     )?;
                 } else {
                     match sley_worktree::checkout_detached_filtered(
+                        cli_session.original_cwd.as_deref(),
                         worktree_root,
                         git_dir,
                         format,
@@ -836,6 +871,7 @@ pub(crate) fn cmd_checkout(
                         Ok(_) => {}
                         Err(err) if checkout_is_dirty_tree_error(&err) => {
                             checkout_twoway_dirty(
+                                cli_session.original_cwd.as_deref(),
                                 &context,
                                 Some(&target_oid),
                                 recurse_submodules,
@@ -973,7 +1009,13 @@ pub(crate) fn cmd_checkout(
                     // shared two-way engine (git's merge_working_tree), so local
                     // modifications that would be overwritten abort the switch
                     // and leave HEAD on the current branch.
-                    checkout_twoway_dirty(&context, Some(&start_oid), recurse_submodules, force)?;
+                    checkout_twoway_dirty(
+                        cli_session.original_cwd.as_deref(),
+                        &context,
+                        Some(&start_oid),
+                        recurse_submodules,
+                        force,
+                    )?;
                 }
                 checkout_switch_to_unborn_branch(git_dir, &branch)?;
                 if create_reflog {
@@ -1080,10 +1122,19 @@ pub(crate) fn cmd_checkout(
         None
     };
     if let Some(target) = branch_target {
-        prefetch_local_promisor_checkout_blobs(cwd, git_dir, format, db, &config, &target)?;
+        prefetch_local_promisor_checkout_blobs(
+            &cli_session.remote_policy,
+            cwd,
+            git_dir,
+            format,
+            db,
+            &config,
+            &target,
+        )?;
         let head_at_target = resolve_ref_peeled(store, "HEAD")? == Some(target);
         if head_at_target && checkout_index_empty(git_dir, format)? {
             sley_worktree::reset_index_and_worktree_to_commit(
+                cli_session.original_cwd.as_deref(),
                 worktree_root,
                 git_dir,
                 format,
@@ -1100,6 +1151,7 @@ pub(crate) fn cmd_checkout(
             let old_tree = commands::merge_rebase::commit_tree_oid(db, format, &checkout_old_head)?;
             let target_tree = commands::merge_rebase::commit_tree_oid(db, format, &target)?;
             if let Err(err) = commands::read_tree::checkout_two_way_engine(
+                cli_session.original_cwd.as_deref(),
                 git_dir,
                 worktree_root,
                 format,
@@ -1172,9 +1224,13 @@ pub(crate) fn cmd_checkout(
             ]));
             let _process_filter_cwd =
                 sley_worktree::set_process_filter_cwd(Some(worktree_root.clone()));
-            if let Err(err) =
-                checkout_twoway_dirty(&context, Some(&target), recurse_submodules, force)
-            {
+            if let Err(err) = checkout_twoway_dirty(
+                cli_session.original_cwd.as_deref(),
+                &context,
+                Some(&target),
+                recurse_submodules,
+                force,
+            ) {
                 checkout_rollback_branch_update(git_dir, format, &branch_update_rollback);
                 return Err(err);
             }
@@ -1189,6 +1245,7 @@ pub(crate) fn cmd_checkout(
         // Same-HEAD, no force, no recurse: preserve index extensions (UNTR) via
         // the lightweight path — `checkout -b new` at the current tip.
         match sley_worktree::checkout_branch_filtered(
+            cli_session.original_cwd.as_deref(),
             worktree_root,
             git_dir.clone(),
             format,
@@ -1201,9 +1258,13 @@ pub(crate) fn cmd_checkout(
                 let from = checkout_reflog_from.clone();
                 let target = sley_refs::resolve_ref_peeled(store, &branch_ref_name(branch)?)?
                     .ok_or_else(|| GitError::reference_not_found("branch"))?;
-                if let Err(err) =
-                    checkout_twoway_dirty(&context, Some(&target), recurse_submodules, force)
-                {
+                if let Err(err) = checkout_twoway_dirty(
+                    cli_session.original_cwd.as_deref(),
+                    &context,
+                    Some(&target),
+                    recurse_submodules,
+                    force,
+                ) {
                     checkout_rollback_branch_update(git_dir, format, &branch_update_rollback);
                     return Err(err);
                 }
@@ -1786,7 +1847,13 @@ pub(crate) fn cmd_switch(cli_session: &crate::session::CliSession, args: &[Strin
             ));
         };
         let context = CheckoutContext::open(cli_session)?;
-        checkout_twoway_dirty(&context, None, false, false)?;
+        checkout_twoway_dirty(
+            cli_session.original_cwd.as_deref(),
+            &context,
+            None,
+            false,
+            false,
+        )?;
         checkout_switch_to_unborn_branch(&context.git_dir, branch)?;
         sley_sequencer::replay::remove_branch_state(&context.git_dir);
         if !args.iter().any(|arg| arg == "-q" || arg == "--quiet") {
@@ -2121,6 +2188,7 @@ pub(crate) fn cmd_restore(cli_session: &crate::session::CliSession, args: &[Stri
         // removed from the index and working tree.
         if let Some(tree_oid) = source_tree.as_ref() {
             sley_worktree::restore_index_and_worktree_paths_from_tree(
+                cli_session.original_cwd.as_deref(),
                 worktree_root,
                 git_dir,
                 format,
@@ -2130,6 +2198,7 @@ pub(crate) fn cmd_restore(cli_session: &crate::session::CliSession, args: &[Stri
             )?;
         } else {
             sley_worktree::restore_index_and_worktree_paths_from_head(
+                cli_session.original_cwd.as_deref(),
                 worktree_root,
                 git_dir,
                 format,
@@ -2156,6 +2225,7 @@ pub(crate) fn cmd_restore(cli_session: &crate::session::CliSession, args: &[Stri
         }
     } else if let Some(tree_oid) = source_tree.as_ref() {
         sley_worktree::restore_worktree_paths_from_tree(
+            cli_session.original_cwd.as_deref(),
             worktree_root,
             git_dir,
             format,
@@ -2170,6 +2240,7 @@ pub(crate) fn cmd_restore(cli_session: &crate::session::CliSession, args: &[Stri
                 _ => sley_worktree::CheckoutConflictStyle::Merge,
             });
         sley_worktree::checkout_index_paths(
+            cli_session.original_cwd.as_deref(),
             worktree_root,
             git_dir,
             format,
@@ -2255,6 +2326,7 @@ fn write_checkout_change_summary(
 }
 
 fn prefetch_local_promisor_checkout_blobs(
+    policy: &sley_remote::RemotePolicy,
     cwd: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -2295,6 +2367,7 @@ fn prefetch_local_promisor_checkout_blobs(
             continue;
         };
         let _ = sley_remote::install_fetch_pack_via_local_upload_pack(
+            policy,
             git_dir,
             &remote_git_dir,
             format,
@@ -2387,6 +2460,7 @@ fn collect_missing_tree_blob_wants(
 /// Prefetch missing non-gitlink blobs under `paths` from `tree_oid` in one
 /// promisor batch (pathspec checkout in a partial clone).
 fn prefetch_pathspec_tree_blobs(
+    policy: &sley_remote::RemotePolicy,
     cwd: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -2426,7 +2500,7 @@ fn prefetch_pathspec_tree_blobs(
     if wants.is_empty() {
         return Ok(());
     }
-    crate::prefetch_promisor_objects(db, &wants, true)
+    crate::prefetch_promisor_objects(policy, db, &wants, true)
 }
 
 fn checkout_index_empty(git_dir: &Path, format: ObjectFormat) -> Result<bool> {
@@ -2486,11 +2560,24 @@ fn checkout_merge_autostash_branch_switch(
     let git_dir = &context.git_dir;
     let worktree_root = &context.worktree_root;
     let format = context.format;
-    if checkout_twoway_dirty(context, Some(target), recurse_submodules, false).is_ok() {
+    if checkout_twoway_dirty(
+        cli_session.original_cwd.as_deref(),
+        context,
+        Some(target),
+        recurse_submodules,
+        false,
+    )
+    .is_ok()
+    {
         return Ok(());
     }
 
-    let stash_oid = match commands::stash::create_stash_for_autostash_at(git_dir, worktree_root)? {
+    let stash_oid = match commands::stash::create_stash_for_autostash_at(
+        cli_session.original_cwd.as_deref(),
+        cli_session.precompose_unicode(),
+        git_dir,
+        worktree_root,
+    )? {
         Some(oid) => oid,
         None => {
             eprintln!("fatal: Cannot autostash");
@@ -2500,6 +2587,7 @@ fn checkout_merge_autostash_branch_switch(
     let head = resolve_revision(git_dir, format, "HEAD", context.replace_objects)?;
     if recurse_submodules {
         commands::read_tree::reset_index_and_worktree_to_commit(
+            cli_session.original_cwd.as_deref(),
             worktree_root,
             git_dir,
             format,
@@ -2507,7 +2595,13 @@ fn checkout_merge_autostash_branch_switch(
             true,
         )?;
     } else {
-        sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &head)?;
+        sley_worktree::reset_index_and_worktree_to_commit(
+            cli_session.original_cwd.as_deref(),
+            worktree_root,
+            git_dir,
+            format,
+            &head,
+        )?;
     }
     // Retry the switch WITHOUT clobbering untracked files. The autostash above
     // only removed *tracked* local modifications; if the switch still fails now,
@@ -2515,8 +2609,16 @@ fn checkout_merge_autostash_branch_switch(
     // `checkout -m` fails atomically rather than nuking it (t2500 "checkout -m
     // does not nuke untracked file"). Restore the stashed changes to the worktree
     // and propagate the error, leaving HEAD and the untracked file untouched.
-    if let Err(err) = checkout_twoway_dirty(context, Some(target), recurse_submodules, false) {
+    if let Err(err) = checkout_twoway_dirty(
+        cli_session.original_cwd.as_deref(),
+        context,
+        Some(target),
+        recurse_submodules,
+        false,
+    ) {
         let _ = commands::stash::apply_stash_commit_quietly_at(
+            cli_session.original_cwd.as_deref(),
+            &cli_session.remote_policy,
             git_dir,
             worktree_root,
             &stash_oid,
@@ -2525,6 +2627,8 @@ fn checkout_merge_autostash_branch_switch(
         return Err(err);
     }
     let applied = commands::stash::apply_stash_commit_quietly_at(
+        cli_session.original_cwd.as_deref(),
+        &cli_session.remote_policy,
         git_dir,
         worktree_root,
         &stash_oid,
@@ -2559,6 +2663,7 @@ fn checkout_print_autostash_conflict_advice() {
 }
 
 fn checkout_twoway_dirty(
+    original_cwd: Option<&std::path::Path>,
     context: &CheckoutContext,
     target: Option<&ObjectId>,
     recurse_submodules: bool,
@@ -2591,6 +2696,7 @@ fn checkout_twoway_dirty(
     };
 
     commands::read_tree::checkout_two_way_engine(
+        original_cwd,
         git_dir,
         worktree_root,
         format,

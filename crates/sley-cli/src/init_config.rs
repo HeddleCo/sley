@@ -4,7 +4,6 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 use sley::{GitConfig, GitError, Result};
-use sley_config;
 
 use crate::commands::remote::write_repo_config;
 use crate::global_options::{

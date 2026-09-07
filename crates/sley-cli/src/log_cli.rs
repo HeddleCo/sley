@@ -4,8 +4,7 @@ use crate::commands;
 use crate::{
     CompiledLogFormat, GitConfig, GitError, LogFormatContext, ObjectFormat, ObjectId, ReflogEntry,
     Result, StashFormatContext, emit_compiled_log_format, emit_compiled_stash_format,
-    has_unescaped_trailing_dollar, log_reencode_message, sley_core, sley_diff_merge, sley_pretty,
-    sley_rev,
+    has_unescaped_trailing_dollar, log_reencode_message,
 };
 use sley::ReferenceTarget as RefTarget;
 use sley_core::DateMode;

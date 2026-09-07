@@ -197,12 +197,15 @@ pub fn untracked_paths_with_options(
     format: ObjectFormat,
     options: UntrackedPathOptions,
 ) -> Result<Vec<Vec<u8>>> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let (index, stat_cache, _) = read_index_entries_with_stat_cache(git_dir, format, &db)?;
     let all_index_paths = read_all_index_paths(git_dir, format)?;
     let ignores = IgnoreMatcher::from_sources(
+        precompose,
         worktree_root,
         options.exclude_standard,
         &options.exclude_patterns,
@@ -210,6 +213,7 @@ pub fn untracked_paths_with_options(
     )?;
     if options.ignored_only {
         return ignored_untracked_paths(
+            precompose,
             worktree_root,
             git_dir,
             &index,
@@ -220,6 +224,7 @@ pub fn untracked_paths_with_options(
     if options.directory {
         let mut paths = BTreeSet::new();
         collect_untracked_directory_paths(
+            precompose,
             worktree_root,
             git_dir,
             worktree_root,
@@ -251,6 +256,8 @@ pub fn killed_paths(
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
 ) -> Result<Vec<Vec<u8>>> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
@@ -277,6 +284,7 @@ pub fn killed_paths(
     }
     let mut paths = BTreeSet::new();
     collect_killed_paths(
+        precompose,
         git_dir,
         worktree_root,
         &[],
@@ -288,6 +296,7 @@ pub fn killed_paths(
 }
 
 fn collect_killed_paths(
+    precompose: sley_core::PrecomposeUnicode,
     git_dir: &Path,
     dir: &Path,
     dir_git_path: &[u8],
@@ -305,17 +314,25 @@ fn collect_killed_paths(
         if is_dot_git_entry(&path) || is_same_path(&path, git_dir) {
             continue;
         }
-        let git_path = git_path_append_component(dir_git_path, &entry.file_name());
+        let git_path = git_path_append_component(precompose, dir_git_path, &entry.file_name());
         let file_type = entry.file_type()?;
         if let Some(mode) = exact.get(&git_path) {
             if file_type.is_dir() && !sley_index::is_gitlink(*mode) && *mode != SPARSE_DIR_MODE {
-                collect_killed_leaves(git_dir, &path, &git_path, paths)?;
+                collect_killed_leaves(precompose, git_dir, &path, &git_path, paths)?;
             }
             continue;
         }
         if directories.contains(&git_path) {
             if file_type.is_dir() {
-                collect_killed_paths(git_dir, &path, &git_path, exact, directories, paths)?;
+                collect_killed_paths(
+                    precompose,
+                    git_dir,
+                    &path,
+                    &git_path,
+                    exact,
+                    directories,
+                    paths,
+                )?;
             } else if file_type.is_file() || file_type.is_symlink() {
                 paths.insert(git_path);
             }
@@ -325,6 +342,7 @@ fn collect_killed_paths(
 }
 
 fn collect_killed_leaves(
+    precompose: sley_core::PrecomposeUnicode,
     git_dir: &Path,
     dir: &Path,
     dir_git_path: &[u8],
@@ -340,10 +358,10 @@ fn collect_killed_leaves(
         if is_dot_git_entry(&path) || is_same_path(&path, git_dir) {
             continue;
         }
-        let git_path = git_path_append_component(dir_git_path, &entry.file_name());
+        let git_path = git_path_append_component(precompose, dir_git_path, &entry.file_name());
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            collect_killed_leaves(git_dir, &path, &git_path, paths)?;
+            collect_killed_leaves(precompose, git_dir, &path, &git_path, paths)?;
         } else if file_type.is_file() || file_type.is_symlink() {
             paths.insert(git_path);
         }
@@ -378,29 +396,32 @@ pub(crate) fn ls_files_untracked_paths_from_worktree(
 }
 
 pub fn path_matches_standard_ignore(
+    precompose: sley_core::PrecomposeUnicode,
     worktree_root: impl AsRef<Path>,
     path: &[u8],
     is_dir: bool,
 ) -> Result<bool> {
-    path_matches_ignore(worktree_root, path, is_dir, true, &[])
+    path_matches_ignore(precompose, worktree_root, path, is_dir, true, &[])
 }
 
 pub fn standard_ignore_match(
+    precompose: sley_core::PrecomposeUnicode,
     worktree_root: impl AsRef<Path>,
     path: &[u8],
     is_dir: bool,
 ) -> Result<Option<IgnoreMatch>> {
-    let ignores = IgnoreMatcher::from_worktree_root(worktree_root.as_ref())?;
+    let ignores = IgnoreMatcher::from_worktree_root(precompose, worktree_root.as_ref())?;
     Ok(ignores.match_for(path, is_dir).map(IgnorePattern::to_match))
 }
 
 pub fn standard_attributes_for_path(
+    precompose: sley_core::PrecomposeUnicode,
     worktree_root: impl AsRef<Path>,
     path: &[u8],
     requested: &[Vec<u8>],
     all: bool,
 ) -> Result<Vec<AttributeCheck>> {
-    let matcher = AttributeMatcher::from_worktree_root(worktree_root.as_ref())?;
+    let matcher = AttributeMatcher::from_worktree_root(precompose, worktree_root.as_ref())?;
     Ok(matcher.attributes_for_path(path, requested, all))
 }
 
@@ -415,9 +436,12 @@ pub struct StandardAttributeMatcher {
 }
 
 impl StandardAttributeMatcher {
-    pub fn from_worktree_root(worktree_root: impl AsRef<Path>) -> Result<Self> {
+    pub fn from_worktree_root(
+        precompose: sley_core::PrecomposeUnicode,
+        worktree_root: impl AsRef<Path>,
+    ) -> Result<Self> {
         Ok(Self {
-            matcher: AttributeMatcher::from_worktree_root(worktree_root.as_ref())?,
+            matcher: AttributeMatcher::from_worktree_root(precompose, worktree_root.as_ref())?,
         })
     }
 
@@ -440,6 +464,8 @@ pub fn standard_attributes_for_path_in_repo(
     include_worktree_attributes: bool,
     ignore_case: bool,
 ) -> Result<Vec<AttributeCheck>> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let attr_root = attr_root.as_ref();
     let git_dir = git_dir.as_ref();
     let mut matcher = AttributeMatcher::default();
@@ -449,7 +475,7 @@ pub fn standard_attributes_for_path_in_repo(
         matcher.read_default_global_attributes();
     }
     if include_worktree_attributes {
-        collect_attribute_patterns(attr_root, attr_root, &mut matcher)?;
+        collect_attribute_patterns(precompose, attr_root, attr_root, &mut matcher)?;
     }
     read_attribute_patterns(
         git_dir.join("info").join("attributes"),
@@ -517,6 +543,7 @@ pub fn standard_attributes_for_path_from_index(
 }
 
 pub fn path_matches_ignore(
+    precompose: sley_core::PrecomposeUnicode,
     worktree_root: impl AsRef<Path>,
     path: &[u8],
     is_dir: bool,
@@ -524,6 +551,7 @@ pub fn path_matches_ignore(
     exclude_patterns: &[Vec<u8>],
 ) -> Result<bool> {
     path_matches_ignore_with_per_directory(
+        precompose,
         worktree_root,
         path,
         is_dir,
@@ -534,6 +562,7 @@ pub fn path_matches_ignore(
 }
 
 pub fn path_matches_ignore_with_per_directory(
+    precompose: sley_core::PrecomposeUnicode,
     worktree_root: impl AsRef<Path>,
     path: &[u8],
     is_dir: bool,
@@ -542,6 +571,7 @@ pub fn path_matches_ignore_with_per_directory(
     exclude_per_directory: &[String],
 ) -> Result<bool> {
     let ignores = IgnoreMatcher::from_sources(
+        precompose,
         worktree_root.as_ref(),
         exclude_standard,
         exclude_patterns,
@@ -551,6 +581,7 @@ pub fn path_matches_ignore_with_per_directory(
 }
 
 pub fn ignored_index_entries<'a>(
+    precompose: sley_core::PrecomposeUnicode,
     worktree_root: impl AsRef<Path>,
     entries: &'a [IndexEntry],
     exclude_standard: bool,
@@ -558,6 +589,7 @@ pub fn ignored_index_entries<'a>(
     exclude_per_directory: &[String],
 ) -> Result<Vec<&'a IndexEntry>> {
     let ignores = IgnoreMatcher::from_sources(
+        precompose,
         worktree_root.as_ref(),
         exclude_standard,
         exclude_patterns,
@@ -570,6 +602,7 @@ pub fn ignored_index_entries<'a>(
 }
 
 pub(crate) fn collect_untracked_directory_paths(
+    precompose: sley_core::PrecomposeUnicode,
     root: &Path,
     git_dir: &Path,
     dir: &Path,
@@ -598,7 +631,7 @@ pub(crate) fn collect_untracked_directory_paths(
         let relative = path.strip_prefix(root).map_err(|_| {
             GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
         })?;
-        let git_path = git_path_bytes(relative)?;
+        let git_path = git_path_bytes(precompose, relative)?;
         if index
             .get(&git_path)
             .is_some_and(|entry| sley_index::is_gitlink(entry.mode))
@@ -617,7 +650,7 @@ pub(crate) fn collect_untracked_directory_paths(
             let needs_descent = untracked_pathspec_needs_descent(&git_path, &options.pathspecs);
             if has_tracked_below {
                 collect_untracked_directory_paths(
-                    root, git_dir, &path, index, ignores, options, paths,
+                    precompose, root, git_dir, &path, index, ignores, options, paths,
                 )?;
             } else if active_repository_worktree_dir(&path, git_dir) {
                 insert_untracked_directory(paths, &git_path);
@@ -634,16 +667,16 @@ pub(crate) fn collect_untracked_directory_paths(
                     continue;
                 }
                 collect_untracked_directory_paths(
-                    root, git_dir, &path, index, ignores, options, paths,
+                    precompose, root, git_dir, &path, index, ignores, options, paths,
                 )?;
             } else if options.preserve_ignored_directories
-                && directory_has_ignored(&path, root, git_dir, ignores)?
+                && directory_has_ignored(precompose, &path, root, git_dir, ignores)?
             {
                 collect_untracked_directory_paths(
-                    root, git_dir, &path, index, ignores, options, paths,
+                    precompose, root, git_dir, &path, index, ignores, options, paths,
                 )?;
             } else if !options.no_empty_directory
-                || directory_has_file(&path, root, git_dir, ignores)?
+                || directory_has_file(precompose, &path, root, git_dir, ignores)?
             {
                 insert_untracked_directory(paths, &git_path);
             }
@@ -724,6 +757,7 @@ pub(crate) fn path_or_parent_is_ignored(
 }
 
 pub(crate) fn status_untracked_paths_from_index(
+    precompose: sley_core::PrecomposeUnicode,
     root: &Path,
     git_dir: &Path,
     index: &Index,
@@ -748,13 +782,14 @@ pub(crate) fn status_untracked_paths_from_index(
         untracked_mode,
         profile,
     };
-    collect_status_untracked_paths(&mut context, root, &[], &mut paths)?;
+    collect_status_untracked_paths(precompose, &mut context, root, &[], &mut paths)?;
     paths.sort();
     paths.dedup();
     Ok(paths)
 }
 
 pub(crate) fn status_untracked_paths_from_borrowed_index(
+    precompose: sley_core::PrecomposeUnicode,
     root: &Path,
     git_dir: &Path,
     index: &BorrowedIndex<'_>,
@@ -766,6 +801,7 @@ pub(crate) fn status_untracked_paths_from_borrowed_index(
         return Ok(Vec::new());
     }
     let (mut paths, local_profile) = collect_status_untracked_paths_from_borrowed_index_parallel(
+        precompose,
         root,
         git_dir,
         index,
@@ -781,6 +817,7 @@ pub(crate) fn status_untracked_paths_from_borrowed_index(
 }
 
 pub(crate) fn stream_status_untracked_paths_from_borrowed_index<F>(
+    precompose: sley_core::PrecomposeUnicode,
     root: &Path,
     git_dir: &Path,
     index: &BorrowedIndex<'_>,
@@ -803,10 +840,11 @@ where
         untracked_mode,
         profile,
     };
-    stream_status_untracked_paths(&mut context, root, &[], &mut emit).map(|_| ())
+    stream_status_untracked_paths(precompose, &mut context, root, &[], &mut emit).map(|_| ())
 }
 
 pub(crate) fn status_untracked_count_from_borrowed_index(
+    precompose: sley_core::PrecomposeUnicode,
     root: &Path,
     git_dir: &Path,
     index: &BorrowedIndex<'_>,
@@ -818,6 +856,7 @@ pub(crate) fn status_untracked_count_from_borrowed_index(
         return Ok(0);
     }
     let (paths, local_profile) = collect_status_untracked_paths_from_borrowed_index_parallel(
+        precompose,
         root,
         git_dir,
         index,
@@ -831,6 +870,7 @@ pub(crate) fn status_untracked_count_from_borrowed_index(
 }
 
 pub(crate) fn collect_status_untracked_paths_from_borrowed_index_parallel(
+    precompose: sley_core::PrecomposeUnicode,
     root: &Path,
     git_dir: &Path,
     index: &BorrowedIndex<'_>,
@@ -860,6 +900,7 @@ pub(crate) fn collect_status_untracked_paths_from_borrowed_index_parallel(
                     profile: Some(&mut output.profile),
                 };
                 collect_status_untracked_frontier_dir(
+                    precompose,
                     &mut context,
                     &task.dir,
                     &task.git_path,
@@ -894,6 +935,7 @@ pub(crate) fn collect_status_untracked_paths_from_borrowed_index_parallel(
                                     profile: Some(&mut output.profile),
                                 };
                                 collect_status_untracked_frontier_dir(
+                                    precompose,
                                     &mut context,
                                     &task.dir,
                                     &task.git_path,
@@ -1094,6 +1136,7 @@ fn sort_status_dir_entries(entries: &mut [StatusDirEntry]) {
 }
 
 pub(crate) fn collect_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
+    precompose: sley_core::PrecomposeUnicode,
     context: &mut StatusUntrackedWalk<'_, T>,
     dir: &Path,
     dir_git_path: &[u8],
@@ -1119,7 +1162,7 @@ pub(crate) fn collect_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
             if file_name == std::ffi::OsStr::new(".git") {
                 continue;
             }
-            let path_len = git_path_push_component(&mut git_path, &file_name);
+            let path_len = git_path_push_component(precompose, &mut git_path, &file_name);
             let entry_result = (|| -> Result<()> {
                 if let Some(tracked_kind) = context.tracked.tracked_kind(&git_path) {
                     if let Some(profile) = context.profile.as_deref_mut() {
@@ -1137,7 +1180,9 @@ pub(crate) fn collect_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
                     if file_type.is_dir() {
                         let path = entry.path_in(dir);
                         if !is_same_path(&path, context.git_dir) {
-                            collect_status_untracked_paths(context, &path, &git_path, paths)?;
+                            collect_status_untracked_paths(
+                                precompose, context, &path, &git_path, paths,
+                            )?;
                         }
                     }
                     return Ok(());
@@ -1184,16 +1229,20 @@ pub(crate) fn collect_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
                             {
                                 push_untracked_directory(paths, &git_path);
                             } else {
-                                collect_status_untracked_paths(context, &path, &git_path, paths)?;
+                                collect_status_untracked_paths(
+                                    precompose, context, &path, &git_path, paths,
+                                )?;
                             }
                         }
                         StatusUntrackedMode::Normal => {
                             if tracked_directory.is_some() {
-                                collect_status_untracked_paths(context, &path, &git_path, paths)?;
+                                collect_status_untracked_paths(
+                                    precompose, context, &path, &git_path, paths,
+                                )?;
                             } else if is_nested_repository_boundary(&path, context.git_dir) {
                                 push_untracked_directory(paths, &git_path);
                             } else if status_untracked_directory_has_file(
-                                context, &path, &git_path,
+                                precompose, context, &path, &git_path,
                             )? {
                                 push_untracked_directory(paths, &git_path);
                             }
@@ -1213,6 +1262,7 @@ pub(crate) fn collect_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
 }
 
 pub(crate) fn collect_status_untracked_frontier_dir<T: StatusTrackedLookup + ?Sized>(
+    precompose: sley_core::PrecomposeUnicode,
     context: &mut StatusUntrackedWalk<'_, T>,
     dir: &Path,
     dir_git_path: &[u8],
@@ -1237,7 +1287,7 @@ pub(crate) fn collect_status_untracked_frontier_dir<T: StatusTrackedLookup + ?Si
         if file_name == std::ffi::OsStr::new(".git") {
             continue;
         }
-        let path_len = git_path_push_component(&mut git_path, &file_name);
+        let path_len = git_path_push_component(precompose, &mut git_path, &file_name);
         let entry_result = (|| -> Result<()> {
             if let Some(tracked_kind) = context.tracked.tracked_kind(&git_path) {
                 if let Some(profile) = context.profile.as_deref_mut() {
@@ -1321,7 +1371,9 @@ pub(crate) fn collect_status_untracked_frontier_dir<T: StatusTrackedLookup + ?Si
                                 ignores: context.ignores.clone(),
                             });
                         } else if is_nested_repository_boundary(&path, context.git_dir)
-                            || status_untracked_directory_has_file(context, &path, &git_path)?
+                            || status_untracked_directory_has_file(
+                                precompose, context, &path, &git_path,
+                            )?
                         {
                             push_untracked_directory(paths, &git_path);
                         }
@@ -1338,6 +1390,7 @@ pub(crate) fn collect_status_untracked_frontier_dir<T: StatusTrackedLookup + ?Si
 }
 
 pub(crate) fn stream_status_untracked_paths<T, F>(
+    precompose: sley_core::PrecomposeUnicode,
     context: &mut StatusUntrackedWalk<'_, T>,
     dir: &Path,
     dir_git_path: &[u8],
@@ -1367,7 +1420,7 @@ where
             if file_name == std::ffi::OsStr::new(".git") {
                 continue;
             }
-            let path_len = git_path_push_component(&mut git_path, &file_name);
+            let path_len = git_path_push_component(precompose, &mut git_path, &file_name);
             let entry_result = (|| -> Result<StreamControl> {
                 if let Some(tracked_kind) = context.tracked.tracked_kind(&git_path) {
                     if let Some(profile) = context.profile.as_deref_mut() {
@@ -1385,8 +1438,10 @@ where
                     if file_type.is_dir() {
                         let path = entry.path_in(dir);
                         if !is_same_path(&path, context.git_dir) {
-                            if stream_status_untracked_paths(context, &path, &git_path, emit)?
-                                .is_stop()
+                            if stream_status_untracked_paths(
+                                precompose, context, &path, &git_path, emit,
+                            )?
+                            .is_stop()
                             {
                                 return Ok(StreamControl::Stop);
                             }
@@ -1446,8 +1501,10 @@ where
                                     return Ok(StreamControl::Stop);
                                 }
                             } else {
-                                if stream_status_untracked_paths(context, &path, &git_path, emit)?
-                                    .is_stop()
+                                if stream_status_untracked_paths(
+                                    precompose, context, &path, &git_path, emit,
+                                )?
+                                .is_stop()
                                 {
                                     return Ok(StreamControl::Stop);
                                 }
@@ -1455,13 +1512,17 @@ where
                         }
                         StatusUntrackedMode::Normal => {
                             if tracked_directory.is_some() {
-                                if stream_status_untracked_paths(context, &path, &git_path, emit)?
-                                    .is_stop()
+                                if stream_status_untracked_paths(
+                                    precompose, context, &path, &git_path, emit,
+                                )?
+                                .is_stop()
                                 {
                                     return Ok(StreamControl::Stop);
                                 }
                             } else if is_nested_repository_boundary(&path, context.git_dir)
-                                || status_untracked_directory_has_file(context, &path, &git_path)?
+                                || status_untracked_directory_has_file(
+                                    precompose, context, &path, &git_path,
+                                )?
                             {
                                 let directory_len = git_path.len();
                                 if git_path.last() != Some(&b'/') {
@@ -1523,6 +1584,7 @@ pub(crate) fn stage0_tracked_directories(index: &Index) -> HashSet<&[u8]> {
 }
 
 pub(crate) fn status_untracked_directory_has_file<T: StatusTrackedLookup + ?Sized>(
+    precompose: sley_core::PrecomposeUnicode,
     context: &mut StatusUntrackedWalk<'_, T>,
     dir: &Path,
     dir_git_path: &[u8],
@@ -1547,7 +1609,7 @@ pub(crate) fn status_untracked_directory_has_file<T: StatusTrackedLookup + ?Size
             if file_name == std::ffi::OsStr::new(".git") {
                 continue;
             }
-            let path_len = git_path_push_component(&mut git_path, &file_name);
+            let path_len = git_path_push_component(precompose, &mut git_path, &file_name);
             let entry_result = (|| -> Result<Option<bool>> {
                 if let Some(profile) = context.profile.as_deref_mut() {
                     profile.file_type_calls += 1;
@@ -1572,7 +1634,7 @@ pub(crate) fn status_untracked_directory_has_file<T: StatusTrackedLookup + ?Size
                     if is_nested_repository_boundary(&path, context.git_dir) {
                         return Ok(Some(true));
                     }
-                    if status_untracked_directory_has_file(context, &path, &git_path)? {
+                    if status_untracked_directory_has_file(precompose, context, &path, &git_path)? {
                         return Ok(Some(true));
                     }
                 }
@@ -1687,6 +1749,7 @@ fn read_skip_worktree_ignore_patterns<T: StatusTrackedLookup + ?Sized>(
 }
 
 pub(crate) fn build_untracked_cache(
+    precompose: sley_core::PrecomposeUnicode,
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -1708,6 +1771,7 @@ pub(crate) fn build_untracked_cache(
     cache.info_exclude = untracked_cache_oid_stat(&git_dir.join("info").join("exclude"), format)?;
     cache.excludes_file = UntrackedCacheOidStat::new(format);
     cache.root = Some(build_untracked_cache_dir(
+        precompose,
         worktree_root,
         git_dir,
         worktree_root,
@@ -1841,6 +1905,7 @@ pub(crate) fn count_untracked_cache_dirs(dir: &UntrackedCacheDir) -> usize {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_untracked_cache_dir<T: StatusTrackedLookup + ?Sized>(
+    precompose: sley_core::PrecomposeUnicode,
     worktree_root: &Path,
     git_dir: &Path,
     dir: &Path,
@@ -1897,7 +1962,7 @@ pub(crate) fn build_untracked_cache_dir<T: StatusTrackedLookup + ?Sized>(
             if file_name == std::ffi::OsStr::new(".git") {
                 continue;
             }
-            let path_len = git_path_push_component(&mut git_path, &file_name);
+            let path_len = git_path_push_component(precompose, &mut git_path, &file_name);
             let entry_result = (|| -> Result<()> {
                 if tracked.tracked_kind(&git_path).is_some() {
                     return Ok(());
@@ -1908,7 +1973,8 @@ pub(crate) fn build_untracked_cache_dir<T: StatusTrackedLookup + ?Sized>(
                     return Ok(());
                 }
                 if file_type.is_file() || file_type.is_symlink() {
-                    node.untracked.push(component_name_bytes(&file_name));
+                    node.untracked
+                        .push(component_name_bytes(precompose, &file_name));
                     return Ok(());
                 }
                 if !is_dir {
@@ -1918,11 +1984,12 @@ pub(crate) fn build_untracked_cache_dir<T: StatusTrackedLookup + ?Sized>(
                 if is_same_path(&path, git_dir) {
                     return Ok(());
                 }
-                let component = component_name_bytes(&file_name);
+                let component = component_name_bytes(precompose, &file_name);
                 let tracked_directory = tracked.tracked_directory_kind(&git_path);
                 let child_check_only = matches!(untracked_mode, StatusUntrackedMode::Normal)
                     && tracked_directory.is_none();
                 let child = build_untracked_cache_dir(
+                    precompose,
                     worktree_root,
                     git_dir,
                     &path,
@@ -1989,10 +2056,13 @@ fn untracked_cache_dir_has_observed_content(dir: &UntrackedCacheDir) -> bool {
             .any(untracked_cache_dir_has_observed_content)
 }
 
-pub(crate) fn component_name_bytes(name: &std::ffi::OsStr) -> Vec<u8> {
+pub(crate) fn component_name_bytes(
+    precompose: sley_core::PrecomposeUnicode,
+    name: &std::ffi::OsStr,
+) -> Vec<u8> {
     // Match git's precompose_utf8_readdir: NFD directory entries become NFC when
     // core.precomposeunicode is true.
-    sley_core::precompose_os_str_bytes_if_needed(name).into_owned()
+    precompose.os_str_bytes(name).into_owned()
 }
 
 pub(crate) fn per_directory_ignore_oid(
@@ -2141,6 +2211,7 @@ pub(crate) fn untracked_normal_rollup_path(
 }
 
 pub(crate) fn ignored_traditional_rollup_path(
+    precompose: sley_core::PrecomposeUnicode,
     root: &Path,
     git_dir: &Path,
     path: &[u8],
@@ -2159,13 +2230,14 @@ pub(crate) fn ignored_traditional_rollup_path(
     }
     let mut absolute = PathBuf::new();
     set_worktree_path_from_repo_path(root, directory_path, &mut absolute)?;
-    if directory_has_file(&absolute, root, git_dir, ignores)? {
+    if directory_has_file(precompose, &absolute, root, git_dir, ignores)? {
         return Ok(path.to_vec());
     }
     Ok(rolled)
 }
 
 pub(crate) fn directory_has_file(
+    precompose: sley_core::PrecomposeUnicode,
     dir: &Path,
     root: &Path,
     git_dir: &Path,
@@ -2190,7 +2262,7 @@ pub(crate) fn directory_has_file(
         let relative = path.strip_prefix(root).map_err(|_| {
             GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
         })?;
-        let git_path = git_path_bytes(relative)?;
+        let git_path = git_path_bytes(precompose, relative)?;
         if ignores.is_ignored(&git_path, metadata.is_dir()) {
             continue;
         }
@@ -2201,7 +2273,7 @@ pub(crate) fn directory_has_file(
             if is_nested_repository_boundary(&path, git_dir) {
                 continue;
             }
-            if directory_has_file(&path, root, git_dir, ignores)? {
+            if directory_has_file(precompose, &path, root, git_dir, ignores)? {
                 return Ok(true);
             }
         }
@@ -2210,6 +2282,7 @@ pub(crate) fn directory_has_file(
 }
 
 pub(crate) fn directory_has_ignored(
+    precompose: sley_core::PrecomposeUnicode,
     dir: &Path,
     root: &Path,
     git_dir: &Path,
@@ -2231,11 +2304,11 @@ pub(crate) fn directory_has_ignored(
         let relative = path.strip_prefix(root).map_err(|_| {
             GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
         })?;
-        let git_path = git_path_bytes(relative)?;
+        let git_path = git_path_bytes(precompose, relative)?;
         if ignores.is_ignored(&git_path, metadata.is_dir()) {
             return Ok(true);
         }
-        if metadata.is_dir() && directory_has_ignored(&path, root, git_dir, ignores)? {
+        if metadata.is_dir() && directory_has_ignored(precompose, &path, root, git_dir, ignores)? {
             return Ok(true);
         }
     }
@@ -2243,6 +2316,7 @@ pub(crate) fn directory_has_ignored(
 }
 
 pub(crate) fn ignored_untracked_paths(
+    precompose: sley_core::PrecomposeUnicode,
     root: &Path,
     git_dir: &Path,
     index: &BTreeMap<Vec<u8>, TrackedEntry>,
@@ -2257,7 +2331,7 @@ pub(crate) fn ignored_untracked_paths(
         ignores,
         directory,
     };
-    collect_ignored_untracked_paths(&context, root, false, &mut paths)?;
+    collect_ignored_untracked_paths(precompose, &context, root, false, &mut paths)?;
     Ok(paths.into_iter().collect())
 }
 
@@ -2287,6 +2361,7 @@ pub(crate) struct IgnoredUntrackedContext<'a> {
 }
 
 pub(crate) fn collect_ignored_untracked_paths(
+    precompose: sley_core::PrecomposeUnicode,
     context: &IgnoredUntrackedContext<'_>,
     dir: &Path,
     parent_ignored: bool,
@@ -2309,7 +2384,7 @@ pub(crate) fn collect_ignored_untracked_paths(
         let relative = path.strip_prefix(context.root).map_err(|_| {
             GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
         })?;
-        let git_path = git_path_bytes(relative)?;
+        let git_path = git_path_bytes(precompose, relative)?;
         if metadata.is_dir() {
             let ignored = parent_ignored || context.ignores.is_ignored(&git_path, true);
             if ignored && !index_has_path_under(context.index, &git_path) {
@@ -2318,13 +2393,13 @@ pub(crate) fn collect_ignored_untracked_paths(
                     directory_path.push(b'/');
                     paths.insert(directory_path);
                 } else {
-                    collect_ignored_untracked_paths(context, &path, true, paths)?;
+                    collect_ignored_untracked_paths(precompose, context, &path, true, paths)?;
                 }
             } else {
                 if is_nested_repository_boundary(&path, context.git_dir) {
                     continue;
                 }
-                collect_ignored_untracked_paths(context, &path, ignored, paths)?;
+                collect_ignored_untracked_paths(precompose, context, &path, ignored, paths)?;
             }
         } else if !context.index.contains_key(&git_path)
             && (metadata.is_file() || metadata.file_type().is_symlink())
@@ -2698,18 +2773,19 @@ impl IgnoreMatcher {
     }
 
     fn from_sources(
+        precompose: sley_core::PrecomposeUnicode,
         root: &Path,
         exclude_standard: bool,
         patterns: &[Vec<u8>],
         per_directory: &[String],
     ) -> Result<Self> {
         let mut matcher = if exclude_standard {
-            Self::from_worktree_root(root)?
+            Self::from_worktree_root(precompose, root)?
         } else {
             Self::default()
         };
         matcher.extend_patterns(patterns);
-        matcher.extend_per_directory_patterns(root, per_directory)?;
+        matcher.extend_per_directory_patterns(precompose, root, per_directory)?;
         Ok(matcher)
     }
 
@@ -2733,11 +2809,18 @@ impl IgnoreMatcher {
         Ok(matcher)
     }
 
-    pub(crate) fn from_worktree_root(root: &Path) -> Result<Self> {
-        Self::from_worktree_root_and_git_dir(root, &root.join(".git"))
+    pub(crate) fn from_worktree_root(
+        precompose: sley_core::PrecomposeUnicode,
+        root: &Path,
+    ) -> Result<Self> {
+        Self::from_worktree_root_and_git_dir(precompose, root, &root.join(".git"))
     }
 
-    pub(crate) fn from_worktree_root_and_git_dir(root: &Path, git_dir: &Path) -> Result<Self> {
+    pub(crate) fn from_worktree_root_and_git_dir(
+        precompose: sley_core::PrecomposeUnicode,
+        root: &Path,
+        git_dir: &Path,
+    ) -> Result<Self> {
         let mut matcher = Self::default();
         if !read_core_excludes_file(root, &mut matcher.patterns) {
             read_default_global_excludes_file(&mut matcher.patterns);
@@ -2750,6 +2833,7 @@ impl IgnoreMatcher {
         );
         matcher.rebuild_buckets();
         collect_per_directory_patterns_into_matcher(
+            precompose,
             root,
             root,
             &[String::from(".gitignore")],
@@ -2764,11 +2848,16 @@ impl IgnoreMatcher {
         }
     }
 
-    fn extend_per_directory_patterns(&mut self, root: &Path, names: &[String]) -> Result<()> {
+    fn extend_per_directory_patterns(
+        &mut self,
+        precompose: sley_core::PrecomposeUnicode,
+        root: &Path,
+        names: &[String],
+    ) -> Result<()> {
         if names.is_empty() {
             return Ok(());
         }
-        collect_per_directory_patterns_into_matcher(root, root, names, self)?;
+        collect_per_directory_patterns_into_matcher(precompose, root, root, names, self)?;
         Ok(())
     }
 

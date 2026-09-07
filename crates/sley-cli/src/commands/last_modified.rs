@@ -1,7 +1,6 @@
 //! `git last-modified`: report the commit that last touched each selected path.
 
 use crate::*;
-use {sley_diff_merge, sley_rev};
 
 #[derive(Clone)]
 struct LastModifiedOptions {

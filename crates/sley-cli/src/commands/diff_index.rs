@@ -17,7 +17,6 @@
 
 use std::io::{self, Write};
 use std::path::Path;
-use {sley_core, sley_diff_merge, sley_index, sley_rev};
 
 use sley::{GitError, ObjectFormat, ObjectId, Result};
 
@@ -436,10 +435,12 @@ pub(crate) fn cmd_diff_index(
     // whitespace error, OR-ing in 1 when `--exit-code`/`--quiet` + changes).
     if check {
         let resolver = commands::diff::WhitespaceRuleResolver::from_git_dir_with_config(
+            cli_session.precompose_unicode(),
             git_dir,
             Some(repo.config()),
         )?;
         let check_failed = commands::diff::run_diff_check(
+            &cli_session.remote_policy,
             &entries,
             db,
             worktree_root,
@@ -470,6 +471,7 @@ pub(crate) fn cmd_diff_index(
                 .unwrap_or(true)
         });
         render(
+            &cli_session.remote_policy,
             &entries,
             &output,
             RenderContext {
@@ -578,6 +580,7 @@ struct RenderContext<'a> {
 }
 
 fn render(
+    policy: &sley_remote::RemotePolicy,
     entries: &[sley_diff_merge::NameStatusEntry],
     output: &DiffIndexOutput,
     ctx: RenderContext<'_>,
@@ -598,13 +601,14 @@ fn render(
             suppress_output: false,
         },
     );
+    let lazy_fetch_adapter_1 = crate::diff_lazy_fetch(policy, ctx.lazy_fetch);
     let stat_entries = if selection.needs_line_stats() {
         collect_diff_stat_entries(
             entries,
             ctx.db,
             ctx.worktree_root,
             ctx.use_worktree_new,
-            crate::diff_lazy_fetch(ctx.lazy_fetch),
+            lazy_fetch_adapter_1.as_option(),
         )?
     } else {
         Vec::new()
@@ -658,6 +662,7 @@ fn render(
             writeln!(stdout)?;
         }
         for entry in entries {
+            let lazy_fetch_adapter_2 = crate::diff_lazy_fetch(policy, ctx.lazy_fetch);
             let options = DiffRenderOptions {
                 line_indicators: sley_diff_merge::render::LineIndicators::default(),
                 suppress_blank_empty: false,
@@ -665,7 +670,7 @@ fn render(
                 anchors: &[],
                 allow_textconv: false,
                 db: ctx.db,
-                lazy_fetch: crate::diff_lazy_fetch(ctx.lazy_fetch),
+                lazy_fetch: lazy_fetch_adapter_2.as_option(),
                 worktree_root: ctx.worktree_root,
                 use_worktree_new: ctx.use_worktree_new,
                 format: ctx.format,

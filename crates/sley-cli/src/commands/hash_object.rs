@@ -2,7 +2,6 @@
 //! apply the same worktree-to-blob conversions that Git uses for path-aware
 //! hashing.
 
-use sley_worktree;
 use std::fs;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};

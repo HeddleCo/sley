@@ -11,7 +11,6 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use {sley_config, sley_core};
 
 use sley_archive::{ArchiveExtraEntry, ArchiveExtras, ZipArchiveOptions};
 

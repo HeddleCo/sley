@@ -1,10 +1,10 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
+use sley_formats::ReftableWriteOptions;
 use std::cell::RefCell;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use {sley_config, sley_formats::ReftableWriteOptions, sley_refs, sley_rev};
 
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.

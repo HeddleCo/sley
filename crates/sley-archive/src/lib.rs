@@ -149,12 +149,14 @@ impl<'a> ArchiveConvert<'a> {
     /// the object database; only attribute lookup comes from the current
     /// worktree chain.
     pub fn from_worktree(
+        precompose: sley_core::PrecomposeUnicode,
         worktree_root: impl AsRef<std::path::Path>,
         config: &'a GitConfig,
     ) -> Result<Self> {
         Ok(Self {
             config,
             attributes: ArchiveAttributes::Worktree(StandardAttributeMatcher::from_worktree_root(
+                precompose,
                 worktree_root,
             )?),
             subst: None,

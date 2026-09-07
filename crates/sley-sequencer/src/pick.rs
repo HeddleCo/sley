@@ -416,6 +416,7 @@ pub fn make_todo_item(
 /// The initial `git cherry-pick` / `git revert` run (option parsing and
 /// opts-normalization stay with the CLI).
 pub fn pick_revisions(
+    original_cwd: Option<&std::path::Path>,
     ctx: &PickContext,
     hosts: &mut PickHosts<'_>,
     opts: &ReplayOpts,
@@ -429,7 +430,7 @@ pub fn pick_revisions(
     if selection.single {
         // Single plain rev: replay it without touching the sequencer dir.
         let item = make_todo_item(&ctx.db, ctx.format, ctx.action, &selection.commits[0])?;
-        return match do_pick_commit(ctx, hosts, opts, &item, true) {
+        return match do_pick_commit(original_cwd, ctx, hosts, opts, &item, true) {
             Ok(PickFlow::Done | PickFlow::Dropped) => Ok(()),
             Ok(PickFlow::Conflict) => Err(GitError::Exit(1)),
             Ok(PickFlow::HaltEmpty) => Err(GitError::Exit(1)),
@@ -468,7 +469,7 @@ pub fn pick_revisions(
     replay::save_head(&ctx.git_dir, &head_text)?;
     replay::save_opts(&ctx.git_dir, opts)?;
     replay::update_abort_safety(&ctx.git_dir, head.as_ref());
-    pick_commits(ctx, hosts, opts, &items)
+    pick_commits(original_cwd, ctx, hosts, opts, &items)
 }
 
 /// Failure routing for the pick engine: `Fatal` is the `res < 0` path (the
@@ -528,6 +529,7 @@ fn check_no_unmerged(ctx: &PickContext) -> std::result::Result<(), ReplayHalt> {
 /// The pick loop (`pick_commits`): replay every remaining todo item, saving
 /// the sheet before each step, and tear the state down on success.
 fn pick_commits(
+    original_cwd: Option<&std::path::Path>,
     ctx: &PickContext,
     hosts: &mut PickHosts<'_>,
     opts: &ReplayOpts,
@@ -535,7 +537,7 @@ fn pick_commits(
 ) -> Result<()> {
     for (index, item) in items.iter().enumerate() {
         replay::save_todo(&ctx.git_dir, &items[index..])?;
-        match do_pick_commit(ctx, hosts, opts, item, false) {
+        match do_pick_commit(original_cwd, ctx, hosts, opts, item, false) {
             Ok(PickFlow::Done | PickFlow::Dropped) => {}
             Ok(PickFlow::Conflict) => return Err(GitError::Exit(1)),
             Ok(PickFlow::HaltEmpty) => return Err(GitError::Exit(1)),
@@ -581,6 +583,7 @@ fn original_commit_empty(
 
 #[allow(clippy::too_many_lines)]
 fn do_pick_commit(
+    original_cwd: Option<&std::path::Path>,
     ctx: &PickContext,
     hosts: &mut PickHosts<'_>,
     opts: &ReplayOpts,
@@ -654,7 +657,7 @@ fn do_pick_commit(
     if opts.allow_ff
         && ((parent.is_some() && parent.as_ref() == head.as_ref()) || (parent.is_none() && unborn))
     {
-        fast_forward_to(ctx, &item.oid, head.as_ref()).map_err(print_fatal_error)?;
+        fast_forward_to(original_cwd, ctx, &item.oid, head.as_ref()).map_err(print_fatal_error)?;
         return Ok(PickFlow::Done);
     }
 
@@ -743,9 +746,11 @@ fn do_pick_commit(
 
     // Pre-flight worktree clobber checks (unpack_trees' verify steps).
     let target_map = merge_results_to_tree_map(&results);
-    if let Err(err) =
-        merge_refuse_if_current_working_directory_becomes_file(&ctx.worktree_root, &target_map)
-    {
+    if let Err(err) = merge_refuse_if_current_working_directory_becomes_file(
+        original_cwd,
+        &ctx.worktree_root,
+        &target_map,
+    ) {
         return match err {
             GitError::Exit(code) => Err(ReplayHalt::Code(code)),
             other => Err(print_fatal_error(other)),
@@ -759,7 +764,7 @@ fn do_pick_commit(
         .or_else(|| config_value(&ctx.config, "commit", "cleanup"));
 
     if !conflicts.is_empty() {
-        apply_merge_results_to_index_and_worktree(ctx, hosts, &ours_map, &results)
+        apply_merge_results_to_index_and_worktree(original_cwd, ctx, hosts, &ours_map, &results)
             .map_err(print_fatal_error)?;
         // State files for the resolution flow.
         let help_msg = std::env::var("GIT_CHERRY_PICK_HELP").ok();
@@ -805,7 +810,7 @@ fn do_pick_commit(
     }
 
     // Clean merge: stage the result.
-    apply_merge_results_to_index_and_worktree(ctx, hosts, &ours_map, &results)
+    apply_merge_results_to_index_and_worktree(original_cwd, ctx, hosts, &ours_map, &results)
         .map_err(print_fatal_error)?;
     let new_tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)
         .map_err(print_fatal_error)?;
@@ -1078,6 +1083,7 @@ fn verify_worktree_safe(
 /// Apply merge results: update the index (preserving cached stat data for
 /// unchanged entries) and the worktree files that changed.
 fn apply_merge_results_to_index_and_worktree(
+    original_cwd: Option<&std::path::Path>,
     ctx: &PickContext,
     hosts: &PickHosts<'_>,
     ours_map: &MergeTreeMap,
@@ -1170,7 +1176,7 @@ fn apply_merge_results_to_index_and_worktree(
             _ => false,
         };
         if remove {
-            merge_remove_worktree_file(&ctx.worktree_root, path)?;
+            merge_remove_worktree_file(original_cwd, &ctx.worktree_root, path)?;
         }
     }
     for (path, result) in results {
@@ -1189,13 +1195,25 @@ fn apply_merge_results_to_index_and_worktree(
                     } else {
                         merge_read_blob_with_fetch(&ctx.db, oid, hosts.promisor_fetch)?
                     };
-                    merge_write_worktree_file(&ctx.worktree_root, path, &content, *mode)?;
+                    merge_write_worktree_file(
+                        original_cwd,
+                        &ctx.worktree_root,
+                        path,
+                        &content,
+                        *mode,
+                    )?;
                 }
             }
             MergePathResult::Resolved(None) => {}
             MergePathResult::Conflict { worktree, .. } => {
                 if let Some((mode, content)) = worktree {
-                    merge_write_worktree_file(&ctx.worktree_root, path, content, *mode)?;
+                    merge_write_worktree_file(
+                        original_cwd,
+                        &ctx.worktree_root,
+                        path,
+                        content,
+                        *mode,
+                    )?;
                 }
             }
         }
@@ -1379,7 +1397,12 @@ fn should_edit(action: ReplayAction, opts: &ReplayOpts) -> bool {
     }
 }
 
-fn fast_forward_to(ctx: &PickContext, target: &ObjectId, head: Option<&ObjectId>) -> Result<()> {
+fn fast_forward_to(
+    original_cwd: Option<&std::path::Path>,
+    ctx: &PickContext,
+    target: &ObjectId,
+    head: Option<&ObjectId>,
+) -> Result<()> {
     let refs = ctx.refs();
     let target_ref = match refs.read_ref("HEAD")? {
         Some(RefTarget::Symbolic(branch)) => branch,
@@ -1401,6 +1424,7 @@ fn fast_forward_to(ctx: &PickContext, target: &ObjectId, head: Option<&ObjectId>
     });
     tx.commit()?;
     sley_worktree::reset_index_and_worktree_to_commit(
+        original_cwd,
         &ctx.worktree_root,
         &ctx.git_dir,
         ctx.format,
@@ -1473,7 +1497,11 @@ fn print_commit_summary_line(ctx: &PickContext, oid: &ObjectId, message: &[u8]) 
 // ---------------------------------------------------------------------------
 
 /// `--continue`.
-pub fn continue_sequence(ctx: &PickContext, hosts: &mut PickHosts<'_>) -> Result<()> {
+pub fn continue_sequence(
+    original_cwd: Option<&std::path::Path>,
+    ctx: &PickContext,
+    hosts: &mut PickHosts<'_>,
+) -> Result<()> {
     let opts = replay::read_opts(&ctx.git_dir).map_err(|err| {
         eprintln!("error: {err}");
         fatal_failed(ctx.action)
@@ -1487,7 +1515,13 @@ pub fn continue_sequence(ctx: &PickContext, hosts: &mut PickHosts<'_>) -> Result
         continue_single_pick(ctx, hosts, &opts)?;
     }
     // The stopped item is concluded; replay the rest.
-    pick_commits(ctx, hosts, &opts, &items[1.min(items.len())..])
+    pick_commits(
+        original_cwd,
+        ctx,
+        hosts,
+        &opts,
+        &items[1.min(items.len())..],
+    )
 }
 
 fn read_populate_todo(ctx: &PickContext) -> Result<Vec<TodoItem>> {
@@ -1635,7 +1669,11 @@ fn continue_single_pick(
 }
 
 /// `--skip`.
-pub fn skip_sequence(ctx: &PickContext, hosts: &mut PickHosts<'_>) -> Result<()> {
+pub fn skip_sequence(
+    original_cwd: Option<&std::path::Path>,
+    ctx: &PickContext,
+    hosts: &mut PickHosts<'_>,
+) -> Result<()> {
     let last = replay::last_command(&ctx.git_dir);
     let state_file = ctx.git_dir.join(ctx.action.head_file());
     if !state_file.exists() {
@@ -1655,7 +1693,7 @@ pub fn skip_sequence(ctx: &PickContext, hosts: &mut PickHosts<'_>) -> Result<()>
     }
     // `git reset --merge HEAD` (an unborn HEAD resets to the empty tree).
     let head = ctx.head_oid();
-    reset_merge(ctx, hosts.promisor_fetch, head.as_ref()).map_err(|_| {
+    reset_merge(original_cwd, ctx, hosts.promisor_fetch, head.as_ref()).map_err(|_| {
         eprintln!("error: failed to skip the commit");
         fatal_failed(ctx.action)
     })?;
@@ -1669,11 +1707,21 @@ pub fn skip_sequence(ctx: &PickContext, hosts: &mut PickHosts<'_>) -> Result<()>
         fatal_failed(ctx.action)
     })?;
     let items = read_populate_todo(ctx)?;
-    pick_commits(ctx, hosts, &opts, &items[1.min(items.len())..])
+    pick_commits(
+        original_cwd,
+        ctx,
+        hosts,
+        &opts,
+        &items[1.min(items.len())..],
+    )
 }
 
 /// `--abort` (`sequencer_rollback`).
-pub fn rollback(ctx: &PickContext, hosts: &PickHosts<'_>) -> Result<()> {
+pub fn rollback(
+    original_cwd: Option<&std::path::Path>,
+    ctx: &PickContext,
+    hosts: &PickHosts<'_>,
+) -> Result<()> {
     let head_file = replay::head_path(&ctx.git_dir);
     if !head_file.exists() {
         // Single-pick abort.
@@ -1687,7 +1735,7 @@ pub fn rollback(ctx: &PickContext, hosts: &PickHosts<'_>) -> Result<()> {
             eprintln!("error: cannot abort from a branch yet to be born");
             return Err(fatal_failed(ctx.action));
         };
-        return reset_merge(ctx, hosts.promisor_fetch, Some(&head)).map_err(|err| {
+        return reset_merge(original_cwd, ctx, hosts.promisor_fetch, Some(&head)).map_err(|err| {
             eprintln!("error: {err}");
             fatal_failed(ctx.action)
         });
@@ -1712,7 +1760,7 @@ pub fn rollback(ctx: &PickContext, hosts: &PickHosts<'_>) -> Result<()> {
     if !replay::rollback_is_safe(&ctx.git_dir, head.as_ref()) {
         eprintln!("warning: You seem to have moved HEAD. Not rewinding, check your HEAD!");
     } else {
-        reset_merge(ctx, hosts.promisor_fetch, Some(&oid)).map_err(|err| {
+        reset_merge(original_cwd, ctx, hosts.promisor_fetch, Some(&oid)).map_err(|err| {
             eprintln!("error: {err}");
             fatal_failed(ctx.action)
         })?;
@@ -1727,11 +1775,13 @@ pub fn rollback(ctx: &PickContext, hosts: &PickHosts<'_>) -> Result<()> {
 /// index. Conflicted paths are reset outright. Clears the in-progress branch
 /// state on success.
 fn reset_merge(
+    original_cwd: Option<&std::path::Path>,
     ctx: &PickContext,
     fetch: Option<&dyn PromisorObjectFetch>,
     target: Option<&ObjectId>,
 ) -> Result<()> {
     reset_merge_in(
+        original_cwd,
         &ctx.git_dir,
         &ctx.worktree_root,
         ctx.format,
@@ -1744,6 +1794,7 @@ fn reset_merge(
 /// Canonical `git reset --merge` used by the replay `--skip`/`--abort` flows
 /// and `git reset --merge` itself.
 pub fn reset_merge_in(
+    original_cwd: Option<&std::path::Path>,
     git_dir: &Path,
     worktree_root: &Path,
     format: sley_core::ObjectFormat,
@@ -1904,7 +1955,7 @@ pub fn reset_merge_in(
     // submodule"). Deletions first leave the parent gone/empty, then the
     // gitlink write recreates the empty directory.
     for path in &deletions {
-        merge_remove_worktree_file(worktree_root, path)?;
+        merge_remove_worktree_file(original_cwd, worktree_root, path)?;
     }
     for (path, (mode, oid)) in &updates {
         let content = if is_gitlink(*mode) {
@@ -1912,7 +1963,7 @@ pub fn reset_merge_in(
         } else {
             merge_read_blob_with_fetch(&db, oid, fetch)?
         };
-        merge_write_worktree_file(worktree_root, path, &content, *mode)?;
+        merge_write_worktree_file(original_cwd, worktree_root, path, &content, *mode)?;
     }
     // Belt-and-suspenders: every target gitlink must exist as a directory
     // placeholder even when no CE_UPDATE was planned (identical oid carried
@@ -1929,7 +1980,7 @@ pub fn reset_merge_in(
         if full.is_dir() {
             continue;
         }
-        merge_write_worktree_file(worktree_root, path, &[], *mode)?;
+        merge_write_worktree_file(original_cwd, worktree_root, path, &[], *mode)?;
     }
     sley_worktree::refresh_index_paths_with_options(
         worktree_root,

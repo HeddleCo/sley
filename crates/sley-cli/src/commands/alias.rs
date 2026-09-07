@@ -17,10 +17,9 @@
 //! remainder after `alias.` becomes the two-level alias name (`foo.bar`),
 //! matched case-insensitively. See `config_alias_cb` in git's `alias.c`.
 
-use crate::sley_config;
 use sley::{GitError, Result};
 use sley_config::ConfigIncludeContext;
-use sley_core;
+
 use std::env;
 use std::fs;
 use std::mem;

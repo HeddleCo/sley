@@ -14,7 +14,6 @@
 //! delivery of the typed engine outcome.
 #![allow(clippy::expect_used)]
 
-use sley_diff_merge;
 // Glob the crate root for shared plumbing; see commands::stash for rationale.
 use crate::*;
 

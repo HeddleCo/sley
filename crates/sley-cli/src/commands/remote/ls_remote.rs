@@ -4,7 +4,6 @@
 #[path = "ls_remote_options.rs"]
 mod ls_remote_options;
 use ls_remote_options::setup_ls_remote_options;
-use sley_config;
 
 use super::fetch::{
     check_transport_allowed_url, configured_server_options, transport_policy_config_for_context,
@@ -40,6 +39,7 @@ fn ls_remote_http_records(
     let filter = ls_remote_filter(options);
     let outcome = sley_remote::ls_remote_with(
         sley_remote::LsRemoteRequest {
+            policy: &context.remote_policy,
             source: &source,
             format: ObjectFormat::Sha1,
             filter: &filter,
@@ -312,7 +312,11 @@ pub(crate) fn cmd_ls_remote(
         return Err(GitError::Exit(128));
     }
     let resolved_repository = context.resolved_remote(&repository)?.url;
-    check_transport_allowed_url(&resolved_repository, Some(&transport_config))?;
+    check_transport_allowed_url(
+        &cli_session.remote_policy,
+        &resolved_repository,
+        Some(&transport_config),
+    )?;
 
     if implicit_repository && !options.quiet {
         eprintln!("From {}", ls_remote_display_url(&context, &repository)?);
@@ -416,6 +420,7 @@ pub(crate) fn cmd_ls_remote(
     let filter = ls_remote_filter(&options);
     let outcome = sley_remote::ls_remote_with(
         sley_remote::LsRemoteRequest {
+            policy: &cli_session.remote_policy,
             source: &source,
             format,
             filter: &filter,
@@ -583,6 +588,7 @@ fn ls_remote_ssh_records(
     let filter = ls_remote_filter(options);
     let outcome = sley_remote::ls_remote_with(
         sley_remote::LsRemoteRequest {
+            policy: &context.remote_policy,
             source: &source,
             format: ObjectFormat::Sha1,
             filter: &filter,
@@ -608,6 +614,7 @@ fn ls_remote_git_records(
     let filter = ls_remote_filter(options);
     let outcome = sley_remote::ls_remote_with(
         sley_remote::LsRemoteRequest {
+            policy: &context.remote_policy,
             source: &source,
             format: ObjectFormat::Sha1,
             filter: &filter,

@@ -2,7 +2,6 @@
 #![allow(clippy::expect_used)]
 
 use crate::*;
-use {sley_refs, sley_rev, sley_worktree};
 
 use super::commit_graph::commit_graph_commit_time_from_committer;
 
@@ -299,7 +298,11 @@ pub(crate) fn cmd_archive(cli_session: &crate::session::CliSession, args: &[Stri
     };
     let mut convert = if worktree_attributes {
         if let Some(worktree_root) = &worktree_root {
-            sley_archive::ArchiveConvert::from_worktree(worktree_root, &config)?
+            sley_archive::ArchiveConvert::from_worktree(
+                cli_session.precompose_unicode(),
+                worktree_root,
+                &config,
+            )?
         } else if let Some(attr_tree_oid) = &archive_attr_tree_oid {
             sley_archive::ArchiveConvert::from_tree(
                 &attr_root,
@@ -344,6 +347,7 @@ pub(crate) fn cmd_archive(cli_session: &crate::session::CliSession, args: &[Stri
     // `UserdiffResolver` resolves `diff=<name>` ⇒ `diff.<name>.binary` config and
     // builtin driver flags.
     let diff_attributes = archive_diff_attributes(
+        cli_session.precompose_unicode(),
         &attr_root,
         &git_dir,
         &db,
@@ -490,6 +494,7 @@ enum ArchiveDiffAttributes {
 }
 
 fn archive_diff_attributes(
+    precompose: sley_core::PrecomposeUnicode,
     attr_root: &Path,
     git_dir: &Path,
     db: &FileObjectDatabase,
@@ -500,7 +505,7 @@ fn archive_diff_attributes(
 ) -> Result<ArchiveDiffAttributes> {
     if let Some(worktree_root) = worktree_root {
         return Ok(ArchiveDiffAttributes::Worktree(
-            sley_worktree::StandardAttributeMatcher::from_worktree_root(worktree_root)?,
+            sley_worktree::StandardAttributeMatcher::from_worktree_root(precompose, worktree_root)?,
         ));
     }
     Ok(ArchiveDiffAttributes::Tree(

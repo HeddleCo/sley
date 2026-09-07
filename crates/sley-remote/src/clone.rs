@@ -84,6 +84,8 @@ pub enum CloneSource {
 /// the unsupported ones are gated before `clone` is called, and the config-writing
 /// ones run inside the `configure`/`configure_branch` callbacks.
 pub struct CloneOptions<'a> {
+    /// Caller-owned namespace and transport policy.
+    pub policy: crate::RemotePolicy,
     /// The remote name to configure and track (`--origin`, default `origin`).
     pub origin: &'a str,
     /// The branch to create locally and check out (the requested `--branch` or
@@ -231,14 +233,18 @@ impl<'a> CloneServices<'a> {
 /// `GitError::Exit`. A missing `refs/remotes/<origin>/<checkout_branch>` after the
 /// fetch is reported as [`GitError::NotFound`] for the caller to map (the CLI
 /// turns an explicit `--branch` miss into its own message).
-pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<CloneOutcome> {
+pub fn clone(
+    original_cwd: Option<&std::path::Path>,
+    request: CloneRequest<'_>,
+    services: CloneServices<'_>,
+) -> Result<CloneOutcome> {
     #[cfg(feature = "http")]
     {
-        clone_impl(request, services, None)
+        clone_impl(original_cwd, request, services, None)
     }
     #[cfg(not(feature = "http"))]
     {
-        clone_impl(request, services)
+        clone_impl(original_cwd, request, services)
     }
 }
 
@@ -252,14 +258,16 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
 /// public URL. Non-HTTP clone sources ignore it.
 #[cfg(feature = "http")]
 pub fn clone_with_http_client(
+    original_cwd: Option<&std::path::Path>,
     request: CloneRequest<'_>,
     services: CloneServices<'_>,
     http_client: Option<&dyn HttpClient>,
 ) -> Result<CloneOutcome> {
-    clone_impl(request, services, http_client)
+    clone_impl(original_cwd, request, services, http_client)
 }
 
 fn clone_impl(
+    original_cwd: Option<&std::path::Path>,
     request: CloneRequest<'_>,
     services: CloneServices<'_>,
     #[cfg(feature = "http")] http_client: Option<&dyn HttpClient>,
@@ -286,7 +294,7 @@ fn clone_impl(
     crate::protocol::check_transport_allowed(
         scheme_for_clone_source(request.source),
         Some(&config),
-        None,
+        &request.options.policy.transport,
     )
     .map_err(crate::protocol::transport_policy_git_error)?;
     let fetch_source = match request.source {
@@ -315,6 +323,7 @@ fn clone_impl(
         },
     };
     let fetch_options = clone_fetch_options(CloneFetchOptions {
+        policy: request.options.policy.clone(),
         progress: request.options.progress,
         depth: request.options.depth,
         deepen_since: request.options.deepen_since,
@@ -356,6 +365,7 @@ fn clone_impl(
         write_clone_remote_head(&store, request.options)?;
         if request.options.checkout {
             sley_worktree::checkout_detached_filtered(
+                original_cwd,
                 request.destination,
                 &git_dir,
                 request.format,
@@ -500,6 +510,7 @@ fn clone_impl(
             fs::create_dir_all(&info)?;
             fs::write(info.join("sparse-checkout"), b"/*\n!/*/\n")?;
             sley_worktree::checkout_commit_to_index_and_worktree_sparse(
+                original_cwd,
                 request.destination,
                 &git_dir,
                 request.format,
@@ -527,6 +538,7 @@ fn clone_impl(
             tx.commit()?;
         } else {
             sley_worktree::checkout_branch_filtered(
+                original_cwd,
                 request.destination,
                 &git_dir,
                 request.format,
@@ -633,6 +645,7 @@ fn fetch_partial_clone_checkout_blobs(
                 }
             }
             crate::local::install_fetch_pack_via_local_upload_pack(
+                &request.options.policy,
                 git_dir,
                 &hydration_git_dir,
                 request.format,
@@ -708,7 +721,8 @@ fn fetch_http_partial_clone_checkout_blobs(
             // deadlines derived from them follow the same settings the rest of
             // the request does.
             default_client =
-                UreqHttpClient::with_limits(crate::transport_limits_from_config(Some(config)));
+                UreqHttpClient::with_limits(crate::transport_limits_from_config(Some(config)))
+                    .with_protocol_policy(request.options.policy.transport.clone(), Some(config));
             &default_client
         }
     };
@@ -753,6 +767,7 @@ fn fetch_http_partial_clone_checkout_blobs(
     let mut progress = crate::SilentProgress;
     if let Some(handshake) = discovered.handshake.as_ref() {
         crate::http::install_fetch_pack_via_http_protocol_v2_fetch(
+            &request.options.policy,
             pack_request,
             handshake,
             credentials,
@@ -761,6 +776,7 @@ fn fetch_http_partial_clone_checkout_blobs(
         )?;
     } else {
         crate::http::install_fetch_pack_via_http_upload_pack(
+            &request.options.policy,
             pack_request,
             credentials,
             &mut progress,
@@ -846,6 +862,7 @@ fn collect_tree_materialization_wants(
 /// `--tags`, not a dry run, not appending). Mirrors the options the CLI's clone
 /// paths passed.
 struct CloneFetchOptions<'a> {
+    policy: crate::RemotePolicy,
     progress: bool,
     depth: Option<u32>,
     deepen_since: Option<i64>,
@@ -860,6 +877,7 @@ struct CloneFetchOptions<'a> {
 
 fn clone_fetch_options(options: CloneFetchOptions<'_>) -> FetchOptions {
     let CloneFetchOptions {
+        policy,
         progress,
         depth,
         deepen_since,
@@ -872,6 +890,7 @@ fn clone_fetch_options(options: CloneFetchOptions<'_>) -> FetchOptions {
         upload_pack_command,
     } = options;
     FetchOptions {
+        policy,
         // Clone keeps fetch bookkeeping quiet, but an explicitly/resolved
         // enabled transfer-progress policy must reach the progress sink.
         quiet: !progress,

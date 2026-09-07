@@ -16,7 +16,6 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
-use crate::sley_config;
 use sley::{GitError, Result};
 use sley_config::ConfigIncludeContext;
 

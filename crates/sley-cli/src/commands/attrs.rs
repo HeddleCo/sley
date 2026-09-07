@@ -1,11 +1,9 @@
 //! Attribute and ignore inspection commands (`check-attr`, `check-ignore`).
 
-use crate::sley_object;
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use {sley_core, sley_index, sley_rev, sley_worktree};
 
 use sley::{GitError, Result};
 use sley_object::tree_entry_object_type;
@@ -130,7 +128,12 @@ pub(crate) fn cmd_check_ignore(
         let ignore_match = if tracked_paths.contains(&git_path) {
             None
         } else {
-            sley_worktree::standard_ignore_match(worktree_root, &git_path, absolute.is_dir())?
+            sley_worktree::standard_ignore_match(
+                cli_session.precompose_unicode(),
+                worktree_root,
+                &git_path,
+                absolute.is_dir(),
+            )?
         };
         let path_matched = ignore_match
             .as_ref()

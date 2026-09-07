@@ -18,7 +18,6 @@
 //! * `refs/bisect/skip-<oid>` -- one ref per skipped commit.
 #![allow(clippy::expect_used)]
 use crate::*;
-use {sley_diff_merge, sley_worktree};
 
 // Upstream `enum bisect_error` values; the process exit code is the negation.
 const BISECT_OK: i32 = 0;
@@ -166,7 +165,14 @@ pub(crate) fn cmd_bisect(cli_session: &crate::session::CliSession, args: &[Strin
                 return Err(GitError::Exit(129));
             }
             let mut out = io::stdout();
-            let code = bisect_state(&repo, &mut terms, args, &mut out)?;
+            let code = bisect_state(
+                cli_session.original_cwd.as_deref(),
+                &cli_session.remote_policy,
+                &repo,
+                &mut terms,
+                args,
+                &mut out,
+            )?;
             out.flush()?;
             bisect_exit(code)
         }
@@ -580,6 +586,8 @@ fn current_bisect_oid(repo: &BisectRepo) -> Result<ObjectId> {
 
 /// Upstream `bisect_state`: argv[0] is the state word, the rest are revs.
 fn bisect_state(
+    original_cwd: Option<&std::path::Path>,
+    policy: &sley_remote::RemotePolicy,
     repo: &BisectRepo,
     terms: &mut BisectTerms,
     argv: &[String],
@@ -655,7 +663,7 @@ fn bisect_state(
             verify_expected = false;
         }
     }
-    bisect_auto_next(repo, terms, out)
+    bisect_auto_next(original_cwd, policy, repo, terms, out)
 }
 
 fn cmd_bisect_skip(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
@@ -697,7 +705,14 @@ fn cmd_bisect_skip(cli_session: &crate::session::CliSession, args: &[String]) ->
         }
     }
     let mut out = io::stdout();
-    let code = bisect_state(&repo, &mut terms, &argv_state, &mut out)?;
+    let code = bisect_state(
+        cli_session.original_cwd.as_deref(),
+        &cli_session.remote_policy,
+        &repo,
+        &mut terms,
+        &argv_state,
+        &mut out,
+    )?;
     out.flush()?;
     bisect_exit(code)
 }
@@ -715,12 +730,24 @@ fn cmd_bisect_next(cli_session: &crate::session::CliSession, args: &[String]) ->
     let mut terms = BisectTerms::default();
     get_terms(&repo, &mut terms);
     let mut out = io::stdout();
-    let code = bisect_next(&repo, &mut terms, &mut out)?;
+    let code = bisect_next(
+        cli_session.original_cwd.as_deref(),
+        &cli_session.remote_policy,
+        &repo,
+        &mut terms,
+        &mut out,
+    )?;
     out.flush()?;
     bisect_exit(code)
 }
 
-fn bisect_next(repo: &BisectRepo, terms: &mut BisectTerms, out: &mut dyn Write) -> Result<i32> {
+fn bisect_next(
+    original_cwd: Option<&std::path::Path>,
+    policy: &sley_remote::RemotePolicy,
+    repo: &BisectRepo,
+    terms: &mut BisectTerms,
+    out: &mut dyn Write,
+) -> Result<i32> {
     if bisect_autostart(repo, terms) != 0 {
         return Ok(BISECT_FAILED);
     }
@@ -728,7 +755,7 @@ fn bisect_next(repo: &BisectRepo, terms: &mut BisectTerms, out: &mut dyn Write) 
     if bisect_next_check(repo, terms, Some(&good_term)) != 0 {
         return Ok(BISECT_FAILED);
     }
-    let res = bisect_next_all(repo, terms, out)?;
+    let res = bisect_next_all(original_cwd, policy, repo, terms, out)?;
     if res == BISECT_INTERNAL_SUCCESS_1ST_BAD_FOUND {
         // Record the conclusion in BISECT_LOG.
         if let Some(bad) = bisect_bad_oid(repo, terms)? {
@@ -752,6 +779,8 @@ fn bisect_next(repo: &BisectRepo, terms: &mut BisectTerms, out: &mut dyn Write) 
 }
 
 fn bisect_auto_next(
+    original_cwd: Option<&std::path::Path>,
+    policy: &sley_remote::RemotePolicy,
     repo: &BisectRepo,
     terms: &mut BisectTerms,
     out: &mut dyn Write,
@@ -760,7 +789,7 @@ fn bisect_auto_next(
         bisect_print_status(repo, terms, out)?;
         return Ok(BISECT_OK);
     }
-    bisect_next(repo, terms, out)
+    bisect_next(original_cwd, policy, repo, terms, out)
 }
 
 /// Append the `# only skipped commits left to test` block to BISECT_LOG
@@ -988,7 +1017,13 @@ fn bisect_start(
         return Ok(res);
     }
 
-    let res = bisect_auto_next(repo, terms, out)?;
+    let res = bisect_auto_next(
+        cli_session.original_cwd.as_deref(),
+        &cli_session.remote_policy,
+        repo,
+        terms,
+        out,
+    )?;
     if !is_bisect_success(res) {
         bisect_clean_state(repo)?;
     }
@@ -1127,7 +1162,13 @@ fn bisect_replay(
     if res != BISECT_OK {
         return Ok(BISECT_FAILED);
     }
-    bisect_auto_next(repo, terms, &mut io::stdout())
+    bisect_auto_next(
+        cli_session.original_cwd.as_deref(),
+        &cli_session.remote_policy,
+        repo,
+        terms,
+        &mut io::stdout(),
+    )
 }
 
 fn process_replay_line(
@@ -1370,7 +1411,13 @@ fn cmd_bisect_run(cli_session: &crate::session::CliSession, args: &[String]) -> 
     let repo = BisectRepo::open(cli_session)?;
     let mut terms = BisectTerms::default();
     get_terms(&repo, &mut terms);
-    bisect_exit(bisect_run(&repo, &mut terms, args)?)
+    bisect_exit(bisect_run(
+        cli_session.original_cwd.as_deref(),
+        &cli_session.remote_policy,
+        &repo,
+        &mut terms,
+        args,
+    )?)
 }
 
 /// Run `command` through the shell, returning the child's exit code (negative
@@ -1388,7 +1435,12 @@ fn do_bisect_run(command: &str) -> Result<i32> {
     }
 }
 
-fn verify_good(repo: &BisectRepo, terms: &BisectTerms, command: &str) -> Result<i32> {
+fn verify_good(
+    original_cwd: Option<&std::path::Path>,
+    repo: &BisectRepo,
+    terms: &BisectTerms,
+    command: &str,
+) -> Result<i32> {
     let goods = bisect_good_oids(repo, terms)?;
     let Some(good_rev) = goods.first().copied() else {
         return Ok(-1);
@@ -1399,18 +1451,24 @@ fn verify_good(repo: &BisectRepo, terms: &BisectTerms, command: &str) -> Result<
         Err(_) => return Ok(-1),
     };
     let mut sink = Vec::new();
-    if bisect_checkout(repo, &good_rev, no_checkout, &mut sink)? != BISECT_OK {
+    if bisect_checkout(original_cwd, repo, &good_rev, no_checkout, &mut sink)? != BISECT_OK {
         return Ok(-1);
     }
     let rc = do_bisect_run(command)?;
     let mut sink = Vec::new();
-    if bisect_checkout(repo, &current, no_checkout, &mut sink)? != BISECT_OK {
+    if bisect_checkout(original_cwd, repo, &current, no_checkout, &mut sink)? != BISECT_OK {
         return Ok(-1);
     }
     Ok(rc)
 }
 
-fn bisect_run(repo: &BisectRepo, terms: &mut BisectTerms, args: &[String]) -> Result<i32> {
+fn bisect_run(
+    original_cwd: Option<&std::path::Path>,
+    policy: &sley_remote::RemotePolicy,
+    repo: &BisectRepo,
+    terms: &mut BisectTerms,
+    args: &[String],
+) -> Result<i32> {
     if bisect_next_check(repo, terms, None) != 0 {
         return Ok(BISECT_FAILED);
     }
@@ -1426,7 +1484,7 @@ fn bisect_run(repo: &BisectRepo, terms: &mut BisectTerms, args: &[String]) -> Re
         // Exit code 126 and 127 can come from the shell when the script is
         // missing or not executable; verify with a known-good revision.
         if is_first_run && (res == 126 || res == 127) {
-            let rc = verify_good(repo, terms, &command)?;
+            let rc = verify_good(original_cwd, repo, terms, &command)?;
             is_first_run = false;
             if !(0..128).contains(&rc) {
                 eprintln!(
@@ -1457,7 +1515,14 @@ fn bisect_run(repo: &BisectRepo, terms: &mut BisectTerms, args: &[String]) -> Re
         // Upstream redirects the state step's stdout into BISECT_RUN, then
         // prints the file.
         let mut buffer: Vec<u8> = Vec::new();
-        let state_res = bisect_state(repo, terms, std::slice::from_ref(&new_state), &mut buffer)?;
+        let state_res = bisect_state(
+            original_cwd,
+            policy,
+            repo,
+            terms,
+            std::slice::from_ref(&new_state),
+            &mut buffer,
+        )?;
         fs::write(repo.state_path("BISECT_RUN"), &buffer)?;
         io::stdout().write_all(&buffer)?;
         io::stdout().flush()?;
@@ -1570,6 +1635,7 @@ fn error_if_skipped_commits(
 /// Check out (or record, with --no-checkout) the next rev and print
 /// `[<oid>] <subject>` (upstream `bisect_checkout`).
 fn bisect_checkout(
+    original_cwd: Option<&std::path::Path>,
     repo: &BisectRepo,
     rev: &ObjectId,
     no_checkout: bool,
@@ -1594,6 +1660,7 @@ fn bisect_checkout(
             .unwrap_or_else(|_| "HEAD".to_string());
         let message = format!("checkout: moving from {old} to {}", rev.to_hex());
         if let Err(err) = sley_worktree::checkout_detached(
+            original_cwd,
             worktree_root,
             &repo.git_dir,
             repo.format,
@@ -1674,6 +1741,7 @@ fn join_oids_hex(oids: &[ObjectId]) -> String {
 
 /// Upstream `check_merge_bases`.
 fn check_merge_bases(
+    original_cwd: Option<&std::path::Path>,
     repo: &BisectRepo,
     terms: &BisectTerms,
     bad: &ObjectId,
@@ -1726,7 +1794,7 @@ fn check_merge_bases(
             );
         } else {
             writeln!(out, "Bisecting: a merge base must be tested")?;
-            let res = bisect_checkout(repo, base, no_checkout, out)?;
+            let res = bisect_checkout(original_cwd, repo, base, no_checkout, out)?;
             if res == BISECT_OK {
                 return Ok(BISECT_INTERNAL_SUCCESS_MERGE_BASE);
             }
@@ -1738,6 +1806,7 @@ fn check_merge_bases(
 
 /// Upstream `check_good_are_ancestors_of_bad`.
 fn check_good_are_ancestors_of_bad(
+    original_cwd: Option<&std::path::Path>,
     repo: &BisectRepo,
     terms: &BisectTerms,
     bad: Option<&ObjectId>,
@@ -1765,7 +1834,16 @@ fn check_good_are_ancestors_of_bad(
         }
     }
     let res = if !all_ancestors {
-        check_merge_bases(repo, terms, bad, goods, skipped, no_checkout, out)?
+        check_merge_bases(
+            original_cwd,
+            repo,
+            terms,
+            bad,
+            goods,
+            skipped,
+            no_checkout,
+            out,
+        )?
     } else {
         BISECT_OK
     };
@@ -1776,7 +1854,13 @@ fn check_good_are_ancestors_of_bad(
 }
 
 /// The core next-step computation (upstream `bisect_next_all`).
-fn bisect_next_all(repo: &BisectRepo, terms: &BisectTerms, out: &mut dyn Write) -> Result<i32> {
+fn bisect_next_all(
+    original_cwd: Option<&std::path::Path>,
+    policy: &sley_remote::RemotePolicy,
+    repo: &BisectRepo,
+    terms: &BisectTerms,
+    out: &mut dyn Write,
+) -> Result<i32> {
     let no_checkout = repo.no_checkout();
     let first_parent = repo.first_parent_mode();
     let bad = bisect_bad_oid(repo, terms)?;
@@ -1785,6 +1869,7 @@ fn bisect_next_all(repo: &BisectRepo, terms: &BisectTerms, out: &mut dyn Write) 
     let find_all = !skipped.is_empty();
 
     let res = check_good_are_ancestors_of_bad(
+        original_cwd,
         repo,
         terms,
         bad.as_ref(),
@@ -1896,7 +1981,7 @@ fn bisect_next_all(repo: &BisectRepo, terms: &BisectTerms, out: &mut dyn Write) 
             bisect_rev.to_hex(),
             quote_term(&terms.bad)
         )?;
-        bisect_show_commit(repo, &bisect_rev, out)?;
+        bisect_show_commit(policy, repo, &bisect_rev, out)?;
         return Ok(BISECT_INTERNAL_SUCCESS_1ST_BAD_FOUND);
     }
 
@@ -1909,12 +1994,17 @@ fn bisect_next_all(repo: &BisectRepo, terms: &BisectTerms, out: &mut dyn Write) 
         plural(steps, "step", "steps"),
     )?;
 
-    bisect_checkout(repo, &bisect_rev, no_checkout, out)
+    bisect_checkout(original_cwd, repo, &bisect_rev, no_checkout, out)
 }
 
 /// Render the first-bad commit like `git show --stat --summary
 /// --no-abbrev-commit --diff-merges=first-parent`.
-fn bisect_show_commit(repo: &BisectRepo, oid: &ObjectId, out: &mut dyn Write) -> Result<()> {
+fn bisect_show_commit(
+    policy: &sley_remote::RemotePolicy,
+    repo: &BisectRepo,
+    oid: &ObjectId,
+    out: &mut dyn Write,
+) -> Result<()> {
     let db = repo.db();
     let object = db.read_object(oid)?;
     if object.object_type != ObjectType::Commit {
@@ -1970,13 +2060,9 @@ fn bisect_show_commit(repo: &BisectRepo, oid: &ObjectId, out: &mut dyn Write) ->
             sley_diff_merge::DiffNameStatusOptions::default(),
         )?,
     };
-    let stat_entries = collect_diff_stat_entries(
-        &entries,
-        &db,
-        None,
-        false,
-        crate::diff_lazy_fetch(repo.lazy_fetch),
-    )?;
+    let lazy_fetch_adapter_1 = crate::diff_lazy_fetch(policy, repo.lazy_fetch);
+    let stat_entries =
+        collect_diff_stat_entries(&entries, &db, None, false, lazy_fetch_adapter_1.as_option())?;
     write_diff_stat_materialized(
         out,
         &stat_entries,

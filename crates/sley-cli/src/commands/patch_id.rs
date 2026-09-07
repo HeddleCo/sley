@@ -52,7 +52,6 @@
 //! such as `cli_git_dir`, `repository_object_format`, `read_repo_config`,
 //! `global_config_value`, and `sley_config::parse_config_bool`.
 use crate::*;
-use sley_config;
 
 /// Exact usage text git's `patch-id` prints for `-h` and on option errors. A raw
 /// string is used so the four-space indentation on the option lines (and the

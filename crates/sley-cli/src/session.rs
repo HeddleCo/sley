@@ -29,6 +29,8 @@ pub(crate) struct CliEnv {
 #[derive(Debug, Clone)]
 pub(crate) struct CliSession {
     pub cwd: PathBuf,
+    pub remote_policy: sley_remote::RemotePolicy,
+    pub original_cwd: Option<PathBuf>,
     pub env: CliEnv,
     /// When set, repository environment overrides are hidden from a child
     /// invocation (local transport subprocess isolation).
@@ -105,6 +107,21 @@ fn apply_global_overrides(
     }
 }
 
+pub(crate) fn remote_policy_from_environment() -> sley_remote::RemotePolicy {
+    sley_remote::RemotePolicy {
+        namespace: sley_core::Namespace::new(&env::var("GIT_NAMESPACE").unwrap_or_default()),
+        transport: sley_remote::TransportPolicy {
+            allow_protocols: env::var("GIT_ALLOW_PROTOCOL")
+                .ok()
+                .map(|s| s.split(':').map(str::to_owned).collect()),
+            from_user: env::var("GIT_PROTOCOL_FROM_USER")
+                .ok()
+                .and_then(|s| sley_config::parse_config_bool(&s))
+                .unwrap_or(true),
+        },
+    }
+}
+
 impl CliSession {
     pub(crate) fn from_parsed_globals(
         cwd: PathBuf,
@@ -117,6 +134,8 @@ impl CliSession {
         pathspec_flags: PathspecFlags,
     ) -> Self {
         Self {
+            remote_policy: sley_remote::RemotePolicy::default(),
+            original_cwd: Some(cwd.clone()),
             cwd,
             env: CliEnv {
                 git_dir,
@@ -130,6 +149,12 @@ impl CliSession {
             local_repo_env_hidden: false,
             repository_snapshot: OnceLock::new(),
         }
+    }
+
+    pub(crate) fn precompose_unicode(&self) -> sley_core::PrecomposeUnicode {
+        self.repository_snapshot()
+            .map(|snapshot| snapshot.config.precompose_unicode())
+            .unwrap_or_default()
     }
 
     /// Resolve and cache the repository/config bootstrap for this invocation.
@@ -166,18 +191,8 @@ impl CliSession {
                 format,
             }))
         }) {
-            Ok(snapshot) => {
-                sley_core::activate_precompose_unicode(snapshot.config.get_bool(
-                    "core",
-                    None,
-                    "precomposeunicode",
-                ));
-                Ok(Arc::clone(snapshot))
-            }
-            Err(err) => {
-                sley_core::activate_precompose_unicode(None);
-                Err(err.clone())
-            }
+            Ok(snapshot) => Ok(Arc::clone(snapshot)),
+            Err(err) => Err(err.clone()),
         }
     }
 
@@ -277,8 +292,12 @@ impl CliSession {
 
     /// Build an invocation context pinned to an already-resolved repository.
     /// Used by nested in-process engine calls that must not rediscover cwd.
-    pub(crate) fn for_repository_paths(cwd: PathBuf, git_dir: PathBuf) -> Self {
-        Self::from_parsed_globals(
+    pub(crate) fn for_repository_paths(
+        remote_policy: &sley_remote::RemotePolicy,
+        cwd: PathBuf,
+        git_dir: PathBuf,
+    ) -> Self {
+        let mut session = Self::from_parsed_globals(
             cwd,
             Some(git_dir),
             None,
@@ -287,7 +306,9 @@ impl CliSession {
             true,
             true,
             PathspecFlags::default(),
-        )
+        );
+        session.remote_policy = remote_policy.clone();
+        session
     }
 
     pub(crate) fn pathspec_flags(&self) -> PathspecFlags {
@@ -311,7 +332,7 @@ impl CliSession {
     pub(crate) fn open_repository(&self) -> Result<Repository> {
         let git_dir = self.git_dir()?;
         let work_tree =
-            crate::sley_worktree::discovery::setup::effective_worktree_for_git_dir(self, &git_dir)?;
+            sley_worktree::discovery::setup::effective_worktree_for_git_dir(self, &git_dir)?;
         let config = crate::read_repo_config(&git_dir)?;
         let use_replace_refs = config
             .get_bool("core", None, "useReplaceRefs")
@@ -338,17 +359,16 @@ impl CliSession {
 
     /// Resolve the worktree for `git_dir` using this invocation's location policy.
     pub(crate) fn worktree_root_for_git_dir(&self, git_dir: &Path) -> Result<PathBuf> {
-        crate::sley_worktree::discovery::setup::effective_worktree_for_git_dir(self, git_dir)?
-            .ok_or_else(|| {
-                GitError::Unsupported("update-index currently requires a non-bare worktree".into())
-            })
+        sley_worktree::discovery::setup::effective_worktree_for_git_dir(self, git_dir)?.ok_or_else(
+            || GitError::Unsupported("update-index currently requires a non-bare worktree".into()),
+        )
     }
 
     /// Resolve the invocation's effective worktree without requiring one.
     /// Read-only commands use this to distinguish a bare repository from a
     /// bare repository paired with an explicit `--work-tree`.
     pub(crate) fn optional_worktree_for_git_dir(&self, git_dir: &Path) -> Result<Option<PathBuf>> {
-        crate::sley_worktree::discovery::setup::effective_worktree_for_git_dir(self, git_dir)
+        sley_worktree::discovery::setup::effective_worktree_for_git_dir(self, git_dir)
     }
 
     /// Resolve the invocation worktree from already-loaded physical and
@@ -361,7 +381,7 @@ impl CliSession {
         linked_worktree: bool,
         policy: crate::repository::WorktreePolicy,
     ) -> Result<Option<PathBuf>> {
-        crate::sley_worktree::discovery::setup::optional_worktree_from_config(
+        sley_worktree::discovery::setup::optional_worktree_from_config(
             self,
             git_dir,
             setup_config,
@@ -373,7 +393,7 @@ impl CliSession {
 
     /// Resolved git directory for this session's cwd.
     pub(crate) fn git_dir(&self) -> Result<PathBuf> {
-        crate::sley_worktree::discovery::setup::invocation_git_dir(self)
+        sley_worktree::discovery::setup::invocation_git_dir(self)
     }
 
     pub(crate) fn cwd(&self) -> &Path {
@@ -384,7 +404,7 @@ impl CliSession {
 /// The CLI session is the library setup engine's source of invocation-scoped
 /// overrides (`--git-dir` / `GIT_DIR`, `--work-tree` / `GIT_WORK_TREE`,
 /// `--bare`, and the invocation cwd).
-impl crate::sley_worktree::discovery::setup::SetupEnvironment for CliSession {
+impl sley_worktree::discovery::setup::SetupEnvironment for CliSession {
     fn cwd(&self) -> &Path {
         &self.cwd
     }
@@ -583,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_snapshot_selection_restores_precompose_policy() {
+    fn cached_snapshots_keep_independent_precompose_policy() {
         let root = unique_temp_dir("session-snapshot-precompose-selection");
         let enabled_root = root.join("enabled");
         let disabled_root = root.join("disabled");
@@ -607,22 +627,50 @@ mod tests {
 
         let parent = session(disabled_root, Some(enabled.git_dir().to_path_buf()));
         parent.repository_snapshot().expect("select enabled parent");
-        assert!(sley_core::precompose_unicode_enabled());
+        assert!(
+            parent
+                .repository_snapshot()
+                .expect("parent snapshot")
+                .config
+                .precompose_unicode()
+                .is_enabled()
+        );
 
         let child = parent.local_repo_env_hidden_child();
         child.repository_snapshot().expect("select disabled child");
-        assert!(!sley_core::precompose_unicode_enabled());
+        assert!(
+            !child
+                .repository_snapshot()
+                .expect("child snapshot")
+                .config
+                .precompose_unicode()
+                .is_enabled()
+        );
 
         parent
             .repository_snapshot()
             .expect("reselect cached parent");
-        assert!(sley_core::precompose_unicode_enabled());
+        assert!(
+            parent
+                .repository_snapshot()
+                .expect("parent snapshot")
+                .config
+                .precompose_unicode()
+                .is_enabled()
+        );
 
         let outside = session(outside_root, None);
         outside
             .repository_snapshot()
             .expect_err("outside fixture has no repository");
-        assert!(!sley_core::precompose_unicode_enabled());
+        assert!(
+            !child
+                .repository_snapshot()
+                .expect("child snapshot")
+                .config
+                .precompose_unicode()
+                .is_enabled()
+        );
 
         fs::remove_dir_all(root).expect("remove fixture");
     }

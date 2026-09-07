@@ -1,7 +1,6 @@
 //! Branch name/ref resolution shared across branch subcommands.
 
 use crate::*;
-use {sley_refs, sley_rev};
 
 #[derive(Clone, Copy)]
 pub(super) enum BranchOperandKind {

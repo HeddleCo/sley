@@ -136,7 +136,11 @@ fn cmd_sparse_init(cli_session: &crate::session::CliSession, args: &[String]) ->
     if read_sparse_patterns(&ctx)?.is_none() {
         write_sparse_file(&ctx, b"/*\n!/*/\n")?;
     }
-    apply_current_sparse(&ctx)?;
+    apply_current_sparse(
+        cli_session.original_cwd.as_deref(),
+        &cli_session.remote_policy,
+        &ctx,
+    )?;
     Ok(())
 }
 
@@ -225,7 +229,11 @@ fn cmd_sparse_set(cli_session: &crate::session::CliSession, args: &[String]) -> 
     enable_sparse_checkout(&ctx, cone_mode)?;
     apply_sparse_index_flag(&ctx, parsed.sparse_index)?;
     write_sparse_file(&ctx, &content)?;
-    apply_current_sparse(&ctx)?;
+    apply_current_sparse(
+        cli_session.original_cwd.as_deref(),
+        &cli_session.remote_policy,
+        &ctx,
+    )?;
     Ok(())
 }
 
@@ -272,7 +280,11 @@ fn cmd_sparse_add(cli_session: &crate::session::CliSession, args: &[String]) -> 
         serialize_noncone_lines(&lines)
     };
     write_sparse_file(&ctx, &content)?;
-    apply_current_sparse(&ctx)?;
+    apply_current_sparse(
+        cli_session.original_cwd.as_deref(),
+        &cli_session.remote_policy,
+        &ctx,
+    )?;
     Ok(())
 }
 
@@ -303,7 +315,11 @@ fn cmd_sparse_reapply(cli_session: &crate::session::CliSession, args: &[String])
     };
     enable_sparse_checkout(&ctx, cone_mode)?;
     apply_sparse_index_flag(&ctx, sparse_index)?;
-    apply_current_sparse(&ctx)?;
+    apply_current_sparse(
+        cli_session.original_cwd.as_deref(),
+        &cli_session.remote_policy,
+        &ctx,
+    )?;
     Ok(())
 }
 
@@ -321,6 +337,7 @@ fn cmd_sparse_disable(cli_session: &crate::session::CliSession, args: &[String])
         sparse_index: false,
     };
     let result = apply_sparse_checkout_with_mode(
+        cli_session.original_cwd.as_deref(),
         &ctx.worktree_root,
         &ctx.git_dir,
         ctx.format,
@@ -1443,7 +1460,11 @@ fn sparse_file_path(git_dir: &Path) -> PathBuf {
 
 /// Reconciles the index and worktree with the pattern file currently on disk,
 /// using the cone vs full matcher implied by `core.sparseCheckoutCone`.
-fn apply_current_sparse(ctx: &SparseContext) -> Result<()> {
+fn apply_current_sparse(
+    original_cwd: Option<&std::path::Path>,
+    policy: &sley_remote::RemotePolicy,
+    ctx: &SparseContext,
+) -> Result<()> {
     let Some(patterns) = read_sparse_patterns(ctx)? else {
         return Ok(());
     };
@@ -1479,8 +1500,9 @@ fn apply_current_sparse(ctx: &SparseContext) -> Result<()> {
     // Expanding the cone may require blobs that a partial clone never
     // downloaded. Prefetch them from configured promisor remotes before the
     // materialize loop (t5620 sparse-checkout set d during backfill --sparse).
-    prefetch_sparse_cone_blobs(ctx, &sparse, mode)?;
+    prefetch_sparse_cone_blobs(policy, ctx, &sparse, mode)?;
     let result = apply_sparse_checkout_with_mode(
+        original_cwd,
         &ctx.worktree_root,
         &ctx.git_dir,
         ctx.format,
@@ -1501,6 +1523,7 @@ fn apply_current_sparse(ctx: &SparseContext) -> Result<()> {
 
 /// Prefetch missing index blobs that the new sparse cone will materialize.
 fn prefetch_sparse_cone_blobs(
+    policy: &sley_remote::RemotePolicy,
     ctx: &SparseContext,
     sparse: &SparseCheckout,
     mode: SparseCheckoutMode,
@@ -1553,6 +1576,7 @@ fn prefetch_sparse_cone_blobs(
             continue;
         };
         let _ = sley_remote::install_fetch_pack_via_local_upload_pack(
+            policy,
             &ctx.git_dir,
             &remote_git_dir,
             ctx.format,

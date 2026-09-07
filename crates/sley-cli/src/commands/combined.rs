@@ -9,7 +9,6 @@
 //! A glob of the crate root brings every shared helper/type into scope via
 //! descendant-privacy; see commands::stash for the rationale.
 use crate::*;
-use sley_diff_merge;
 
 /// One path of a combined merge diff: the merge result plus each parent's state
 /// for that path (mirrors git's `struct combine_diff_path`).
@@ -340,6 +339,7 @@ pub(crate) fn combined_path_matches_find_objects(
 /// Emit one combined-patch file — git's `show_patch_diff`. Returns `true` when a
 /// header+body was emitted (some hunks survived, or modes differ).
 pub(crate) fn write_combined_patch(
+    policy: &sley_remote::RemotePolicy,
     stdout: &mut dyn Write,
     ctx: &CombinedRenderCtx<'_>,
     path: &CombinedPath,
@@ -349,16 +349,21 @@ pub(crate) fn write_combined_patch(
     // `grab_blob` synthesizes `Subproject commit <hex>\n` for `S_ISGITLINK(mode)`
     // before any object read, exactly as the non-combined diff path does. Reading
     // it as a blob would error or yield garbage.
+    let lazy_fetch_adapter_1 = crate::diff_lazy_fetch(policy, ctx.lazy_fetch);
     let result_blob = match &path.result_oid {
         Some(oid) if path.result_mode == 0o160000 => gitlink_diff_content(oid, false),
-        Some(oid) => read_blob(ctx.db, oid, crate::diff_lazy_fetch(ctx.lazy_fetch))?,
+        Some(oid) => read_blob(ctx.db, oid, lazy_fetch_adapter_1.as_option())?,
         None => Vec::new(),
     };
     let mut parent_blobs: Vec<Vec<u8>> = Vec::with_capacity(num_parent);
     for parent in &path.parents {
         parent_blobs.push(match &parent.oid {
             Some(oid) if parent.mode == 0o160000 => gitlink_diff_content(oid, false),
-            Some(oid) => read_blob(ctx.db, oid, crate::diff_lazy_fetch(ctx.lazy_fetch))?,
+            Some(oid) => read_blob(
+                ctx.db,
+                oid,
+                crate::diff_lazy_fetch(policy, ctx.lazy_fetch).as_option(),
+            )?,
             None => Vec::new(),
         });
     }

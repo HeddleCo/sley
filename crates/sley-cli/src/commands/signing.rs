@@ -2,7 +2,7 @@
 //! commands.
 
 use crate::*;
-use sley_config;
+
 use std::process::Stdio;
 
 #[derive(Debug, Clone, Default)]

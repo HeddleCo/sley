@@ -166,7 +166,11 @@ pub(crate) fn cmd_fetch_pack(
             format.name()
         )));
     }
-    let advertisements = sley_remote::local_fetch_advertisements(&remote_git_dir, format)?;
+    let advertisements = sley_remote::local_fetch_advertisements(
+        &cli_session.remote_policy,
+        &remote_git_dir,
+        format,
+    )?;
     let remote_config = read_repo_config(&remote_common_git_dir)?;
     let transfer_filter = match flags.filter.as_deref() {
         None => None,
@@ -285,6 +289,7 @@ pub(crate) fn cmd_fetch_pack(
     };
     if !wants.is_empty() {
         let shallow_info = sley_remote::install_fetch_pack_via_local_upload_pack(
+            &cli_session.remote_policy,
             &git_dir,
             &remote_git_dir,
             format,

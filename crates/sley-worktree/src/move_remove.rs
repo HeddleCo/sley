@@ -14,6 +14,7 @@ use crate::types_admin::*;
 use sley_core::paths::{normalize_lexical, relative_path_between};
 
 pub fn remove_index_and_worktree_paths(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
@@ -21,6 +22,8 @@ pub fn remove_index_and_worktree_paths(
     options: RemoveOptions,
     config_parameters_env: Option<&str>,
 ) -> Result<RemoveResult> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let cwd = env::current_dir()?;
     let worktree_root = absolute_path_lexically(worktree_root.as_ref(), &cwd);
     let git_dir = absolute_path_lexically(git_dir.as_ref(), &cwd);
@@ -48,6 +51,7 @@ pub fn remove_index_and_worktree_paths(
     let needs_sparse_expansion = !original_sparse_dir_paths.is_empty()
         && paths.iter().any(|path| {
             remove_pathspec_intersects_sparse_directory(
+                precompose,
                 worktree_root,
                 path,
                 &original_sparse_dir_paths,
@@ -178,7 +182,9 @@ pub fn remove_index_and_worktree_paths(
     // 1/2/3 together), matching git's name-keyed removal.
     let mut selected = BTreeSet::new();
     let mut only_match_sparse: Vec<String> = Vec::new();
-    if let Some(mut pathspecs) = RemoveCompiledPathspecs::parse(worktree_root, paths)? {
+    if let Some(mut pathspecs) =
+        RemoveCompiledPathspecs::parse_precomposed(precompose, worktree_root, paths)?
+    {
         // Match every non-sparse-dir entry first (dense + sparse), then partition
         // per include pathspec so a mixed dense/sparse match stays silent.
         let mut all_matched = BTreeSet::new();
@@ -250,7 +256,7 @@ pub fn remove_index_and_worktree_paths(
             })?;
             // A pathspec with a trailing slash (e.g. `git rm dir/`) only matches a
             // directory: it must never match a same-named tracked file.
-            let git_path = git_path_bytes(relative)?;
+            let git_path = git_path_bytes(precompose, relative)?;
             // Worktree-relative display used in sparse advice (`rm b` → `b`).
             let display = String::from_utf8_lossy(&git_path).into_owned();
             if !has_trailing_slash && index_paths.contains(&git_path) {
@@ -576,6 +582,7 @@ pub fn remove_index_and_worktree_paths(
             let is_gitlink = gitlink_paths.contains(path);
             let is_stage0_gitlink = stage0_gitlink_paths.contains(path);
             match remove_tracked_worktree_path(
+                original_cwd,
                 worktree_root,
                 path,
                 is_gitlink,
@@ -641,7 +648,14 @@ pub fn remove_index_and_worktree_paths(
         && let Some((sparse, mode)) = active_sparse_checkout(git_dir)?
         && sparse.sparse_index
     {
-        apply_sparse_checkout_with_mode(worktree_root, git_dir, format, &sparse, mode)?;
+        apply_sparse_checkout_with_mode(
+            original_cwd,
+            worktree_root,
+            git_dir,
+            format,
+            &sparse,
+            mode,
+        )?;
     }
     Ok(RemoveResult {
         removed: display_removed_paths(),
@@ -661,13 +675,17 @@ struct RemoveCompiledPathspecs {
 }
 
 impl RemoveCompiledPathspecs {
-    fn parse(worktree_root: &Path, paths: &[PathBuf]) -> Result<Option<Self>> {
+    fn parse_precomposed(
+        precompose: sley_core::PrecomposeUnicode,
+        worktree_root: &Path,
+        paths: &[PathBuf],
+    ) -> Result<Option<Self>> {
         let mut saw_magic = false;
         let mut specs = Vec::with_capacity(paths.len());
         let mut have_include = false;
         let mut implicit_prefix = Vec::new();
         for path in paths {
-            let parsed = remove_pathspec_parts(worktree_root, path)?;
+            let parsed = remove_pathspec_parts(precompose, worktree_root, path)?;
             saw_magic |= parsed.from_magic;
             if parsed.from_magic && implicit_prefix.is_empty() {
                 implicit_prefix = parsed.prefix.clone();
@@ -720,7 +738,11 @@ struct RemovePathspecParts {
     from_magic: bool,
 }
 
-fn remove_pathspec_parts(worktree_root: &Path, path: &Path) -> Result<RemovePathspecParts> {
+fn remove_pathspec_parts(
+    precompose: sley_core::PrecomposeUnicode,
+    worktree_root: &Path,
+    path: &Path,
+) -> Result<RemovePathspecParts> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -730,7 +752,7 @@ fn remove_pathspec_parts(worktree_root: &Path, path: &Path) -> Result<RemovePath
     let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
         GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
     })?;
-    let git_path = git_path_bytes(relative)?;
+    let git_path = git_path_bytes(precompose, relative)?;
     let components = git_path
         .split(|byte| *byte == b'/')
         .filter(|component| !component.is_empty())
@@ -769,11 +791,12 @@ fn remove_path_under_prefix(path: &[u8], prefix: &[u8]) -> bool {
 /// enough to avoid expanding for in-cone specs such as `deep/deep*`, while
 /// conservatively expanding for broad globs such as `*/a` and `**a`.
 fn remove_pathspec_intersects_sparse_directory(
+    precompose: sley_core::PrecomposeUnicode,
     worktree_root: &Path,
     path: &Path,
     sparse_directories: &BTreeSet<Vec<u8>>,
 ) -> Result<bool> {
-    let parsed = remove_pathspec_parts(worktree_root, path)?;
+    let parsed = remove_pathspec_parts(precompose, worktree_root, path)?;
     if parsed.from_magic {
         return Ok(true);
     }
@@ -827,6 +850,7 @@ fn remove_pathspec_intersects_sparse_directory(
 /// could not be unlinked because it is a directory (the caller decides whether
 /// that aborts the run). A path that has already vanished is a no-op success.
 pub(crate) fn remove_tracked_worktree_path(
+    original_cwd: Option<&std::path::Path>,
     root: &Path,
     path: &[u8],
     is_gitlink: bool,
@@ -850,7 +874,7 @@ pub(crate) fn remove_tracked_worktree_path(
                 if file.join(".git").is_dir() && !is_stage0_gitlink {
                     return Ok(false);
                 }
-                if !force && original_cwd_is_inside(&file) {
+                if !force && original_cwd_is_inside(original_cwd, &file) {
                     let nested_git = file.join(".git");
                     if nested_git.is_dir() {
                         let _ = fs::remove_dir_all(nested_git);
@@ -873,7 +897,7 @@ pub(crate) fn remove_tracked_worktree_path(
                 if fs::symlink_metadata(&file).is_ok() {
                     fs::remove_dir(&file)?;
                 }
-                prune_empty_parents(root, file.parent())?;
+                prune_empty_parents(original_cwd, root, file.parent())?;
                 return Ok(true);
             }
             // A directory in the worktree where a plain file is tracked cannot
@@ -884,7 +908,7 @@ pub(crate) fn remove_tracked_worktree_path(
         Ok(_) => {}
     }
     fs::remove_file(&file)?;
-    prune_empty_parents(root, file.parent())?;
+    prune_empty_parents(original_cwd, root, file.parent())?;
     Ok(true)
 }
 
@@ -1316,6 +1340,7 @@ pub(crate) fn print_rm_error_files(
 }
 
 pub fn move_index_and_worktree_path(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
@@ -1323,6 +1348,8 @@ pub fn move_index_and_worktree_path(
     destination: &Path,
     options: MoveOptions,
 ) -> Result<MoveResult> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
@@ -1380,7 +1407,12 @@ pub fn move_index_and_worktree_path(
     // contents). git still treats it as a directory; detect that from the index.
     let destination_was_existing_dir = destination_absolute.is_dir()
         || (options.sparse
-            && move_dir_has_tracked_contents(&index, worktree_root, &destination_absolute));
+            && move_dir_has_tracked_contents(
+                precompose,
+                &index,
+                worktree_root,
+                &destination_absolute,
+            ));
     let mut destination_absolute = if destination_was_existing_dir {
         let Some(file_name) = source_absolute.file_name() else {
             return Err(GitError::InvalidPath(format!(
@@ -1413,8 +1445,8 @@ pub fn move_index_and_worktree_path(
                 destination.display()
             ))
         })?;
-    let source_path = git_path_bytes(source_relative)?;
-    let destination_path = git_path_bytes(destination_relative)?;
+    let source_path = git_path_bytes(precompose, source_relative)?;
+    let destination_path = git_path_bytes(precompose, destination_relative)?;
     if destination_has_trailing_separator
         && !destination_was_existing_dir
         && !destination_absolute.is_dir()
@@ -1615,6 +1647,7 @@ pub fn move_index_and_worktree_path(
     let gitlink_gitdir_moves = prepare_moved_gitlink_gitdirs(worktree_root, &gitlink_moves)?;
     if options.sparse && !directory_entries.is_empty() {
         return sparse_directory_move(
+            original_cwd,
             worktree_root,
             git_dir,
             format,
@@ -1718,6 +1751,7 @@ pub fn move_index_and_worktree_path(
     // materialized (and the bit cleared) only when it lands inside the cone.
     if options.sparse {
         return sparse_single_file_move(
+            original_cwd,
             worktree_root,
             git_dir,
             format,
@@ -1778,11 +1812,16 @@ pub fn move_index_and_worktree_path(
 /// Whether the index holds any tracked entries under `dir_absolute`. Used to
 /// recognise a directory that `git sparse-checkout` removed from disk but still
 /// tracks as a valid `git mv --sparse` destination directory.
-fn move_dir_has_tracked_contents(index: &Index, worktree_root: &Path, dir_absolute: &Path) -> bool {
+fn move_dir_has_tracked_contents(
+    precompose: sley_core::PrecomposeUnicode,
+    index: &Index,
+    worktree_root: &Path,
+    dir_absolute: &Path,
+) -> bool {
     let Ok(relative) = dir_absolute.strip_prefix(worktree_root) else {
         return false;
     };
-    let Ok(git_path) = git_path_bytes(relative) else {
+    let Ok(git_path) = git_path_bytes(precompose, relative) else {
         return false;
     };
     if git_path.is_empty() {
@@ -1804,6 +1843,7 @@ fn move_dir_has_tracked_contents(index: &Index, worktree_root: &Path, dir_absolu
 /// file and gain the skip-worktree bit (git's mv.c SPARSE handling).
 #[allow(clippy::too_many_arguments)]
 fn sparse_single_file_move(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -1877,7 +1917,10 @@ fn sparse_single_file_move(
                     fs::create_dir_all(parent)?;
                 }
                 if fs::symlink_metadata(destination_absolute).is_ok() {
-                    crate::checkout::remove_existing_worktree_path(destination_absolute)?;
+                    crate::checkout::remove_existing_worktree_path(
+                        original_cwd,
+                        destination_absolute,
+                    )?;
                 }
                 fs::rename(source_absolute, destination_absolute)?;
                 if let Ok(metadata) = fs::symlink_metadata(destination_absolute) {
@@ -1888,9 +1931,12 @@ fn sparse_single_file_move(
             } else {
                 // Clean in-cone -> out-of-cone: drop the worktree file, keep only
                 // the (now skip-worktree) index entry.
-                crate::checkout::remove_existing_worktree_path(source_absolute)?;
+                crate::checkout::remove_existing_worktree_path(original_cwd, source_absolute)?;
                 if fs::symlink_metadata(destination_absolute).is_ok() {
-                    crate::checkout::remove_existing_worktree_path(destination_absolute)?;
+                    crate::checkout::remove_existing_worktree_path(
+                        original_cwd,
+                        destination_absolute,
+                    )?;
                 }
                 crate::checkout::set_skip_worktree(&mut destination_entry);
             }
@@ -1900,7 +1946,7 @@ fn sparse_single_file_move(
                 fs::create_dir_all(parent)?;
             }
             if fs::symlink_metadata(destination_absolute).is_ok() {
-                crate::checkout::remove_existing_worktree_path(destination_absolute)?;
+                crate::checkout::remove_existing_worktree_path(original_cwd, destination_absolute)?;
             }
             fs::rename(source_absolute, destination_absolute)?;
             if destination_in_cone {
@@ -1915,6 +1961,7 @@ fn sparse_single_file_move(
         crate::checkout::clear_skip_worktree(&mut destination_entry);
         if fs::symlink_metadata(destination_absolute).is_err() {
             crate::checkout::materialize_index_entry_file(
+                original_cwd,
                 &db,
                 worktree_root,
                 destination_absolute,
@@ -2030,6 +2077,7 @@ fn remove_empty_dirs_under(dir: &Path) -> Result<bool> {
 /// may be sparsified off disk, so this never relies on a whole-tree rename.
 #[allow(clippy::too_many_arguments)]
 fn sparse_directory_move(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -2105,7 +2153,10 @@ fn sparse_directory_move(
                         fs::create_dir_all(parent)?;
                     }
                     if fs::symlink_metadata(&destination_absolute).is_ok() {
-                        crate::checkout::remove_existing_worktree_path(&destination_absolute)?;
+                        crate::checkout::remove_existing_worktree_path(
+                            original_cwd,
+                            &destination_absolute,
+                        )?;
                     }
                     fs::rename(&source_absolute, &destination_absolute)?;
                     if let Ok(metadata) = fs::symlink_metadata(&destination_absolute) {
@@ -2114,9 +2165,12 @@ fn sparse_directory_move(
                     }
                     dirty_paths.push(destination.clone());
                 } else {
-                    crate::checkout::remove_existing_worktree_path(&source_absolute)?;
+                    crate::checkout::remove_existing_worktree_path(original_cwd, &source_absolute)?;
                     if fs::symlink_metadata(&destination_absolute).is_ok() {
-                        crate::checkout::remove_existing_worktree_path(&destination_absolute)?;
+                        crate::checkout::remove_existing_worktree_path(
+                            original_cwd,
+                            &destination_absolute,
+                        )?;
                     }
                     crate::checkout::set_skip_worktree(&mut destination_entry);
                 }
@@ -2125,7 +2179,10 @@ fn sparse_directory_move(
                     fs::create_dir_all(parent)?;
                 }
                 if fs::symlink_metadata(&destination_absolute).is_ok() {
-                    crate::checkout::remove_existing_worktree_path(&destination_absolute)?;
+                    crate::checkout::remove_existing_worktree_path(
+                        original_cwd,
+                        &destination_absolute,
+                    )?;
                 }
                 fs::rename(&source_absolute, &destination_absolute)?;
                 if destination_in_cone {
@@ -2140,6 +2197,7 @@ fn sparse_directory_move(
             crate::checkout::clear_skip_worktree(&mut destination_entry);
             if fs::symlink_metadata(&destination_absolute).is_err() {
                 crate::checkout::materialize_index_entry_file(
+                    original_cwd,
                     &db,
                     worktree_root,
                     &destination_absolute,
@@ -2173,7 +2231,7 @@ fn sparse_directory_move(
     let source_root = worktree_path(worktree_root, &source_path)?;
     remove_empty_dirs_under(&source_root)?;
     for parent in source_parents {
-        prune_empty_parents(worktree_root, Some(&parent))?;
+        prune_empty_parents(original_cwd, worktree_root, Some(&parent))?;
     }
     advise_on_moving_dirty_paths(git_dir, &dirty_paths);
     apply_moved_gitlink_gitdirs(gitlink_gitdir_moves)?;

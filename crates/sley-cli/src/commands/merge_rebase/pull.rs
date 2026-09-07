@@ -1,5 +1,4 @@
 use super::*;
-use {sley_core, sley_diff_merge, sley_index, sley_remote, sley_rev, sley_worktree};
 
 pub(crate) fn read_commit_tree(
     db: &FileObjectDatabase,
@@ -240,6 +239,7 @@ fn ensure_pull_not_in_merge(git_dir: &Path, format: ObjectFormat) -> Result<()> 
 }
 
 fn update_worktree_after_fetch_moved_head(
+    original_cwd: Option<&std::path::Path>,
     git_dir: &Path,
     worktree_root: &Path,
     format: ObjectFormat,
@@ -265,7 +265,13 @@ fn update_worktree_after_fetch_moved_head(
         return Err(GitError::Exit(128));
     }
     verify_fast_forward_untracked_safe(worktree_root, git_dir, db, format, &orig_tree, &curr_tree)?;
-    sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &curr_head)?;
+    sley_worktree::reset_index_and_worktree_to_commit(
+        original_cwd,
+        worktree_root,
+        git_dir,
+        format,
+        &curr_head,
+    )?;
     Ok(())
 }
 
@@ -734,6 +740,8 @@ fn pull_fetch(
 }
 
 fn pull_checkout_into_void(
+    original_cwd: Option<&std::path::Path>,
+    policy: &sley_remote::RemotePolicy,
     git_dir: &Path,
     worktree_root: &Path,
     db: &FileObjectDatabase,
@@ -797,9 +805,9 @@ fn pull_checkout_into_void(
         let content = if sley_index::is_gitlink(*mode) {
             Vec::new()
         } else {
-            merge_read_blob(db, oid, lazy_fetch)?
+            merge_read_blob(policy, db, oid, lazy_fetch)?
         };
-        merge_write_worktree_file(worktree_root, path, &content, *mode)?;
+        merge_write_worktree_file(original_cwd, worktree_root, path, &content, *mode)?;
         index_entries.push(merge_index_entry(path, *mode, *oid, 0));
     }
     index_entries.sort_by(|left, right| left.path.cmp(&right.path));
@@ -817,6 +825,7 @@ fn pull_checkout_into_void(
 }
 
 fn hydrate_pull_target_blobs(
+    policy: &sley_remote::RemotePolicy,
     git_dir: &Path,
     db: &FileObjectDatabase,
     format: ObjectFormat,
@@ -838,8 +847,9 @@ fn hydrate_pull_target_blobs(
         })
         .collect::<Result<Vec<_>>>()?;
     if !missing.is_empty() {
-        let _ =
-            sley_remote::hydrate_objects_from_local_promisor_remotes(git_dir, format, &missing)?;
+        let _ = sley_remote::hydrate_objects_from_local_promisor_remotes(
+            policy, git_dir, format, &missing,
+        )?;
         db.refresh_read_cache();
     }
     Ok(())
@@ -1054,6 +1064,7 @@ pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]
         ensure_pull_rebase_clean_without_autostash(&git_dir, &worktree_root, format)?;
     }
     let fetch_options = FetchOptions {
+        policy: cli_session.remote_policy.clone(),
         quiet: verbosity < 0,
         progress: None,
         auto_follow_tags: true,
@@ -1149,27 +1160,31 @@ pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
     let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
-    fetch_populated_submodules_after_superproject(FetchSubmoduleRequest {
-        runtime_cwd: remote_context.cwd(),
-        git_dir: &git_dir,
-        format,
-        worktree_root: &worktree_root,
-        config: &config,
-        recurse_submodules: fetch_recurse_submodules,
-        default_recurse_submodules: FetchRecurseSubmodules::OnDemand,
-        source: &remote,
-        changed_gitlinks: changed_gitlinks_for_fetch(
-            &git_dir,
+    fetch_populated_submodules_after_superproject(
+        &cli_session.remote_policy,
+        FetchSubmoduleRequest {
+            runtime_cwd: remote_context.cwd(),
+            git_dir: &git_dir,
             format,
-            &before_fetch_refs,
-            &fetch_outcome,
-        )?,
-        options: &fetch_options,
-        submodule_prefix: "",
-        jobs: None,
-    })?;
+            worktree_root: &worktree_root,
+            config: &config,
+            recurse_submodules: fetch_recurse_submodules,
+            default_recurse_submodules: FetchRecurseSubmodules::OnDemand,
+            source: &remote,
+            changed_gitlinks: changed_gitlinks_for_fetch(
+                &git_dir,
+                format,
+                &before_fetch_refs,
+                &fetch_outcome,
+            )?,
+            options: &fetch_options,
+            submodule_prefix: "",
+            jobs: None,
+        },
+    )?;
     let curr_head = head_commit_oid(&store)?;
     update_worktree_after_fetch_moved_head(
+        cli_session.original_cwd.as_deref(),
         &git_dir,
         &worktree_root,
         format,
@@ -1210,6 +1225,8 @@ pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]
         }
         let merge_oid = merge_records[0].oid;
         pull_checkout_into_void(
+            cli_session.original_cwd.as_deref(),
+            &cli_session.remote_policy,
             &git_dir,
             &worktree_root,
             &db,
@@ -1292,6 +1309,7 @@ pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]
     if effective_rebase.enabled() {
         if fast_forward {
             hydrate_pull_target_blobs(
+                &cli_session.remote_policy,
                 &git_dir,
                 &db,
                 format,
@@ -1352,7 +1370,14 @@ pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]
         return Ok(());
     }
     if fast_forward {
-        hydrate_pull_target_blobs(&git_dir, &db, format, &theirs_oid, cli_session.lazy_fetch())?;
+        hydrate_pull_target_blobs(
+            &cli_session.remote_policy,
+            &git_dir,
+            &db,
+            format,
+            &theirs_oid,
+            cli_session.lazy_fetch(),
+        )?;
         let mut merge_args = Vec::new();
         if let Some(ff) = opt_ff {
             merge_args.push(ff.as_merge_arg().to_string());

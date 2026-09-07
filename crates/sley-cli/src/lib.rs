@@ -88,10 +88,6 @@ mod trace2_cli;
 pub(crate) use sley_options::validators::*;
 pub(crate) use sley_ref_filter::*;
 pub(crate) use sley_rev::revlist::*;
-pub(crate) use {
-    sley_config, sley_core, sley_diff_merge, sley_index, sley_object, sley_odb, sley_pack,
-    sley_pretty, sley_refs, sley_remote, sley_rev, sley_worktree,
-};
 
 pub use global_options::argv_string_from_os;
 pub(crate) use global_options::{
@@ -293,15 +289,10 @@ pub(crate) fn collect_short_status_with_options(
 }
 
 pub fn run(args: Vec<String>) -> Result<()> {
-    sley_core::set_original_cwd(env::current_dir().ok());
+    let original_cwd = env::current_dir().ok();
     let global = apply_global_options(&args)?;
-    // `--namespace` overrides `GIT_NAMESPACE` for this process (git uses setenv;
-    // the workspace forbids `env::set_var`, so a process-local override is used).
-    if let Some(namespace) = global.namespace.clone() {
-        sley_core::set_git_namespace_override(Some(namespace));
-    }
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let cli_session = session::CliSession::from_parsed_globals(
+    let mut cli_session = session::CliSession::from_parsed_globals(
         cwd,
         global.git_dir.clone(),
         global.work_tree.clone(),
@@ -311,6 +302,11 @@ pub fn run(args: Vec<String>) -> Result<()> {
         global.lazy_fetch,
         global.pathspec_flags,
     );
+    cli_session.original_cwd = original_cwd;
+    cli_session.remote_policy = session::remote_policy_from_environment();
+    if let Some(namespace) = &global.namespace {
+        cli_session.remote_policy.namespace = sley_core::Namespace::new(namespace);
+    }
     sley_core::trace2::touch();
     sley_core::trace2::start(global.args);
     trace2_emit_process_ancestry_at_depth(sley_core::trace2::depth(), &[]);
@@ -333,13 +329,11 @@ pub fn run(args: Vec<String>) -> Result<()> {
     let mut dispatch_args: Vec<String> = global.args.to_vec();
     match cli_session.repository_snapshot() {
         Ok(snapshot) => {
-            sley_core::activate_precompose_unicode(snapshot.config.get_bool(
-                "core",
-                None,
-                "precomposeunicode",
-            ));
             if dispatch_args.len() > 1 {
-                sley_core::precompose_argv_if_needed(&mut dispatch_args[1..]);
+                snapshot
+                    .config
+                    .precompose_unicode()
+                    .argv(&mut dispatch_args[1..]);
             }
         }
         // Commands such as `config --global` remain valid without a repository;

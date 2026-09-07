@@ -11,6 +11,7 @@ use crate::index::*;
 use crate::types_admin::*;
 
 pub(crate) fn restore_index_entry(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -20,6 +21,7 @@ pub(crate) fn restore_index_entry(
     stat_cache: Option<&IndexStatCache>,
 ) -> Result<Option<IndexEntry>> {
     restore_index_entry_maybe_delayed(
+        original_cwd,
         worktree_root,
         git_dir,
         format,
@@ -32,6 +34,7 @@ pub(crate) fn restore_index_entry(
 }
 
 pub(crate) fn restore_index_entry_maybe_delayed(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -48,7 +51,7 @@ pub(crate) fn restore_index_entry_maybe_delayed(
     // update` territory. Single gitlink rule via `sley_index::is_gitlink`.
     if sley_index::is_gitlink(entry.mode) {
         let dir_path = worktree_path(worktree_root, entry.path.as_bytes())?;
-        materialize_gitlink_dir(worktree_root, &dir_path)?;
+        materialize_gitlink_dir(original_cwd, worktree_root, &dir_path)?;
         return Ok(None);
     }
     let file_path = worktree_path(worktree_root, entry.path.as_bytes())?;
@@ -101,7 +104,7 @@ pub(crate) fn restore_index_entry_maybe_delayed(
         None => Cow::Borrowed(&object.body),
     };
     prepare_blob_parent_dirs(worktree_root, &file_path)?;
-    remove_existing_worktree_path(&file_path)?;
+    remove_existing_worktree_path(original_cwd, &file_path)?;
     write_blob_body_or_symlink(&file_path, entry.mode, &body, &object.body)?;
     let metadata = fs::symlink_metadata(&file_path)?;
     Ok(Some(index_entry_with_refreshed_stat(entry, &metadata)))
@@ -1509,7 +1512,12 @@ impl TrackedOnlyCleanFilter {
         } else {
             worktree_root.join(repo_path_to_os_path(git_path)?)
         };
-        read_dir_attribute_patterns(worktree_root, &dir, &mut self.matcher)
+        read_dir_attribute_patterns(
+            self.config.precompose_unicode(),
+            worktree_root,
+            &dir,
+            &mut self.matcher,
+        )
     }
 }
 
@@ -1586,8 +1594,12 @@ impl WorktreeEntriesWalk<'_> {
     }
 }
 
-pub(crate) fn git_path_append_component(parent: &[u8], component: &std::ffi::OsStr) -> Vec<u8> {
-    let component = os_str_component_bytes(component);
+pub(crate) fn git_path_append_component(
+    precompose: sley_core::PrecomposeUnicode,
+    parent: &[u8],
+    component: &std::ffi::OsStr,
+) -> Vec<u8> {
+    let component = os_str_component_bytes(precompose, component);
     let separator = usize::from(!parent.is_empty());
     let mut path = Vec::with_capacity(parent.len() + separator + component.len());
     if !parent.is_empty() {
@@ -1598,9 +1610,13 @@ pub(crate) fn git_path_append_component(parent: &[u8], component: &std::ffi::OsS
     path
 }
 
-pub(crate) fn git_path_push_component(path: &mut Vec<u8>, component: &std::ffi::OsStr) -> usize {
+pub(crate) fn git_path_push_component(
+    precompose: sley_core::PrecomposeUnicode,
+    path: &mut Vec<u8>,
+    component: &std::ffi::OsStr,
+) -> usize {
     let original_len = path.len();
-    let component = os_str_component_bytes(component);
+    let component = os_str_component_bytes(precompose, component);
     if !path.is_empty() {
         path.push(b'/');
     }
@@ -1612,8 +1628,11 @@ pub(crate) fn git_path_push_component(path: &mut Vec<u8>, component: &std::ffi::
 ///
 /// When `core.precomposeunicode` is active, NFD names are converted to NFC so
 /// worktree walks match the precomposed index (git's `precompose_utf8_readdir`).
-pub(crate) fn os_str_component_bytes(component: &std::ffi::OsStr) -> Cow<'_, [u8]> {
-    sley_core::precompose_os_str_bytes_if_needed(component)
+pub(crate) fn os_str_component_bytes(
+    precompose: sley_core::PrecomposeUnicode,
+    component: &std::ffi::OsStr,
+) -> Cow<'_, [u8]> {
+    precompose.os_str_bytes(component)
 }
 
 pub(crate) fn collect_worktree_entries(
@@ -1643,7 +1662,11 @@ pub(crate) fn collect_worktree_entries(
             continue;
         }
         let metadata = entry.metadata()?;
-        let git_path = git_path_append_component(dir_git_path, &file_name);
+        let git_path = git_path_append_component(
+            context.config.precompose_unicode(),
+            dir_git_path,
+            &file_name,
+        );
         if context
             .ignores
             .as_ref()
@@ -1957,7 +1980,11 @@ pub(crate) fn worktree_path(root: &Path, path: &[u8]) -> Result<PathBuf> {
     Ok(root.join(relative))
 }
 
-pub(crate) fn remove_worktree_file(root: &Path, path: &[u8]) -> Result<()> {
+pub(crate) fn remove_worktree_file(
+    original_cwd: Option<&std::path::Path>,
+    root: &Path,
+    path: &[u8],
+) -> Result<()> {
     let file = worktree_path(root, path)?;
     // Use lstat semantics. `Path::is_dir` follows symlinks, so a symlink to a
     // directory was previously sent to `remove_dir` and failed with ENOTDIR;
@@ -1985,20 +2012,24 @@ pub(crate) fn remove_worktree_file(root: &Path, path: &[u8]) -> Result<()> {
         // rmdirs the path when empty (remove_scheduled_dirs) and leaves a
         // populated submodule in place.
         match fs::remove_dir(&file) {
-            Ok(()) => prune_empty_parents(root, file.parent())?,
+            Ok(()) => prune_empty_parents(original_cwd, root, file.parent())?,
             Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
             Err(err) => return Err(err.into()),
         }
         return Ok(());
     }
     fs::remove_file(&file)?;
-    prune_empty_parents(root, file.parent())?;
+    prune_empty_parents(original_cwd, root, file.parent())?;
     Ok(())
 }
 
-pub(crate) fn prune_empty_parents(root: &Path, mut dir: Option<&Path>) -> Result<()> {
+pub(crate) fn prune_empty_parents(
+    original_cwd: Option<&std::path::Path>,
+    root: &Path,
+    mut dir: Option<&Path>,
+) -> Result<()> {
     while let Some(path) = dir {
-        if path == root || path_is_original_cwd(path) {
+        if path == root || path_is_original_cwd(original_cwd, path) {
             break;
         }
         match fs::remove_dir(path) {
@@ -2011,21 +2042,21 @@ pub(crate) fn prune_empty_parents(root: &Path, mut dir: Option<&Path>) -> Result
     Ok(())
 }
 
-pub(crate) fn original_cwd_absolute() -> Option<PathBuf> {
-    let cwd = sley_core::original_cwd().or_else(|| env::current_dir().ok())?;
+pub(crate) fn original_cwd_absolute(original_cwd: Option<&Path>) -> Option<PathBuf> {
+    let cwd = original_cwd?.to_path_buf();
     Some(fs::canonicalize(&cwd).unwrap_or(cwd))
 }
 
-pub(crate) fn path_is_original_cwd(path: &Path) -> bool {
-    let Some(cwd) = original_cwd_absolute() else {
+pub(crate) fn path_is_original_cwd(original_cwd: Option<&std::path::Path>, path: &Path) -> bool {
+    let Some(cwd) = original_cwd_absolute(original_cwd) else {
         return false;
     };
     let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     path == cwd
 }
 
-pub(crate) fn original_cwd_is_inside(path: &Path) -> bool {
-    let Some(cwd) = original_cwd_absolute() else {
+pub(crate) fn original_cwd_is_inside(original_cwd: Option<&std::path::Path>, path: &Path) -> bool {
+    let Some(cwd) = original_cwd_absolute(original_cwd) else {
         return false;
     };
     let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -2033,6 +2064,7 @@ pub(crate) fn original_cwd_is_inside(path: &Path) -> bool {
 }
 
 pub(crate) fn refuse_if_current_working_directory_becomes_file(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
     target_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
 ) -> Result<()> {
@@ -2041,7 +2073,7 @@ pub(crate) fn refuse_if_current_working_directory_becomes_file(
             continue;
         }
         let path = worktree_path(worktree_root, path)?;
-        if path_is_original_cwd(&path)
+        if path_is_original_cwd(original_cwd, &path)
             && fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir())
         {
             return refuse_remove_current_working_directory(&path);
@@ -2117,7 +2149,10 @@ pub(crate) fn symlink_target_bytes(path: &Path) -> Result<Vec<u8>> {
     Ok(target.to_string_lossy().replace('\\', "/").into_bytes())
 }
 
-pub(crate) fn git_path_bytes(path: &Path) -> Result<Vec<u8>> {
+pub(crate) fn git_path_bytes(
+    precompose: sley_core::PrecomposeUnicode,
+    path: &Path,
+) -> Result<Vec<u8>> {
     if path.components().any(|component| {
         matches!(
             component,
@@ -2131,7 +2166,7 @@ pub(crate) fn git_path_bytes(path: &Path) -> Result<Vec<u8>> {
     }
     // Precompose each component when core.precomposeunicode is active so CLI
     // NFD pathspecs land as NFC index paths (git's precompose_argv_prefix).
-    let path = sley_core::precompose_path_if_needed(path);
+    let path = precompose.path(path);
     Ok(path
         .components()
         .filter_map(|component| match component {

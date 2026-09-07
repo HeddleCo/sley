@@ -1006,6 +1006,7 @@ pub struct SshFetchPackRequest<'a> {
 }
 
 pub fn install_fetch_pack_via_ssh_upload_pack(
+    policy: &crate::RemotePolicy,
     request: SshFetchPackRequest<'_>,
     progress: &mut dyn ProgressSink,
     cancel: CancelFlag<'_>,
@@ -1027,11 +1028,9 @@ pub fn install_fetch_pack_via_ssh_upload_pack(
         deepen: request.deepen,
         ..UploadPackRequest::default()
     };
-    let haves = request
-        .haves
-        .clone()
-        .map(Ok)
-        .unwrap_or_else(|| crate::local::local_have_oids(request.git_dir, request.format))?;
+    let haves = request.haves.clone().map(Ok).unwrap_or_else(|| {
+        crate::local::local_have_oids(policy, request.git_dir, request.format)
+    })?;
     let (child, stdin, mut stdout, stderr_drain) = spawn_service_process(
         request.remote,
         GitService::UploadPack,

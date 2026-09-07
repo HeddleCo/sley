@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 /// optional. `fetch` uses [`RemoteCommandContext::require_repository`].
 #[derive(Debug, Clone)]
 pub(crate) struct RemoteCommandContext {
+    pub remote_policy: sley_remote::RemotePolicy,
     cwd: PathBuf,
     git_dir: Option<PathBuf>,
     repository: Option<sley::Repository>,
@@ -23,6 +24,7 @@ impl RemoteCommandContext {
             .as_ref()
             .and_then(|repository| read_repo_config(repository.git_dir()).ok());
         Self {
+            remote_policy: cli_session.remote_policy.clone(),
             cwd: cli_session.cwd().to_path_buf(),
             git_dir: repository
                 .as_ref()
@@ -36,6 +38,7 @@ impl RemoteCommandContext {
         let repository = cli_session.open_repository()?;
         let config = read_repo_config(repository.git_dir())?;
         Ok(Self {
+            remote_policy: cli_session.remote_policy.clone(),
             cwd: cli_session.cwd().to_path_buf(),
             git_dir: Some(repository.git_dir().to_path_buf()),
             repository: Some(repository),
@@ -43,10 +46,15 @@ impl RemoteCommandContext {
         })
     }
 
-    pub(crate) fn for_repository_paths(cwd: &Path, git_dir: &Path) -> Result<Self> {
+    pub(crate) fn for_repository_paths(
+        remote_policy: &sley_remote::RemotePolicy,
+        cwd: &Path,
+        git_dir: &Path,
+    ) -> Result<Self> {
         let repository = sley::Repository::open(git_dir)?;
         let config = read_repo_config(repository.git_dir())?;
         Ok(Self {
+            remote_policy: remote_policy.clone(),
             cwd: cwd.to_path_buf(),
             git_dir: Some(repository.git_dir().to_path_buf()),
             repository: Some(repository),
@@ -54,8 +62,14 @@ impl RemoteCommandContext {
         })
     }
 
-    pub(crate) fn from_explicit(cwd: &Path, git_dir: &Path, config: GitConfig) -> Self {
+    pub(crate) fn from_explicit(
+        remote_policy: &sley_remote::RemotePolicy,
+        cwd: &Path,
+        git_dir: &Path,
+        config: GitConfig,
+    ) -> Self {
         Self {
+            remote_policy: remote_policy.clone(),
             cwd: cwd.to_path_buf(),
             git_dir: Some(git_dir.to_path_buf()),
             repository: None,

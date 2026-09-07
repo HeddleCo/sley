@@ -5,7 +5,6 @@ use std::fmt::Write as _;
 use std::io::{self, BufRead, BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
-use {sley_index, sley_rev, sley_worktree};
 
 use super::args::{GitArgCursor, LongOption, option_takes_no_value, switch_requires_value};
 use crate::*;
@@ -369,8 +368,12 @@ impl CatFileObjectRequest {
             CatFileObjectMode::Command(
                 mode @ (CatFileCmdMode::Textconv | CatFileCmdMode::Filters),
             ) => query.print_transform(mode, self.force_path.as_deref()),
-            CatFileObjectMode::Command(mode) => query.print_command_mode(mode),
-            CatFileObjectMode::Typed(object_type) => query.print_typed_body(object_type),
+            CatFileObjectMode::Command(mode) => {
+                query.print_command_mode(&cli_session.remote_policy, mode)
+            }
+            CatFileObjectMode::Typed(object_type) => {
+                query.print_typed_body(&cli_session.remote_policy, object_type)
+            }
         }
     }
 }
@@ -534,12 +537,16 @@ impl ObjectQuery<'_> {
         }
     }
 
-    fn print_command_mode(&self, mode: CatFileCmdMode) -> Result<()> {
+    fn print_command_mode(
+        &self,
+        policy: &sley_remote::RemotePolicy,
+        mode: CatFileCmdMode,
+    ) -> Result<()> {
         match mode {
             CatFileCmdMode::Exists => self.print_exists(),
             CatFileCmdMode::Type => self.print_type(),
             CatFileCmdMode::Size => self.print_size(),
-            CatFileCmdMode::Pretty => self.print_pretty(),
+            CatFileCmdMode::Pretty => self.print_pretty(policy),
             // `--textconv`/`--filters` are dispatched to `print_transform` before
             // reaching here (they need the recorded path + mode, not just an oid).
             CatFileCmdMode::Textconv | CatFileCmdMode::Filters => {
@@ -709,10 +716,11 @@ impl ObjectQuery<'_> {
 
     /// `-p`: read object info, then emit the body (pretty-printing a tree). Upstream routes a
     /// missing object or unreadable header through "Not a valid object name".
-    fn print_pretty(&self) -> Result<()> {
+    fn print_pretty(&self, policy: &sley_remote::RemotePolicy) -> Result<()> {
         let (oid, _) = self.resolve_command_oid()?;
         let read_oid = self.view.replacement_oid(&oid)?;
         let object = match crate::read_object_maybe_prefetch_promisor(
+            policy,
             self.view.db(),
             &read_oid,
             self.view.lazy_fetch,
@@ -765,7 +773,11 @@ impl ObjectQuery<'_> {
         }
     }
 
-    fn print_typed_body(&self, object_type: ObjectType) -> Result<()> {
+    fn print_typed_body(
+        &self,
+        policy: &sley_remote::RemotePolicy,
+        object_type: ObjectType,
+    ) -> Result<()> {
         let is_full_hex = self.name.len() == self.view.format().hex_len()
             && self.name.bytes().all(|byte| byte.is_ascii_hexdigit());
         let oid = if is_full_hex {
@@ -776,6 +788,7 @@ impl ObjectQuery<'_> {
         let oid = self.view.replacement_oid(&oid)?;
         if is_full_hex {
             let object = match crate::read_object_maybe_prefetch_promisor(
+                policy,
                 self.view.db(),
                 &oid,
                 self.view.lazy_fetch,
@@ -2056,7 +2069,12 @@ fn cat_file_transform_blob(
             let config = read_repo_config(git_dir).unwrap_or_default();
             let attributes = view
                 .worktree_root()
-                .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
+                .map(|root| {
+                    sley_worktree::StandardAttributeMatcher::from_worktree_root(
+                        config.precompose_unicode(),
+                        root,
+                    )
+                })
                 .transpose()?;
             let resolver = commands::userdiff::UserdiffResolver::with_attributes(
                 attributes,

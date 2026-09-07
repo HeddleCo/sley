@@ -97,6 +97,13 @@ pub use unpack_worktree::{
     write_tree_entry_to_worktree_with_hooks,
 };
 
+/// Resolve normalization once for a filesystem operation's repository.
+pub(crate) fn precompose_for_git_dir(git_dir: &std::path::Path) -> sley_core::PrecomposeUnicode {
+    sley_config::read_effective_worktree_config(git_dir, None)
+        .map(|config| config.precompose_unicode())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -697,6 +704,7 @@ mod tests {
         let mut ignores =
             IgnoreMatcher::from_worktree_base(&root).expect("test operation should succeed");
         let paths = status_untracked_paths_from_borrowed_index(
+            sley_core::PrecomposeUnicode::default(),
             &root,
             &git_dir,
             &borrowed,
@@ -854,6 +862,7 @@ mod tests {
         fs::remove_file(root.join("file")).expect("remove worktree copy");
 
         checkout_index_paths_with_database(
+            None,
             &root,
             &git_dir,
             ObjectFormat::Sha1,
@@ -892,6 +901,7 @@ mod tests {
         build_commit(&root, &git_dir, &["outside", "sub/file"]);
 
         apply_sparse_checkout_with_mode(
+            None,
             &root,
             &git_dir,
             ObjectFormat::Sha1,
@@ -913,6 +923,7 @@ mod tests {
             smudge_config: None,
         };
         let outcome = checkout_index_paths_with_database_outcome_sparse(
+            None,
             &root,
             &git_dir,
             ObjectFormat::Sha1,
@@ -931,6 +942,7 @@ mod tests {
         assert!(index_entry_for(&read_index(&git_dir), b"outside").is_skip_worktree());
 
         let outcome = checkout_index_paths_with_database_outcome_sparse(
+            None,
             &root,
             &git_dir,
             ObjectFormat::Sha1,
@@ -967,6 +979,7 @@ mod tests {
         // Full (non-cone) pattern: keep only the `in/` subtree.
         let sparse = full_sparse(&[b"/in/"]);
         let result = apply_sparse_checkout_with_mode(
+            None,
             &root,
             &git_dir,
             ObjectFormat::Sha1,
@@ -1020,6 +1033,7 @@ mod tests {
             .expect("write conflicted fixture index");
 
         let result = apply_sparse_checkout_with_mode(
+            None,
             &root,
             &git_dir,
             ObjectFormat::Sha1,
@@ -1046,6 +1060,7 @@ mod tests {
 
         // First narrow to `a/`.
         apply_sparse_checkout_with_mode(
+            None,
             &root,
             &git_dir,
             ObjectFormat::Sha1,
@@ -1064,6 +1079,7 @@ mod tests {
         // Now switch the cone to `b/`: `a/` must leave, `b/` must come back with
         // the correct content, and the skip-worktree bits must flip.
         apply_sparse_checkout_with_mode(
+            None,
             &root,
             &git_dir,
             ObjectFormat::Sha1,
@@ -1115,7 +1131,7 @@ mod tests {
         };
         // Auto mode should detect cone shape on its own.
         assert!(patterns_are_cone(&sparse.patterns));
-        apply_sparse_checkout(&root, &git_dir, ObjectFormat::Sha1, &sparse)
+        apply_sparse_checkout(None, &root, &git_dir, ObjectFormat::Sha1, &sparse)
             .expect("test operation should succeed");
 
         assert!(root.join("root.txt").exists());
@@ -1217,6 +1233,7 @@ mod tests {
 
         let sparse = full_sparse(&[b"/in/"]);
         apply_sparse_checkout_with_mode(
+            None,
             &root,
             &git_dir,
             ObjectFormat::Sha1,
@@ -1229,6 +1246,7 @@ mod tests {
         // Re-applying the same spec is a no-op: the already-skipped file stays
         // absent and the bit stays set (we do not resurrect it).
         let result = apply_sparse_checkout_with_mode(
+            None,
             &root,
             &git_dir,
             ObjectFormat::Sha1,
@@ -1261,6 +1279,7 @@ mod tests {
             sparse_index: true,
         };
         apply_sparse_checkout_with_mode(
+            None,
             root,
             git_dir,
             ObjectFormat::Sha1,
@@ -1296,9 +1315,15 @@ mod tests {
         // decide whether it is safe to evict.
         fs::create_dir_all(root.join("skip")).expect("recreate excluded directory");
         fs::write(root.join("skip/b"), b"skip\n").expect("recreate clean excluded file");
-        let clean =
-            apply_sparse_checkout_with_mode(&root, &git_dir, ObjectFormat::Sha1, &sparse, mode)
-                .expect("reapply sparse checkout to clean file");
+        let clean = apply_sparse_checkout_with_mode(
+            None,
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &sparse,
+            mode,
+        )
+        .expect("reapply sparse checkout to clean file");
         assert!(clean.not_up_to_date.is_empty());
         assert!(!root.join("skip/b").exists());
         assert!(
@@ -1310,9 +1335,15 @@ mod tests {
 
         fs::create_dir_all(root.join("skip")).expect("recreate excluded directory");
         fs::write(root.join("skip/b"), b"modified\n").expect("write dirty excluded file");
-        let dirty =
-            apply_sparse_checkout_with_mode(&root, &git_dir, ObjectFormat::Sha1, &sparse, mode)
-                .expect("reapply sparse checkout to dirty file");
+        let dirty = apply_sparse_checkout_with_mode(
+            None,
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &sparse,
+            mode,
+        )
+        .expect("reapply sparse checkout to dirty file");
         assert_eq!(dirty.not_up_to_date, vec![b"skip/b".to_vec()]);
         assert_eq!(
             fs::read(root.join("skip/b")).expect("read dirty file"),
@@ -1362,6 +1393,8 @@ mod tests {
             ),
         ]);
         restore_index_and_worktree_paths_from_entries(
+            None,
+            sley_core::PrecomposeUnicode::default(),
             &root,
             &git_dir,
             ObjectFormat::Sha1,
@@ -1450,6 +1483,8 @@ mod tests {
             },
         )]);
         restore_index_and_worktree_paths_from_entries(
+            None,
+            sley_core::PrecomposeUnicode::default(),
             &root,
             &git_dir,
             ObjectFormat::Sha1,
@@ -1501,6 +1536,8 @@ mod tests {
             },
         )]);
         restore_index_and_worktree_paths_from_entries(
+            None,
+            sley_core::PrecomposeUnicode::default(),
             &root,
             &git_dir,
             ObjectFormat::Sha1,
@@ -1514,7 +1551,7 @@ mod tests {
         let (sparse, mode) = active_sparse_checkout(&git_dir)
             .expect("read sparse checkout")
             .expect("active sparse checkout");
-        apply_sparse_checkout_with_mode(&root, &git_dir, ObjectFormat::Sha1, &sparse, mode)
+        apply_sparse_checkout_with_mode(None, &root, &git_dir, ObjectFormat::Sha1, &sparse, mode)
             .expect("reapply sparse checkout");
 
         let summary = checkout_change_summary(&root, &git_dir, ObjectFormat::Sha1, &base)
@@ -1574,7 +1611,7 @@ mod tests {
             .expect("clear stale sparse marker");
         write_repository_index_ref(&git_dir, ObjectFormat::Sha1, &removed)
             .expect("write index with staged sparse directory deletion");
-        reset_index_and_worktree_to_commit(&root, &git_dir, ObjectFormat::Sha1, &commit)
+        reset_index_and_worktree_to_commit(None, &root, &git_dir, ObjectFormat::Sha1, &commit)
             .expect("hard reset sparse index");
 
         let restored = read_index(&git_dir);
@@ -1599,6 +1636,7 @@ mod tests {
         configure_cone_sparse_index(&root, &git_dir, &commit);
 
         let result = remove_index_and_worktree_paths(
+            None,
             &root,
             &git_dir,
             ObjectFormat::Sha1,
@@ -1640,6 +1678,7 @@ mod tests {
         // keep the in-cone file and evict the out-of-cone one.
         let sparse = full_sparse(&[b"/keep/"]);
         let result = checkout_detached_sparse(
+            None,
             &root,
             &git_dir,
             ObjectFormat::Sha1,
@@ -1688,6 +1727,7 @@ mod tests {
         let config = GitConfig::read(git_dir.join("config")).expect("read config");
 
         let result = checkout_branch_filtered(
+            None,
             &root,
             &git_dir,
             ObjectFormat::Sha1,
@@ -1711,6 +1751,7 @@ mod tests {
         )));
         let ignore_oid = index_entry_for(&index, b"done/.gitignore").oid;
         let primed_cache = build_untracked_cache(
+            sley_core::PrecomposeUnicode::default(),
             &root,
             &git_dir,
             ObjectFormat::Sha1,
@@ -1737,6 +1778,7 @@ mod tests {
         );
         assert!(status.iter().any(|entry| entry.path == b"done/visible"));
         let cache = build_untracked_cache(
+            sley_core::PrecomposeUnicode::default(),
             &root,
             &git_dir,
             ObjectFormat::Sha1,
@@ -1819,6 +1861,7 @@ mod tests {
         let config = GitConfig::default();
 
         checkout_detached_filtered(
+            None,
             &root,
             &git_dir,
             ObjectFormat::Sha1,
@@ -1982,6 +2025,7 @@ mod tests {
         build_commit(&root, &git_dir, &["subdir/file3"]);
 
         let result = restore_index_and_worktree_paths_from_tree(
+            None,
             &root,
             &git_dir,
             ObjectFormat::Sha1,
@@ -2166,10 +2210,19 @@ mod tests {
 
         let requested = vec![b"diff".to_vec()];
         let path = b"src/nested/file.rs";
-        let per_path = standard_attributes_for_path(&root, path, &requested, false)
-            .expect("test operation should succeed");
-        let matcher = StandardAttributeMatcher::from_worktree_root(&root)
-            .expect("test operation should succeed");
+        let per_path = standard_attributes_for_path(
+            sley_core::PrecomposeUnicode::default(),
+            &root,
+            path,
+            &requested,
+            false,
+        )
+        .expect("test operation should succeed");
+        let matcher = StandardAttributeMatcher::from_worktree_root(
+            sley_core::PrecomposeUnicode::default(),
+            &root,
+        )
+        .expect("test operation should succeed");
         assert_eq!(
             matcher.attributes_for_path(path, &requested, false),
             per_path
@@ -2200,8 +2253,14 @@ mod tests {
         .expect("test operation should succeed");
 
         let path = b"src/nested/file.txt";
-        let full = standard_attributes_for_path(&root, path, filter_attribute_names(), false)
-            .expect("test operation should succeed");
+        let full = standard_attributes_for_path(
+            sley_core::PrecomposeUnicode::default(),
+            &root,
+            path,
+            filter_attribute_names(),
+            false,
+        )
+        .expect("test operation should succeed");
         assert_eq!(
             filter_attribute_checks(&root, path).expect("attribute checks should load"),
             full
@@ -2662,6 +2721,7 @@ mod tests {
         // hash and are not filter-aware. Checkout will then smudge it to CRLF.
         fs::write(root.join("crlf.txt"), b"alpha\nbeta\n").expect("test operation should succeed");
         checkout_detached_filtered(
+            None,
             &root,
             &git_dir,
             ObjectFormat::Sha1,

@@ -1,7 +1,6 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 #![allow(clippy::expect_used)]
 
-use {sley_diff_merge, sley_object, sley_worktree};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use super::status::{
@@ -1531,6 +1530,7 @@ pub(crate) fn cmd_commit(
     // exits 1 (t3436 date tests: amend after a leftover rebase dir).
     if in_rebase && !amend {
         return conclude_rebase_step_via_commit(
+            &cli_session.remote_policy,
             &git_dir,
             format,
             author,
@@ -1544,6 +1544,8 @@ pub(crate) fn cmd_commit(
     }
     if in_merge {
         return conclude_in_progress_merge(
+            cli_session.original_cwd.as_deref(),
+            &cli_session.remote_policy,
             &git_dir,
             &worktree_root_for_git_dir(cli_session, &git_dir)?,
             format,
@@ -1556,6 +1558,8 @@ pub(crate) fn cmd_commit(
     }
     if in_cherry_pick || in_revert {
         return conclude_replay_via_commit(
+            cli_session.original_cwd.as_deref(),
+            &cli_session.remote_policy,
             &git_dir,
             &worktree_root_for_git_dir(cli_session, &git_dir)?,
             format,
@@ -1745,6 +1749,8 @@ pub(crate) fn cmd_commit(
         format,
     )?;
     remove_commit_state_files(
+        cli_session.original_cwd.as_deref(),
+        &cli_session.remote_policy,
         &git_dir,
         &worktree_root_for_git_dir(cli_session, &git_dir)?,
         cli_session.lazy_fetch(),
@@ -1755,6 +1761,7 @@ pub(crate) fn cmd_commit(
         // (reuse from -C/-c/amend). Shows the `Date:` line in the summary.
         let show_author_date = author_date.is_some() || reuse_message.is_some() || amend;
         print_commit_summary(
+            &cli_session.remote_policy,
             &git_dir,
             format,
             &commit_odb,
@@ -1842,6 +1849,7 @@ fn run_auto_maintenance_after_commit(
 /// summary reuses any hot pack/MIDX state from the commit path instead of
 /// opening a second database for the same repository.
 fn print_commit_summary(
+    policy: &sley_remote::RemotePolicy,
     git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
@@ -1899,13 +1907,9 @@ fn print_commit_summary(
         sley_diff_merge::DiffNameStatusOptions::default(),
     )?;
     if !entries.is_empty() {
-        let stat_entries = collect_diff_stat_entries(
-            &entries,
-            db,
-            None,
-            false,
-            crate::diff_lazy_fetch(lazy_fetch),
-        )?;
+        let lazy_fetch_adapter_1 = crate::diff_lazy_fetch(policy, lazy_fetch);
+        let stat_entries =
+            collect_diff_stat_entries(&entries, db, None, false, lazy_fetch_adapter_1.as_option())?;
         write_diff_shortstat_materialized(&mut out, &stat_entries)?;
         for entry in &entries {
             write_commit_summary_entry(&mut out, entry)?;
@@ -2017,6 +2021,8 @@ fn commit_message_with_trailers<'a>(
 /// the last-pick sequencer-state teardown).
 #[allow(clippy::too_many_arguments)]
 fn conclude_replay_via_commit(
+    original_cwd: Option<&std::path::Path>,
+    policy: &sley_remote::RemotePolicy,
     git_dir: &Path,
     worktree_root: &Path,
     format: ObjectFormat,
@@ -2119,7 +2125,7 @@ fn conclude_replay_via_commit(
     });
     tx.commit()?;
     sley_sequencer::replay::post_commit_cleanup(git_dir);
-    remove_commit_state_files(git_dir, worktree_root, lazy_fetch);
+    remove_commit_state_files(original_cwd, policy, git_dir, worktree_root, lazy_fetch);
     commands::hooks::run_post_index_change_hook_at(git_dir, false, false)?;
     if !quiet {
         println!("{new_oid}");
@@ -2207,6 +2213,8 @@ fn commit_partial_paths(
     sley_worktree::refresh_repository_cache_tree(git_dir, format, &db)?;
     sley_sequencer::replay::post_commit_cleanup(git_dir);
     remove_commit_state_files(
+        cli_session.original_cwd.as_deref(),
+        &cli_session.remote_policy,
         git_dir,
         &worktree_root_for_git_dir(cli_session, git_dir)?,
         cli_session.lazy_fetch(),
@@ -2565,10 +2573,23 @@ fn restore_taken_index_snapshot(git_dir: &Path, snapshot: &Option<Option<Vec<u8>
     Ok(())
 }
 
-fn remove_commit_state_files(git_dir: &Path, worktree_root: &Path, lazy_fetch: bool) {
+fn remove_commit_state_files(
+    original_cwd: Option<&std::path::Path>,
+    policy: &sley_remote::RemotePolicy,
+    git_dir: &Path,
+    worktree_root: &Path,
+    lazy_fetch: bool,
+) {
     let format = repository_object_format(git_dir).ok();
     if let Some(format) = format {
-        commands::merge_rebase::apply_merge_autostash(git_dir, worktree_root, format, lazy_fetch);
+        commands::merge_rebase::apply_merge_autostash(
+            original_cwd,
+            policy,
+            git_dir,
+            worktree_root,
+            format,
+            lazy_fetch,
+        );
     }
     for name in [
         "MERGE_HEAD",
@@ -3614,7 +3635,8 @@ fn append_commit_diff_index_patch(
                 anchors: &[],
                 allow_textconv: true,
                 db: &db,
-                lazy_fetch: crate::diff_lazy_fetch(lazy_fetch),
+                lazy_fetch: crate::diff_lazy_fetch(&cli_session.remote_policy, lazy_fetch)
+                    .as_option(),
                 worktree_root: worktree.then_some(worktree_root.as_path()),
                 use_worktree_new: worktree,
                 format,

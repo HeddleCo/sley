@@ -301,6 +301,7 @@ pub(crate) fn read_default_global_excludes_file(patterns: &mut Vec<IgnorePattern
 }
 
 pub(crate) fn collect_per_directory_patterns_into_matcher(
+    precompose: sley_core::PrecomposeUnicode,
     root: &Path,
     dir: &Path,
     names: &[String],
@@ -311,7 +312,7 @@ pub(crate) fn collect_per_directory_patterns_into_matcher(
         let relative = dir.strip_prefix(root).map_err(|_| {
             GitError::InvalidPath(format!("path {} is outside worktree", dir.display()))
         })?;
-        let base = git_path_bytes(relative)?;
+        let base = git_path_bytes(precompose, relative)?;
         let mut source = base.clone();
         if !source.is_empty() {
             source.push(b'/');
@@ -335,9 +336,11 @@ pub(crate) fn collect_per_directory_patterns_into_matcher(
             let relative = path.strip_prefix(root).map_err(|_| {
                 GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
             })?;
-            let git_path = git_path_bytes(relative)?;
+            let git_path = git_path_bytes(precompose, relative)?;
             if !matcher.is_ignored(&git_path, true) {
-                collect_per_directory_patterns_into_matcher(root, &path, names, matcher)?;
+                collect_per_directory_patterns_into_matcher(
+                    precompose, root, &path, names, matcher,
+                )?;
             }
         }
     }
@@ -920,11 +923,14 @@ pub(crate) struct AttributeAssignment {
 }
 
 impl AttributeMatcher {
-    pub(crate) fn from_worktree_root(root: &Path) -> Result<Self> {
+    pub(crate) fn from_worktree_root(
+        precompose: sley_core::PrecomposeUnicode,
+        root: &Path,
+    ) -> Result<Self> {
         let mut matcher = Self::default();
         let git_dir = root.join(".git");
         matcher.configure_from_repo(root, &git_dir);
-        collect_attribute_patterns(root, root, &mut matcher)?;
+        collect_attribute_patterns(precompose, root, root, &mut matcher)?;
         read_attribute_patterns(
             git_dir.join("info").join("attributes"),
             &mut matcher,
@@ -1182,6 +1188,7 @@ pub(crate) fn read_dir_ignore_patterns_for_base(
 /// within `root`. Used both by the eager full-tree pass and by the status/diff
 /// worktree walk as it descends, so the tree is read for attributes exactly once.
 pub(crate) fn read_dir_attribute_patterns(
+    precompose: sley_core::PrecomposeUnicode,
     root: &Path,
     dir: &Path,
     matcher: &mut AttributeMatcher,
@@ -1189,7 +1196,7 @@ pub(crate) fn read_dir_attribute_patterns(
     let relative = dir.strip_prefix(root).map_err(|_| {
         GitError::InvalidPath(format!("path {} is outside worktree", dir.display()))
     })?;
-    let base = git_path_bytes(relative)?;
+    let base = git_path_bytes(precompose, relative)?;
     read_dir_attribute_patterns_for_base(dir, &base, matcher)
 }
 
@@ -1208,11 +1215,12 @@ pub(crate) fn read_dir_attribute_patterns_for_base(
 }
 
 pub(crate) fn collect_attribute_patterns(
+    precompose: sley_core::PrecomposeUnicode,
     root: &Path,
     dir: &Path,
     matcher: &mut AttributeMatcher,
 ) -> Result<()> {
-    read_dir_attribute_patterns(root, dir, matcher)?;
+    read_dir_attribute_patterns(precompose, root, dir, matcher)?;
 
     let mut entries = fs::read_dir(dir)?.collect::<std::result::Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.file_name());
@@ -1222,7 +1230,7 @@ pub(crate) fn collect_attribute_patterns(
             continue;
         }
         if entry.metadata()?.is_dir() {
-            collect_attribute_patterns(root, &path, matcher)?;
+            collect_attribute_patterns(precompose, root, &path, matcher)?;
         }
     }
     Ok(())

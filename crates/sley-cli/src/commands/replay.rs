@@ -202,7 +202,10 @@ fn run_git_replay(cli_session: &crate::session::CliSession, args: &[String]) -> 
         replace_objects: cli_session.replace_objects(),
         db,
     };
-    let hosts = replay_hosts(cli_session.lazy_fetch());
+    let prefetch = CliPromisorPrefetch {
+        policy: cli_session.remote_policy.clone(),
+    };
+    let hosts = replay_hosts(cli_session.lazy_fetch().then_some(&prefetch));
     let plan = build_git_replay_plan(&ctx, parsed)?;
     let new_oid = replay_commits_to_base(&ctx, &hosts, &plan)?;
     emit_or_update_replay_ref(&ctx, &plan, &new_oid)
@@ -493,7 +496,7 @@ fn select_git_replay_commits(
         commits.reverse();
         return Ok(commits);
     }
-    let hosts = replay_hosts(false);
+    let hosts = replay_hosts(None);
     sley_sequencer::pick::select_commits(ctx, &hosts, action, rev_args)
 }
 
@@ -927,7 +930,9 @@ fn parse_mainline(value: &str) -> Result<u32> {
 // too; its extra lazy-fetch flag travels through the host bundle instead.
 
 /// Partial-clone hydration adapter handed to the sequencer engine.
-struct CliPromisorPrefetch;
+struct CliPromisorPrefetch {
+    policy: sley_remote::RemotePolicy,
+}
 
 impl sley_sequencer::apply::PromisorObjectFetch for CliPromisorPrefetch {
     fn read_object_maybe_prefetch(
@@ -935,7 +940,7 @@ impl sley_sequencer::apply::PromisorObjectFetch for CliPromisorPrefetch {
         db: &FileObjectDatabase,
         oid: &ObjectId,
     ) -> Result<std::sync::Arc<EncodedObject>> {
-        read_object_maybe_prefetch_promisor(db, oid, true)
+        read_object_maybe_prefetch_promisor(&self.policy, db, oid, true)
     }
 }
 
@@ -1004,16 +1009,33 @@ fn run_replay(
                 Ok(())
             }
             CmdMode::Continue => {
-                let mut hosts = replay_hosts(cli_session.lazy_fetch());
-                sley_sequencer::pick::continue_sequence(&ctx, &mut hosts)
+                let prefetch = CliPromisorPrefetch {
+                    policy: cli_session.remote_policy.clone(),
+                };
+                let mut hosts = replay_hosts(cli_session.lazy_fetch().then_some(&prefetch));
+                sley_sequencer::pick::continue_sequence(
+                    cli_session.original_cwd.as_deref(),
+                    &ctx,
+                    &mut hosts,
+                )
             }
             CmdMode::Abort => {
-                let hosts = replay_hosts(cli_session.lazy_fetch());
-                sley_sequencer::pick::rollback(&ctx, &hosts)
+                let prefetch = CliPromisorPrefetch {
+                    policy: cli_session.remote_policy.clone(),
+                };
+                let hosts = replay_hosts(cli_session.lazy_fetch().then_some(&prefetch));
+                sley_sequencer::pick::rollback(cli_session.original_cwd.as_deref(), &ctx, &hosts)
             }
             CmdMode::Skip => {
-                let mut hosts = replay_hosts(cli_session.lazy_fetch());
-                sley_sequencer::pick::skip_sequence(&ctx, &mut hosts)
+                let prefetch = CliPromisorPrefetch {
+                    policy: cli_session.remote_policy.clone(),
+                };
+                let mut hosts = replay_hosts(cli_session.lazy_fetch().then_some(&prefetch));
+                sley_sequencer::pick::skip_sequence(
+                    cli_session.original_cwd.as_deref(),
+                    &ctx,
+                    &mut hosts,
+                )
             }
         };
     }
@@ -1050,15 +1072,23 @@ fn run_replay(
     if parsed.rev_args.is_empty() {
         return Err(usage_error(action));
     }
-    let mut hosts = replay_hosts(cli_session.lazy_fetch());
-    sley_sequencer::pick::pick_revisions(&ctx, &mut hosts, &opts, &parsed.rev_args)
+    let prefetch = CliPromisorPrefetch {
+        policy: cli_session.remote_policy.clone(),
+    };
+    let mut hosts = replay_hosts(cli_session.lazy_fetch().then_some(&prefetch));
+    sley_sequencer::pick::pick_revisions(
+        cli_session.original_cwd.as_deref(),
+        &ctx,
+        &mut hosts,
+        &opts,
+        &parsed.rev_args,
+    )
 }
 
 /// Assemble the host services (editor/hook runs, trailer recognition,
 /// partial-clone hydration) for one invocation. All seams are plain static
 /// functions, so the bundle carries no borrows.
-fn replay_hosts(lazy_fetch: bool) -> sley_sequencer::pick::PickHosts<'static> {
-    static PREFETCH: CliPromisorPrefetch = CliPromisorPrefetch;
+fn replay_hosts(prefetch: Option<&CliPromisorPrefetch>) -> sley_sequencer::pick::PickHosts<'_> {
     sley_sequencer::pick::PickHosts {
         prepare_commit_message: &|git_dir, message, source_merge, edit| {
             prepare_replay_host_message(git_dir, message, source_merge, edit)
@@ -1067,7 +1097,8 @@ fn replay_hosts(lazy_fetch: bool) -> sley_sequencer::pick::PickHosts<'static> {
         has_conforming_trailer_block: &|config, text| {
             commands::interpret_trailers::message_has_conforming_trailer_block(config, text)
         },
-        promisor_fetch: if lazy_fetch { Some(&PREFETCH) } else { None },
+        promisor_fetch: prefetch
+            .map(|fetch| fetch as &dyn sley_sequencer::apply::PromisorObjectFetch),
         usage_error: &|action| usage_error(action),
     }
 }
@@ -1187,6 +1218,8 @@ pub(crate) fn comment_char(git_dir: &Path) -> u8 {
 /// Historical CLI signature; the canonical implementation (and its
 /// partial-clone hydration seam) lives in the sequencer.
 pub(crate) fn reset_merge_in(
+    original_cwd: Option<&std::path::Path>,
+    policy: &sley_remote::RemotePolicy,
     git_dir: &Path,
     worktree_root: &Path,
     format: ObjectFormat,
@@ -1194,14 +1227,17 @@ pub(crate) fn reset_merge_in(
     config: &GitConfig,
     lazy_fetch: bool,
 ) -> Result<()> {
-    static PREFETCH: CliPromisorPrefetch = CliPromisorPrefetch;
+    let prefetch = CliPromisorPrefetch {
+        policy: policy.clone(),
+    };
     sley_sequencer::pick::reset_merge_in(
+        original_cwd,
         git_dir,
         worktree_root,
         format,
         target,
         config,
-        lazy_fetch.then_some(&PREFETCH as &'static dyn sley_sequencer::apply::PromisorObjectFetch),
+        lazy_fetch.then_some(&prefetch as &dyn sley_sequencer::apply::PromisorObjectFetch),
     )
 }
 

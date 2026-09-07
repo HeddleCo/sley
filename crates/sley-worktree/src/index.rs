@@ -290,8 +290,11 @@ pub fn update_index_paths_with_index(
     paths: &[PathBuf],
     options: UpdateIndexOptions,
 ) -> Result<UpdateIndexResult> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let ordered = ordered_paths_from_plain(paths, options);
     update_index_paths_impl(
+        precompose,
         worktree_root.as_ref(),
         git_dir.as_ref(),
         format,
@@ -361,6 +364,7 @@ pub fn update_index_ordered_paths_filtered_with_index(
     verbose: bool,
 ) -> Result<UpdateIndexResult> {
     update_index_paths_impl(
+        config.precompose_unicode(),
         worktree_root.as_ref(),
         git_dir.as_ref(),
         format,
@@ -438,6 +442,7 @@ pub fn update_index_paths_filtered_with_index(
 ) -> Result<UpdateIndexResult> {
     let ordered = ordered_paths_from_plain(paths, options);
     update_index_paths_impl(
+        config.precompose_unicode(),
         worktree_root.as_ref(),
         git_dir.as_ref(),
         format,
@@ -475,6 +480,7 @@ pub fn renormalize_index_paths_filtered(
     };
     let ordered = ordered_paths_from_plain(paths, options);
     update_index_paths_impl(
+        config.precompose_unicode(),
         worktree_root.as_ref(),
         git_dir,
         format,
@@ -611,6 +617,8 @@ pub fn collect_index_worktree_status_with_index(
     format: ObjectFormat,
     index: &Index,
 ) -> Result<Vec<ShortStatusEntry>> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
@@ -630,6 +638,7 @@ pub fn collect_index_worktree_status_with_index(
     )?;
     let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
     let untracked = status_untracked_paths_from_index(
+        precompose,
         worktree_root,
         git_dir,
         index,
@@ -1346,6 +1355,7 @@ pub(crate) enum IndexCleanMode {
 }
 
 pub(crate) fn update_index_paths_impl(
+    precompose: sley_core::PrecomposeUnicode,
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -1380,7 +1390,7 @@ pub(crate) fn update_index_paths_impl(
     // dirty in a huge checkout. Large batches still amortize the full matcher.
     let clean_filter = match clean_config {
         Some(_) if paths.len() >= 64 => Some(UpdateIndexCleanFilter::Full(
-            AttributeMatcher::from_worktree_root(worktree_root)?,
+            AttributeMatcher::from_worktree_root(precompose, worktree_root)?,
         )),
         Some(_) => Some(UpdateIndexCleanFilter::PathLocal),
         None => None,
@@ -1414,7 +1424,7 @@ pub(crate) fn update_index_paths_impl(
         let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
             GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
         })?;
-        let git_path = git_path_bytes(relative)?;
+        let git_path = git_path_bytes(precompose, relative)?;
         if index_sparse_dir_contains_path(&index, &git_path) {
             expand_sparse_index_directories(&mut index, &odb, format, |directory| {
                 git_path.starts_with(directory)
@@ -1761,6 +1771,8 @@ pub fn refresh_index_paths_with_options(
     allow_unmerged: bool,
     really_refresh: bool,
 ) -> Result<UpdateIndexResult> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
@@ -1794,7 +1806,7 @@ pub fn refresh_index_paths_with_options(
             let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
                 GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
             })?;
-            git_path_bytes(relative)
+            git_path_bytes(precompose, relative)
         })
         .collect::<Result<Vec<_>>>()?;
     let selected_paths = selected_paths.into_iter().collect::<BTreeSet<_>>();
@@ -2097,10 +2109,12 @@ pub fn update_index_again(
     paths: &[PathBuf],
     options: UpdateIndexOptions,
 ) -> Result<UpdateIndexResult> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let (entry_count, again_paths) =
-        select_index_again_paths(worktree_root, git_dir, format, paths)?;
+        select_index_again_paths(precompose, worktree_root, git_dir, format, paths)?;
     if again_paths.is_empty() {
         return Ok(UpdateIndexResult {
             entries: entry_count,
@@ -2122,10 +2136,12 @@ pub fn set_index_skip_worktree_again(
     paths: &[PathBuf],
     skip_worktree: bool,
 ) -> Result<UpdateIndexResult> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let (entry_count, again_paths) =
-        select_index_again_paths(worktree_root, git_dir, format, paths)?;
+        select_index_again_paths(precompose, worktree_root, git_dir, format, paths)?;
     if again_paths.is_empty() {
         return Ok(UpdateIndexResult {
             entries: entry_count,
@@ -2136,6 +2152,7 @@ pub fn set_index_skip_worktree_again(
 }
 
 fn select_index_again_paths(
+    precompose: sley_core::PrecomposeUnicode,
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -2154,7 +2171,7 @@ fn select_index_again_paths(
     // no observable full-index transition.
     expand_sparse_index_in_memory(&mut index, &db, format)?;
     let head_entries = head_tree_entries(git_dir, format, &db)?;
-    let selected_paths = selected_git_paths(worktree_root, paths)?;
+    let selected_paths = selected_git_paths(precompose, worktree_root, paths)?;
     let mut again_paths = Vec::new();
     for entry in &index.entries {
         if index_entry_stage(entry) != 0 {
@@ -2182,6 +2199,8 @@ pub fn set_index_assume_unchanged_paths(
     paths: &[PathBuf],
     assume_unchanged: bool,
 ) -> Result<UpdateIndexResult> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
@@ -2211,7 +2230,7 @@ pub fn set_index_assume_unchanged_paths(
             let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
                 GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
             })?;
-            git_path_bytes(relative)
+            git_path_bytes(precompose, relative)
         })
         .collect::<Result<Vec<_>>>()?;
     for path in selected_paths {
@@ -2238,6 +2257,7 @@ pub fn set_index_assume_unchanged_paths(
 }
 
 pub(crate) fn selected_git_paths(
+    precompose: sley_core::PrecomposeUnicode,
     worktree_root: &Path,
     paths: &[PathBuf],
 ) -> Result<BTreeSet<Vec<u8>>> {
@@ -2252,7 +2272,7 @@ pub(crate) fn selected_git_paths(
             let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
                 GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
             })?;
-            git_path_bytes(relative)
+            git_path_bytes(precompose, relative)
         })
         .collect()
 }
@@ -2270,6 +2290,8 @@ pub fn set_index_skip_worktree_paths(
     paths: &[PathBuf],
     skip_worktree: bool,
 ) -> Result<UpdateIndexResult> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
@@ -2299,7 +2321,7 @@ pub fn set_index_skip_worktree_paths(
             let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
                 GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
             })?;
-            git_path_bytes(relative)
+            git_path_bytes(precompose, relative)
         })
         .collect::<Result<Vec<_>>>()?;
     for path in selected_paths {
@@ -2336,6 +2358,8 @@ pub fn set_index_fsmonitor_valid_paths(
     paths: &[PathBuf],
     _fsmonitor_valid: bool,
 ) -> Result<UpdateIndexResult> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
@@ -2360,7 +2384,7 @@ pub fn set_index_fsmonitor_valid_paths(
             let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
                 GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
             })?;
-            git_path_bytes(relative)
+            git_path_bytes(precompose, relative)
         })
         .collect::<Result<Vec<_>>>()?;
     for path in selected_paths {
@@ -2536,7 +2560,14 @@ pub fn refresh_untracked_cache_after_status(
         emit_untracked_cache_bypass_trace();
         return Ok(());
     }
-    let cache = build_untracked_cache(worktree_root, git_dir, format, &index, untracked_mode)?;
+    let cache = build_untracked_cache(
+        config.precompose_unicode(),
+        worktree_root,
+        git_dir,
+        format,
+        &index,
+        untracked_mode,
+    )?;
     emit_untracked_cache_trace(old_cache.as_ref(), &cache);
     index.set_untracked_cache(format, Some(&cache))?;
     write_repository_index_ref(git_dir, format, &index)?;

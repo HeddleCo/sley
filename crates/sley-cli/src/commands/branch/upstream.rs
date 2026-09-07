@@ -3,7 +3,6 @@
 use super::config::write_branch_repo_config;
 use super::operand::{BranchOperandKind, branch_resolve_local_branch_operand};
 use crate::*;
-use {sley_refs, sley_rev};
 
 pub(super) enum BranchUpstreamAction {
     Set(String),

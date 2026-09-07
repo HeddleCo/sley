@@ -1,6 +1,5 @@
 use super::*;
 use std::sync::Arc;
-use {sley_core, sley_diff_merge};
 
 // ===== git merge (3-way) =====
 //
@@ -19,7 +18,10 @@ pub(crate) use sley_sequencer::apply::{
 };
 
 /// Host-side partial-clone hydration handed to the sequencer apply backend.
-struct MergePrefetch;
+struct MergePrefetch {
+    policy: sley_remote::RemotePolicy,
+    enabled: bool,
+}
 
 impl sley_sequencer::apply::PromisorObjectFetch for MergePrefetch {
     fn read_object_maybe_prefetch(
@@ -27,32 +29,50 @@ impl sley_sequencer::apply::PromisorObjectFetch for MergePrefetch {
         db: &FileObjectDatabase,
         oid: &ObjectId,
     ) -> Result<Arc<EncodedObject>> {
-        crate::read_object_maybe_prefetch_promisor(db, oid, true)
+        crate::read_object_maybe_prefetch_promisor(&self.policy, db, oid, self.enabled)
     }
 }
 
-fn apply_fetch(
-    lazy_fetch: bool,
-) -> Option<&'static dyn sley_sequencer::apply::PromisorObjectFetch> {
-    static PREFETCH: MergePrefetch = MergePrefetch;
-    lazy_fetch.then_some(&PREFETCH)
+impl MergePrefetch {
+    fn as_option(&self) -> Option<&dyn sley_sequencer::apply::PromisorObjectFetch> {
+        self.enabled
+            .then_some(self as &dyn sley_sequencer::apply::PromisorObjectFetch)
+    }
+}
+
+fn apply_fetch(policy: &sley_remote::RemotePolicy, enabled: bool) -> MergePrefetch {
+    MergePrefetch {
+        policy: policy.clone(),
+        enabled,
+    }
 }
 
 pub(crate) fn merge_read_blob(
+    policy: &sley_remote::RemotePolicy,
     db: &FileObjectDatabase,
     oid: &ObjectId,
     lazy_fetch: bool,
 ) -> Result<Vec<u8>> {
-    sley_sequencer::apply::merge_read_blob_with_fetch(db, oid, apply_fetch(lazy_fetch))
+    sley_sequencer::apply::merge_read_blob_with_fetch(
+        db,
+        oid,
+        apply_fetch(policy, lazy_fetch).as_option(),
+    )
 }
 
 pub(crate) fn merge_worktree_content(
+    policy: &sley_remote::RemotePolicy,
     db: &FileObjectDatabase,
     mode: u32,
     oid: &ObjectId,
     lazy_fetch: bool,
 ) -> Result<Vec<u8>> {
-    sley_sequencer::apply::merge_worktree_content(db, mode, oid, apply_fetch(lazy_fetch))
+    sley_sequencer::apply::merge_worktree_content(
+        db,
+        mode,
+        oid,
+        apply_fetch(policy, lazy_fetch).as_option(),
+    )
 }
 
 /// Clear worktree files that block any directory path in the merged result.
@@ -133,6 +153,7 @@ pub(crate) fn worktree_file_matches_ours(
 /// porcelains consume. It is rename-aware (the merge-ort non-recursive rename
 /// case) because the library merge runs with rename detection enabled.
 pub(crate) fn three_way_merge_trees(
+    policy: &sley_remote::RemotePolicy,
     db: &FileObjectDatabase,
     config: &GitConfig,
     lazy_fetch: bool,
@@ -144,6 +165,7 @@ pub(crate) fn three_way_merge_trees(
     theirs_label: &str,
 ) -> Result<(MergePathResults, MergeConflictPaths)> {
     three_way_merge_trees_with_favor(
+        policy,
         db,
         config,
         lazy_fetch,
@@ -162,6 +184,7 @@ pub(crate) fn three_way_merge_trees(
 /// and honour `merge.conflictStyle`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn three_way_merge_trees_styled(
+    policy: &sley_remote::RemotePolicy,
     db: &FileObjectDatabase,
     config: &GitConfig,
     lazy_fetch: bool,
@@ -175,6 +198,7 @@ pub(crate) fn three_way_merge_trees_styled(
     style: sley_diff_merge::ConflictStyle,
 ) -> Result<(MergePathResults, MergeConflictPaths)> {
     three_way_merge_trees_styled_with_strategy_options(
+        policy,
         db,
         config,
         lazy_fetch,
@@ -194,6 +218,7 @@ pub(crate) fn three_way_merge_trees_styled(
 /// command's `-X` strategy options instead of dropping them at the CLI seam.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn three_way_merge_trees_styled_with_strategy_options(
+    policy: &sley_remote::RemotePolicy,
     db: &FileObjectDatabase,
     config: &GitConfig,
     lazy_fetch: bool,
@@ -208,6 +233,7 @@ pub(crate) fn three_way_merge_trees_styled_with_strategy_options(
     strategy_options: &[String],
 ) -> Result<(MergePathResults, MergeConflictPaths)> {
     let (results, conflicts, _) = three_way_merge_trees_inner_with_info_opts(
+        policy,
         db,
         format,
         base,
@@ -268,6 +294,7 @@ pub(crate) fn merge_conflict_style_from_config(
 /// conflict-favouring choice (used by `git merge -X ours|theirs`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn three_way_merge_trees_with_favor(
+    policy: &sley_remote::RemotePolicy,
     db: &FileObjectDatabase,
     config: &GitConfig,
     lazy_fetch: bool,
@@ -280,6 +307,7 @@ pub(crate) fn three_way_merge_trees_with_favor(
     favor: sley_diff_merge::MergeFavor,
 ) -> Result<(MergePathResults, MergeConflictPaths)> {
     three_way_merge_trees_inner(
+        policy,
         db,
         config,
         lazy_fetch,
@@ -329,6 +357,7 @@ pub(crate) fn merge_ws_ignore_from_strategy_opts(opts: &[String]) -> sley_diff_m
 
 #[allow(clippy::too_many_arguments)]
 fn three_way_merge_trees_inner(
+    policy: &sley_remote::RemotePolicy,
     db: &FileObjectDatabase,
     config: &GitConfig,
     lazy_fetch: bool,
@@ -343,6 +372,7 @@ fn three_way_merge_trees_inner(
     style: sley_diff_merge::ConflictStyle,
 ) -> Result<(MergePathResults, MergeConflictPaths)> {
     let (results, conflicts, _) = three_way_merge_trees_inner_with_info(
+        policy,
         db,
         config,
         lazy_fetch,
@@ -361,6 +391,7 @@ fn three_way_merge_trees_inner(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn three_way_merge_trees_inner_with_info(
+    policy: &sley_remote::RemotePolicy,
     db: &FileObjectDatabase,
     config: &GitConfig,
     lazy_fetch: bool,
@@ -375,6 +406,7 @@ pub(crate) fn three_way_merge_trees_inner_with_info(
     style: sley_diff_merge::ConflictStyle,
 ) -> Result<(MergePathResults, MergeConflictPaths, MergeInfoMessages)> {
     three_way_merge_trees_inner_with_info_opts(
+        policy,
         db,
         format,
         base,
@@ -415,6 +447,7 @@ pub(crate) struct RenameMergeConfig {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn three_way_merge_trees_inner_with_info_opts(
+    policy: &sley_remote::RemotePolicy,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     base: &MergeTreeMap,
@@ -429,6 +462,7 @@ pub(crate) fn three_way_merge_trees_inner_with_info_opts(
     renames: RenameMergeConfig,
 ) -> Result<(MergePathResults, MergeConflictPaths, MergeInfoMessages)> {
     three_way_merge_trees_inner_with_info_opts_and_path_favor(
+        policy,
         db,
         format,
         base,
@@ -447,6 +481,7 @@ pub(crate) fn three_way_merge_trees_inner_with_info_opts(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn three_way_merge_trees_inner_with_info_opts_and_path_favor(
+    policy: &sley_remote::RemotePolicy,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     base: &MergeTreeMap,
@@ -462,6 +497,7 @@ pub(crate) fn three_way_merge_trees_inner_with_info_opts_and_path_favor(
     path_favor: Option<&MergePathFavorResolver<'_>>,
 ) -> Result<(MergePathResults, MergeConflictPaths, MergeInfoMessages)> {
     three_way_merge_trees_inner_with_info_opts_and_path_resolvers(
+        policy,
         db,
         format,
         base,
@@ -481,6 +517,7 @@ pub(crate) fn three_way_merge_trees_inner_with_info_opts_and_path_favor(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn three_way_merge_trees_inner_with_info_opts_and_path_resolvers(
+    policy: &sley_remote::RemotePolicy,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     base: &MergeTreeMap,
@@ -497,6 +534,7 @@ pub(crate) fn three_way_merge_trees_inner_with_info_opts_and_path_resolvers(
     path_marker_size: Option<&MergePathMarkerSizeResolver<'_>>,
 ) -> Result<(MergePathResults, MergeConflictPaths, MergeInfoMessages)> {
     let outcome = three_way_merge_trees_outcome_with_info_opts_and_path_resolvers(
+        policy,
         db,
         format,
         base,
@@ -518,6 +556,7 @@ pub(crate) fn three_way_merge_trees_inner_with_info_opts_and_path_resolvers(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn three_way_merge_trees_outcome_with_info_opts_and_path_resolvers(
+    policy: &sley_remote::RemotePolicy,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     base: &MergeTreeMap,
@@ -557,6 +596,6 @@ pub(crate) fn three_way_merge_trees_outcome_with_info_opts_and_path_resolvers(
         path_favor,
         path_marker_size,
         path_is_binary,
-        apply_fetch(renames.lazy_fetch),
+        apply_fetch(policy, renames.lazy_fetch).as_option(),
     )
 }

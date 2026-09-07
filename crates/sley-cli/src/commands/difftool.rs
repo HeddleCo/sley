@@ -58,13 +58,21 @@ pub(crate) fn cmd_difftool(
     let tool = resolve_difftool_tool(config, &options, gui)?;
     let prompt = should_prompt(config, &options);
     if options.dir_diff {
-        return run_dir_difftool(&repo, &options, &tool, &diffs, lazy_fetch);
+        return run_dir_difftool(
+            &cli_session.remote_policy,
+            &repo,
+            &options,
+            &tool,
+            &diffs,
+            lazy_fetch,
+        );
     }
 
     let temp = TempDir::new("sley-difftool")?;
     let total = diffs.len();
     for (idx, entry) in diffs.iter().enumerate() {
         let materialized = materialize_difftool_entry(
+            &cli_session.remote_policy,
             repo.objects(),
             worktree_root,
             entry,
@@ -342,6 +350,7 @@ fn order_difftool_entries(
 }
 
 fn materialize_difftool_entry(
+    policy: &sley_remote::RemotePolicy,
     db: &FileObjectDatabase,
     worktree_root: &Path,
     entry: &sley_diff_merge::NameStatusEntry,
@@ -354,7 +363,12 @@ fn materialize_difftool_entry(
     let remote = temp.join("right").join(&rel);
     write_materialized(
         &local,
-        diff_entry_old_content(entry, db, crate::diff_lazy_fetch(lazy_fetch))?.as_deref(),
+        diff_entry_old_content(
+            entry,
+            db,
+            crate::diff_lazy_fetch(policy, lazy_fetch).as_option(),
+        )?
+        .as_deref(),
         entry.old_mode,
     )?;
     write_materialized(
@@ -368,7 +382,7 @@ fn materialize_difftool_entry(
             // read from the worktree file, not looked up in the odb.
             right_side_is_worktree,
             None,
-            crate::diff_lazy_fetch(lazy_fetch),
+            crate::diff_lazy_fetch(policy, lazy_fetch).as_option(),
         )?
         .as_deref(),
         entry.new_mode,
@@ -423,6 +437,7 @@ fn run_difftool_command(
 }
 
 fn run_dir_difftool(
+    policy: &sley_remote::RemotePolicy,
     repo: &RepositoryContext,
     options: &DifftoolOptions,
     tool: &ToolCommand,
@@ -442,19 +457,23 @@ fn run_dir_difftool(
         let rel = repo_path_to_path(&entry.path);
         write_dir_materialized(
             &left.join(&rel),
-            diff_entry_old_content(entry, repo.objects(), crate::diff_lazy_fetch(lazy_fetch))?
-                .as_deref(),
+            diff_entry_old_content(
+                entry,
+                repo.objects(),
+                crate::diff_lazy_fetch(policy, lazy_fetch).as_option(),
+            )?
+            .as_deref(),
             entry.old_mode,
         )?;
         let right_path = right.join(&rel);
         let mut right_was_symlink = false;
-        if options.symlinks && can_symlink_right_side(repo, entry, lazy_fetch)? {
+        if options.symlinks && can_symlink_right_side(policy, repo, entry, lazy_fetch)? {
             symlink_worktree_file(repo.worktree_root()?.join(&rel), &right_path)?;
             right_was_symlink = true;
         } else {
             write_dir_materialized(
                 &right_path,
-                dir_diff_new_content(repo, entry, lazy_fetch)?.as_deref(),
+                dir_diff_new_content(policy, repo, entry, lazy_fetch)?.as_deref(),
                 entry.new_mode,
             )?;
         }
@@ -544,6 +563,7 @@ fn write_dir_materialized(path: &Path, content: Option<&[u8]>, mode: Option<u32>
 }
 
 fn dir_diff_new_content(
+    policy: &sley_remote::RemotePolicy,
     repo: &RepositoryContext,
     entry: &sley_diff_merge::NameStatusEntry,
     lazy_fetch: bool,
@@ -560,11 +580,12 @@ fn dir_diff_new_content(
         Some(repo.worktree_root()?),
         entry.new_oid.is_none(),
         None,
-        crate::diff_lazy_fetch(lazy_fetch),
+        crate::diff_lazy_fetch(policy, lazy_fetch).as_option(),
     )
 }
 
 fn can_symlink_right_side(
+    policy: &sley_remote::RemotePolicy,
     repo: &RepositoryContext,
     entry: &sley_diff_merge::NameStatusEntry,
     lazy_fetch: bool,
@@ -582,10 +603,11 @@ fn can_symlink_right_side(
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Ok(false);
     }
-    Ok(
-        read_blob(repo.objects(), oid, crate::diff_lazy_fetch(lazy_fetch))?
-            == fs::read(worktree_path)?,
-    )
+    Ok(read_blob(
+        repo.objects(),
+        oid,
+        crate::diff_lazy_fetch(policy, lazy_fetch).as_option(),
+    )? == fs::read(worktree_path)?)
 }
 
 fn is_regular_file_mode(mode: Option<u32>) -> bool {

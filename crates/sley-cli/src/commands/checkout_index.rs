@@ -9,7 +9,6 @@
 //! is a drop-in replacement.
 #![allow(clippy::expect_used)]
 
-use sley_worktree;
 // Pull shared plumbing (RepositoryContext, ObjectReader, Index/IndexEntry,
 // GitError/Result, std::* re-exports, …) from the crate root.
 // A submodule can see its ancestors' items, so the glob keeps this file in step

@@ -1,7 +1,6 @@
 //! `git tag` (create/list/delete/verify) and tag-message helpers.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use {sley_refs, sley_rev};
 // Glob the crate root for shared plumbing; see commands::stash for rationale.
 use crate::*;
 use std::borrow::Cow;

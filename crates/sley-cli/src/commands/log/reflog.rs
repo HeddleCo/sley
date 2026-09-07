@@ -1,5 +1,4 @@
 use super::*;
-use sley_rev;
 
 pub(super) struct ReflogWalkOptions<'a> {
     pub(super) max_count: Option<usize>,

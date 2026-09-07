@@ -4172,15 +4172,20 @@ pub fn branch_delete_parity_for_format(format: ObjectFormat) -> Result<BranchDel
     result
 }
 
-pub fn checkout_branch_parity() -> Result<CheckoutParity> {
-    checkout_branch_parity_for_format(ObjectFormat::Sha1)
+pub fn checkout_branch_parity(original_cwd: Option<&std::path::Path>) -> Result<CheckoutParity> {
+    checkout_branch_parity_for_format(original_cwd, ObjectFormat::Sha1)
 }
 
-pub fn checkout_branch_parity_sha256() -> Result<CheckoutParity> {
-    checkout_branch_parity_for_format(ObjectFormat::Sha256)
+pub fn checkout_branch_parity_sha256(
+    original_cwd: Option<&std::path::Path>,
+) -> Result<CheckoutParity> {
+    checkout_branch_parity_for_format(original_cwd, ObjectFormat::Sha256)
 }
 
-pub fn checkout_branch_parity_for_format(format: ObjectFormat) -> Result<CheckoutParity> {
+pub fn checkout_branch_parity_for_format(
+    original_cwd: Option<&std::path::Path>,
+    format: ObjectFormat,
+) -> Result<CheckoutParity> {
     let root = unique_temp_dir("sley-checkout");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<CheckoutParity> {
@@ -4238,7 +4243,14 @@ pub fn checkout_branch_parity_for_format(format: ObjectFormat) -> Result<Checkou
             },
         )?;
 
-        sley_worktree::checkout_branch(&root, root.join(".git"), format, "feature", identity)?;
+        sley_worktree::checkout_branch(
+            original_cwd,
+            &root,
+            root.join(".git"),
+            format,
+            "feature",
+            identity,
+        )?;
         let branch = String::from_utf8_lossy(&run_git(&root, ["branch", "--show-current"], &[])?)
             .trim()
             .to_string();
@@ -6628,14 +6640,14 @@ mod tests {
 
     #[test]
     fn upstream_git_reads_rust_checkout_branch_result() {
-        let result = checkout_branch_parity().expect("test operation should succeed");
+        let result = checkout_branch_parity(None).expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_checkout_branch_parity(result);
     }
 
     #[test]
     fn upstream_git_reads_rust_checkout_branch_result_sha256() {
-        let result = checkout_branch_parity_sha256().expect("test operation should succeed");
+        let result = checkout_branch_parity_sha256(None).expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_checkout_branch_parity(result);
     }

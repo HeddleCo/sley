@@ -182,6 +182,7 @@ pub fn run_push_to_checkout(
 /// refuse dirty worktrees / staged changes, refuse untracked paths that the new
 /// tree would overwrite, then hard-reset the index+worktree to `new_oid`.
 pub fn update_worktree_for_update_instead(
+    original_cwd: Option<&std::path::Path>,
     git_dir: &Path,
     format: sley_core::ObjectFormat,
     new_oid: &sley_core::ObjectId,
@@ -196,11 +197,12 @@ pub fn update_worktree_for_update_instead(
     if run_push_to_checkout_hook(git_dir, new_oid, &worktree, remote_stderr, true)? {
         return Ok(());
     }
-    push_to_deploy(git_dir, &worktree, format, new_oid)
+    push_to_deploy(original_cwd, git_dir, &worktree, format, new_oid)
 }
 
 /// Default updateInstead path when no push-to-checkout hook is installed.
 fn push_to_deploy(
+    original_cwd: Option<&std::path::Path>,
     git_dir: &Path,
     worktree: &Path,
     format: sley_core::ObjectFormat,
@@ -240,9 +242,16 @@ fn push_to_deploy(
         ));
     }
 
-    sley_worktree::reset_index_and_worktree_to_commit(worktree, git_dir, format, new_oid).map_err(
-        |err| GitError::Command(format!("Could not update working tree to new HEAD: {err}")),
-    )?;
+    sley_worktree::reset_index_and_worktree_to_commit(
+        original_cwd,
+        worktree,
+        git_dir,
+        format,
+        new_oid,
+    )
+    .map_err(|err| {
+        GitError::Command(format!("Could not update working tree to new HEAD: {err}"))
+    })?;
     Ok(())
 }
 

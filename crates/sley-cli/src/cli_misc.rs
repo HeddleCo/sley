@@ -13,8 +13,6 @@ use sley_refs::{FileRefStore, resolve_ref_peeled, validate_symref_name};
 
 use crate::collect_short_status;
 use crate::collect_short_status_with_options;
-use crate::sley_index;
-use crate::sley_worktree;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AddAction {

@@ -2938,6 +2938,7 @@ mod worktree_attribute_cache_tests {
 
     #[test]
     fn builtin_binary_macro_unsets_text_by_default() {
+        let precompose = sley_core::PrecomposeUnicode::default();
         let root = temp_root();
         initialize_worktree(&root);
         fs::write(root.join(".gitattributes"), b"*.txt binary\n").expect("write binary attribute");
@@ -2950,7 +2951,8 @@ mod worktree_attribute_cache_tests {
         ]
         .map(<[u8]>::to_vec)
         .to_vec();
-        let flat = AttributeMatcher::from_worktree_root(&root).expect("create flat matcher");
+        let flat =
+            AttributeMatcher::from_worktree_root(precompose, &root).expect("create flat matcher");
         assert_eq!(
             flat.attributes_for_path(b"file.txt", &requested, false),
             vec![
@@ -2988,6 +2990,7 @@ mod worktree_attribute_cache_tests {
 
     #[test]
     fn info_definition_overrides_builtin_binary_for_root_patterns() {
+        let precompose = sley_core::PrecomposeUnicode::default();
         let root = temp_root();
         initialize_worktree(&root);
         fs::write(root.join(".gitattributes"), b"*.txt binary\n")
@@ -3006,7 +3009,8 @@ mod worktree_attribute_cache_tests {
         ]
         .map(<[u8]>::to_vec)
         .to_vec();
-        let flat = AttributeMatcher::from_worktree_root(&root).expect("create flat matcher");
+        let flat =
+            AttributeMatcher::from_worktree_root(precompose, &root).expect("create flat matcher");
         assert_eq!(
             flat.attributes_for_path(b"file.txt", &requested, false),
             vec![

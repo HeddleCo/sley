@@ -1,6 +1,5 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
-use {sley_config, sley_diff_merge, sley_index, sley_rev, sley_worktree};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
@@ -277,6 +276,8 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
             resolve_revision_commitish(&git_dir, format, target, cli_session.replace_objects())?;
         let target_commit = sley_rev::peel_to_commit(&db, format, &target_oid)?;
         return commands::replay::reset_merge_in(
+            cli_session.original_cwd.as_deref(),
+            &cli_session.remote_policy,
             &git_dir,
             &worktree_root,
             format,
@@ -335,6 +336,7 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
         // worktree (carrying forward safe local modifications, aborting on a
         // touched-file conflict). This may leave staged changes in the index.
         commands::read_tree::checkout_two_way_engine(
+            cli_session.original_cwd.as_deref(),
             &git_dir,
             &worktree_root,
             format,
@@ -431,6 +433,7 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
         write_reset_orig_head(&git_dir, &old_head, format)?;
         if recurse_submodules {
             let reset_result = commands::read_tree::reset_index_and_worktree_to_commit(
+                cli_session.original_cwd.as_deref(),
                 &worktree_root,
                 &git_dir,
                 format,
@@ -456,6 +459,7 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
             reset_result?;
         } else {
             sley_worktree::reset_index_and_worktree_to_commit_with_process_filter_metadata(
+                cli_session.original_cwd.as_deref(),
                 worktree_root,
                 git_dir.clone(),
                 format,
@@ -475,7 +479,12 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
         if !quiet {
             print_reset_hard_head(&git_dir, format, &target_commit)?;
         }
-        commands::merge_rebase::save_merge_autostash(&git_dir, format);
+        commands::merge_rebase::save_merge_autostash(
+            cli_session.original_cwd.as_deref(),
+            &cli_session.remote_policy,
+            &git_dir,
+            format,
+        );
         sley_sequencer::replay::remove_branch_state(&git_dir);
         return Ok(());
     }

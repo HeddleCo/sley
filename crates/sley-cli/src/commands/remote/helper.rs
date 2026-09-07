@@ -25,8 +25,17 @@ pub(crate) fn fetch_with_remote_helper(
     let Some(spec) = sley_remote::resolve_remote_helper(&config, source) else {
         return Ok(None);
     };
-    check_transport_allowed_url(spec.url.as_deref().unwrap_or(source), Some(&config))?;
-    sley_remote::check_transport_allowed(&spec.name, Some(&config), None).map_err(|error| {
+    check_transport_allowed_url(
+        &context.remote_policy,
+        spec.url.as_deref().unwrap_or(source),
+        Some(&config),
+    )?;
+    sley_remote::check_transport_allowed(
+        &spec.name,
+        Some(&config),
+        &context.remote_policy.transport,
+    )
+    .map_err(|error| {
         eprintln!("fatal: {error}");
         GitError::Exit(128)
     })?;
@@ -60,6 +69,7 @@ pub(crate) fn fetch_with_remote_helper(
 }
 
 pub(crate) fn discover_remote_helper_for_clone(
+    remote_policy: &sley_remote::RemotePolicy,
     config: &GitConfig,
     git_dir: &Path,
     spec: sley_remote::RemoteHelperSpec,
@@ -67,10 +77,11 @@ pub(crate) fn discover_remote_helper_for_clone(
     // The clone dispatcher already validated the resolved URL. Once it has
     // selected a custom helper, validate the helper transport name rather than
     // reparsing its user-defined URL scheme as a native transport.
-    sley_remote::check_transport_allowed(&spec.name, Some(config), None).map_err(|error| {
-        eprintln!("fatal: {error}");
-        GitError::Exit(128)
-    })?;
+    sley_remote::check_transport_allowed(&spec.name, Some(config), &remote_policy.transport)
+        .map_err(|error| {
+            eprintln!("fatal: {error}");
+            GitError::Exit(128)
+        })?;
     trace_remote_helper(&spec);
     sley_remote::discover_remote_helper_fetch(spec, git_dir, ObjectFormat::Sha1)
         .map_err(render_remote_helper_error)
@@ -114,6 +125,7 @@ pub(crate) fn fetch_with_discovered_remote_helper(
 }
 
 pub(super) fn push_with_remote_helper(
+    remote_policy: &sley_remote::RemotePolicy,
     git_dir: &Path,
     format: ObjectFormat,
     remote: &str,
@@ -125,10 +137,11 @@ pub(super) fn push_with_remote_helper(
     let Some(spec) = sley_remote::resolve_remote_helper(&config, remote) else {
         return Ok(None);
     };
-    sley_remote::check_transport_allowed(&spec.name, Some(&config), None).map_err(|error| {
-        eprintln!("fatal: {error}");
-        GitError::Exit(128)
-    })?;
+    sley_remote::check_transport_allowed(&spec.name, Some(&config), &remote_policy.transport)
+        .map_err(|error| {
+            eprintln!("fatal: {error}");
+            GitError::Exit(128)
+        })?;
     trace_remote_helper(&spec);
     let mut plumbing = NativeRemoteHelperPlumbing;
     let mut events = CliRemoteHelperEvents;
@@ -346,6 +359,7 @@ mod tests {
             ..GitConfig::default()
         };
         let error = discover_remote_helper_for_clone(
+            &sley_remote::RemotePolicy::default(),
             &config,
             Path::new("/repository-is-not-opened-before-policy-check"),
             sley_remote::RemoteHelperSpec {

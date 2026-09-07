@@ -1,5 +1,4 @@
 use super::*;
-use {sley_diff_merge, sley_rev};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LogDiffMerges {
@@ -244,11 +243,12 @@ impl LogDiffContext<'_> {
     /// differ between the default and oneline/format outputs).
     pub(super) fn render(
         &self,
+        policy: &sley_remote::RemotePolicy,
         record: &sley_rev::CommitRecord,
         line_prefix_width: i64,
         out: &mut Vec<u8>,
     ) -> Result<()> {
-        self.render_against_parent(record, None, line_prefix_width, out)
+        self.render_against_parent(policy, record, None, line_prefix_width, out)
     }
 
     pub(super) fn separate_parent_count(&self, record: &sley_rev::CommitRecord) -> Option<usize> {
@@ -258,16 +258,18 @@ impl LogDiffContext<'_> {
 
     pub(super) fn render_parent(
         &self,
+        policy: &sley_remote::RemotePolicy,
         record: &sley_rev::CommitRecord,
         parent_index: usize,
         line_prefix_width: i64,
         out: &mut Vec<u8>,
     ) -> Result<()> {
-        self.render_against_parent(record, Some(parent_index), line_prefix_width, out)
+        self.render_against_parent(policy, record, Some(parent_index), line_prefix_width, out)
     }
 
     fn render_against_parent(
         &self,
+        policy: &sley_remote::RemotePolicy,
         record: &sley_rev::CommitRecord,
         parent_index: Option<usize>,
         line_prefix_width: i64,
@@ -287,10 +289,10 @@ impl LogDiffContext<'_> {
             && parent_index.is_none()
             && let LogDiffMerges::Combined { dense } = self.merges
         {
-            return self.render_combined_merge(record, dense, line_prefix_width, out);
+            return self.render_combined_merge(policy, record, dense, line_prefix_width, out);
         }
         if parents.len() > 1 && parent_index.is_none() && self.merges == LogDiffMerges::Remerge {
-            return self.render_remerge_diff(record, line_prefix_width, out);
+            return self.render_remerge_diff(policy, record, line_prefix_width, out);
         }
         let parent_tree = if let Some(parent_index) = parent_index {
             let Some(parent) = parents.get(parent_index) else {
@@ -386,13 +388,14 @@ impl LogDiffContext<'_> {
         }
 
         let opts = self.opts;
+        let lazy_fetch_adapter_1 = crate::diff_lazy_fetch(policy, self.lazy_fetch);
         let stat_entries = if opts.numstat || opts.stat || opts.compact_summary || opts.shortstat {
             collect_diff_stat_entries(
                 &entries,
                 self.db,
                 None,
                 false,
-                crate::diff_lazy_fetch(self.lazy_fetch),
+                lazy_fetch_adapter_1.as_option(),
             )?
         } else {
             Vec::new()
@@ -467,7 +470,7 @@ impl LogDiffContext<'_> {
                         anchors: &[],
                         allow_textconv: true,
                         db: self.db,
-                        lazy_fetch: crate::diff_lazy_fetch(self.lazy_fetch),
+                        lazy_fetch: crate::diff_lazy_fetch(policy, self.lazy_fetch).as_option(),
                         worktree_root: None,
                         use_worktree_new: false,
                         format: self.format,
@@ -510,6 +513,7 @@ impl LogDiffContext<'_> {
     /// conflicted in the re-merge (git's do_remerge_diff).
     fn render_remerge_diff(
         &self,
+        policy: &sley_remote::RemotePolicy,
         record: &sley_rev::CommitRecord,
         line_prefix_width: i64,
         out: &mut Vec<u8>,
@@ -652,7 +656,7 @@ impl LogDiffContext<'_> {
                         anchors: &[],
                         allow_textconv: true,
                         db: self.db,
-                        lazy_fetch: crate::diff_lazy_fetch(self.lazy_fetch),
+                        lazy_fetch: crate::diff_lazy_fetch(policy, self.lazy_fetch).as_option(),
                         worktree_root: None,
                         use_worktree_new: false,
                         format: self.format,
@@ -710,6 +714,7 @@ impl LogDiffContext<'_> {
     /// owns separators).
     fn render_combined_merge(
         &self,
+        policy: &sley_remote::RemotePolicy,
         record: &sley_rev::CommitRecord,
         dense: bool,
         line_prefix_width: i64,
@@ -777,13 +782,14 @@ impl LogDiffContext<'_> {
                 writeln!(out, "{}", String::from_utf8_lossy(&path.path))?;
             }
         }
+        let lazy_fetch_adapter_2 = crate::diff_lazy_fetch(policy, self.lazy_fetch);
         let stat_entries = if opts.numstat || opts.stat || opts.compact_summary || opts.shortstat {
             collect_diff_stat_entries(
                 &first_parent_entries,
                 self.db,
                 None,
                 false,
-                crate::diff_lazy_fetch(self.lazy_fetch),
+                lazy_fetch_adapter_2.as_option(),
             )?
         } else {
             Vec::new()
@@ -823,7 +829,7 @@ impl LogDiffContext<'_> {
             }
             let render_ctx = self.combined_ctx(dense);
             for path in &paths {
-                commands::combined::write_combined_patch(out, &render_ctx, path)?;
+                commands::combined::write_combined_patch(policy, out, &render_ctx, path)?;
             }
         }
         Ok(())

@@ -1,6 +1,5 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
-use {sley_core, sley_diff_merge, sley_index, sley_rev, sley_worktree};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
@@ -311,6 +310,7 @@ fn cmd_submodule_add(
     }
     if !options.force
         && sley_worktree::path_matches_standard_ignore(
+            cli_session.precompose_unicode(),
             worktree_root,
             normalized_path.as_bytes(),
             true,

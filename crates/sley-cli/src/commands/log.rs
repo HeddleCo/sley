@@ -1,7 +1,6 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 #![allow(clippy::expect_used)]
 
-use {sley_diff_merge, sley_rev, sley_worktree};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
@@ -2653,7 +2652,12 @@ fn cmd_log_impl(
         if diff_opts.any() || diff_opts.merges_imply_patch || compiled_pickaxe.is_some() {
             let attributes = worktree_root
                 .as_deref()
-                .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
+                .map(|root| {
+                    sley_worktree::StandardAttributeMatcher::from_worktree_root(
+                        cli_session.precompose_unicode(),
+                        root,
+                    )
+                })
                 .transpose()?;
             Some(commands::userdiff::UserdiffResolver::with_attributes(
                 attributes,
@@ -2936,45 +2940,48 @@ fn cmd_log_impl(
             eprintln!("fatal: -L does not yet support the requested diff format");
             return Err(GitError::Exit(128));
         }
-        return run_line_log_output(LineLogOutputCtx {
-            git_dir: &git_dir,
-            db: &db,
-            lazy_fetch,
-            replace_objects: cli_session.replace_objects(),
-            format,
-            config: &config,
-            tip: starts[0],
-            args: &line_log_args,
-            output: &output,
-            diff_opts: &diff_opts,
-            date_mode: &date_mode,
-            abbrev_len,
-            abbrev_commit,
-            detect_renames: filter_detect_renames,
-            first_parent,
-            max_count,
-            reverse,
-            show_parents,
-            decoration,
-            output_encoding: &output_encoding,
-            src_prefix: line_log_src_prefix.as_deref(),
-            dst_prefix: line_log_dst_prefix.as_deref(),
-            full_index: line_log_full_index,
-            abbrev_len_explicit,
-            max_age,
-            min_age,
-            pickaxe: compiled_pickaxe.as_ref(),
-            pickaxe_ignore_case,
-            pickaxe_text,
-            pickaxe_detect_renames,
-            diff_filter_mask,
-            reverse_diff: diff_reverse,
-            graph,
-            color_always,
-            color_moved: line_log_color_moved,
-            userdiff: log_userdiff.as_ref(),
-            output_path: log_output_path.as_deref(),
-        });
+        return run_line_log_output(
+            &cli_session.remote_policy,
+            LineLogOutputCtx {
+                git_dir: &git_dir,
+                db: &db,
+                lazy_fetch,
+                replace_objects: cli_session.replace_objects(),
+                format,
+                config: &config,
+                tip: starts[0],
+                args: &line_log_args,
+                output: &output,
+                diff_opts: &diff_opts,
+                date_mode: &date_mode,
+                abbrev_len,
+                abbrev_commit,
+                detect_renames: filter_detect_renames,
+                first_parent,
+                max_count,
+                reverse,
+                show_parents,
+                decoration,
+                output_encoding: &output_encoding,
+                src_prefix: line_log_src_prefix.as_deref(),
+                dst_prefix: line_log_dst_prefix.as_deref(),
+                full_index: line_log_full_index,
+                abbrev_len_explicit,
+                max_age,
+                min_age,
+                pickaxe: compiled_pickaxe.as_ref(),
+                pickaxe_ignore_case,
+                pickaxe_text,
+                pickaxe_detect_renames,
+                diff_filter_mask,
+                reverse_diff: diff_reverse,
+                graph,
+                color_always,
+                color_moved: line_log_color_moved,
+                userdiff: log_userdiff.as_ref(),
+                output_path: log_output_path.as_deref(),
+            },
+        );
     }
     if let Some(path) = log_output_path {
         return Err(GitError::Command(format!(
@@ -3801,7 +3808,12 @@ fn cmd_log_impl(
                         // the graph, so use that without advancing it.
                         let prefix_width =
                             graph_state.graph_width() as i64 + log_prefix_display_width(prefix);
-                        log_diff.render(record, prefix_width, &mut diff_block)?;
+                        log_diff.render(
+                            &cli_session.remote_policy,
+                            record,
+                            prefix_width,
+                            &mut diff_block,
+                        )?;
                         if !diff_block.is_empty() {
                             diff_attached = true;
                             if msg.last() != Some(&b'\n') {
@@ -3850,7 +3862,12 @@ fn cmd_log_impl(
                         if let Some(log_diff) = &log_diff {
                             let prefix_width =
                                 graph_state.graph_width() as i64 + log_prefix_display_width(prefix);
-                            log_diff.render(record, prefix_width, &mut diff_block)?;
+                            log_diff.render(
+                                &cli_session.remote_policy,
+                                record,
+                                prefix_width,
+                                &mut diff_block,
+                            )?;
                             if !diff_block.is_empty() {
                                 msg.extend_from_slice(diff_opts.block_separator_for(record));
                                 msg.extend_from_slice(&diff_block);
@@ -3969,7 +3986,12 @@ fn cmd_log_impl(
                         // git's line-prefix callback gives it.
                         let prefix_width =
                             graph_state.graph_width() as i64 + log_prefix_display_width(prefix);
-                        log_diff.render(record, prefix_width, &mut diff_block)?;
+                        log_diff.render(
+                            &cli_session.remote_policy,
+                            record,
+                            prefix_width,
+                            &mut diff_block,
+                        )?;
                         if !diff_block.is_empty() {
                             msg.extend_from_slice(diff_opts.block_separator_for(record));
                             msg.extend_from_slice(&diff_block);
@@ -4011,13 +4033,19 @@ fn cmd_log_impl(
                             log_prefix_display_width(line_prefix.as_deref().unwrap_or(""));
                         if let Some(parent_index) = separate_parent_index {
                             log_diff.render_parent(
+                                &cli_session.remote_policy,
                                 record,
                                 parent_index,
                                 prefix_width,
                                 &mut diff_block,
                             )?;
                         } else {
-                            log_diff.render(record, prefix_width, &mut diff_block)?;
+                            log_diff.render(
+                                &cli_session.remote_policy,
+                                record,
+                                prefix_width,
+                                &mut diff_block,
+                            )?;
                         }
                     }
                     if whatchanged && log_diff.is_some() && diff_block.is_empty() {
@@ -4318,7 +4346,12 @@ fn cmd_log_impl(
                     // entry, with no separating blank line. `--line-prefix`
                     // narrows the stat budget and prefixes every diff line.
                     let prefix = line_prefix.as_deref().unwrap_or("");
-                    log_diff.render(record, log_prefix_display_width(prefix), &mut diff_block)?;
+                    log_diff.render(
+                        &cli_session.remote_policy,
+                        record,
+                        log_prefix_display_width(prefix),
+                        &mut diff_block,
+                    )?;
                     if !diff_block.is_empty() {
                         let mut stdout = io::stdout();
                         let separator = diff_opts.block_separator_for(record);

@@ -3,7 +3,6 @@
 
 use crate::*;
 use sley_worktree::admin::{LinkedWorktreeAdmin, WorktreeAdminOutcome, WorktreeAdminSnapshot};
-use {sley_config, sley_core, sley_index, sley_worktree};
 
 #[path = "worktree_options.rs"]
 mod worktree_options;
@@ -283,7 +282,12 @@ pub(crate) fn cmd_worktree_add(
         // Build the target tree normally, then reconcile it through the shared
         // sparse engine so skip-worktree bits, sparse-directory collapsing and
         // materialized files all use the same semantics as sparse-checkout set.
-        sley_worktree::reapply_active_sparse_checkout(&path, &admin_dir, format)?;
+        sley_worktree::reapply_active_sparse_checkout(
+            cli_session.original_cwd.as_deref(),
+            &path,
+            &admin_dir,
+            format,
+        )?;
     }
     // The prepare line was already printed (before check_candidate_path); only
     // the post-checkout "HEAD is now at ..." reset line remains.

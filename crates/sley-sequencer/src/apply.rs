@@ -156,6 +156,7 @@ pub fn merge_index_entry(path: &[u8], mode: u32, oid: ObjectId, stage: u16) -> I
 // ===== worktree materialization =====
 
 pub fn merge_write_worktree_file(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
     path: &[u8],
     content: &[u8],
@@ -183,14 +184,14 @@ pub fn merge_write_worktree_file(
         if full.is_dir() {
             return Ok(());
         }
-        merge_unlink_path_in_the_way(&full)?;
+        merge_unlink_path_in_the_way(original_cwd, &full)?;
         std::fs::create_dir_all(&full)?;
         return Ok(());
     }
     // Unlink whatever is in the way first (git's entry.c `write_entry`), so a type
     // change (regular file ⇄ symlink) is overwritten rather than written *through*
     // an existing symlink or left stale — the symlink-stash-apply / merge cases.
-    merge_unlink_path_in_the_way(&full)?;
+    merge_unlink_path_in_the_way(original_cwd, &full)?;
     if (mode & 0o170000) == 0o120000 {
         // Symlink entry (mode 120000): the blob bytes are the link target.
         #[cfg(unix)]
@@ -217,11 +218,11 @@ pub fn merge_write_worktree_file(
 /// Remove whatever currently occupies `full` (lstat-based, so a dangling symlink
 /// is removed as the link, not followed) before a merge materializes a new object
 /// there. A directory in the way is removed recursively (D/F transition).
-fn merge_unlink_path_in_the_way(full: &Path) -> Result<()> {
+fn merge_unlink_path_in_the_way(original_cwd: Option<&std::path::Path>, full: &Path) -> Result<()> {
     match std::fs::symlink_metadata(full) {
         Ok(metadata) => {
             if metadata.is_dir() {
-                if merge_path_is_original_cwd(full) {
+                if merge_path_is_original_cwd(original_cwd, full) {
                     return merge_refuse_remove_current_working_directory(full);
                 }
                 match std::fs::remove_dir_all(full) {
@@ -267,7 +268,11 @@ fn remove_blocking_file_ancestors(worktree_root: &Path, rel: &str) -> Result<()>
     Ok(())
 }
 
-pub fn merge_remove_worktree_file(worktree_root: &Path, path: &[u8]) -> Result<()> {
+pub fn merge_remove_worktree_file(
+    original_cwd: Option<&std::path::Path>,
+    worktree_root: &Path,
+    path: &[u8],
+) -> Result<()> {
     let rel = std::str::from_utf8(path)
         .map_err(|_| GitError::InvalidFormat("non-utf8 worktree path".into()))?;
     let full = worktree_root.join(rel);
@@ -275,7 +280,7 @@ pub fn merge_remove_worktree_file(worktree_root: &Path, path: &[u8]) -> Result<(
     // dangling one, leaving it behind on removal.
     match std::fs::symlink_metadata(&full) {
         Ok(metadata) if metadata.is_dir() => {
-            if merge_path_is_original_cwd(&full) {
+            if merge_path_is_original_cwd(original_cwd, &full) {
                 return Ok(());
             }
             // A directory occupies a tracked path being removed: this is a
@@ -308,15 +313,16 @@ pub fn merge_remove_worktree_file(worktree_root: &Path, path: &[u8]) -> Result<(
         Err(err) if err.raw_os_error() == Some(20) => {}
         Err(err) => return Err(err.into()),
     }
-    merge_prune_empty_dirs(worktree_root, full.parent());
+    merge_prune_empty_dirs(original_cwd, worktree_root, full.parent());
     Ok(())
 }
 
 pub fn merge_refuse_if_current_working_directory_becomes_file(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
     target_entries: &MergeTreeMap,
 ) -> Result<()> {
-    let Some(cwd) = merge_original_cwd_relative_to(worktree_root) else {
+    let Some(cwd) = merge_original_cwd_relative_to(original_cwd, worktree_root) else {
         return Ok(());
     };
     if target_entries.iter().any(|(path, (mode, _))| {
@@ -330,14 +336,17 @@ pub fn merge_refuse_if_current_working_directory_becomes_file(
     Ok(())
 }
 
-fn merge_original_cwd_absolute() -> Option<PathBuf> {
-    let cwd = sley_core::original_cwd().or_else(|| std::env::current_dir().ok())?;
+fn merge_original_cwd_absolute(original_cwd: Option<&Path>) -> Option<PathBuf> {
+    let cwd = original_cwd?.to_path_buf();
     Some(std::fs::canonicalize(&cwd).unwrap_or(cwd))
 }
 
-fn merge_original_cwd_relative_to(worktree_root: &Path) -> Option<Vec<u8>> {
+fn merge_original_cwd_relative_to(
+    original_cwd: Option<&std::path::Path>,
+    worktree_root: &Path,
+) -> Option<Vec<u8>> {
     let root = std::fs::canonicalize(worktree_root).unwrap_or_else(|_| worktree_root.to_path_buf());
-    let cwd = merge_original_cwd_absolute()?;
+    let cwd = merge_original_cwd_absolute(original_cwd)?;
     if cwd == root {
         return None;
     }
@@ -345,8 +354,8 @@ fn merge_original_cwd_relative_to(worktree_root: &Path) -> Option<Vec<u8>> {
     Some(path_to_git_bytes_lossy(rel))
 }
 
-fn merge_path_is_original_cwd(path: &Path) -> bool {
-    let Some(cwd) = merge_original_cwd_absolute() else {
+fn merge_path_is_original_cwd(original_cwd: Option<&std::path::Path>, path: &Path) -> bool {
+    let Some(cwd) = merge_original_cwd_absolute(original_cwd) else {
         return false;
     };
     let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -361,9 +370,13 @@ fn merge_refuse_remove_current_working_directory(path: &Path) -> Result<()> {
     Err(GitError::Exit(128))
 }
 
-fn merge_prune_empty_dirs(root: &Path, mut dir: Option<&Path>) {
+fn merge_prune_empty_dirs(
+    original_cwd: Option<&std::path::Path>,
+    root: &Path,
+    mut dir: Option<&Path>,
+) {
     while let Some(path) = dir {
-        if path == root || merge_path_is_original_cwd(path) {
+        if path == root || merge_path_is_original_cwd(original_cwd, path) {
             break;
         }
         if std::fs::remove_dir(path).is_err() {

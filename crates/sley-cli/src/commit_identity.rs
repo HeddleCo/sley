@@ -17,7 +17,6 @@ use sley::GitConfig;
 
 use crate::common_git_dir_for_git_dir;
 use crate::session;
-use crate::sley_config;
 
 /// Load identity/config fallback using an explicit invocation session.
 pub(crate) fn identity_effective_config_for(

@@ -115,7 +115,8 @@ pub(crate) fn cmd_receive_pack(
     features.push_options = config
         .get_bool("receive", None, "advertisepushoptions")
         .unwrap_or(false);
-    let mut advertisements = sley_remote::local_fetch_advertisements(&git_dir, format)?;
+    let mut advertisements =
+        sley_remote::local_fetch_advertisements(&cli_session.remote_policy, &git_dir, format)?;
     sley_remote::attach_receive_pack_capabilities(&mut advertisements, format, &features)?;
 
     if advertise_refs || !stateless_rpc {
@@ -156,19 +157,23 @@ pub(crate) fn cmd_receive_pack(
         .any(|cap| cap.name == "report-status" || cap.name == "report-status-v2");
     let mut hook_stderr = Vec::new();
     let push_options = header.push_options.as_deref().unwrap_or(&[]);
-    let outcome = sley_remote::serve_receive_pack(sley_remote::ReceivePackServerRequest {
-        git_dir: &git_dir,
-        format,
-        header: &header,
-        pack_reader: &mut stdin,
-        config: &config,
-        validation: &validation,
-        options: sley_remote::ReceivePackServerOptions {
-            quiet,
-            remote_stderr: Some(&mut hook_stderr),
-            run_post_hooks: false,
+    let outcome = sley_remote::serve_receive_pack(
+        cli_session.original_cwd.as_deref(),
+        sley_remote::ReceivePackServerRequest {
+            policy: &cli_session.remote_policy,
+            git_dir: &git_dir,
+            format,
+            header: &header,
+            pack_reader: &mut stdin,
+            config: &config,
+            validation: &validation,
+            options: sley_remote::ReceivePackServerOptions {
+                quiet,
+                remote_stderr: Some(&mut hook_stderr),
+                run_post_hooks: false,
+            },
         },
-    })?;
+    )?;
     if use_sideband {
         let stdout = io::stdout();
         let mut stdout = stdout.lock();
@@ -299,6 +304,7 @@ pub(crate) fn cmd_upload_pack(
         let mut stdout = stdout.lock();
         return if stateless_rpc {
             sley_remote::serve_upload_pack_v2_stateless_with_config(
+                &cli_session.remote_policy,
                 &git_dir,
                 format,
                 &config,
@@ -307,6 +313,7 @@ pub(crate) fn cmd_upload_pack(
             )
         } else {
             sley_remote::serve_upload_pack_v2_with_config(
+                &cli_session.remote_policy,
                 &git_dir,
                 format,
                 &config,
@@ -315,8 +322,9 @@ pub(crate) fn cmd_upload_pack(
             )
         };
     }
-    let features = sley_remote::upload_pack_features(&git_dir, format)?;
-    let mut advertisements = sley_remote::local_fetch_advertisements(&git_dir, format)?;
+    let features = sley_remote::upload_pack_features(&cli_session.remote_policy, &git_dir, format)?;
+    let mut advertisements =
+        sley_remote::local_fetch_advertisements(&cli_session.remote_policy, &git_dir, format)?;
     sley_remote::attach_upload_pack_capabilities(&mut advertisements, format, &features)?;
 
     {
@@ -530,8 +538,11 @@ pub(crate) fn cmd_send_pack(
 
     // `--mirror` deletes remote refs the local repo no longer has.
     if mirror {
-        let remote_advertisements =
-            sley_remote::local_fetch_advertisements(&remote_git_dir, format)?;
+        let remote_advertisements = sley_remote::local_fetch_advertisements(
+            &cli_session.remote_policy,
+            &remote_git_dir,
+            format,
+        )?;
         let local_names: std::collections::HashSet<String> = store
             .list_refs()?
             .into_iter()
@@ -564,26 +575,30 @@ pub(crate) fn cmd_send_pack(
         progress: false,
         thin,
     };
-    run_push_local_report(RunPushLocalReport {
-        git_dir: &git_dir,
-        common_git_dir: &common_git_dir,
-        format,
-        remote: dest,
-        resolved_remote: dest,
-        remote_git_dir: &remote_git_dir,
-        remote_common_git_dir: &remote_common_git_dir,
-        refspecs: &refspecs,
-        options,
-        porcelain: false,
-        atomic,
-        force_if_includes: false,
-        push_options: &[],
-        force_with_lease: &force_with_lease,
-        force_with_lease_default: false,
-        replace_objects: cli_session.replace_objects(),
-        receive_pack_command: receive_pack_command.as_deref(),
-        receive_config_overrides: &receive_config_overrides,
-    })
+    run_push_local_report(
+        cli_session.original_cwd.as_deref(),
+        &cli_session.remote_policy,
+        RunPushLocalReport {
+            git_dir: &git_dir,
+            common_git_dir: &common_git_dir,
+            format,
+            remote: dest,
+            resolved_remote: dest,
+            remote_git_dir: &remote_git_dir,
+            remote_common_git_dir: &remote_common_git_dir,
+            refspecs: &refspecs,
+            options,
+            porcelain: false,
+            atomic,
+            force_if_includes: false,
+            push_options: &[],
+            force_with_lease: &force_with_lease,
+            force_with_lease_default: false,
+            replace_objects: cli_session.replace_objects(),
+            receive_pack_command: receive_pack_command.as_deref(),
+            receive_config_overrides: &receive_config_overrides,
+        },
+    )
 }
 
 fn reject_duplicate_push_destinations(refspecs: &[String]) -> Result<()> {
@@ -833,6 +848,7 @@ pub(crate) fn cmd_push(cli_session: &crate::session::CliSession, args: &[String]
             remote.as_str()
         };
         if super::helper::push_with_remote_helper(
+            &cli_session.remote_policy,
             &git_dir,
             format,
             helper_remote,
@@ -847,7 +863,7 @@ pub(crate) fn cmd_push(cli_session: &crate::session::CliSession, args: &[String]
         {
             continue;
         }
-        check_transport_allowed_url(&resolved_remote, Some(&config))?;
+        check_transport_allowed_url(&cli_session.remote_policy, &resolved_remote, Some(&config))?;
         let parsed_remote = parse_remote_url(&resolved_remote)?;
         // All transports delegate the git work to `sley_remote::push`, picked purely
         // by the resolved `PushDestination`; this command keeps owning URL/repo
@@ -882,6 +898,7 @@ pub(crate) fn cmd_push(cli_session: &crate::session::CliSession, args: &[String]
             // `--mirror` also deletes remote refs the local repo no longer has.
             let remote_advertisements = if mirror || prune || follow_tags {
                 Some(sley_remote::local_fetch_advertisements(
+                    &cli_session.remote_policy,
                     remote_git_dir,
                     format,
                 )?)
@@ -938,6 +955,8 @@ pub(crate) fn cmd_push(cli_session: &crate::session::CliSession, args: &[String]
             )?;
             if force_with_lease_default {
                 expand_default_force_with_lease(
+                    cli_session.original_cwd.as_deref(),
+                    &cli_session.remote_policy,
                     &git_dir,
                     &common_git_dir,
                     format,
@@ -1002,26 +1021,30 @@ pub(crate) fn cmd_push(cli_session: &crate::session::CliSession, args: &[String]
                 }
             }
             trace_configured_local_protocol_version(Some(config));
-            let result = run_push_local_report(RunPushLocalReport {
-                git_dir: &git_dir,
-                common_git_dir: &common_git_dir,
-                format,
-                remote: &remote,
-                resolved_remote: &resolved_remote,
-                remote_git_dir,
-                remote_common_git_dir,
-                refspecs: &refspecs,
-                options,
-                porcelain,
-                atomic,
-                force_if_includes,
-                push_options: &push_options,
-                force_with_lease: &force_with_lease,
-                force_with_lease_default,
-                replace_objects: cli_session.replace_objects(),
-                receive_pack_command: receive_pack_command.as_deref(),
-                receive_config_overrides: &receive_config_overrides,
-            });
+            let result = run_push_local_report(
+                cli_session.original_cwd.as_deref(),
+                &cli_session.remote_policy,
+                RunPushLocalReport {
+                    git_dir: &git_dir,
+                    common_git_dir: &common_git_dir,
+                    format,
+                    remote: &remote,
+                    resolved_remote: &resolved_remote,
+                    remote_git_dir,
+                    remote_common_git_dir,
+                    refspecs: &refspecs,
+                    options,
+                    porcelain,
+                    atomic,
+                    force_if_includes,
+                    push_options: &push_options,
+                    force_with_lease: &force_with_lease,
+                    force_with_lease_default,
+                    replace_objects: cli_session.replace_objects(),
+                    receive_pack_command: receive_pack_command.as_deref(),
+                    receive_config_overrides: &receive_config_overrides,
+                },
+            );
             if result.is_ok() {
                 trace2_local_transfer_negotiation(config, receive_pack_command.as_deref());
             }
@@ -1034,6 +1057,7 @@ pub(crate) fn cmd_push(cli_session: &crate::session::CliSession, args: &[String]
             None => push_options_from_config(&repo_config)?,
         };
         run_push(
+            cli_session.original_cwd.as_deref(),
             &remote_context,
             &git_dir,
             &common_git_dir,
@@ -1291,6 +1315,8 @@ fn resolve_force_with_lease(
 }
 
 fn expand_default_force_with_lease(
+    original_cwd: Option<&std::path::Path>,
+    policy: &sley_remote::RemotePolicy,
     git_dir: &Path,
     common_git_dir: &Path,
     format: ObjectFormat,
@@ -1309,6 +1335,8 @@ fn expand_default_force_with_lease(
 ) -> Result<()> {
     let source_db = crate::repository::open_object_database(git_dir, format, replace_objects)?;
     let preview = sley_remote::push_local_with_report_and_objects(
+        original_cwd,
+        policy,
         sley_remote::PushReportRequest {
             git_dir,
             common_git_dir,
@@ -2223,6 +2251,7 @@ fn push_command_was_forced(
 }
 
 fn run_push(
+    original_cwd: Option<&std::path::Path>,
     context: &RemoteCommandContext,
     git_dir: &Path,
     common_git_dir: &Path,
@@ -2240,6 +2269,7 @@ fn run_push(
     let mut credentials = sley_remote::CredentialHelperProvider::new(Some(&config));
     let mut progress = StdoutProgress::default();
     let remote_options = sley_remote::PushOptions {
+        policy: context.remote_policy.clone(),
         quiet: options.quiet,
         force: options.force,
         thin: options.thin,
@@ -2344,7 +2374,7 @@ fn run_push(
         sley_refs::RefTransactionPhase::Prepared,
     )?;
     let preflight_rejections = plan.preflight_rejections.clone();
-    let outcome = sley_remote::execute_push_plan(request, &mut services, plan)?;
+    let outcome = sley_remote::execute_push_plan(original_cwd, request, &mut services, plan)?;
     run_local_receive_reference_transaction_hook_phase(
         destination,
         &outcome.commands,
@@ -2447,7 +2477,11 @@ struct RunPushLocalReport<'a> {
 /// Drive a file:// push through [`sley_remote::push_local_with_report`], render
 /// git's `transport_print_push_status`, update remote-tracking refs, run hooks,
 /// and return the git exit code (1 when any ref was rejected).
-fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
+fn run_push_local_report(
+    original_cwd: Option<&std::path::Path>,
+    policy: &sley_remote::RemotePolicy,
+    req: RunPushLocalReport<'_>,
+) -> Result<()> {
     let config = read_repo_config(req.git_dir).unwrap_or_default();
     let source_db =
         crate::repository::open_object_database(req.git_dir, req.format, req.replace_objects)?;
@@ -2478,6 +2512,8 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
     // is written, matching git's receive-pack ordering, and reject all refs when
     // a hook declines.
     let plan = sley_remote::push_local_with_report_and_objects(
+        original_cwd,
+        policy,
         sley_remote::PushReportRequest {
             git_dir: req.git_dir,
             common_git_dir: req.common_git_dir,
@@ -2550,6 +2586,7 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
     {
         let local_db = FileObjectDatabase::from_git_dir(req.common_git_dir, req.format);
         sley_remote::stage_local_push_quarantine(
+            policy,
             req.remote_git_dir,
             req.remote_common_git_dir,
             req.format,
@@ -2590,6 +2627,8 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
         plan
     } else {
         sley_remote::push_local_with_report_and_objects(
+            original_cwd,
+            policy,
             sley_remote::PushReportRequest {
                 git_dir: req.git_dir,
                 common_git_dir: req.common_git_dir,

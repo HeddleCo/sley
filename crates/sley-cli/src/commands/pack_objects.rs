@@ -22,7 +22,6 @@ use std::collections::BTreeMap;
 use std::io::BufRead;
 use std::io::IsTerminal;
 use std::sync::Arc;
-use {sley_config, sley_core, sley_odb, sley_rev};
 
 use crate::*;
 use sley::PackWriteOptions;
@@ -401,6 +400,7 @@ pub(crate) fn cmd_pack_objects(
         (oids, objects, Vec::new())
     } else if traversal {
         collect_traversal_objects(
+            &cli_session.remote_policy,
             &git_dir,
             &common_git_dir,
             &database,
@@ -414,6 +414,7 @@ pub(crate) fn cmd_pack_objects(
         let mut objects = Vec::with_capacity(oids.len());
         for oid in &oids {
             match crate::read_object_maybe_prefetch_promisor(
+                &cli_session.remote_policy,
                 &database,
                 oid,
                 cli_session.lazy_fetch(),
@@ -1310,6 +1311,7 @@ fn include_tags_for_packed_objects(
 /// Returns the objects to encode fresh (oids + bodies) and the optional
 /// verbatim reuse (whose objects are excluded from the fresh list).
 fn collect_traversal_objects(
+    policy: &sley_remote::RemotePolicy,
     git_dir: &Path,
     common_git_dir: &Path,
     database: &FileObjectDatabase,
@@ -1463,7 +1465,7 @@ fn collect_traversal_objects(
             lazy_fetch,
         };
         for oid in wants.iter().rev() {
-            walk.visit_oid(*oid, Vec::new(), 0, true, &mut traversal_state)?;
+            walk.visit_oid(policy, *oid, Vec::new(), 0, true, &mut traversal_state)?;
         }
     }
     let FilteredPackTraversalState {
@@ -1707,6 +1709,7 @@ struct FilteredPackTraversalState {
 impl FilteredPackTraversal<'_> {
     fn visit_oid(
         &self,
+        policy: &sley_remote::RemotePolicy,
         oid: ObjectId,
         path: Vec<u8>,
         depth: usize,
@@ -1716,18 +1719,25 @@ impl FilteredPackTraversal<'_> {
         if self.excluded.contains(&oid) {
             return Ok(());
         }
-        let object =
-            crate::read_object_maybe_prefetch_promisor(self.database, &oid, self.lazy_fetch)?;
+        let object = crate::read_object_maybe_prefetch_promisor(
+            policy,
+            self.database,
+            &oid,
+            self.lazy_fetch,
+        )?;
         match object.object_type {
-            ObjectType::Commit => self.visit_commit(oid, object, provided, state),
-            ObjectType::Tree => self.visit_tree(oid, object, path, depth, provided, state),
-            ObjectType::Tag => self.visit_tag(oid, object, provided, state),
-            ObjectType::Blob => self.visit_blob(oid, path, depth, provided, Some(object), state),
+            ObjectType::Commit => self.visit_commit(policy, oid, object, provided, state),
+            ObjectType::Tree => self.visit_tree(policy, oid, object, path, depth, provided, state),
+            ObjectType::Tag => self.visit_tag(policy, oid, object, provided, state),
+            ObjectType::Blob => {
+                self.visit_blob(policy, oid, path, depth, provided, Some(object), state)
+            }
         }
     }
 
     fn visit_commit(
         &self,
+        policy: &sley_remote::RemotePolicy,
         oid: ObjectId,
         object: Arc<EncodedObject>,
         provided: bool,
@@ -1746,15 +1756,16 @@ impl FilteredPackTraversal<'_> {
             return Ok(());
         }
         let commit = Commit::parse_ref(self.format, &object.body)?;
-        self.visit_tree_oid(commit.tree, Vec::new(), 0, false, state)?;
+        self.visit_tree_oid(policy, commit.tree, Vec::new(), 0, false, state)?;
         for parent in commit.parents {
-            self.visit_oid(parent, Vec::new(), 0, false, state)?;
+            self.visit_oid(policy, parent, Vec::new(), 0, false, state)?;
         }
         Ok(())
     }
 
     fn visit_tag(
         &self,
+        policy: &sley_remote::RemotePolicy,
         oid: ObjectId,
         object: Arc<EncodedObject>,
         provided: bool,
@@ -1769,11 +1780,12 @@ impl FilteredPackTraversal<'_> {
             return Ok(());
         }
         let tag = Tag::parse_ref(self.format, &object.body)?;
-        self.visit_oid(tag.object, Vec::new(), 0, false, state)
+        self.visit_oid(policy, tag.object, Vec::new(), 0, false, state)
     }
 
     fn visit_tree_oid(
         &self,
+        policy: &sley_remote::RemotePolicy,
         oid: ObjectId,
         path: Vec<u8>,
         depth: usize,
@@ -1784,6 +1796,7 @@ impl FilteredPackTraversal<'_> {
             return Ok(());
         }
         let object = match crate::read_object_maybe_prefetch_promisor(
+            policy,
             self.database,
             &oid,
             self.lazy_fetch,
@@ -1795,11 +1808,12 @@ impl FilteredPackTraversal<'_> {
             }
             Err(err) => return Err(err),
         };
-        self.visit_tree(oid, object, path, depth, provided, state)
+        self.visit_tree(policy, oid, object, path, depth, provided, state)
     }
 
     fn visit_tree(
         &self,
+        policy: &sley_remote::RemotePolicy,
         oid: ObjectId,
         object: Arc<EncodedObject>,
         path: Vec<u8>,
@@ -1832,9 +1846,9 @@ impl FilteredPackTraversal<'_> {
             let entry_path = pack_filter_join_path(&path, entry.name);
             let entry_type = tree_entry_object_type(entry.mode);
             if entry_type == ObjectType::Tree {
-                self.visit_tree_oid(entry.oid, entry_path, depth + 1, false, state)?;
+                self.visit_tree_oid(policy, entry.oid, entry_path, depth + 1, false, state)?;
             } else {
-                self.visit_blob(entry.oid, entry_path, depth + 1, false, None, state)?;
+                self.visit_blob(policy, entry.oid, entry_path, depth + 1, false, None, state)?;
             }
         }
         Ok(())
@@ -1842,6 +1856,7 @@ impl FilteredPackTraversal<'_> {
 
     fn visit_blob(
         &self,
+        policy: &sley_remote::RemotePolicy,
         oid: ObjectId,
         path: Vec<u8>,
         depth: usize,
@@ -1860,6 +1875,7 @@ impl FilteredPackTraversal<'_> {
             match object {
                 Some(ref object) => Some(object.body.len()),
                 None => match crate::read_object_maybe_prefetch_promisor(
+                    policy,
                     self.database,
                     &oid,
                     self.lazy_fetch,
@@ -1888,6 +1904,7 @@ impl FilteredPackTraversal<'_> {
             let object = match object {
                 Some(object) => object,
                 None => match crate::read_object_maybe_prefetch_promisor(
+                    policy,
                     self.database,
                     &oid,
                     self.lazy_fetch,

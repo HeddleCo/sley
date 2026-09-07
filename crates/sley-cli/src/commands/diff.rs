@@ -1,7 +1,6 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 #![allow(clippy::expect_used)]
 
-use {sley_config, sley_index, sley_rev, sley_worktree};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
@@ -574,12 +573,16 @@ impl WhitespaceRuleResolver {
     /// A conflicting `core.whitespace` (both `tab-in-indent` and
     /// `indent-with-non-tab`) is fatal, mirroring git's `parse_whitespace_rule`
     /// `die`.
-    pub(crate) fn from_git_dir(git_dir: &Path) -> Result<Self> {
+    pub(crate) fn from_git_dir(
+        precompose: sley_core::PrecomposeUnicode,
+        git_dir: &Path,
+    ) -> Result<Self> {
         let config = read_repo_config(git_dir).ok();
-        Self::from_git_dir_with_config(git_dir, config.as_ref())
+        Self::from_git_dir_with_config(precompose, git_dir, config.as_ref())
     }
 
     pub(crate) fn from_git_dir_with_config(
+        precompose: sley_core::PrecomposeUnicode,
         git_dir: &Path,
         config: Option<&GitConfig>,
     ) -> Result<Self> {
@@ -596,7 +599,7 @@ impl WhitespaceRuleResolver {
             .ok()
             .flatten()
             .and_then(|root| {
-                sley_worktree::StandardAttributeMatcher::from_worktree_root(root).ok()
+                sley_worktree::StandardAttributeMatcher::from_worktree_root(precompose, root).ok()
             });
         Ok(Self {
             config_rule,
@@ -683,6 +686,7 @@ fn conflict_marker_size_from_attr(state: Option<&sley_worktree::AttributeState>)
 /// mirroring git's `checkdiff`. Returns `true` if any whitespace error (or
 /// leftover conflict marker) was found.
 pub(crate) fn run_diff_check(
+    policy: &sley_remote::RemotePolicy,
     entries: &[sley_diff_merge::NameStatusEntry],
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
@@ -701,18 +705,20 @@ pub(crate) fn run_diff_check(
         if entry.new_mode == Some(0o160000) {
             continue;
         }
+        let lazy_fetch_adapter_1 = crate::diff_lazy_fetch(policy, lazy_fetch);
         let new_content = diff_entry_new_content(
             entry,
             db,
             worktree_root,
             use_worktree_new,
             worktree_clean,
-            crate::diff_lazy_fetch(lazy_fetch),
+            lazy_fetch_adapter_1.as_option(),
         )?;
         let Some(new_content) = new_content else {
             continue;
         };
         let old_content = diff_entry_old_content_for_diff(
+            policy,
             entry,
             db,
             worktree_root,
@@ -746,6 +752,7 @@ pub(crate) fn run_diff_check(
 }
 
 fn diff_entry_old_content_for_diff(
+    policy: &sley_remote::RemotePolicy,
     entry: &sley_diff_merge::NameStatusEntry,
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
@@ -754,7 +761,11 @@ fn diff_entry_old_content_for_diff(
     lazy_fetch: bool,
 ) -> Result<Option<Vec<u8>>> {
     if !use_worktree_old {
-        return diff_entry_old_content(entry, db, crate::diff_lazy_fetch(lazy_fetch));
+        return diff_entry_old_content(
+            entry,
+            db,
+            crate::diff_lazy_fetch(policy, lazy_fetch).as_option(),
+        );
     }
     let Some(mode) = entry.old_mode else {
         return Ok(None);
@@ -928,6 +939,7 @@ fn global_external_diff_command(config: Option<&GitConfig>) -> Option<ExternalDi
 }
 
 fn run_external_diff_entries(
+    policy: &sley_remote::RemotePolicy,
     entries: &[sley_diff_merge::NameStatusEntry],
     lookup_entries: &DiffRelativeLookupMap,
     db: &FileObjectDatabase,
@@ -975,6 +987,7 @@ fn run_external_diff_entries(
             lazy_fetch,
         };
         let rc = run_one_external_diff(
+            policy,
             entry,
             lookup_entry,
             &command,
@@ -1034,6 +1047,7 @@ struct ExternalDiffProcessContext<'a> {
 }
 
 fn run_one_external_diff(
+    policy: &sley_remote::RemotePolicy,
     entry: &sley_diff_merge::NameStatusEntry,
     lookup_entry: &sley_diff_merge::NameStatusEntry,
     command: &ExternalDiffCommand,
@@ -1042,6 +1056,7 @@ fn run_one_external_diff(
     context: &mut ExternalDiffProcessContext<'_>,
 ) -> Result<i32> {
     let old_file = prepare_external_diff_file(
+        policy,
         entry,
         lookup_entry,
         context.db,
@@ -1052,6 +1067,7 @@ fn run_one_external_diff(
         context.lazy_fetch,
     )?;
     let new_file = prepare_external_diff_file(
+        policy,
         entry,
         lookup_entry,
         context.db,
@@ -1149,6 +1165,7 @@ impl Drop for ExternalDiffFile {
 }
 
 fn prepare_external_diff_file(
+    policy: &sley_remote::RemotePolicy,
     entry: &sley_diff_merge::NameStatusEntry,
     lookup_entry: &sley_diff_merge::NameStatusEntry,
     db: &FileObjectDatabase,
@@ -1171,6 +1188,8 @@ fn prepare_external_diff_file(
             });
         }
     }
+    let lazy_fetch_adapter_2 = crate::diff_lazy_fetch(policy, lazy_fetch);
+    let lazy_fetch_adapter_3 = crate::diff_lazy_fetch(policy, lazy_fetch);
     let content = if new_side {
         diff_entry_new_content(
             lookup_entry,
@@ -1178,10 +1197,10 @@ fn prepare_external_diff_file(
             worktree_root,
             use_worktree_new,
             None,
-            crate::diff_lazy_fetch(lazy_fetch),
+            lazy_fetch_adapter_2.as_option(),
         )?
     } else {
-        diff_entry_old_content(lookup_entry, db, crate::diff_lazy_fetch(lazy_fetch))?
+        diff_entry_old_content(lookup_entry, db, lazy_fetch_adapter_3.as_option())?
     };
     let Some(content) = content else {
         return Ok(ExternalDiffFile {
@@ -1534,6 +1553,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
         }
         paths.extend(explicit_paths);
         return cmd_diff_no_index(
+            &cli_session.remote_policy,
             &cwd,
             &paths,
             DiffNoIndexParams {
@@ -1968,6 +1988,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
     };
     if diff_trees.len() >= 3 {
         let has_differences = write_diff_combined_trees(
+            &cli_session.remote_policy,
             &db,
             format,
             &diff_trees,
@@ -2098,7 +2119,12 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                             oids
                         })
                         .collect();
-                    crate::prefetch_promisor_objects(&db, &rename_oids, true)?;
+                    crate::prefetch_promisor_objects(
+                        &cli_session.remote_policy,
+                        &db,
+                        &rename_oids,
+                        true,
+                    )?;
                 }
                 if inexact_renames {
                     let diff =
@@ -2229,6 +2255,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
         };
         let worktree_clean = worktree_clean_apply.as_ref().map(clean_context);
         apply_diff_pickaxe(
+            &cli_session.remote_policy,
             entries,
             needle.as_bytes(),
             pickaxe_all,
@@ -2318,7 +2345,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                 ws_ignore,
                 ignore_blank_lines,
                 &ignore_regexes,
-                crate::diff_lazy_fetch(lazy_fetch),
+                crate::diff_lazy_fetch(&cli_session.remote_policy, lazy_fetch).as_option(),
             )? {
                 visible.push(entry);
             }
@@ -2332,6 +2359,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
     // Content is batch-prefetched once for every Modified pair that may break.
     let mut entries = if diff_rewrite_control {
         apply_diff_break_rewrites(
+            &cli_session.remote_policy,
             entries,
             &relative_lookup_entries,
             &db,
@@ -2365,9 +2393,13 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
     // whitespace error; combined with `--exit-code`/`--quiet` (not exclusive)
     // the change bit (1) is OR-ed in, matching git's exit codes.
     if check && !name_status && !name_only {
-        let resolver =
-            WhitespaceRuleResolver::from_git_dir_with_config(&git_dir, repo_config.as_ref())?;
+        let resolver = WhitespaceRuleResolver::from_git_dir_with_config(
+            cli_session.precompose_unicode(),
+            &git_dir,
+            repo_config.as_ref(),
+        )?;
         let check_failed = run_diff_check(
+            &cli_session.remote_policy,
             &entries,
             &db,
             worktree_root.as_deref(),
@@ -2393,7 +2425,12 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
     if allow_external && show_patch_for_external {
         let userdiff_attributes = worktree_root
             .as_deref()
-            .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
+            .map(|root| {
+                sley_worktree::StandardAttributeMatcher::from_worktree_root(
+                    cli_session.precompose_unicode(),
+                    root,
+                )
+            })
             .transpose()?;
         let userdiff = commands::userdiff::UserdiffResolver::with_attributes(
             userdiff_attributes,
@@ -2401,6 +2438,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
         );
         let global_external = global_external_diff_command(repo_config.as_ref());
         if let Some(code) = run_external_diff_entries(
+            &cli_session.remote_policy,
             &entries,
             &relative_lookup_entries,
             &db,
@@ -2435,8 +2473,11 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
         let show_patch = render_selection.patch;
         let show_summary = render_selection.summary;
         let stat_entries = if render_selection.needs_line_stats() {
+            let lazy_fetch_adapter_4 =
+                crate::diff_lazy_fetch(&cli_session.remote_policy, lazy_fetch);
             let mut stat_entries = if ignore_active {
                 collect_diff_stat_entries_with_ignore(
+                    &cli_session.remote_policy,
                     &entries,
                     &relative_lookup_entries,
                     &db,
@@ -2454,6 +2495,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                 )?
             } else if !relative_lookup_entries.is_empty() {
                 collect_diff_stat_entries_with_lookup(
+                    &cli_session.remote_policy,
                     &entries,
                     &relative_lookup_entries,
                     &db,
@@ -2469,11 +2511,12 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                     worktree_root.as_deref(),
                     use_worktree_new,
                     worktree_clean.as_ref(),
-                    crate::diff_lazy_fetch(lazy_fetch),
+                    lazy_fetch_adapter_4.as_option(),
                 )?
             };
             if diff_rewrite_control {
                 apply_diff_break_rewrite_stats(
+                    &cli_session.remote_policy,
                     &mut stat_entries,
                     &relative_lookup_entries,
                     &db,
@@ -2539,7 +2582,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                     use_worktree_new,
                     worktree_clean.as_ref(),
                     dirstat_options,
-                    crate::diff_lazy_fetch(lazy_fetch),
+                    crate::diff_lazy_fetch(&cli_session.remote_policy, lazy_fetch).as_option(),
                 )?;
             }
             Ok(())
@@ -2547,7 +2590,13 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
         if show_patch {
             // One promisor negotiation for every blob the patch body will open
             // (git's `diff_queued_diff_prefetch`).
-            crate::prefetch_diff_entry_blobs(&db, &entries, use_worktree_new, lazy_fetch)?;
+            crate::prefetch_diff_entry_blobs(
+                &cli_session.remote_policy,
+                &db,
+                &entries,
+                use_worktree_new,
+                lazy_fetch,
+            )?;
             let combined_unmerged = if plain_index_worktree_diff {
                 diff_unmerged_worktree_combined_paths(&git_dir, worktree_root.as_deref(), format)?
             } else {
@@ -2566,7 +2615,12 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
             // `--cached`.
             let userdiff_attributes = worktree_root
                 .as_deref()
-                .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
+                .map(|root| {
+                    sley_worktree::StandardAttributeMatcher::from_worktree_root(
+                        cli_session.precompose_unicode(),
+                        root,
+                    )
+                })
                 .transpose()?;
             let userdiff = commands::userdiff::UserdiffResolver::with_attributes(
                 userdiff_attributes,
@@ -2577,7 +2631,11 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
             // off (git suppresses ws-highlight under --word-diff).
             let ws_resolver = (colors.is_some() && word_request.is_none())
                 .then(|| {
-                    WhitespaceRuleResolver::from_git_dir_with_config(&git_dir, repo_config.as_ref())
+                    WhitespaceRuleResolver::from_git_dir_with_config(
+                        cli_session.precompose_unicode(),
+                        &git_dir,
+                        repo_config.as_ref(),
+                    )
                 })
                 .transpose()?;
             render_diff_entries(
@@ -2632,6 +2690,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                     if let Some(combined) = combined_unmerged.get(entry.path.as_bytes()) {
                         if wrote_combined_unmerged.insert(entry.path.as_bytes().to_vec()) {
                             write_diff_unmerged_worktree_combined(
+                                &cli_session.remote_policy,
                                 stdout,
                                 &db,
                                 combined,
@@ -2661,11 +2720,14 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                     };
                     let lookup_entry = diff_relative_lookup_entry(entry, &relative_lookup_entries);
                     let relative_materialized = !relative_lookup_entries.is_empty();
+                    let lazy_fetch_adapter_5 =
+                        crate::diff_lazy_fetch(&cli_session.remote_policy, lazy_fetch);
                     let materialized_contents = if !is_gitlink_pair(lookup_entry)
                         && (relative_materialized || use_worktree_old || worktree_clean.is_some())
                     {
                         Some((
                             diff_entry_old_content_for_diff(
+                                &cli_session.remote_policy,
                                 lookup_entry,
                                 &db,
                                 worktree_root.as_deref(),
@@ -2679,7 +2741,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                                 worktree_root.as_deref(),
                                 use_worktree_new,
                                 worktree_clean.as_ref(),
-                                crate::diff_lazy_fetch(lazy_fetch),
+                                lazy_fetch_adapter_5.as_option(),
                             )?,
                         ))
                     } else {
@@ -2688,12 +2750,14 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                     let no_index_contents = materialized_contents
                         .as_ref()
                         .map(|(old, new)| (old.as_deref(), new.as_deref()));
+                    let lazy_fetch_adapter_6 =
+                        crate::diff_lazy_fetch(&cli_session.remote_policy, lazy_fetch);
                     let options = DiffRenderOptions {
                         line_indicators: sley_diff_merge::render::LineIndicators::default(),
                         suppress_blank_empty,
                         binary: patch_binary,
                         db: &db,
-                        lazy_fetch: crate::diff_lazy_fetch(lazy_fetch),
+                        lazy_fetch: lazy_fetch_adapter_6.as_option(),
                         worktree_root: worktree_root.as_deref(),
                         use_worktree_new,
                         format,
@@ -2866,6 +2930,7 @@ struct CombinedDiffOptions<'a> {
 }
 
 fn write_diff_combined_trees(
+    policy: &sley_remote::RemotePolicy,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     trees: &[ObjectId],
@@ -2954,7 +3019,7 @@ fn write_diff_combined_trees(
             writeln!(out)?;
         }
         for path in &paths {
-            commands::combined::write_combined_patch(&mut out, &render_ctx, path)?;
+            commands::combined::write_combined_patch(policy, &mut out, &render_ctx, path)?;
         }
     }
 
@@ -3035,6 +3100,7 @@ fn diff_unmerged_worktree_combined_paths(
 }
 
 fn write_diff_unmerged_worktree_combined(
+    policy: &sley_remote::RemotePolicy,
     stdout: &mut dyn Write,
     db: &FileObjectDatabase,
     path: &UnmergedWorktreeCombinedPath,
@@ -3043,8 +3109,10 @@ fn write_diff_unmerged_worktree_combined(
     dst_prefix: &str,
     lazy_fetch: bool,
 ) -> Result<()> {
-    let ours = read_blob(db, &path.ours, crate::diff_lazy_fetch(lazy_fetch))?;
-    let theirs = read_blob(db, &path.theirs, crate::diff_lazy_fetch(lazy_fetch))?;
+    let lazy_fetch_adapter_7 = crate::diff_lazy_fetch(policy, lazy_fetch);
+    let ours = read_blob(db, &path.ours, lazy_fetch_adapter_7.as_option())?;
+    let lazy_fetch_adapter_8 = crate::diff_lazy_fetch(policy, lazy_fetch);
+    let theirs = read_blob(db, &path.theirs, lazy_fetch_adapter_8.as_option())?;
     let ours_lines = diff_split_lines(&ours);
     let theirs_lines = diff_split_lines(&theirs);
     let worktree_lines = diff_split_lines(&path.worktree);
@@ -3165,6 +3233,7 @@ fn parse_ws_error_highlight_kinds(value: Option<&str>) -> Option<WsErrorHighligh
 }
 
 pub(crate) fn apply_diff_pickaxe(
+    policy: &sley_remote::RemotePolicy,
     entries: Vec<sley_diff_merge::NameStatusEntry>,
     needle: &[u8],
     pickaxe_all: bool,
@@ -3180,6 +3249,7 @@ pub(crate) fn apply_diff_pickaxe(
     if pickaxe_all {
         for entry in &entries {
             if diff_entry_matches_pickaxe(
+                policy,
                 entry,
                 needle,
                 db,
@@ -3197,6 +3267,7 @@ pub(crate) fn apply_diff_pickaxe(
     let mut matches = Vec::new();
     for entry in &entries {
         if diff_entry_matches_pickaxe(
+            policy,
             entry,
             needle,
             db,
@@ -3212,6 +3283,7 @@ pub(crate) fn apply_diff_pickaxe(
 }
 
 fn diff_entry_matches_pickaxe(
+    policy: &sley_remote::RemotePolicy,
     entry: &sley_diff_merge::NameStatusEntry,
     needle: &[u8],
     db: &FileObjectDatabase,
@@ -3220,14 +3292,16 @@ fn diff_entry_matches_pickaxe(
     worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
     lazy_fetch: bool,
 ) -> Result<bool> {
-    let old_content = diff_entry_old_content(entry, db, crate::diff_lazy_fetch(lazy_fetch))?;
+    let lazy_fetch_adapter_9 = crate::diff_lazy_fetch(policy, lazy_fetch);
+    let old_content = diff_entry_old_content(entry, db, lazy_fetch_adapter_9.as_option())?;
+    let lazy_fetch_adapter_10 = crate::diff_lazy_fetch(policy, lazy_fetch);
     let new_content = diff_entry_new_content(
         entry,
         db,
         worktree_root,
         use_worktree_new,
         worktree_clean,
-        crate::diff_lazy_fetch(lazy_fetch),
+        lazy_fetch_adapter_10.as_option(),
     )?;
     Ok(
         count_non_overlapping_occurrences(old_content.as_deref().unwrap_or_default(), needle)
@@ -3542,6 +3616,7 @@ fn diff_relative_display_path(path: &[u8], prefix: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn collect_diff_stat_entries_with_ignore<'a>(
+    policy: &sley_remote::RemotePolicy,
     entries: &'a [sley_diff_merge::NameStatusEntry],
     lookup_entries: &DiffRelativeLookupMap,
     db: &FileObjectDatabase,
@@ -3554,15 +3629,17 @@ fn collect_diff_stat_entries_with_ignore<'a>(
     let mut stat_entries = Vec::with_capacity(entries.len());
     for entry in entries {
         let lookup_entry = diff_relative_lookup_entry(entry, lookup_entries);
+        let lazy_fetch_adapter_11 = crate::diff_lazy_fetch(policy, lazy_fetch);
         let old_content =
-            diff_entry_old_content(lookup_entry, db, crate::diff_lazy_fetch(lazy_fetch))?;
+            diff_entry_old_content(lookup_entry, db, lazy_fetch_adapter_11.as_option())?;
+        let lazy_fetch_adapter_12 = crate::diff_lazy_fetch(policy, lazy_fetch);
         let new_content = diff_entry_new_content(
             lookup_entry,
             db,
             worktree_root,
             use_worktree_new,
             worktree_clean,
-            crate::diff_lazy_fetch(lazy_fetch),
+            lazy_fetch_adapter_12.as_option(),
         )?;
         let stats = if old_content.as_deref().is_some_and(is_binary_content)
             || new_content.as_deref().is_some_and(is_binary_content)
@@ -3585,6 +3662,7 @@ fn collect_diff_stat_entries_with_ignore<'a>(
 }
 
 fn collect_diff_stat_entries_with_lookup<'a>(
+    policy: &sley_remote::RemotePolicy,
     entries: &'a [sley_diff_merge::NameStatusEntry],
     lookup_entries: &DiffRelativeLookupMap,
     db: &FileObjectDatabase,
@@ -3596,15 +3674,17 @@ fn collect_diff_stat_entries_with_lookup<'a>(
     let mut stat_entries = Vec::with_capacity(entries.len());
     for entry in entries {
         let lookup_entry = diff_relative_lookup_entry(entry, lookup_entries);
+        let lazy_fetch_adapter_13 = crate::diff_lazy_fetch(policy, lazy_fetch);
         let old_content =
-            diff_entry_old_content(lookup_entry, db, crate::diff_lazy_fetch(lazy_fetch))?;
+            diff_entry_old_content(lookup_entry, db, lazy_fetch_adapter_13.as_option())?;
+        let lazy_fetch_adapter_14 = crate::diff_lazy_fetch(policy, lazy_fetch);
         let new_content = diff_entry_new_content(
             lookup_entry,
             db,
             worktree_root,
             use_worktree_new,
             worktree_clean,
-            crate::diff_lazy_fetch(lazy_fetch),
+            lazy_fetch_adapter_14.as_option(),
         )?;
         let stats = diff_line_stats(old_content.as_deref(), new_content.as_deref());
         stat_entries.push(DiffStatEntryData { entry, stats });
@@ -3613,6 +3693,7 @@ fn collect_diff_stat_entries_with_lookup<'a>(
 }
 
 fn apply_diff_break_rewrite_stats(
+    policy: &sley_remote::RemotePolicy,
     entries: &mut [DiffStatEntryData<'_>],
     lookup_entries: &DiffRelativeLookupMap,
     db: &FileObjectDatabase,
@@ -3626,15 +3707,17 @@ fn apply_diff_break_rewrite_stats(
             continue;
         }
         let lookup_entry = diff_relative_lookup_entry(data.entry, lookup_entries);
+        let lazy_fetch_adapter_15 = crate::diff_lazy_fetch(policy, lazy_fetch);
         let old_content =
-            diff_entry_old_content(lookup_entry, db, crate::diff_lazy_fetch(lazy_fetch))?;
+            diff_entry_old_content(lookup_entry, db, lazy_fetch_adapter_15.as_option())?;
+        let lazy_fetch_adapter_16 = crate::diff_lazy_fetch(policy, lazy_fetch);
         let new_content = diff_entry_new_content(
             lookup_entry,
             db,
             worktree_root,
             use_worktree_new,
             worktree_clean,
-            crate::diff_lazy_fetch(lazy_fetch),
+            lazy_fetch_adapter_16.as_option(),
         )?;
         let (Some(old), Some(new)) = (old_content.as_deref(), new_content.as_deref()) else {
             continue;
@@ -3656,6 +3739,7 @@ fn apply_diff_break_rewrite_stats(
 /// Split complete rewrites (`-B`) into a delete + create pair, matching git's
 /// `diffcore_break` default 50% threshold. Blobs are batch-prefetched first.
 fn apply_diff_break_rewrites(
+    policy: &sley_remote::RemotePolicy,
     entries: Vec<sley_diff_merge::NameStatusEntry>,
     lookup_entries: &DiffRelativeLookupMap,
     db: &FileObjectDatabase,
@@ -3676,7 +3760,7 @@ fn apply_diff_break_rewrites(
                 .filter(|_| lookup.old_mode != Some(0o160000) && lookup.new_mode != Some(0o160000))
         })
         .collect();
-    crate::prefetch_promisor_objects(db, &modified_oids, lazy_fetch)?;
+    crate::prefetch_promisor_objects(policy, db, &modified_oids, lazy_fetch)?;
 
     let mut out = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -3689,15 +3773,17 @@ fn apply_diff_break_rewrites(
             continue;
         }
         let lookup_entry = diff_relative_lookup_entry(&entry, lookup_entries);
+        let lazy_fetch_adapter_17 = crate::diff_lazy_fetch(policy, lazy_fetch);
         let old_content =
-            diff_entry_old_content(lookup_entry, db, crate::diff_lazy_fetch(lazy_fetch))?;
+            diff_entry_old_content(lookup_entry, db, lazy_fetch_adapter_17.as_option())?;
+        let lazy_fetch_adapter_18 = crate::diff_lazy_fetch(policy, lazy_fetch);
         let new_content = diff_entry_new_content(
             lookup_entry,
             db,
             worktree_root,
             use_worktree_new,
             worktree_clean,
-            crate::diff_lazy_fetch(lazy_fetch),
+            lazy_fetch_adapter_18.as_option(),
         )?;
         let (Some(old), Some(new)) = (old_content.as_deref(), new_content.as_deref()) else {
             out.push(entry);
@@ -3845,6 +3931,7 @@ enum NoIndexPathKind {
 /// the object database. Attributes and `diff.*` config still apply when the
 /// command runs inside a repository. Exits 1 when the files differ.
 fn cmd_diff_no_index(
+    policy: &sley_remote::RemotePolicy,
     cwd: &Path,
     paths: &[String],
     params: DiffNoIndexParams<'_>,
@@ -3949,7 +4036,15 @@ fn cmd_diff_no_index(
     );
     let userdiff_attributes = worktree_root
         .as_ref()
-        .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
+        .map(|root| {
+            sley_worktree::StandardAttributeMatcher::from_worktree_root(
+                config
+                    .as_ref()
+                    .map(GitConfig::precompose_unicode)
+                    .unwrap_or_default(),
+                root,
+            )
+        })
         .transpose()?;
     let userdiff =
         commands::userdiff::UserdiffResolver::with_attributes(userdiff_attributes, config.clone());
@@ -4055,6 +4150,7 @@ fn cmd_diff_no_index(
             return Err(GitError::Exit(1));
         }
         for entry in &entries {
+            let lazy_fetch_adapter_19 = crate::diff_lazy_fetch(policy, params.lazy_fetch);
             let options = DiffRenderOptions {
                 line_indicators: sley_diff_merge::render::LineIndicators::default(),
                 suppress_blank_empty: false,
@@ -4062,7 +4158,7 @@ fn cmd_diff_no_index(
                 anchors: params.anchored,
                 allow_textconv: true,
                 db,
-                lazy_fetch: crate::diff_lazy_fetch(params.lazy_fetch),
+                lazy_fetch: lazy_fetch_adapter_19.as_option(),
                 worktree_root: None,
                 use_worktree_new: false,
                 format,

@@ -9,7 +9,6 @@
 //! real command's output and exit codes.
 #![allow(clippy::expect_used)]
 
-use sley_rev;
 use sley_rev::name_rev::{
     CommitMetadataCache, RevName, Tip, committer_timestamp, name_all_tips, rev_name_string,
 };

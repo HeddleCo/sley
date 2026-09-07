@@ -273,8 +273,8 @@ pub use capabilities::RemoteTransportKind;
 
 mod protocol;
 pub use protocol::{
-    TransportPolicyError, check_transport_allowed, is_transport_allowed,
-    transport_scheme_for_remote, transport_scheme_for_url,
+    RemotePolicy, TransportPolicy, TransportPolicyError, check_transport_allowed,
+    is_transport_allowed, transport_scheme_for_remote, transport_scheme_for_url,
 };
 
 mod promisor;
@@ -532,6 +532,7 @@ mod tests {
 
     fn fetch_options(depth: Option<u32>) -> FetchOptions {
         FetchOptions {
+            policy: Default::default(),
             quiet: true,
             progress: None,
             auto_follow_tags: false,
@@ -690,6 +691,7 @@ mod tests {
         write_live_commit(&local, &branch);
         let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
         let options = PushOptions {
+            policy: Default::default(),
             quiet: true,
             force: false,
             thin: PushThinMode::Auto,
@@ -699,6 +701,7 @@ mod tests {
         let mut progress = SilentProgress;
 
         let outcome = push(
+            None,
             PushRequest {
                 git_dir: &local,
                 common_git_dir: &local,
@@ -843,6 +846,7 @@ mod tests {
         let mut configure = |_git_dir: &Path| Ok(config.clone());
         let mut configure_branch = |_git_dir: &Path, _branch: &str| Ok(config.clone());
         let options = CloneOptions {
+            policy: Default::default(),
             origin: "origin",
             checkout_branch: &branch,
             remote_head_branch: &branch,
@@ -869,6 +873,7 @@ mod tests {
         let mut progress = SilentProgress;
 
         let outcome = clone(
+            None,
             CloneRequest {
                 destination: &destination,
                 git_dir_override: None,

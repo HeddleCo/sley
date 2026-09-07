@@ -1,90 +1,36 @@
-//! Git ref namespaces (`GIT_NAMESPACE` / `--namespace`).
-//!
-//! When a namespace is active, server-side ref advertisement and updates are
-//! confined to `refs/namespaces/<ns>/…`, while clients see the un-namespaced
-//! logical names. Mirrors `environment.c::get_git_namespace` /
-//! `strip_namespace`.
-//!
-//! The CLI cannot call `setenv` (workspace ban on `env::set_var`), so
-//! `--namespace` is recorded in a process-local override that takes precedence
-//! over `GIT_NAMESPACE`. Child processes spawned for `ext::` remotes inherit
-//! the real environment and re-parse `--namespace` from their argv.
+//! Repository/operation-owned Git ref namespace. Never reads process environment.
 
-use std::env;
-use std::sync::Mutex;
+/// An expanded Git namespace. Construct once at the caller boundary and share
+/// by reference across an operation's workers. Nested names retain Git's layout.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Namespace(String);
 
-static NAMESPACE_OVERRIDE: Mutex<Option<String>> = Mutex::new(None);
-
-/// Record a `--namespace` / `--namespace=` global option for this process.
-///
-/// Pass `Some("")` to clear an active override; pass `None` to leave the
-/// override untouched. An explicit override always wins over `GIT_NAMESPACE`.
-pub fn set_git_namespace_override(raw: Option<String>) {
-    if let Ok(mut guard) = NAMESPACE_OVERRIDE.lock() {
-        *guard = raw;
-    }
-}
-
-/// Clear any `--namespace` override so subsequent calls read only the env.
-pub fn clear_git_namespace_override() {
-    if let Ok(mut guard) = NAMESPACE_OVERRIDE.lock() {
-        *guard = None;
-    }
-}
-
-/// The active git namespace prefix, e.g. `refs/namespaces/foo/`, or empty when
-/// no namespace is active. Nested raw namespaces (`a/b`) expand to
-/// `refs/namespaces/a/refs/namespaces/b/`.
-pub fn get_git_namespace() -> String {
-    let raw = namespace_raw();
-    if raw.is_empty() {
-        return String::new();
-    }
-    let mut buf = String::new();
-    for component in raw.split('/') {
-        if component.is_empty() {
-            continue;
+impl Namespace {
+    pub fn new(raw: &str) -> Self {
+        let mut prefix = String::new();
+        for component in raw.split('/').filter(|part| !part.is_empty()) {
+            prefix.push_str("refs/namespaces/");
+            prefix.push_str(component);
+            prefix.push('/');
         }
-        buf.push_str("refs/namespaces/");
-        buf.push_str(component);
-        buf.push('/');
+        Self(prefix)
     }
-    buf
-}
 
-/// Strip the active namespace prefix from `namespaced_ref`, returning the
-/// logical name. Returns `None` when the ref is outside the current namespace
-/// (or when no namespace is active and the name is not itself).
-pub fn strip_namespace(namespaced_ref: &str) -> Option<&str> {
-    let ns = get_git_namespace();
-    if ns.is_empty() {
-        return Some(namespaced_ref);
+    pub fn prefix(&self) -> &str {
+        &self.0
     }
-    namespaced_ref.strip_prefix(ns.as_str())
-}
 
-/// Expand a logical (client-visible) ref name into the on-disk namespaced form.
-pub fn expand_namespace(logical_ref: &str) -> String {
-    let ns = get_git_namespace();
-    if ns.is_empty() {
-        logical_ref.to_string()
-    } else {
-        format!("{ns}{logical_ref}")
+    pub fn strip<'a>(&self, physical: &'a str) -> Option<&'a str> {
+        physical.strip_prefix(self.prefix())
     }
-}
 
-/// Whether a namespace is currently active.
-pub fn namespace_active() -> bool {
-    !get_git_namespace().is_empty()
-}
-
-fn namespace_raw() -> String {
-    if let Ok(guard) = NAMESPACE_OVERRIDE.lock()
-        && let Some(ref value) = *guard
-    {
-        return value.clone();
+    pub fn expand(&self, logical: &str) -> String {
+        format!("{}{logical}", self.0)
     }
-    env::var("GIT_NAMESPACE").unwrap_or_default()
+
+    pub fn is_active(&self) -> bool {
+        !self.0.is_empty()
+    }
 }
 
 /// Match `transfer.hideRefs` / `uploadpack.hideRefs` / `receive.hideRefs`
@@ -133,76 +79,44 @@ fn hidden_ref_pattern_matches(refname: &str, pattern: &str) -> bool {
 mod tests {
     use super::*;
 
-    static TEST_NAMESPACE_LOCK: Mutex<()> = Mutex::new(());
-
     #[test]
     fn empty_namespace_is_identity() {
-        let _guard = TEST_NAMESPACE_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        clear_git_namespace_override();
-        set_git_namespace_override(Some(String::new()));
-        assert_eq!(get_git_namespace(), "");
-        assert_eq!(strip_namespace("refs/heads/main"), Some("refs/heads/main"));
-        assert_eq!(expand_namespace("refs/heads/main"), "refs/heads/main");
-        clear_git_namespace_override();
+        let ns = Namespace::default();
+        assert_eq!(ns.prefix(), "");
+        assert_eq!(ns.strip("refs/heads/main"), Some("refs/heads/main"));
+        assert_eq!(ns.expand("refs/heads/main"), "refs/heads/main");
     }
 
     #[test]
-    fn simple_namespace_expands_and_strips() {
-        let _guard = TEST_NAMESPACE_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        clear_git_namespace_override();
-        set_git_namespace_override(Some("namespace".into()));
-        assert_eq!(get_git_namespace(), "refs/namespaces/namespace/");
+    fn namespaces_expand_and_strip_independently() {
+        let first = Namespace::new("namespace");
+        let second = Namespace::new("a/b");
+        assert_eq!(second.prefix(), "refs/namespaces/a/refs/namespaces/b/");
         assert_eq!(
-            expand_namespace("refs/heads/main"),
+            first.expand("refs/heads/main"),
             "refs/namespaces/namespace/refs/heads/main"
         );
         assert_eq!(
-            strip_namespace("refs/namespaces/namespace/refs/heads/main"),
+            first.strip("refs/namespaces/namespace/refs/heads/main"),
             Some("refs/heads/main")
         );
-        assert_eq!(
-            strip_namespace("refs/namespaces/other/refs/heads/main"),
-            None
-        );
-        clear_git_namespace_override();
-    }
-
-    #[test]
-    fn nested_namespace_expands() {
-        let _guard = TEST_NAMESPACE_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        clear_git_namespace_override();
-        set_git_namespace_override(Some("a/b".into()));
-        assert_eq!(get_git_namespace(), "refs/namespaces/a/refs/namespaces/b/");
-        clear_git_namespace_override();
+        assert_eq!(first.strip("refs/namespaces/other/refs/heads/main"), None);
     }
 
     #[test]
     fn hide_refs_caret_uses_full_name() {
-        let patterns = vec!["^refs/namespaces/namespace/refs/tags".into()];
+        let ns = Namespace::new("namespace");
+        let full = ns.expand("refs/tags/1");
         assert!(ref_is_hidden(
-            Some("refs/tags/1"),
-            "refs/namespaces/namespace/refs/tags/1",
-            &patterns
+            ns.strip(&full),
+            &full,
+            &["^refs/namespaces/namespace/refs/tags".into()]
         ));
-        // Without caret, unstripped pattern does not match logical name.
-        let patterns = vec!["refs/namespaces/namespace/refs/tags".into()];
         assert!(!ref_is_hidden(
-            Some("refs/tags/1"),
-            "refs/namespaces/namespace/refs/tags/1",
-            &patterns
+            ns.strip(&full),
+            &full,
+            &["refs/namespaces/namespace/refs/tags".into()]
         ));
-        // Logical pattern hides stripped name.
-        let patterns = vec!["refs/tags".into()];
-        assert!(ref_is_hidden(
-            Some("refs/tags/1"),
-            "refs/namespaces/namespace/refs/tags/1",
-            &patterns
-        ));
+        assert!(ref_is_hidden(ns.strip(&full), &full, &["refs/tags".into()]));
     }
 }

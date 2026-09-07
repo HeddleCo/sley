@@ -113,6 +113,14 @@ impl sley_core::fsync::FsyncConfigSource for GitConfig {
 }
 
 impl GitConfig {
+    /// Path normalization owned by this configuration snapshot.
+    pub fn precompose_unicode(&self) -> sley_core::PrecomposeUnicode {
+        sley_core::PrecomposeUnicode::new(
+            self.get_bool("core", None, "precomposeunicode")
+                .unwrap_or(false),
+        )
+    }
+
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         let text =
             std::str::from_utf8(bytes).map_err(|err| GitError::InvalidFormat(err.to_string()))?;
@@ -596,9 +604,6 @@ pub fn read_repo_config_file_only(git_dir: &Path) -> Result<GitConfig> {
     // defined by a config `[remote "<name>"].url`. Synthesize the equivalent
     // `[remote]` sections so every remote-aware command sees a uniform view.
     remotes::augment_with_legacy_remote_files(&mut config, git_dir);
-    // Activate NFD→NFC path conversion for this thread when the effective
-    // repository config enables it (git's cached `precomposed_unicode`).
-    sley_core::activate_precompose_unicode(config.get_bool("core", None, "precomposeunicode"));
     Ok(config)
 }
 
@@ -658,10 +663,6 @@ pub fn read_effective_worktree_config(
         };
         append_injected_config_sections_with_includes(&mut config, &parameters, &context, &base)?;
     }
-    // Keep git's cached `precomposed_unicode` behaviour for worktree lookups:
-    // callers previously reached it through [`read_repo_config`], and upstream
-    // caches it from the full effective stack.
-    sley_core::activate_precompose_unicode(config.get_bool("core", None, "precomposeunicode"));
     Ok(config)
 }
 

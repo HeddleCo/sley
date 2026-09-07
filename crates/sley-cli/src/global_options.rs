@@ -261,7 +261,7 @@ fn push_config_env(spec: &str) -> Result<GlobalConfigOverride> {
 /// [`sley_config::push_cmdline_config_parameter`] so library code (ext:: remotes)
 /// can export the same fragment to child processes.
 fn push_split_parameter(key: &str, value: Option<&str>) {
-    crate::sley_config::push_cmdline_config_parameter(key, value);
+    sley_config::push_cmdline_config_parameter(key, value);
 }
 
 /// The effective `GIT_CONFIG_PARAMETERS` string: the inherited env value (if any)
@@ -270,7 +270,7 @@ fn push_split_parameter(key: &str, value: Option<&str>) {
 /// parsed for in-process reads and exported to shell-alias / ext:: subprocesses
 /// so they inherit the parent's overrides.
 pub(crate) fn effective_config_parameters_env() -> Option<String> {
-    crate::sley_config::effective_config_parameters_env()
+    sley_config::effective_config_parameters_env()
 }
 
 /// Look up the last-set injected override for `key` (canonicalised), across the
@@ -279,7 +279,7 @@ pub(crate) fn effective_config_parameters_env() -> Option<String> {
 /// entry yields `"true"`). Used by command-side consumers (init, rev-parse's
 /// `core.abbrev`, etc.) that need a single injected value before a full config load.
 pub(crate) fn global_config_value(key: &str) -> Result<Option<String>> {
-    let canonical = match crate::sley_config::canonicalize_config_key(key) {
+    let canonical = match sley_config::canonicalize_config_key(key) {
         Ok(canonical) => canonical,
         // The lookup key is a fixed internal key; if it fails to canonicalise
         // there can be no matching override.
@@ -300,9 +300,9 @@ pub(crate) fn global_config_value(key: &str) -> Result<Option<String>> {
 /// `GIT_CONFIG_PARAMETERS` = inherited env + command-line `-c`/`--config-env`),
 /// converting any parse failure into git's `error: <msg>\nfatal: unable to parse
 /// command-line config` two-line diagnostic with exit 128.
-pub(crate) fn injected_config_parameters() -> Result<Vec<crate::sley_config::ConfigParameter>> {
+pub(crate) fn injected_config_parameters() -> Result<Vec<sley_config::ConfigParameter>> {
     let params_env = effective_config_parameters_env();
-    crate::sley_config::injected_config_parameters(params_env.as_deref())
+    sley_config::injected_config_parameters(params_env.as_deref())
         .map_err(report_config_parameter_error)
 }
 
@@ -310,20 +310,20 @@ pub(crate) const DEFAULT_BIG_FILE_THRESHOLD: u64 = 512 * 1024 * 1024;
 
 pub(crate) fn core_big_file_threshold(git_dir: Option<&Path>) -> Result<u64> {
     let context = match git_dir {
-        Some(git_dir) => crate::sley_config::ConfigIncludeContext::new(
-            Some(crate::sley_config::git_dir_for_include_context(git_dir)),
-            crate::sley_config::repo_current_branch_name(git_dir),
+        Some(git_dir) => sley_config::ConfigIncludeContext::new(
+            Some(sley_config::git_dir_for_include_context(git_dir)),
+            sley_config::repo_current_branch_name(git_dir),
         ),
-        None => crate::sley_config::ConfigIncludeContext::new(None, None),
+        None => sley_config::ConfigIncludeContext::new(None, None),
     };
-    let mut config = crate::sley_config::load_pre_dispatch_config(git_dir, &context)
+    let mut config = sley_config::load_pre_dispatch_config(git_dir, &context)
         .map_err(crate::report_config_setup_error)?;
     let parameters = injected_config_parameters()?;
     let base = match env::current_dir() {
         Ok(path) => path,
         Err(_) => PathBuf::from("."),
     };
-    crate::sley_config::append_injected_config_sections_with_includes(
+    sley_config::append_injected_config_sections_with_includes(
         &mut config,
         &parameters,
         &context,
@@ -351,7 +351,7 @@ pub(crate) fn core_big_file_threshold(git_dir: Option<&Path>) -> Result<u64> {
 /// Print git's exact diagnostic for a config-injection parse failure and return
 /// the matching exit status. Git prints the specific `error:` line followed by a
 /// generic `fatal: unable to parse command-line config` and exits 128.
-fn report_config_parameter_error(err: crate::sley_config::ConfigParameterError) -> GitError {
+fn report_config_parameter_error(err: sley_config::ConfigParameterError) -> GitError {
     eprintln!("error: {}", err.message());
     eprintln!("fatal: unable to parse command-line config");
     GitError::Exit(128)

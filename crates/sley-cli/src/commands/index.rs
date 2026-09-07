@@ -1,7 +1,6 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 #![allow(clippy::expect_used)]
 
-use {sley_diff_merge, sley_index, sley_rev, sley_worktree};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
@@ -922,7 +921,8 @@ pub(crate) fn cmd_ls_files(
         return Ok(());
     }
     let mut stdout = io::stdout();
-    let pathspec = LsFilesPathspec::new(
+    let pathspec = LsFilesPathspec::with_precompose(
+        cli_session.precompose_unicode(),
         &cwd,
         &worktree_root,
         full_name,
@@ -1092,6 +1092,7 @@ pub(crate) fn cmd_ls_files(
             let oid_candidates = ls_files_oid_candidates(&index);
             if ignored && cached {
                 let ignored_entries = sley_worktree::ignored_index_entries(
+                    cli_session.precompose_unicode(),
                     &worktree_root,
                     &index.entries,
                     exclude_standard,

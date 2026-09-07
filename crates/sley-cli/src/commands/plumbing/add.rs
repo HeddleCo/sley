@@ -2,7 +2,6 @@
 #![allow(clippy::expect_used)]
 
 use crate::*;
-use {sley_diff_merge, sley_index, sley_worktree};
 
 struct AddContext {
     cwd: PathBuf,
@@ -430,9 +429,16 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
     // fast path, etc.): `git -C unpopulated-sub add .` must die here.
     let parsed_index = sley_worktree::read_repository_index(git_dir, format)?;
     die_in_unpopulated_submodule(cwd, worktree_root, parsed_index.as_ref())?;
-    die_on_pathspec_inside_submodule(cwd, worktree_root, parsed_index.as_ref(), &paths)?;
+    die_on_pathspec_inside_submodule(
+        cli_session.precompose_unicode(),
+        cwd,
+        worktree_root,
+        parsed_index.as_ref(),
+        &paths,
+    )?;
     if renormalize {
         let tracked_paths = resolve_add_renormalize_paths(
+            cli_session.precompose_unicode(),
             cwd,
             worktree_root,
             git_dir,
@@ -460,6 +466,7 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
     }
     if refresh {
         refresh_index_after_add(
+            cli_session.precompose_unicode(),
             cwd,
             worktree_root,
             git_dir,
@@ -471,11 +478,19 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
         return Ok(());
     }
     if intent_to_add && !dry_run {
-        return add_intent_to_add(cwd, worktree_root, git_dir, format, &paths);
+        return add_intent_to_add(
+            cli_session.precompose_unicode(),
+            cwd,
+            worktree_root,
+            git_dir,
+            format,
+            &paths,
+        );
     }
     if !update
         && !all
         && let Some(actions) = try_add_regular_exact_tracked_raw(
+            cli_session.precompose_unicode(),
             cwd,
             worktree_root,
             git_dir,
@@ -600,6 +615,7 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
         }
         if do_refresh {
             refresh_index_after_add(
+                cli_session.precompose_unicode(),
                 cwd,
                 worktree_root,
                 git_dir,
@@ -620,6 +636,7 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
         exact_tracked,
         ignored_paths,
     } = resolve_add_regular_actions(
+        cli_session.precompose_unicode(),
         cwd,
         worktree_root,
         git_dir,
@@ -769,6 +786,7 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
         if do_refresh && !add_refresh_is_redundant(worktree_root, &refresh_paths, &verbose_actions)
         {
             refresh_index_after_add(
+                cli_session.precompose_unicode(),
                 cwd,
                 worktree_root,
                 git_dir,
@@ -787,6 +805,7 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
     }
     if do_refresh && !add_refresh_is_redundant(worktree_root, &refresh_paths, &actions) {
         refresh_index_after_add(
+            cli_session.precompose_unicode(),
             cwd,
             worktree_root,
             git_dir,
@@ -815,6 +834,7 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
 /// are left untouched. The index is rewritten with the entries kept in git's
 /// canonical (path, stage) sort order.
 pub(super) fn add_intent_to_add(
+    precompose: sley_core::PrecomposeUnicode,
     cwd: &Path,
     worktree_root: &Path,
     git_dir: &Path,
@@ -838,7 +858,7 @@ pub(super) fn add_intent_to_add(
         let Ok(relative) = absolute.strip_prefix(worktree_root) else {
             continue;
         };
-        let git_path = add_git_path_bytes(relative)?;
+        let git_path = add_git_path_bytes(precompose, relative)?;
         if git_path.is_empty() {
             continue;
         }
@@ -977,6 +997,7 @@ fn print_add_ignore_errors_message(worktree_root: &Path, path: &Path, err: &GitE
 }
 
 fn try_add_regular_exact_tracked_raw(
+    precompose: sley_core::PrecomposeUnicode,
     cwd: &Path,
     worktree_root: &Path,
     git_dir: &Path,
@@ -1004,7 +1025,7 @@ fn try_add_regular_exact_tracked_raw(
     if relative.as_os_str().is_empty() {
         return Ok(None);
     }
-    let git_path = match add_git_path_bytes(relative) {
+    let git_path = match add_git_path_bytes(precompose, relative) {
         Ok(path) => path,
         Err(_) => return Ok(None),
     };
@@ -1039,6 +1060,7 @@ fn add_pathspec_has_trailing_separator(path: &Path) -> bool {
 /// `add -u`/`-A`) refreshes every tracked entry. Quiet + tolerant of missing
 /// files (content mismatches are genuine worktree changes, not a refresh error).
 fn refresh_index_after_add(
+    precompose: sley_core::PrecomposeUnicode,
     cwd: &Path,
     worktree_root: &Path,
     git_dir: &Path,
@@ -1081,8 +1103,13 @@ fn refresh_index_after_add(
             let odb = sley_odb::FileObjectDatabase::from_git_dir(git_dir, format);
             sley_worktree::expand_sparse_index_view(&mut index, &odb, format)?;
         }
-        let mut compiled =
-            AddCompiledPathspecs::parse(cwd, worktree_root, refresh_paths, pathspec_magic)?;
+        let mut compiled = AddCompiledPathspecs::parse_precomposed(
+            precompose,
+            cwd,
+            worktree_root,
+            refresh_paths,
+            pathspec_magic,
+        )?;
         let mut selected = Vec::new();
         for entry in &index.entries {
             if entry.stage() != sley_index::Stage::Normal {
@@ -1196,6 +1223,7 @@ fn die_in_unpopulated_submodule_with_prefix(relative: &Path, index: &Index) -> R
 }
 
 fn die_on_pathspec_inside_submodule(
+    precompose: sley_core::PrecomposeUnicode,
     cwd: &Path,
     worktree_root: &Path,
     index: Option<&Index>,
@@ -1215,7 +1243,7 @@ fn die_on_pathspec_inside_submodule(
     }
     let mut git_paths = Vec::with_capacity(paths.len());
     for path in paths {
-        match add_pathspec_git_path_for_submodule_fast(cwd, worktree_root, path)? {
+        match add_pathspec_git_path_for_submodule_fast(precompose, cwd, worktree_root, path)? {
             AddSubmodulePathspec::Inside(git_path) => git_paths.push((path, git_path)),
             AddSubmodulePathspec::Outside => {}
             AddSubmodulePathspec::Unsafe => {
@@ -1243,6 +1271,7 @@ enum AddSubmodulePathspec {
 }
 
 fn add_pathspec_git_path_for_submodule_fast(
+    precompose: sley_core::PrecomposeUnicode,
     cwd: &Path,
     worktree_root: &Path,
     path: &Path,
@@ -1261,7 +1290,9 @@ fn add_pathspec_git_path_for_submodule_fast(
     }) {
         return Ok(AddSubmodulePathspec::Unsafe);
     }
-    Ok(AddSubmodulePathspec::Inside(add_git_path_bytes(relative)?))
+    Ok(AddSubmodulePathspec::Inside(add_git_path_bytes(
+        precompose, relative,
+    )?))
 }
 
 fn gitlink_ancestor_for_path<'a>(entries: &'a [IndexEntry], git_path: &[u8]) -> Option<&'a [u8]> {
@@ -1459,7 +1490,8 @@ struct AddCompiledPathspecs {
 }
 
 impl AddCompiledPathspecs {
-    fn parse(
+    fn parse_precomposed(
+        precompose: sley_core::PrecomposeUnicode,
         cwd: &Path,
         worktree_root: &Path,
         paths: &[PathBuf],
@@ -1474,7 +1506,7 @@ impl AddCompiledPathspecs {
         let mut specs = Vec::with_capacity(paths.len());
         let mut have_include = false;
         for path in paths {
-            let arg = add_pathspec_arg_for_matcher(worktree_root, path)?;
+            let arg = add_pathspec_arg_for_matcher(precompose, worktree_root, path)?;
             let element = sley_pathspec::parse_normalized_pathspec_element(
                 &cwd_prefix,
                 &arg,
@@ -1540,6 +1572,7 @@ impl AddCompiledPathspecs {
 /// Renormalization implies `-u`: tracked deletions remain selected for removal,
 /// while untracked filesystem matches are never introduced.
 fn resolve_add_renormalize_paths(
+    precompose: sley_core::PrecomposeUnicode,
     cwd: &Path,
     worktree_root: &Path,
     git_dir: &Path,
@@ -1547,7 +1580,13 @@ fn resolve_add_renormalize_paths(
     paths: &[PathBuf],
     pathspec_magic: sley_worktree::PathspecMatchMagic,
 ) -> Result<Vec<PathBuf>> {
-    let mut compiled = AddCompiledPathspecs::parse(cwd, worktree_root, paths, pathspec_magic)?;
+    let mut compiled = AddCompiledPathspecs::parse_precomposed(
+        precompose,
+        cwd,
+        worktree_root,
+        paths,
+        pathspec_magic,
+    )?;
     let index = sley_worktree::read_repository_index(git_dir, format)?;
     let mut selected = Vec::new();
     if let Some(index) = index {
@@ -1569,7 +1608,11 @@ fn resolve_add_renormalize_paths(
     Ok(selected)
 }
 
-fn add_pathspec_arg_for_matcher(worktree_root: &Path, path: &Path) -> Result<String> {
+fn add_pathspec_arg_for_matcher(
+    precompose: sley_core::PrecomposeUnicode,
+    worktree_root: &Path,
+    path: &Path,
+) -> Result<String> {
     if !path.is_absolute() {
         return Ok(path.to_string_lossy().into_owned());
     }
@@ -1610,7 +1653,7 @@ fn add_pathspec_arg_for_matcher(worktree_root: &Path, path: &Path) -> Result<Str
     let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
         GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
     })?;
-    let git_path = add_git_path_bytes(relative)?;
+    let git_path = add_git_path_bytes(precompose, relative)?;
     if git_path.is_empty() {
         Ok(":/".to_string())
     } else {
@@ -1708,6 +1751,7 @@ struct TrackedExactResolution {
 }
 
 fn resolve_add_regular_actions(
+    precompose: sley_core::PrecomposeUnicode,
     cwd: &Path,
     worktree_root: &Path,
     git_dir: &Path,
@@ -1718,6 +1762,7 @@ fn resolve_add_regular_actions(
     pathspec_magic: sley_worktree::PathspecMatchMagic,
 ) -> Result<AddRegularResolution> {
     if let Some(exact) = resolve_add_regular_tracked_exact_actions(
+        precompose,
         cwd,
         worktree_root,
         git_dir,
@@ -1747,8 +1792,13 @@ fn resolve_add_regular_actions(
         let odb = sley_odb::FileObjectDatabase::from_git_dir(git_dir, format);
         sley_worktree::expand_sparse_index_view(index, &odb, format)?;
     }
-    let mut compiled_pathspecs =
-        AddCompiledPathspecs::parse(cwd, worktree_root, &paths, pathspec_magic)?;
+    let mut compiled_pathspecs = AddCompiledPathspecs::parse_precomposed(
+        precompose,
+        cwd,
+        worktree_root,
+        &paths,
+        pathspec_magic,
+    )?;
     let pathspecs = paths
         .into_iter()
         .map(|path| {
@@ -1790,6 +1840,7 @@ fn resolve_add_regular_actions(
     }
     if !options.force {
         for (idx, ignored_path) in collect_add_ignored_pathspec_matches(
+            precompose,
             worktree_root,
             git_dir,
             format,
@@ -1937,7 +1988,7 @@ fn resolve_add_regular_actions(
                 continue;
             }
             if let Some(ignored_path) =
-                ignored_missing_add_pathspec(worktree_root, display, pathspec)?
+                ignored_missing_add_pathspec(precompose, worktree_root, display, pathspec)?
             {
                 matched[idx] = true;
                 compiled_pathspecs.mark_matched(idx);
@@ -1960,6 +2011,7 @@ fn resolve_add_regular_actions(
 }
 
 fn collect_add_ignored_pathspec_matches(
+    precompose: sley_core::PrecomposeUnicode,
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -2004,7 +2056,12 @@ fn collect_add_ignored_pathspec_matches(
             if add_ignored_path_matches(display, &candidate_path, pathspec) {
                 matches.push((
                     idx,
-                    add_ignored_display_path(worktree_root, &candidate_path, candidate)?,
+                    add_ignored_display_path(
+                        precompose,
+                        worktree_root,
+                        &candidate_path,
+                        candidate,
+                    )?,
                 ));
             }
         }
@@ -2088,6 +2145,7 @@ fn add_ignored_path_matches(display: &Path, candidate_path: &Path, pathspec: &Pa
 }
 
 fn ignored_missing_add_pathspec(
+    precompose: sley_core::PrecomposeUnicode,
     worktree_root: &Path,
     display: &Path,
     pathspec: &Path,
@@ -2098,12 +2156,12 @@ fn ignored_missing_add_pathspec(
     let Ok(relative) = pathspec.strip_prefix(worktree_root) else {
         return Ok(None);
     };
-    let git_path = add_git_path_bytes(relative)?;
+    let git_path = add_git_path_bytes(precompose, relative)?;
     if git_path.is_empty() {
         return Ok(None);
     }
     Ok(
-        sley_worktree::standard_ignore_match(worktree_root, &git_path, false)?
+        sley_worktree::standard_ignore_match(precompose, worktree_root, &git_path, false)?
             .filter(|ignore_match| ignore_match.ignored)
             .map(|_| git_path),
     )
@@ -2122,6 +2180,7 @@ fn worktree_path_from_git_path(worktree_root: &Path, git_path: &[u8]) -> Result<
 }
 
 fn add_ignored_display_path(
+    precompose: sley_core::PrecomposeUnicode,
     worktree_root: &Path,
     candidate_path: &Path,
     candidate_git_path: &[u8],
@@ -2137,7 +2196,7 @@ fn add_ignored_display_path(
         prefix.extend_from_slice(component);
         let prefix_path = worktree_path_from_git_path(worktree_root, &prefix)?;
         let is_dir = prefix_path.is_dir();
-        if sley_worktree::standard_ignore_match(worktree_root, &prefix, is_dir)?
+        if sley_worktree::standard_ignore_match(precompose, worktree_root, &prefix, is_dir)?
             .is_some_and(|ignore_match| ignore_match.ignored)
         {
             return Ok(prefix);
@@ -2145,6 +2204,7 @@ fn add_ignored_display_path(
     }
     if candidate_path.is_dir() {
         return add_git_path_bytes(
+            precompose,
             candidate_path
                 .strip_prefix(worktree_root)
                 .map_err(|_| GitError::InvalidPath(candidate_path.display().to_string()))?,
@@ -2180,6 +2240,7 @@ fn add_ignored_file_advice_enabled(config: &GitConfig) -> bool {
 }
 
 fn resolve_add_regular_tracked_exact_actions(
+    precompose: sley_core::PrecomposeUnicode,
     cwd: &Path,
     worktree_root: &Path,
     git_dir: &Path,
@@ -2209,7 +2270,7 @@ fn resolve_add_regular_tracked_exact_actions(
         let Ok(relative) = absolute.strip_prefix(worktree_root) else {
             return Ok(None);
         };
-        let git_path = add_git_path_bytes(relative)?;
+        let git_path = add_git_path_bytes(precompose, relative)?;
         let range = add_index_entries_path_range(&index.entries, &git_path);
         if range.is_empty() {
             let metadata = match fs::symlink_metadata(&absolute) {
@@ -2228,7 +2289,7 @@ fn resolve_add_regular_tracked_exact_actions(
             if metadata.is_dir() || !(file_type.is_file() || file_type.is_symlink()) {
                 return Ok(None);
             }
-            if sley_worktree::standard_ignore_match(worktree_root, &git_path, false)?
+            if sley_worktree::standard_ignore_match(precompose, worktree_root, &git_path, false)?
                 .is_some_and(|ignore_match| ignore_match.ignored)
             {
                 return Ok(None);
@@ -2337,7 +2398,7 @@ fn reject_add_skip_worktree_paths(
         let Ok(relative) = absolute.strip_prefix(worktree_root) else {
             continue;
         };
-        let git_path = match add_git_path_bytes(relative) {
+        let git_path = match add_git_path_bytes(config.precompose_unicode(), relative) {
             Ok(path) => path,
             Err(_) => continue,
         };
@@ -2573,7 +2634,10 @@ pub(super) fn normalize_add_absolute_path(cwd: &Path, path: &Path) -> PathBuf {
     normalized
 }
 
-pub(super) fn add_git_path_bytes(path: &Path) -> Result<Vec<u8>> {
+pub(super) fn add_git_path_bytes(
+    precompose: sley_core::PrecomposeUnicode,
+    path: &Path,
+) -> Result<Vec<u8>> {
     if path.components().any(|component| {
         matches!(
             component,
@@ -2586,7 +2650,7 @@ pub(super) fn add_git_path_bytes(path: &Path) -> Result<Vec<u8>> {
         )));
     }
     // NFD→NFC when core.precomposeunicode is set (git precompose_argv_prefix).
-    let path = sley_core::precompose_path_if_needed(path);
+    let path = precompose.path(path);
     Ok(path
         .components()
         .filter_map(|component| match component {

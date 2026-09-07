@@ -17,7 +17,6 @@ use sley_grep::{Regex, RegexMode};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use {sley_config, sley_worktree};
 
 /// One row of the upstream builtin driver table.
 pub(crate) struct BuiltinDriver {

@@ -1,7 +1,6 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
 use crate::*;
-use {sley_index, sley_worktree};
 
 use super::add::{
     active_sparse_checkout_for_add, add_git_path_bytes, add_index_entries_path_range,
@@ -142,6 +141,7 @@ pub(crate) fn cmd_rm(cli_session: &crate::session::CliSession, args: &[String]) 
         .collect::<Vec<_>>();
     let config_parameters_env = effective_config_parameters_env();
     let result = sley_worktree::remove_index_and_worktree_paths(
+        cli_session.original_cwd.as_deref(),
         worktree_root,
         git_dir,
         format,
@@ -251,6 +251,7 @@ pub(crate) fn cmd_mv(cli_session: &crate::session::CliSession, args: &[String]) 
         vec![false; sources.len()]
     } else {
         let (rejected_paths, per_source) = mv_sparse_rejections(
+            cli_session.precompose_unicode(),
             &cwd,
             &worktree_root,
             &git_dir,
@@ -278,6 +279,7 @@ pub(crate) fn cmd_mv(cli_session: &crate::session::CliSession, args: &[String]) 
             cwd.join(source)
         };
         let result = sley_worktree::move_index_and_worktree_path(
+            cli_session.original_cwd.as_deref(),
             &worktree_root,
             &git_dir,
             format,
@@ -343,6 +345,7 @@ pub(crate) fn cmd_mv(cli_session: &crate::session::CliSession, args: &[String]) 
 /// absent skip-worktree index entry (git's "lstat fails + ce_skip_worktree"
 /// branch). A destination is sparse when it lies outside the cone.
 fn mv_sparse_rejections(
+    precompose: sley_core::PrecomposeUnicode,
     cwd: &Path,
     worktree_root: &Path,
     git_dir: &Path,
@@ -358,7 +361,7 @@ fn mv_sparse_rejections(
     // disk (but still tracks) as a directory; detect that from the index so a
     // contained file's mapped destination path is computed correctly.
     let dest_is_dir = destination.is_dir()
-        || mv_git_relative_path(worktree_root, destination).is_some_and(|dest_git| {
+        || mv_git_relative_path(precompose, worktree_root, destination).is_some_and(|dest_git| {
             let mut prefix = dest_git;
             prefix.push(b'/');
             index.as_ref().is_some_and(|index| {
@@ -383,10 +386,10 @@ fn mv_sparse_rejections(
         } else {
             destination.to_path_buf()
         };
-        let Some(src_git) = mv_git_relative_path(worktree_root, &source_abs) else {
+        let Some(src_git) = mv_git_relative_path(precompose, worktree_root, &source_abs) else {
             continue;
         };
-        let dst_git = mv_git_relative_path(worktree_root, &dest_abs);
+        let dst_git = mv_git_relative_path(precompose, worktree_root, &dest_abs);
         // A directory source (still tracked under a prefix even after its files
         // were sparsified off disk) expands to its contained entries: git lists
         // each contained file's source and mapped destination that is sparse.
@@ -440,9 +443,13 @@ fn mv_sparse_rejections(
     Ok((rejected, per_source))
 }
 
-fn mv_git_relative_path(worktree_root: &Path, absolute: &Path) -> Option<Vec<u8>> {
+fn mv_git_relative_path(
+    precompose: sley_core::PrecomposeUnicode,
+    worktree_root: &Path,
+    absolute: &Path,
+) -> Option<Vec<u8>> {
     let relative = absolute.strip_prefix(worktree_root).ok()?;
-    let git_path = add_git_path_bytes(relative).ok()?;
+    let git_path = add_git_path_bytes(precompose, relative).ok()?;
     (!git_path.is_empty()).then_some(git_path)
 }
 

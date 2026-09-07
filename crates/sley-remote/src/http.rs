@@ -111,9 +111,10 @@ impl HttpOperationBatch {
     ///
     /// See [`transport_limits_from_config`]; with no relevant keys set this
     /// is exactly [`Self::new`].
-    pub fn with_config(config: Option<&GitConfig>) -> Self {
+    pub fn with_config(policy: &crate::TransportPolicy, config: Option<&GitConfig>) -> Self {
         Self {
-            client: UreqHttpClient::with_limits(transport_limits_from_config(config)),
+            client: UreqHttpClient::with_limits(transport_limits_from_config(config))
+                .with_protocol_policy(policy.clone(), config),
         }
     }
 
@@ -133,8 +134,12 @@ pub fn new_http_client() -> UreqHttpClient {
 }
 
 /// [`new_http_client`] with the ceilings `config` asks for.
-pub fn new_http_client_with_config(config: Option<&GitConfig>) -> UreqHttpClient {
+pub fn new_http_client_with_config(
+    policy: &crate::TransportPolicy,
+    config: Option<&GitConfig>,
+) -> UreqHttpClient {
     UreqHttpClient::with_limits(transport_limits_from_config(config))
+        .with_protocol_policy(policy.clone(), config)
 }
 
 /// Perform an HTTP request, retrying once with credential-provider-supplied
@@ -929,6 +934,7 @@ pub struct HttpProtocolV2FetchOutcome {
 }
 
 pub fn install_fetch_pack_via_http_upload_pack<C: HttpClient + ?Sized>(
+    policy: &crate::RemotePolicy,
     request: HttpFetchPackRequest<'_, C>,
     credentials: &mut dyn CredentialProvider,
     progress: &mut dyn ProgressSink,
@@ -956,6 +962,7 @@ pub fn install_fetch_pack_via_http_upload_pack<C: HttpClient + ?Sized>(
         request.filter.as_ref(),
     );
     let haves = request_haves(
+        policy,
         request.git_dir,
         request.format,
         request.omit_haves,
@@ -1117,6 +1124,7 @@ pub fn negotiate_only_http<C: HttpClient + ?Sized>(
 }
 
 pub fn install_fetch_pack_via_http_protocol_v2_fetch<C: HttpClient + ?Sized>(
+    policy: &crate::RemotePolicy,
     request: HttpFetchPackRequest<'_, C>,
     handshake: &TransportHandshake,
     credentials: &mut dyn CredentialProvider,
@@ -1124,6 +1132,7 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch<C: HttpClient + ?Sized>(
     cancel: CancelFlag<'_>,
 ) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
     install_fetch_pack_via_http_protocol_v2_fetch_with_want_refs(
+        policy,
         request,
         Vec::new(),
         handshake,
@@ -1138,6 +1147,7 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch<C: HttpClient + ?Sized>(
 /// time. Keeping the names separate from [`HttpFetchPackRequest`] preserves the
 /// exact-OID request API used by independent partial-clone callers.
 pub fn install_fetch_pack_via_http_protocol_v2_fetch_with_want_refs<C: HttpClient + ?Sized>(
+    policy: &crate::RemotePolicy,
     mut request: HttpFetchPackRequest<'_, C>,
     want_refs: Vec<String>,
     handshake: &TransportHandshake,
@@ -1164,6 +1174,7 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch_with_want_refs<C: HttpClien
         return Ok(HttpProtocolV2FetchOutcome::default());
     }
     let haves = request_negotiation_haves(
+        policy,
         request.git_dir,
         request.format,
         request.omit_haves,
@@ -1560,6 +1571,7 @@ fn all_wants_present(db: &FileObjectDatabase, wants: &[ObjectId]) -> Result<bool
 }
 
 fn request_haves(
+    policy: &crate::RemotePolicy,
     git_dir: &Path,
     format: ObjectFormat,
     omit_haves: bool,
@@ -1570,11 +1582,12 @@ fn request_haves(
     } else if let Some(haves) = custom_haves {
         Ok(haves)
     } else {
-        crate::local::local_have_oids(git_dir, format)
+        crate::local::local_have_oids(policy, git_dir, format)
     }
 }
 
 fn request_negotiation_haves(
+    policy: &crate::RemotePolicy,
     git_dir: &Path,
     format: ObjectFormat,
     omit_haves: bool,
@@ -1585,7 +1598,7 @@ fn request_negotiation_haves(
     } else if let Some(haves) = custom_haves {
         Ok(haves)
     } else {
-        crate::local::local_negotiation_have_oids(git_dir, format)
+        crate::local::local_negotiation_have_oids(policy, git_dir, format)
     }
 }
 
@@ -2223,6 +2236,7 @@ mod tests {
         let mut progress = crate::SilentProgress;
 
         install_fetch_pack_via_http_protocol_v2_fetch(
+            &crate::RemotePolicy::default(),
             packfile_uri_request(&client, &git_dir, &remote, inline_oid),
             &packfile_uri_handshake(),
             &mut credentials,
@@ -2269,6 +2283,7 @@ mod tests {
         let mut progress = crate::SilentProgress;
 
         let error = install_fetch_pack_via_http_protocol_v2_fetch(
+            &crate::RemotePolicy::default(),
             packfile_uri_request(&client, &git_dir, &remote, inline_oid),
             &packfile_uri_handshake(),
             &mut credentials,
@@ -2311,6 +2326,7 @@ mod tests {
         let mut progress = crate::SilentProgress;
 
         let error = install_fetch_pack_via_http_protocol_v2_fetch(
+            &crate::RemotePolicy::default(),
             packfile_uri_request(&client, &git_dir, &remote, inline_oid),
             &packfile_uri_handshake(),
             &mut credentials,
@@ -2355,6 +2371,7 @@ mod tests {
         let mut progress = crate::SilentProgress;
 
         install_fetch_pack_via_http_protocol_v2_fetch(
+            &crate::RemotePolicy::default(),
             packfile_uri_request(&client, &git_dir, &remote, inline_oid),
             &handshake,
             &mut credentials,

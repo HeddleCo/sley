@@ -310,6 +310,7 @@ pub struct RebaseApplyParams {
 /// Start a fresh `git rebase --apply` series. The caller has already detached
 /// HEAD onto `onto`; here we write the apply state dir and drive the series.
 pub fn start_rebase_apply(
+    original_cwd: Option<&std::path::Path>,
     ctx: &AmContext,
     hosts: &AmHosts<'_>,
     params: RebaseApplyParams,
@@ -404,7 +405,14 @@ pub fn start_rebase_apply(
     fs::write(state_dir.join("quiet"), bool_flag(params.quiet))?;
     write_am_rerere_autoupdate(&state_dir, params.rerere_autoupdate)?;
 
-    run_am_series(ctx, hosts, &state_dir, 1, AmResumeOverrides::default())
+    run_am_series(
+        original_cwd,
+        ctx,
+        hosts,
+        &state_dir,
+        1,
+        AmResumeOverrides::default(),
+    )
 }
 
 /// Whether a `.git/rebase-apply/` state dir belongs to a `git rebase --apply`
@@ -415,21 +423,39 @@ pub fn rebase_apply_in_progress(git_dir: &Path) -> bool {
 }
 
 /// `git rebase --apply --continue`: resume the am series, then finish the rebase.
-pub fn rebase_apply_continue(ctx: &AmContext, hosts: &AmHosts<'_>) -> Result<()> {
+pub fn rebase_apply_continue(
+    original_cwd: Option<&std::path::Path>,
+    ctx: &AmContext,
+    hosts: &AmHosts<'_>,
+) -> Result<()> {
     let state_dir = ctx.git_dir.join("rebase-apply");
-    am_continue(ctx, hosts, &state_dir, AmResumeOverrides::default())
+    am_continue(
+        original_cwd,
+        ctx,
+        hosts,
+        &state_dir,
+        AmResumeOverrides::default(),
+    )
 }
 
 /// `git rebase --apply --skip`.
-pub fn rebase_apply_skip(ctx: &AmContext, hosts: &AmHosts<'_>) -> Result<()> {
+pub fn rebase_apply_skip(
+    original_cwd: Option<&std::path::Path>,
+    ctx: &AmContext,
+    hosts: &AmHosts<'_>,
+) -> Result<()> {
     let state_dir = ctx.git_dir.join("rebase-apply");
-    am_skip(ctx, hosts, &state_dir)
+    am_skip(original_cwd, ctx, hosts, &state_dir)
 }
 
 /// `git rebase --apply --abort`: restore the original branch and drop state.
-pub fn rebase_apply_abort(ctx: &AmContext, hosts: &AmHosts<'_>) -> Result<()> {
+pub fn rebase_apply_abort(
+    original_cwd: Option<&std::path::Path>,
+    ctx: &AmContext,
+    hosts: &AmHosts<'_>,
+) -> Result<()> {
     let state_dir = ctx.git_dir.join("rebase-apply");
-    am_abort(ctx, hosts, &state_dir)
+    am_abort(original_cwd, ctx, hosts, &state_dir)
 }
 
 /// Read every mbox file (or stdin when none are given), keeping one buffer *per
@@ -1130,6 +1156,7 @@ fn update_am_abort_safety(ctx: &AmContext, state_dir: &Path) -> Result<()> {
 /// `overrides` (non-empty only on `--retry`) override the saved options for the
 /// resumed patch at `start`; subsequent patches use the saved session options.
 fn run_am_series(
+    original_cwd: Option<&std::path::Path>,
     ctx: &AmContext,
     hosts: &AmHosts<'_>,
     state_dir: &Path,
@@ -1230,6 +1257,7 @@ fn run_am_series(
         }
 
         match apply_one_patch(
+            original_cwd,
             ctx,
             hosts,
             state_dir,
@@ -1335,6 +1363,7 @@ fn am_index_is_dirty(ctx: &AmContext, head_oid: &ObjectId) -> Result<bool> {
 /// 3-way leaves conflict markers in the worktree and a conflicted index.
 #[allow(clippy::too_many_arguments)]
 fn apply_one_patch(
+    original_cwd: Option<&std::path::Path>,
     ctx: &AmContext,
     hosts: &AmHosts<'_>,
     state_dir: &Path,
@@ -1374,7 +1403,7 @@ fn apply_one_patch(
     // 3-way backend.
     if apply_opts.reject {
         let (actions, rejects) = try_reject_apply(ctx, &file_patches, apply_opts)?;
-        apply_actions(ctx, &actions)?;
+        apply_actions(original_cwd, ctx, &actions)?;
         write_am_rejects(worktree_root, &rejects)?;
         if !rejects.is_empty() {
             return Ok(ApplyResult::Conflict);
@@ -1386,7 +1415,7 @@ fn apply_one_patch(
 
     match try_straight_apply(ctx, &file_patches, apply_opts)? {
         Some(actions) => {
-            apply_actions(ctx, &actions)?;
+            apply_actions(original_cwd, ctx, &actions)?;
             let new_oid = stage_and_commit(ctx, hosts, patch, &actions, commit_opts)?;
             record_rebase_rewrite(state_dir, format, number, &new_oid)?;
             Ok(ApplyResult::Committed)
@@ -1397,6 +1426,7 @@ fn apply_one_patch(
                     println!("Using index info to reconstruct a base tree...");
                 }
                 return apply_three_way(
+                    original_cwd,
                     ctx,
                     hosts,
                     state_dir,
@@ -2110,7 +2140,11 @@ fn ws_fuzzy_matchlines(a: &[u8], b: &[u8]) -> bool {
     i == a.len() && j == b.len()
 }
 
-fn apply_actions(ctx: &AmContext, actions: &[ApplyFileAction]) -> Result<()> {
+fn apply_actions(
+    original_cwd: Option<&std::path::Path>,
+    ctx: &AmContext,
+    actions: &[ApplyFileAction],
+) -> Result<()> {
     let worktree_root: &Path = &ctx.worktree_root;
     let format: ObjectFormat = ctx.format;
 
@@ -2124,7 +2158,7 @@ fn apply_actions(ctx: &AmContext, actions: &[ApplyFileAction]) -> Result<()> {
     // ordering would prune the just-emptied directory after the create.
     for action in actions {
         if let ApplyFileAction::Remove { path } = action {
-            merge_remove_worktree_file(worktree_root, path)?;
+            merge_remove_worktree_file(original_cwd, worktree_root, path)?;
         }
     }
     for action in actions {
@@ -2146,7 +2180,7 @@ fn apply_actions(ctx: &AmContext, actions: &[ApplyFileAction]) -> Result<()> {
             } else {
                 Cow::Borrowed(content.as_slice())
             };
-            merge_write_worktree_file(worktree_root, path, &worktree_content, *mode)?;
+            merge_write_worktree_file(original_cwd, worktree_root, path, &worktree_content, *mode)?;
         }
     }
     Ok(())
@@ -2614,6 +2648,7 @@ fn is_trailer_line(line: &str) -> bool {
 /// worktree state ("ours"). Reuses the shared tree-merge engine.
 #[allow(clippy::too_many_arguments)]
 fn apply_three_way(
+    original_cwd: Option<&std::path::Path>,
     ctx: &AmContext,
     hosts: &AmHosts<'_>,
     state_dir: &Path,
@@ -2843,6 +2878,7 @@ fn apply_three_way(
     }
 
     write_merge_index_and_worktree(
+        original_cwd,
         git_dir,
         worktree_root,
         format,
@@ -3068,7 +3104,9 @@ fn lookup_patch_base_blob(
 
 /// Materialise a 3-way merge result into the index (with conflict stages) and
 /// the worktree (with conflict markers for unresolved paths).
+#[allow(clippy::too_many_arguments)] // Policy is explicit alongside the existing operation inputs.
 fn write_merge_index_and_worktree(
+    original_cwd: Option<&std::path::Path>,
     git_dir: &Path,
     worktree_root: &Path,
     format: ObjectFormat,
@@ -3089,15 +3127,17 @@ fn write_merge_index_and_worktree(
                     } else {
                         merge_read_blob_with_fetch(db, oid, fetch)?
                     };
-                    merge_write_worktree_file(worktree_root, path, &content, *mode)?;
+                    merge_write_worktree_file(original_cwd, worktree_root, path, &content, *mode)?;
                 }
             }
-            MergePathResult::Resolved(None) => merge_remove_worktree_file(worktree_root, path)?,
+            MergePathResult::Resolved(None) => {
+                merge_remove_worktree_file(original_cwd, worktree_root, path)?
+            }
             MergePathResult::Conflict { worktree, .. } => match worktree {
                 Some((mode, content)) => {
-                    merge_write_worktree_file(worktree_root, path, content, *mode)?
+                    merge_write_worktree_file(original_cwd, worktree_root, path, content, *mode)?
                 }
-                None => merge_remove_worktree_file(worktree_root, path)?,
+                None => merge_remove_worktree_file(original_cwd, worktree_root, path)?,
             },
         }
     }
@@ -3477,6 +3517,7 @@ fn am_remove_worktree_path(worktree_root: &Path, rel: &[u8]) -> Result<()> {
 /// restored file must go) so `am --abort` reports a failed exit status (t4151
 /// "git am --abort return failed exit status when it fails").
 fn am_clean_index(
+    original_cwd: Option<&std::path::Path>,
     ctx: &AmContext,
     curr_head: Option<&ObjectId>,
     orig_head: Option<&ObjectId>,
@@ -3599,6 +3640,7 @@ fn am_clean_index(
             sley_config::read_repo_config(git_dir, effective_config_parameters_env().as_deref())
                 .unwrap_or_default();
         sley_worktree::checkout_index_paths(
+            original_cwd,
             worktree_root,
             git_dir,
             format,
@@ -3648,7 +3690,12 @@ fn am_subdirectory_has_unowned_entries(
 
 /// `git am --abort`: restore the branch to where the series started and drop
 /// the state directory.
-pub fn am_abort(ctx: &AmContext, hosts: &AmHosts<'_>, state_dir: &Path) -> Result<()> {
+pub fn am_abort(
+    original_cwd: Option<&std::path::Path>,
+    ctx: &AmContext,
+    hosts: &AmHosts<'_>,
+    state_dir: &Path,
+) -> Result<()> {
     let git_dir: &Path = &ctx.git_dir;
     let worktree_root: &Path = &ctx.worktree_root;
     let format: ObjectFormat = ctx.format;
@@ -3722,6 +3769,7 @@ pub fn am_abort(ctx: &AmContext, hosts: &AmHosts<'_>, state_dir: &Path) -> Resul
             }
             tx.commit()?;
             sley_worktree::reset_index_and_worktree_to_commit(
+                original_cwd,
                 worktree_root,
                 git_dir,
                 format,
@@ -3784,7 +3832,7 @@ pub fn am_abort(ctx: &AmContext, hosts: &AmHosts<'_>, state_dir: &Path) -> Resul
     // here (e.g. a directory where a tracked file must be restored) aborts with
     // a non-zero exit and the state dir intact (t4151 "return failed exit
     // status when it fails").
-    if am_clean_index(ctx, curr_head.as_ref(), orig_head.as_ref()).is_err() {
+    if am_clean_index(original_cwd, ctx, curr_head.as_ref(), orig_head.as_ref()).is_err() {
         // git's `am_abort`: `if (clean_index(...)) die("failed to clean index")`.
         // HEAD is not moved and the state dir is left in place.
         eprintln!("fatal: failed to clean index");
@@ -3844,7 +3892,12 @@ pub fn am_quit(ctx: &AmContext, hosts: &AmHosts<'_>, state_dir: &Path) -> Result
 
 /// `git am --skip`: discard the current patch's partial state, reset the
 /// worktree/index to HEAD, and resume with the next patch.
-pub fn am_skip(ctx: &AmContext, hosts: &AmHosts<'_>, state_dir: &Path) -> Result<()> {
+pub fn am_skip(
+    original_cwd: Option<&std::path::Path>,
+    ctx: &AmContext,
+    hosts: &AmHosts<'_>,
+    state_dir: &Path,
+) -> Result<()> {
     let git_dir: &Path = &ctx.git_dir;
     let format: ObjectFormat = ctx.format;
 
@@ -3861,7 +3914,7 @@ pub fn am_skip(ctx: &AmContext, hosts: &AmHosts<'_>, state_dir: &Path) -> Result
     // branch, in which case the index is simply cleared.
     let refs = FileRefStore::new(git_dir, format);
     let head_oid = head_commit_oid(&refs)?;
-    am_clean_index(ctx, head_oid.as_ref(), head_oid.as_ref())?;
+    am_clean_index(original_cwd, ctx, head_oid.as_ref(), head_oid.as_ref())?;
     let next = read_state_usize(state_dir, "next")?;
     // git's `am_skip` records the skipped commit in `rewritten` too: `<orig> <HEAD>`,
     // where HEAD is the (cleaned) tip at skip time (am.c:2131). The post-rewrite
@@ -3870,6 +3923,7 @@ pub fn am_skip(ctx: &AmContext, hosts: &AmHosts<'_>, state_dir: &Path) -> Result
         record_rebase_rewrite(state_dir, format, next, head_oid)?;
     }
     run_am_series(
+        original_cwd,
         ctx,
         hosts,
         state_dir,
@@ -3881,6 +3935,7 @@ pub fn am_skip(ctx: &AmContext, hosts: &AmHosts<'_>, state_dir: &Path) -> Result
 /// `git am --continue`/`--resolved`: commit the staged resolution of the current
 /// patch using its preserved author/message, then resume with the next patch.
 pub fn am_continue(
+    original_cwd: Option<&std::path::Path>,
     ctx: &AmContext,
     hosts: &AmHosts<'_>,
     state_dir: &Path,
@@ -3956,6 +4011,7 @@ pub fn am_continue(
             }
             AmInteractiveDecision::Skip => {
                 return run_am_series(
+                    original_cwd,
                     ctx,
                     hosts,
                     state_dir,
@@ -3973,6 +4029,7 @@ pub fn am_continue(
     // is enabled and a MERGE_RR is in progress.
     (hosts.rerere_record_resolved)()?;
     run_am_series(
+        original_cwd,
         ctx,
         hosts,
         state_dir,
@@ -3985,6 +4042,7 @@ pub fn am_continue(
 /// any command-line option overrides (git's RESUME_APPLY). The override applies
 /// to this patch only; subsequent patches use the saved session options.
 pub fn am_retry(
+    original_cwd: Option<&std::path::Path>,
     ctx: &AmContext,
     hosts: &AmHosts<'_>,
     state_dir: &Path,
@@ -3992,13 +4050,14 @@ pub fn am_retry(
 ) -> Result<()> {
     am_require_in_progress(state_dir)?;
     let next = read_state_usize(state_dir, "next")?;
-    run_am_series(ctx, hosts, state_dir, next, overrides)
+    run_am_series(original_cwd, ctx, hosts, state_dir, next, overrides)
 }
 
 /// `git am --allow-empty`: when an empty patch stopped the series, record it as
 /// an empty commit and continue. For non-empty/conflicted states, use the normal
 /// `--continue` validation so clean or unmerged indexes are still rejected.
 pub fn am_continue_allow_empty(
+    original_cwd: Option<&std::path::Path>,
     ctx: &AmContext,
     hosts: &AmHosts<'_>,
     state_dir: &Path,
@@ -4021,14 +4080,26 @@ pub fn am_continue_allow_empty(
             .any(|entry| (entry.flags >> 12) & 0x3 != 0)
     });
     if has_unmerged {
-        return am_continue(ctx, hosts, state_dir, AmResumeOverrides::default());
+        return am_continue(
+            original_cwd,
+            ctx,
+            hosts,
+            state_dir,
+            AmResumeOverrides::default(),
+        );
     }
 
     let refs = FileRefStore::new(git_dir, format);
     if let Some(head_oid) = head_commit_oid(&refs)?
         && am_index_is_dirty(ctx, &head_oid)?
     {
-        return am_continue(ctx, hosts, state_dir, AmResumeOverrides::default());
+        return am_continue(
+            original_cwd,
+            ctx,
+            hosts,
+            state_dir,
+            AmResumeOverrides::default(),
+        );
     }
 
     let commit_opts = read_am_commit_opts(state_dir);
@@ -4043,6 +4114,7 @@ pub fn am_continue_allow_empty(
         println!("No changes - recorded it as an empty commit.");
     }
     run_am_series(
+        original_cwd,
         ctx,
         hosts,
         state_dir,
@@ -4062,6 +4134,7 @@ pub fn am_continue_allow_empty(
 /// with no mbox arguments and an existing session) this resumes the empty-patch
 /// stop instead of starting a new run.
 pub fn start_am(
+    original_cwd: Option<&std::path::Path>,
     ctx: &AmContext,
     hosts: &AmHosts<'_>,
     options: &AmOptions,
@@ -4074,7 +4147,7 @@ pub fn start_am(
     let state_dir = git_dir.join("rebase-apply");
 
     if allow_empty_resume && options.mboxes.is_empty() && state_dir.exists() {
-        return am_continue_allow_empty(ctx, hosts, &state_dir);
+        return am_continue_allow_empty(original_cwd, ctx, hosts, &state_dir);
     }
 
     // Starting a new run while one is unfinished is an error in git.
@@ -4137,5 +4210,12 @@ pub fn start_am(
         fs::write(state_dir.join("orig-head"), format!("{head_oid}\n"))?;
     }
 
-    run_am_series(ctx, hosts, &state_dir, 1, AmResumeOverrides::default())
+    run_am_series(
+        original_cwd,
+        ctx,
+        hosts,
+        &state_dir,
+        1,
+        AmResumeOverrides::default(),
+    )
 }

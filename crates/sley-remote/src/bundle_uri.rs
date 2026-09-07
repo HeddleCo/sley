@@ -307,11 +307,13 @@ fn ordered_bundle_entries(list: &BundleUriList) -> Vec<&BundleUriEntry> {
 ///   warned about (upstream's "failed to download bundle from URI" text) and the
 ///   remaining bundles / the normal negotiation still proceed.
 pub fn prefetch_advertised_bundle_uris(
+    policy: &crate::TransportPolicy,
+    config: Option<&sley_config::GitConfig>,
     git_dir: &Path,
     format: ObjectFormat,
     list: &BundleUriList,
 ) -> Result<()> {
-    let client = UreqHttpClient::new();
+    let client = UreqHttpClient::new().with_protocol_policy(policy.clone(), config);
     prefetch_advertised_bundle_uris_with_client(&client, git_dir, format, list)
 }
 

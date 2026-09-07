@@ -26,7 +26,9 @@ A consumer that needs the complete previous facade can use:
 sley = { version = "=0.10.0", features = ["full"] }
 ```
 
-Choose narrower features when possible:
+Choose narrower features when possible. The `tls-rustls`, `tls-native-tls`, and
+`tls-platform-verifier` choices enable `remote`. `fetch-profile` forwards remote
+instrumentation only when the remote dependency is already enabled:
 
 | Feature | Public symbols enabled |
 | --- | --- |
@@ -53,3 +55,179 @@ resolution at `sley_formats::worktree_root_for_git_dir`. Their existing
 `sley_worktree` re-exports remain available. Opening, discovering, reading and
 writing a bare repository no longer requires the worktree engine. No crate was
 merged or removed; the CLI and all oracle scripts remain enrolled.
+
+## Repository and operation policy (rank 1)
+
+The libraries no longer read `GIT_NAMESPACE`, `GIT_ALLOW_PROTOCOL`, or
+`GIT_PROTOCOL_FROM_USER`. Configuration reads no longer activate Unicode policy,
+and there is no process-wide original working directory. The CLI captures its
+transport/namespace environment and original CWD once at its entry point, applies
+`--namespace`, and supplies those values to its operations.
+
+| Removed API / behavior | Explicit replacement |
+| --- | --- |
+| `set_git_namespace_override`, `clear_git_namespace_override`, `get_git_namespace`, `strip_namespace`, `expand_namespace`, `namespace_active` | Construct `sley_core::Namespace::new(raw)` and use `Namespace::{prefix,strip,expand,is_active}`. `Namespace::default()` means the unnamespaced repository. Nested names still expand through `refs/namespaces/` for each component. Put the value in `sley_remote::RemotePolicy::namespace`. |
+| `set_precompose_unicode`, `activate_precompose_unicode`, `precompose_unicode_enabled` | Use `sley_core::PrecomposeUnicode::new(enabled)` or `GitConfig::precompose_unicode()`. Test `PrecomposeUnicode::is_enabled()`. Each configuration snapshot owns its value; copy it into workers. |
+| `precompose_string_if_needed`, `precompose_bytes_if_needed`, `precompose_owned_string_if_needed`, `precompose_path_if_needed`, `precompose_os_str_bytes_if_needed`, `precompose_argv_if_needed` | Call `PrecomposeUnicode::{string,bytes,owned_string,path,os_str_bytes,argv}` on that value, respectively. `has_non_ascii` remains a pure predicate. |
+| `set_original_cwd`, `original_cwd` | Capture the caller's absolute directory outside the library. Mutating entry points take `original_cwd: Option<&Path>`; use `Some(path)` to preserve it during directory pruning and D/F replacement. `None` explicitly selects no protected caller directory. `ReadTreeWorktree` now owns an `original_cwd: Option<PathBuf>` field. |
+| `check_transport_allowed(scheme, config, from_user)` and `is_transport_allowed(scheme, config, from_user)` | The third argument is now `&sley_remote::TransportPolicy` (also exported by `sley_transport`). `allow_protocols: None` uses config/default rules; `Some(vec![])` denies every protocol; a nonempty list overrides config. `from_user: bool` determines whether `allow=user` permits the operation. Neither function reads environment. |
+| Ambient policy in `UreqHttpClient` | Bind the snapshot using `UreqHttpClient::with_protocol_policy(transport_policy, config)`. Initial requests use `transport_policy.from_user`; redirects retain the same allow-list/config and use `from_user=false`. A custom `HttpClient` owns its redirect policy. |
+
+`RemotePolicy` is a cloneable value with `namespace: Namespace` and
+`transport: TransportPolicy`. `FetchOptions`, `PushOptions`, and `CloneOptions`
+now have a required `policy: RemotePolicy` field (their defaults supply the
+default policy). Add `policy: &RemotePolicy` to `LsRemoteRequest`,
+`HttpReceivePackObservationRequest`, and `ReceivePackServerRequest` literals. An observed HTTP push still consumes its observation
+exactly once.
+
+For example, initialize the policy once for a tenant and clone it into options:
+
+```rust
+use sley_core::Namespace;
+use sley_remote::{FetchOptions, RemotePolicy, TransportPolicy};
+
+let policy = RemotePolicy {
+    namespace: Namespace::new("tenant/project"),
+    transport: TransportPolicy {
+        allow_protocols: Some(vec!["https".into(), "ssh".into()]),
+        from_user: false,
+    },
+};
+let options = FetchOptions { policy, ..FetchOptions::default() };
+```
+
+The following signature map lists the changed public engine entry points. Here
+`policy` means `&RemotePolicy`, except that `HttpOperationBatch::with_config`,
+`new_http_client_with_config`, and `prefetch_advertised_bundle_uris` take
+`&TransportPolicy`. `precompose` means `PrecomposeUnicode` and `original_cwd`
+means `Option<&Path>`. Repository-aware worktree operations derive Unicode policy
+from their own config; APIs without a repository/config argument require the
+explicit value. `prefetch_advertised_bundle_uris` additionally takes
+`config: Option<&GitConfig>` immediately after its transport policy.
+
+The following take `original_cwd` before their existing arguments (after `&self` on methods):
+
+- `sley::Repository::push`
+- `sley::Repository::push_actions`
+- `sley::Repository::push_actions_with_cancel`
+- `sley::Repository::push_actions_with_http_client`
+- `sley::Repository::push_actions_with_http_client_and_cancel`
+- `sley::Repository::push_with_cancel`
+- `sley::clone_repository`
+- `sley_remote::clone`
+- `sley_remote::clone_with_http_client`
+- `sley_remote::execute_push_action_plan`
+- `sley_remote::execute_push_plan`
+- `sley_remote::push`
+- `sley_remote::push_actions`
+- `sley_remote::push_actions_with_http_client`
+- `sley_remote::receive_pack_into_local_repository`
+- `sley_remote::receive_pack_reachable_pack_into_local_repository`
+- `sley_remote::receive_pack_stream_into_local_repository`
+- `sley_remote::serve_receive_pack`
+- `sley_remote::update_worktree_for_update_instead`
+- `sley_sequencer::am::am_abort`
+- `sley_sequencer::am::am_continue`
+- `sley_sequencer::am::am_continue_allow_empty`
+- `sley_sequencer::am::am_retry`
+- `sley_sequencer::am::am_skip`
+- `sley_sequencer::am::rebase_apply_abort`
+- `sley_sequencer::am::rebase_apply_continue`
+- `sley_sequencer::am::rebase_apply_skip`
+- `sley_sequencer::am::start_am`
+- `sley_sequencer::am::start_rebase_apply`
+- `sley_sequencer::apply::merge_refuse_if_current_working_directory_becomes_file`
+- `sley_sequencer::apply::merge_remove_worktree_file`
+- `sley_sequencer::apply::merge_write_worktree_file`
+- `sley_sequencer::pick::continue_sequence`
+- `sley_sequencer::pick::pick_revisions`
+- `sley_sequencer::pick::reset_merge_in`
+- `sley_sequencer::pick::rollback`
+- `sley_sequencer::pick::skip_sequence`
+- `sley_sequencer::rebase_drive::complete_action`
+- `sley_sequencer::rebase_drive::create_autostash`
+- `sley_sequencer::rebase_drive::pick_commits`
+- `sley_sequencer::rebase_drive::rebase_abort`
+- `sley_sequencer::rebase_drive::rebase_continue`
+- `sley_sequencer::rebase_drive::rebase_skip`
+- `sley_sequencer::rebase_drive::reset_index_and_worktree_to_commit_for_rebase`
+- `sley_worktree::apply_sparse_checkout`
+- `sley_worktree::apply_sparse_checkout_with_mode`
+- `sley_worktree::checkout_branch`
+- `sley_worktree::checkout_branch_filtered`
+- `sley_worktree::checkout_commit_to_index_and_worktree_sparse`
+- `sley_worktree::checkout_detached`
+- `sley_worktree::checkout_detached_filtered`
+- `sley_worktree::checkout_detached_sparse`
+- `sley_worktree::checkout_index_paths`
+- `sley_worktree::checkout_index_paths_with_database`
+- `sley_worktree::checkout_index_paths_with_database_outcome`
+- `sley_worktree::checkout_index_paths_with_database_outcome_sparse`
+- `sley_worktree::checkout_tree_to_index_and_worktree`
+- `sley_worktree::checkout_two_way_engine`
+- `sley_worktree::materialize_checkout_entries_with_database`
+- `sley_worktree::move_index_and_worktree_path`
+- `sley_worktree::prune_empty_dirs`
+- `sley_worktree::reapply_active_sparse_checkout`
+- `sley_worktree::refuse_if_unpack_entries_turn_cwd_into_file`
+- `sley_worktree::refuse_if_unpack_result_removes_current_directory`
+- `sley_worktree::remove_index_and_worktree_paths`
+- `sley_worktree::remove_path_in_the_way`
+- `sley_worktree::remove_worktree_path`
+- `sley_worktree::reset_index_and_worktree_to_commit`
+- `sley_worktree::reset_index_and_worktree_to_commit_with_process_filter_metadata`
+- `sley_worktree::restore_index_and_worktree_paths_from_head`
+- `sley_worktree::restore_index_and_worktree_paths_from_tree`
+- `sley_worktree::restore_worktree_paths`
+- `sley_worktree::restore_worktree_paths_filtered`
+- `sley_worktree::restore_worktree_paths_from_head`
+- `sley_worktree::restore_worktree_paths_from_tree`
+- `sley_worktree::write_tree_entry_to_worktree`
+- `sley_worktree::write_tree_entry_to_worktree_with_hooks`
+
+The following take `original_cwd`, then `policy` before their existing arguments (after `&self` on methods):
+
+- `sley_remote::push_local_with_report`
+- `sley_remote::push_local_with_report_and_objects`
+
+The following take `policy` before their existing arguments (after `&self` on methods):
+
+- `sley::Repository::ls_remote`
+- `sley::Repository::ls_remote_with_http_client`
+- `sley_remote::HttpOperationBatch::with_config`
+- `sley_remote::hydrate_objects_from_local_promisor_remotes`
+- `sley_remote::hydrate_reachable_from_local_promisor_remotes`
+- `sley_remote::install_fetch_pack_via_git_upload_pack`
+- `sley_remote::install_fetch_pack_via_http_protocol_v2_fetch`
+- `sley_remote::install_fetch_pack_via_http_protocol_v2_fetch_with_want_refs`
+- `sley_remote::install_fetch_pack_via_http_upload_pack`
+- `sley_remote::install_fetch_pack_via_local_upload_pack`
+- `sley_remote::install_fetch_pack_via_local_upload_pack_with_promisor_decision`
+- `sley_remote::install_fetch_pack_via_ssh_upload_pack`
+- `sley_remote::local_fetch_advertisements`
+- `sley_remote::local_have_oids`
+- `sley_remote::local_protocol_v2_ls_refs_advertisements`
+- `sley_remote::ls_remote`
+- `sley_remote::mark_complete_local_refs`
+- `sley_remote::negotiate_only_local`
+- `sley_remote::new_http_client_with_config`
+- `sley_remote::prefetch_advertised_bundle_uris`
+- `sley_remote::prefetch_diff_entry_blobs`
+- `sley_remote::prefetch_promisor_objects`
+- `sley_remote::read_object_maybe_prefetch_promisor`
+- `sley_remote::serve_upload_pack_v2`
+- `sley_remote::serve_upload_pack_v2_stateless_with_config`
+- `sley_remote::serve_upload_pack_v2_with_config`
+- `sley_remote::stage_local_push_quarantine`
+- `sley_remote::upload_pack_features`
+
+The following take `precompose` before their existing arguments (after `&self` on methods):
+
+- `sley_archive::ArchiveConvert<'a>::from_worktree`
+- `sley_worktree::StandardAttributeMatcher::from_worktree_root`
+- `sley_worktree::ignored_index_entries`
+- `sley_worktree::path_matches_ignore`
+- `sley_worktree::path_matches_ignore_with_per_directory`
+- `sley_worktree::path_matches_standard_ignore`
+- `sley_worktree::standard_attributes_for_path`
+- `sley_worktree::standard_ignore_match`

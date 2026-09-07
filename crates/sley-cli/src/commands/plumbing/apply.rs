@@ -2,7 +2,6 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use crate::*;
-use {sley_core, sley_rev, sley_worktree};
 
 use super::add::add_intent_to_add;
 
@@ -315,6 +314,7 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
         .get_bool("core", None, "fileMode")
         .unwrap_or(true);
     let ws_resolver = commands::diff::WhitespaceRuleResolver::from_git_dir_with_config(
+        cli_session.precompose_unicode(),
         git_dir,
         Some(repo_config),
     )?;
@@ -550,6 +550,8 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
     // direct apply below when the pre-image blobs are not available.
     if three_way
         && apply_three_way_path(
+            cli_session.original_cwd.as_deref(),
+            &cli_session.remote_policy,
             git_dir,
             worktree_root,
             format,
@@ -976,6 +978,7 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
             } => {
                 if !cached {
                     apply_write_worktree_file(
+                        cli_session.original_cwd.as_deref(),
                         &worktree_base,
                         worktree_root,
                         git_dir,
@@ -999,7 +1002,11 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
             }
             ApplyAction::Remove { path } => {
                 if !cached {
-                    merge_remove_worktree_file(&worktree_base, path)?;
+                    merge_remove_worktree_file(
+                        cli_session.original_cwd.as_deref(),
+                        &worktree_base,
+                        path,
+                    )?;
                 }
                 if index.is_some() {
                     index_mutations
@@ -1023,7 +1030,11 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
                 // empty (ENOTEMPTY is warn-only) and prune empty leading dirs
                 // via remove_path (t4134).
                 if !cached {
-                    merge_remove_worktree_file(&worktree_base, path)?;
+                    merge_remove_worktree_file(
+                        cli_session.original_cwd.as_deref(),
+                        &worktree_base,
+                        path,
+                    )?;
                 }
                 if index.is_some() {
                     index_mutations
@@ -1067,7 +1078,14 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
             )?;
         }
     } else if intent_to_add && !index_paths.is_empty() {
-        add_intent_to_add(worktree_root, worktree_root, git_dir, format, &index_paths)?;
+        add_intent_to_add(
+            cli_session.precompose_unicode(),
+            worktree_root,
+            worktree_root,
+            git_dir,
+            format,
+            &index_paths,
+        )?;
     }
     // `--reject`: write each `<file>.rej` (git opens it `O_CREAT|O_EXCL`, unlinking
     // a stale one first), then exit 1 because the patch did not fully apply.
@@ -2281,6 +2299,7 @@ fn record_apply_result_overlay(
 /// umask, e.g. `0077` -> `0700`/`0600`, and never widens via `core.sharedRepository`.)
 /// `umask_complement` is `0777 & ~umask`, derived once per invocation.
 fn apply_write_worktree_file(
+    original_cwd: Option<&std::path::Path>,
     worktree_base: &Path,
     filter_worktree_root: &Path,
     git_dir: &Path,
@@ -2303,7 +2322,7 @@ fn apply_write_worktree_file(
     } else {
         content.to_vec()
     };
-    merge_write_worktree_file(worktree_base, path, &content, mode)?;
+    merge_write_worktree_file(original_cwd, worktree_base, path, &content, mode)?;
     // Only regular files carry a umask-derived mode; symlinks/gitlinks are left
     // as `merge_write_worktree_file` created them.
     #[cfg(unix)]
@@ -2446,6 +2465,8 @@ fn read_worktree_patch_blob_bytes_with_eol(
 /// when a pre-image blob was unavailable (the caller falls back to direct apply).
 #[allow(clippy::too_many_arguments)]
 fn apply_three_way_path(
+    original_cwd: Option<&std::path::Path>,
+    policy: &sley_remote::RemotePolicy,
     git_dir: &Path,
     worktree_root: &Path,
     format: ObjectFormat,
@@ -2588,6 +2609,7 @@ fn apply_three_way_path(
 
     let (results, conflicts, _info) =
         commands::merge_rebase::three_way_merge_trees_inner_with_info(
+            policy,
             db,
             config,
             lazy_fetch,
@@ -2604,6 +2626,8 @@ fn apply_three_way_path(
 
     if !check {
         apply_write_three_way(
+            original_cwd,
+            policy,
             git_dir,
             worktree_root,
             format,
@@ -2668,6 +2692,8 @@ fn apply_resolve_preimage_blob(
 /// Write the 3-way merge result: a conflicted index (stages 1/2/3) for conflicts,
 /// stage-0 entries otherwise, plus the worktree (unless `--cached`).
 fn apply_write_three_way(
+    original_cwd: Option<&std::path::Path>,
+    policy: &sley_remote::RemotePolicy,
     git_dir: &Path,
     worktree_root: &Path,
     format: ObjectFormat,
@@ -2723,16 +2749,19 @@ fn apply_write_three_way(
         match result {
             MergePathResult::Resolved(Some((mode, oid))) => {
                 if ours_map.get(path) != Some(&(*mode, *oid)) {
-                    let content = commands::merge_rebase::merge_read_blob(db, oid, lazy_fetch)?;
-                    merge_write_worktree_file(worktree_root, path, &content, *mode)?;
+                    let content =
+                        commands::merge_rebase::merge_read_blob(policy, db, oid, lazy_fetch)?;
+                    merge_write_worktree_file(original_cwd, worktree_root, path, &content, *mode)?;
                 }
             }
-            MergePathResult::Resolved(None) => merge_remove_worktree_file(worktree_root, path)?,
+            MergePathResult::Resolved(None) => {
+                merge_remove_worktree_file(original_cwd, worktree_root, path)?
+            }
             MergePathResult::Conflict { worktree, .. } => match worktree {
                 Some((mode, content)) => {
-                    merge_write_worktree_file(worktree_root, path, content, *mode)?;
+                    merge_write_worktree_file(original_cwd, worktree_root, path, content, *mode)?;
                 }
-                None => merge_remove_worktree_file(worktree_root, path)?,
+                None => merge_remove_worktree_file(original_cwd, worktree_root, path)?,
             },
         }
     }

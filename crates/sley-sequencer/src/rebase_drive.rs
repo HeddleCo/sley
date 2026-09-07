@@ -337,6 +337,7 @@ fn is_submodule_only_status(entry: &sley_worktree::ShortStatusEntry) -> bool {
 // ---------------------------------------------------------------------------
 
 pub fn reset_index_and_worktree_to_commit_for_rebase(
+    original_cwd: Option<&std::path::Path>,
     ctx: &RebaseContext,
     hosts: &RebaseHosts<'_>,
     commit: &ObjectId,
@@ -345,6 +346,7 @@ pub fn reset_index_and_worktree_to_commit_for_rebase(
         return (hosts.reset_submodules)(commit);
     }
     sley_worktree::reset_index_and_worktree_to_commit_with_process_filter_metadata(
+        original_cwd,
         &ctx.worktree_root,
         &ctx.git_dir,
         ctx.format,
@@ -793,15 +795,17 @@ fn print_merge_would_overwrite_untracked(paths: &[Vec<u8>]) {
 }
 
 fn checkout_onto(
+    original_cwd: Option<&std::path::Path>,
     ctx: &RebaseContext,
     hosts: &RebaseHosts<'_>,
     opts: &MachineOpts,
     onto_name: &str,
 ) -> Result<()> {
-    checkout_onto_base(ctx, hosts, opts, onto_name, &opts.onto)
+    checkout_onto_base(original_cwd, ctx, hosts, opts, onto_name, &opts.onto)
 }
 
 fn checkout_onto_base(
+    original_cwd: Option<&std::path::Path>,
     ctx: &RebaseContext,
     hosts: &RebaseHosts<'_>,
     opts: &MachineOpts,
@@ -827,7 +831,8 @@ fn checkout_onto_base(
         eprintln!("error: could not detach HEAD");
         return Err(GitError::Exit(1));
     }
-    if let Err(err) = reset_index_and_worktree_to_commit_for_rebase(ctx, hosts, base) {
+    if let Err(err) = reset_index_and_worktree_to_commit_for_rebase(original_cwd, ctx, hosts, base)
+    {
         apply_autostash(ctx, hosts);
         sheet::remove_merge_state(&ctx.git_dir);
         eprintln!("error: could not detach HEAD");
@@ -862,7 +867,9 @@ fn checkout_onto_base(
 /// sequence editor when interactive, fast-forward leading picks that are
 /// already on the base (`skip_unnecessary_picks`), and hand control to the
 /// drive loop.
+#[allow(clippy::too_many_arguments)] // Policy is explicit alongside the existing operation inputs.
 pub fn complete_action(
+    original_cwd: Option<&std::path::Path>,
     ctx: &RebaseContext,
     hosts: &RebaseHosts<'_>,
     opts: MachineOpts,
@@ -937,12 +944,12 @@ pub fn complete_action(
                 eprintln!("{message}");
             }
             print_edit_todo_recovery_advice();
-            checkout_onto(ctx, hosts, &opts, onto_name)?;
+            checkout_onto(original_cwd, ctx, hosts, &opts, onto_name)?;
             return Err(GitError::Exit(1));
         }
         // Missing-commit check against the original list.
         if check_todo_dropped_commits(ctx, hosts, &new_items, &parsed)? {
-            checkout_onto(ctx, hosts, &opts, onto_name)?;
+            checkout_onto(original_cwd, ctx, hosts, &opts, onto_name)?;
             return Err(GitError::Exit(1));
         }
         new_items = parsed;
@@ -1024,9 +1031,9 @@ pub fn complete_action(
     todo.total_nr = todo.done_nr + sheet::count_commands(&todo.items);
     write_state_atomic(ctx.state_path("end"), format!("{}\n", todo.total_nr))?;
 
-    checkout_onto_base(ctx, hosts, &opts, onto_name, &base)?;
+    checkout_onto_base(original_cwd, ctx, hosts, &opts, onto_name, &base)?;
 
-    pick_commits(ctx, hosts, &opts, &mut todo)
+    pick_commits(original_cwd, ctx, hosts, &opts, &mut todo)
 }
 
 fn stripspace_drop_comments(text: &str, comment: u8) -> String {
@@ -1132,6 +1139,7 @@ fn check_todo_dropped_commits_against_backup(
 // ---------------------------------------------------------------------------
 
 pub fn pick_commits(
+    original_cwd: Option<&std::path::Path>,
     ctx: &RebaseContext,
     hosts: &RebaseHosts<'_>,
     opts: &MachineOpts,
@@ -1168,7 +1176,7 @@ pub fn pick_commits(
             | TodoCommand::Edit
             | TodoCommand::Fixup
             | TodoCommand::Squash => {
-                let stop = pick_one_commit(ctx, hosts, opts, todo, &item)?;
+                let stop = pick_one_commit(original_cwd, ctx, hosts, opts, todo, &item)?;
                 match stop {
                     PickOutcome::Continue => {}
                     PickOutcome::EditStop => return Ok(()),
@@ -1190,13 +1198,13 @@ pub fn pick_commits(
                 do_label(ctx, &item.arg)?;
             }
             TodoCommand::Reset => {
-                if let Err(err) = do_reset(ctx, hosts, opts, &item.arg) {
+                if let Err(err) = do_reset(original_cwd, ctx, hosts, opts, &item.arg) {
                     reschedule_current(ctx, hosts, todo, &item)?;
                     return Err(err);
                 }
             }
             TodoCommand::Merge => {
-                let stop = do_merge(ctx, hosts, opts, todo, &item)?;
+                let stop = do_merge(original_cwd, ctx, hosts, opts, todo, &item)?;
                 match stop {
                     PickOutcome::Continue => {}
                     PickOutcome::EditStop => return Ok(()),
@@ -1352,6 +1360,7 @@ fn do_label(ctx: &RebaseContext, name: &str) -> Result<()> {
 }
 
 fn do_reset(
+    original_cwd: Option<&std::path::Path>,
     ctx: &RebaseContext,
     hosts: &RebaseHosts<'_>,
     opts: &MachineOpts,
@@ -1399,7 +1408,7 @@ fn do_reset(
         eprintln!("Please move or remove them before you reset.");
         return Err(GitError::Exit(1));
     }
-    reset_index_and_worktree_to_commit_for_rebase(ctx, hosts, &target)?;
+    reset_index_and_worktree_to_commit_for_rebase(original_cwd, ctx, hosts, &target)?;
     let refs = ctx.refs();
     let old = head_commit_oid(refs)?.unwrap_or(ObjectId::null(ctx.format));
     let committer = committer_identity_for_reflog(&ctx.config)?;
@@ -1438,6 +1447,7 @@ pub fn create_squash_onto(ctx: &RebaseContext) -> Result<ObjectId> {
 }
 
 fn do_merge(
+    original_cwd: Option<&std::path::Path>,
     ctx: &RebaseContext,
     hosts: &RebaseHosts<'_>,
     opts: &MachineOpts,
@@ -1479,7 +1489,7 @@ fn do_merge(
             return Ok(PickOutcome::Fail(1));
         }
         let target = merge_heads[0].1;
-        reset_index_and_worktree_to_commit_for_rebase(ctx, hosts, &target)?;
+        reset_index_and_worktree_to_commit_for_rebase(original_cwd, ctx, hosts, &target)?;
         let committer = committer_identity_for_reflog(&ctx.config)?;
         detach_head_with_reflog(ctx, head, target, ctx.reflog("merge", None), committer)?;
         return Ok(PickOutcome::Continue);
@@ -1493,7 +1503,7 @@ fn do_merge(
             .copied()
             .eq(merge_heads.iter().map(|(_, oid)| *oid))
     {
-        reset_index_and_worktree_to_commit_for_rebase(ctx, hosts, &record.oid)?;
+        reset_index_and_worktree_to_commit_for_rebase(original_cwd, ctx, hosts, &record.oid)?;
         let committer = committer_identity_for_reflog(&ctx.config)?;
         detach_head_with_reflog(
             ctx,
@@ -1529,6 +1539,7 @@ fn do_merge(
 
     if merge_heads.len() > 1 {
         return do_octopus_merge_commit(
+            original_cwd,
             ctx,
             hosts,
             opts,
@@ -1610,7 +1621,14 @@ fn do_merge(
     write_state_atomic(ctx.state_path("message"), &message)?;
     write_state_atomic(ctx.git_dir.join("MERGE_HEAD"), format!("{merge_head}\n"))?;
 
-    apply_merge_results(ctx, hosts, &results, &ours_map, !conflicts.is_empty())?;
+    apply_merge_results(
+        original_cwd,
+        ctx,
+        hosts,
+        &results,
+        &ours_map,
+        !conflicts.is_empty(),
+    )?;
     if !conflicts.is_empty() {
         let merged_tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
         write_state_atomic(ctx.git_dir.join("AUTO_MERGE"), format!("{merged_tree}\n"))?;
@@ -2083,6 +2101,7 @@ fn create_merge_commit_from_index(
 
 #[allow(clippy::too_many_arguments)]
 fn do_octopus_merge_commit(
+    original_cwd: Option<&std::path::Path>,
     ctx: &RebaseContext,
     hosts: &RebaseHosts<'_>,
     opts: &MachineOpts,
@@ -2134,7 +2153,14 @@ fn do_octopus_merge_commit(
             },
             hosts.promisor_fetch,
         )?;
-        apply_merge_results(ctx, hosts, &results, &ours_map, !conflicts.is_empty())?;
+        apply_merge_results(
+            original_cwd,
+            ctx,
+            hosts,
+            &results,
+            &ours_map,
+            !conflicts.is_empty(),
+        )?;
         if !conflicts.is_empty() {
             return Ok(PickOutcome::Fail(1));
         }
@@ -2165,6 +2191,7 @@ enum PickOutcome {
 
 #[allow(clippy::too_many_arguments)]
 fn pick_one_commit(
+    original_cwd: Option<&std::path::Path>,
     ctx: &RebaseContext,
     hosts: &RebaseHosts<'_>,
     opts: &MachineOpts,
@@ -2213,7 +2240,7 @@ fn pick_one_commit(
             reschedule_current(ctx, hosts, todo, item)?;
             return Ok(PickOutcome::Fail(1));
         }
-        reset_index_and_worktree_to_commit_for_rebase(ctx, hosts, &oid)?;
+        reset_index_and_worktree_to_commit_for_rebase(original_cwd, ctx, hosts, &oid)?;
         let committer = committer_identity_for_reflog(&ctx.config)?;
         detach_head_with_reflog(
             ctx,
@@ -2355,7 +2382,14 @@ fn pick_one_commit(
         })
         .collect();
 
-    apply_merge_results(ctx, hosts, &results, &ours_map, !conflicts.is_empty())?;
+    apply_merge_results(
+        original_cwd,
+        ctx,
+        hosts,
+        &results,
+        &ours_map,
+        !conflicts.is_empty(),
+    )?;
 
     if !conflicts.is_empty() {
         // Conflict stop.
@@ -2672,6 +2706,7 @@ fn write_message_files(
 }
 
 fn apply_merge_results(
+    original_cwd: Option<&std::path::Path>,
     ctx: &RebaseContext,
     hosts: &RebaseHosts<'_>,
     results: &MergePathResults,
@@ -2716,21 +2751,31 @@ fn apply_merge_results(
                     } else {
                         merge_read_blob_with_fetch(&ctx.db(), oid, hosts.promisor_fetch)?
                     };
-                    merge_write_worktree_file(&ctx.worktree_root, path, &content, *mode)?;
+                    merge_write_worktree_file(
+                        original_cwd,
+                        &ctx.worktree_root,
+                        path,
+                        &content,
+                        *mode,
+                    )?;
                 }
             }
             MergePathResult::Resolved(None) => {
                 if ours_map.contains_key(path) {
-                    merge_remove_worktree_file(&ctx.worktree_root, path)?;
+                    merge_remove_worktree_file(original_cwd, &ctx.worktree_root, path)?;
                 }
             }
             MergePathResult::Conflict { worktree, .. } => {
                 if with_conflicts {
                     match worktree {
-                        Some((mode, content)) => {
-                            merge_write_worktree_file(&ctx.worktree_root, path, content, *mode)?
-                        }
-                        None => merge_remove_worktree_file(&ctx.worktree_root, path)?,
+                        Some((mode, content)) => merge_write_worktree_file(
+                            original_cwd,
+                            &ctx.worktree_root,
+                            path,
+                            content,
+                            *mode,
+                        )?,
+                        None => merge_remove_worktree_file(original_cwd, &ctx.worktree_root, path)?,
                     }
                 }
             }
@@ -3660,7 +3705,11 @@ pub fn cleanup_rewritten_refs(ctx: &RebaseContext) {
 // --continue / --skip / --abort / --quit / --edit-todo
 // ---------------------------------------------------------------------------
 
-pub fn rebase_continue(ctx: &RebaseContext, hosts: &RebaseHosts<'_>) -> Result<()> {
+pub fn rebase_continue(
+    original_cwd: Option<&std::path::Path>,
+    ctx: &RebaseContext,
+    hosts: &RebaseHosts<'_>,
+) -> Result<()> {
     let db = ctx.db();
     let opts = sheet::read_rebase_state(&ctx.git_dir, ctx.format)?;
 
@@ -3694,7 +3743,7 @@ pub fn rebase_continue(ctx: &RebaseContext, hosts: &RebaseHosts<'_>) -> Result<(
     record_stopped_sha_rewritten(ctx, &todo)?;
     let _ = fs::remove_file(ctx.state_path("stopped-sha"));
 
-    pick_commits(ctx, hosts, &opts, &mut todo)
+    pick_commits(original_cwd, ctx, hosts, &opts, &mut todo)
 }
 
 fn record_stopped_sha_rewritten(ctx: &RebaseContext, todo: &TodoList) -> Result<()> {
@@ -3849,13 +3898,17 @@ fn next_is_fixup_first(todo: &TodoList) -> bool {
         .is_some_and(|item| item.command.is_fixup())
 }
 
-pub fn rebase_skip(ctx: &RebaseContext, hosts: &RebaseHosts<'_>) -> Result<()> {
+pub fn rebase_skip(
+    original_cwd: Option<&std::path::Path>,
+    ctx: &RebaseContext,
+    hosts: &RebaseHosts<'_>,
+) -> Result<()> {
     let db = ctx.db();
     let opts = sheet::read_rebase_state(&ctx.git_dir, ctx.format)?;
     let refs = ctx.refs();
     let head =
         head_commit_oid(refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
-    reset_index_and_worktree_to_commit_for_rebase(ctx, hosts, &head)?;
+    reset_index_and_worktree_to_commit_for_rebase(original_cwd, ctx, hosts, &head)?;
     let _ = fs::remove_file(ctx.git_dir.join("CHERRY_PICK_HEAD"));
     let _ = fs::remove_file(ctx.git_dir.join("MERGE_MSG"));
     let _ = fs::remove_file(ctx.git_dir.join("AUTO_MERGE"));
@@ -3866,13 +3919,17 @@ pub fn rebase_skip(ctx: &RebaseContext, hosts: &RebaseHosts<'_>) -> Result<()> {
     }
     record_stopped_sha_rewritten(ctx, &todo)?;
     let _ = fs::remove_file(ctx.state_path("stopped-sha"));
-    pick_commits(ctx, hosts, &opts, &mut todo)
+    pick_commits(original_cwd, ctx, hosts, &opts, &mut todo)
 }
 
-pub fn rebase_abort(ctx: &RebaseContext, hosts: &RebaseHosts<'_>) -> Result<()> {
+pub fn rebase_abort(
+    original_cwd: Option<&std::path::Path>,
+    ctx: &RebaseContext,
+    hosts: &RebaseHosts<'_>,
+) -> Result<()> {
     let opts = sheet::read_rebase_state(&ctx.git_dir, ctx.format)?;
     let target = peel_to_commit(&ctx.db(), ctx.format, &opts.orig_head)?;
-    reset_index_and_worktree_to_commit_for_rebase(ctx, hosts, &target)?;
+    reset_index_and_worktree_to_commit_for_rebase(original_cwd, ctx, hosts, &target)?;
     let refs = ctx.refs();
     let committer = committer_identity_for_reflog(&ctx.config)?;
     let old_head = head_commit_oid(refs)?.unwrap_or(ObjectId::null(ctx.format));
@@ -4027,6 +4084,7 @@ pub fn rebase_edit_todo(ctx: &RebaseContext, hosts: &RebaseHosts<'_>) -> Result<
 /// `--autostash`): stash the dirty state into the active backend's state dir
 /// and reset back to a clean HEAD.
 pub fn create_autostash(
+    original_cwd: Option<&std::path::Path>,
     ctx: &RebaseContext,
     hosts: &RebaseHosts<'_>,
     use_apply_backend: bool,
@@ -4064,7 +4122,7 @@ pub fn create_autostash(
     let refs = ctx.refs();
     let head =
         head_commit_oid(refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
-    reset_index_and_worktree_to_commit_for_rebase(ctx, hosts, &head)?;
+    reset_index_and_worktree_to_commit_for_rebase(original_cwd, ctx, hosts, &head)?;
     Ok(())
 }
 

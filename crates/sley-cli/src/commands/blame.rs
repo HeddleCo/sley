@@ -29,7 +29,6 @@
 //! `git blame` exactly, and for explicit revisions it always matches.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use {sley_index, sley_rev, sley_worktree};
 // Glob the crate root for shared plumbing (RepositoryContext, repository_abbrev,
 // FileObjectDatabase, FileRefStore, Commit, Tree, the identity/date formatting
 // helpers, and so on). See commands::stash for the rationale: a submodule can
@@ -44,6 +43,7 @@ use sley_rev::blame::{
 /// The object-read hook blame's walk uses: plain repository reads plus
 /// promisor hydration when partial-clone lazy fetching is enabled.
 struct BlamePrefetchReader<'a> {
+    policy: &'a sley_remote::RemotePolicy,
     db: &'a FileObjectDatabase,
     lazy_fetch: bool,
 }
@@ -53,7 +53,7 @@ impl BlameObjectSource for BlamePrefetchReader<'_> {
         &self,
         oid: &ObjectId,
     ) -> Result<std::sync::Arc<sley_object::EncodedObject>> {
-        read_object_maybe_prefetch_promisor(self.db, oid, self.lazy_fetch)
+        read_object_maybe_prefetch_promisor(self.policy, self.db, oid, self.lazy_fetch)
     }
 }
 
@@ -245,6 +245,7 @@ fn run_blame(
     let format = repo.format();
     let db = repo.objects();
     let blame_reader = BlamePrefetchReader {
+        policy: &cli_session.remote_policy,
         db,
         lazy_fetch: cli_session.lazy_fetch(),
     };
@@ -321,7 +322,13 @@ fn run_blame(
         resolver: repo
             .worktree_root()
             .ok()
-            .and_then(|root| sley_worktree::StandardAttributeMatcher::from_worktree_root(root).ok())
+            .and_then(|root| {
+                sley_worktree::StandardAttributeMatcher::from_worktree_root(
+                    cli_session.precompose_unicode(),
+                    root,
+                )
+                .ok()
+            })
             .map(|attrs| {
                 commands::userdiff::UserdiffResolver::with_attributes(
                     Some(attrs),
@@ -1140,7 +1147,8 @@ fn read_index_blob(
     }) else {
         return Ok(None);
     };
-    let object = read_object_maybe_prefetch_promisor(db, &entry.oid, reader.lazy_fetch)?;
+    let object =
+        read_object_maybe_prefetch_promisor(reader.policy, db, &entry.oid, reader.lazy_fetch)?;
     if object.object_type != ObjectType::Blob {
         return Ok(None);
     }

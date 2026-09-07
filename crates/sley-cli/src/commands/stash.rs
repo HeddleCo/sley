@@ -1,7 +1,6 @@
 //! `git stash` and its subcommands
 //! (push/save/pop/apply/branch/clear/drop/create/store/show/list).
 
-use {sley_config, sley_core, sley_diff_merge, sley_rev, sley_worktree};
 // Command modules pull their shared plumbing from the crate root. A glob import
 // works because a submodule can access its ancestor module's items (including
 // private ones), so every helper, type, and re-export visible at the crate root
@@ -515,6 +514,8 @@ fn apply_stash_entry(
         style: stash_apply_conflict_style(&git_dir),
     };
     let outcome = apply_stash_via_merge(
+        cli_session.original_cwd.as_deref(),
+        &cli_session.remote_policy,
         &db,
         format,
         &stash_state,
@@ -532,7 +533,13 @@ fn apply_stash_entry(
             )));
         }
         let untracked_commit = Commit::parse(format, &untracked_object.body)?;
-        restore_stash_tree_to_worktree(&worktree_root, &db, format, &untracked_commit.tree)?;
+        restore_stash_tree_to_worktree(
+            cli_session.original_cwd.as_deref(),
+            &worktree_root,
+            &db,
+            format,
+            &untracked_commit.tree,
+        )?;
     }
     if !options.quiet {
         if tracked_tree_unchanged {
@@ -596,6 +603,8 @@ fn stash_apply_conflict_style(git_dir: &Path) -> sley_diff_merge::ConflictStyle 
 /// Run the 3-way merge that applies a stash onto the current index + worktree and
 /// materialize the result. Mirrors `do_apply_stash` in git's builtin/stash.c.
 fn apply_stash_via_merge(
+    original_cwd: Option<&std::path::Path>,
+    policy: &sley_remote::RemotePolicy,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     state: &StashApplyState<'_>,
@@ -642,6 +651,7 @@ fn apply_stash_via_merge(
             None
         } else {
             let (idx_results, idx_conflicts) = three_way_merge_trees(
+                policy,
                 db,
                 config,
                 lazy_fetch,
@@ -671,6 +681,7 @@ fn apply_stash_via_merge(
     let base_map = sley_diff_merge::flatten_tree(db, format, state.base_tree)?;
     let theirs_map = sley_diff_merge::flatten_tree(db, format, state.stash_tree)?;
     let (results, conflicts) = three_way_merge_trees_styled(
+        policy,
         db,
         config,
         lazy_fetch,
@@ -689,6 +700,8 @@ fn apply_stash_via_merge(
     verify_stash_apply_safe(state.worktree_root, format, &ours_map, &results)?;
 
     apply_stash_merge_results(
+        original_cwd,
+        policy,
         state.worktree_root,
         state.git_dir,
         db,
@@ -936,6 +949,8 @@ fn verify_stash_apply_safe(
 /// conflicts) and the worktree (write resolved/conflict-marker blobs, remove
 /// deletions). Mirrors replay.rs' `apply_merge_results_to_index_and_worktree`.
 fn apply_stash_merge_results(
+    original_cwd: Option<&std::path::Path>,
+    policy: &sley_remote::RemotePolicy,
     worktree_root: &Path,
     git_dir: &Path,
     db: &FileObjectDatabase,
@@ -972,20 +987,20 @@ fn apply_stash_merge_results(
         match result {
             MergePathResult::Resolved(Some((mode, oid))) => {
                 if ours_map.get(path) != Some(&(*mode, *oid)) {
-                    let content = merge_read_blob(db, oid, lazy_fetch)?;
-                    merge_write_worktree_file(worktree_root, path, &content, *mode)?;
+                    let content = merge_read_blob(policy, db, oid, lazy_fetch)?;
+                    merge_write_worktree_file(original_cwd, worktree_root, path, &content, *mode)?;
                 }
             }
             MergePathResult::Resolved(None) => {
                 if ours_map.contains_key(path) {
-                    merge_remove_worktree_file(worktree_root, path)?;
+                    merge_remove_worktree_file(original_cwd, worktree_root, path)?;
                 }
             }
             MergePathResult::Conflict { worktree, .. } => match worktree {
                 Some((mode, content)) => {
-                    merge_write_worktree_file(worktree_root, path, content, *mode)?
+                    merge_write_worktree_file(original_cwd, worktree_root, path, content, *mode)?
                 }
-                None => merge_remove_worktree_file(worktree_root, path)?,
+                None => merge_remove_worktree_file(original_cwd, worktree_root, path)?,
             },
         }
     }
@@ -1088,15 +1103,24 @@ fn stash_changed_pathbufs(paths: &BTreeSet<Vec<u8>>) -> Result<Vec<PathBuf>> {
 }
 
 fn restore_stash_tree_to_worktree(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     tree_oid: &ObjectId,
 ) -> Result<()> {
-    restore_stash_tree_entries_to_worktree(worktree_root, db, format, tree_oid, Vec::new())
+    restore_stash_tree_entries_to_worktree(
+        original_cwd,
+        worktree_root,
+        db,
+        format,
+        tree_oid,
+        Vec::new(),
+    )
 }
 
 fn restore_stash_tree_entries_to_worktree(
+    original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
     db: &FileObjectDatabase,
     format: ObjectFormat,
@@ -1118,7 +1142,14 @@ fn restore_stash_tree_entries_to_worktree(
         }
         path.extend_from_slice(entry.name);
         if entry.mode == 0o040000 {
-            restore_stash_tree_entries_to_worktree(worktree_root, db, format, &entry.oid, path)?;
+            restore_stash_tree_entries_to_worktree(
+                original_cwd,
+                worktree_root,
+                db,
+                format,
+                &entry.oid,
+                path,
+            )?;
             continue;
         }
         let object = db.read_object(&entry.oid)?;
@@ -1129,7 +1160,7 @@ fn restore_stash_tree_entries_to_worktree(
                 object.object_type.as_str()
             )));
         }
-        merge_write_worktree_file(worktree_root, &path, &object.body, entry.mode)?;
+        merge_write_worktree_file(original_cwd, worktree_root, &path, &object.body, entry.mode)?;
     }
     Ok(())
 }
@@ -1530,7 +1561,12 @@ fn cmd_stash_push(cli_session: &crate::session::CliSession, args: &[String]) -> 
         return Ok(());
     };
 
-    store_created_stash(created, quiet, keep_index)
+    store_created_stash(
+        cli_session.original_cwd.as_deref(),
+        created,
+        quiet,
+        keep_index,
+    )
 }
 
 fn stash_pathspec_from_file_requires_value_error<T>() -> Result<T> {
@@ -1613,7 +1649,10 @@ fn stash_push_patch(
         &git_dir,
         &common_git_dir,
         &worktree_root,
-        &sley_core::original_cwd().unwrap_or_else(|| cli_session.cwd().to_path_buf()),
+        &cli_session
+            .original_cwd
+            .clone()
+            .unwrap_or_else(|| cli_session.cwd().to_path_buf()),
         format,
         &original_entries,
         pathspecs,
@@ -1963,10 +2002,20 @@ fn cmd_stash_save(cli_session: &crate::session::CliSession, args: &[String]) -> 
         }
         return Ok(());
     };
-    store_created_stash(created, quiet, keep_index)
+    store_created_stash(
+        cli_session.original_cwd.as_deref(),
+        created,
+        quiet,
+        keep_index,
+    )
 }
 
-fn store_created_stash(created: CreatedStash, quiet: bool, keep_index: bool) -> Result<()> {
+fn store_created_stash(
+    original_cwd: Option<&std::path::Path>,
+    created: CreatedStash,
+    quiet: bool,
+    keep_index: bool,
+) -> Result<()> {
     record_created_stash(&created)?;
     if !quiet {
         println!(
@@ -1974,7 +2023,7 @@ fn store_created_stash(created: CreatedStash, quiet: bool, keep_index: bool) -> 
             created.message
         );
     }
-    cleanup_stored_stash(created, quiet, keep_index)
+    cleanup_stored_stash(original_cwd, created, quiet, keep_index)
 }
 
 fn record_created_stash(created: &CreatedStash) -> Result<()> {
@@ -2009,7 +2058,12 @@ fn commit_stash_store_plan(
     Ok(true)
 }
 
-fn cleanup_stored_stash(created: CreatedStash, quiet: bool, keep_index: bool) -> Result<()> {
+fn cleanup_stored_stash(
+    original_cwd: Option<&std::path::Path>,
+    created: CreatedStash,
+    quiet: bool,
+    keep_index: bool,
+) -> Result<()> {
     if !created.staged_worktree_conflicts.is_empty() {
         report_stash_staged_worktree_conflicts(&created.staged_worktree_conflicts, quiet);
         return Err(GitError::Exit(1));
@@ -2028,6 +2082,7 @@ fn cleanup_stored_stash(created: CreatedStash, quiet: bool, keep_index: bool) ->
                 &created.head_oid
             };
             sley_worktree::reset_index_and_worktree_to_commit(
+                original_cwd,
                 &created.worktree_root,
                 &created.git_dir,
                 created.format,
@@ -2036,6 +2091,7 @@ fn cleanup_stored_stash(created: CreatedStash, quiet: bool, keep_index: bool) ->
         }
     } else if keep_index {
         sley_worktree::restore_worktree_paths(
+            original_cwd,
             &created.worktree_root,
             &created.git_dir,
             created.format,
@@ -2043,6 +2099,7 @@ fn cleanup_stored_stash(created: CreatedStash, quiet: bool, keep_index: bool) ->
         )?;
     } else {
         sley_worktree::restore_index_and_worktree_paths_from_head(
+            original_cwd,
             &created.worktree_root,
             &created.git_dir,
             created.format,
@@ -2093,6 +2150,8 @@ fn create_stash_commit(
     let git_dir = cli_session.git_dir()?;
     let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
     create_stash_commit_at(
+        cli_session.original_cwd.as_deref(),
+        cli_session.precompose_unicode(),
         &git_dir,
         &worktree_root,
         cli_session.cwd(),
@@ -2108,6 +2167,8 @@ fn create_stash_commit(
 
 #[allow(clippy::too_many_arguments)]
 fn create_stash_commit_at(
+    original_cwd: Option<&Path>,
+    precompose: sley_core::PrecomposeUnicode,
     git_dir: &Path,
     worktree_root: &Path,
     cwd: &Path,
@@ -2159,7 +2220,8 @@ fn create_stash_commit_at(
     let pathspec = if pathspecs.is_empty() {
         None
     } else {
-        Some(LsFilesPathspec::new(
+        Some(LsFilesPathspec::with_precompose(
+            precompose,
             &cwd,
             &worktree_root,
             true,
@@ -2320,7 +2382,9 @@ fn create_stash_commit_at(
         index_oid: index_commit,
         git_dir,
         common_git_dir,
-        preserved_cwd: sley_core::original_cwd().unwrap_or_else(|| cwd.clone()),
+        preserved_cwd: original_cwd
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| cwd.clone()),
         worktree_root,
         untracked_paths,
         pathspec_paths,
@@ -3521,13 +3585,15 @@ fn cmd_stash_show(cli_session: &crate::session::CliSession, args: &[String]) -> 
             if !has_visual_mode {
                 show_stat = true;
             }
+            let lazy_fetch_adapter_1 =
+                crate::diff_lazy_fetch(&cli_session.remote_policy, cli_session.lazy_fetch());
             let stat_entries = if show_numstat || show_stat || compact_summary || show_shortstat {
                 collect_diff_stat_entries(
                     &entries,
                     &db,
                     None,
                     false,
-                    crate::diff_lazy_fetch(cli_session.lazy_fetch()),
+                    lazy_fetch_adapter_1.as_option(),
                 )?
             } else {
                 Vec::new()
@@ -3579,6 +3645,10 @@ fn cmd_stash_show(cli_session: &crate::session::CliSession, args: &[String]) -> 
                     writeln!(stdout)?;
                 }
                 for entry in &entries {
+                    let lazy_fetch_adapter_2 = crate::diff_lazy_fetch(
+                        &cli_session.remote_policy,
+                        cli_session.lazy_fetch(),
+                    );
                     let options = DiffRenderOptions {
                         line_indicators: sley_diff_merge::render::LineIndicators::default(),
                         suppress_blank_empty: false,
@@ -3586,7 +3656,7 @@ fn cmd_stash_show(cli_session: &crate::session::CliSession, args: &[String]) -> 
                         anchors: &[],
                         allow_textconv: false,
                         db: &db,
-                        lazy_fetch: crate::diff_lazy_fetch(cli_session.lazy_fetch()),
+                        lazy_fetch: lazy_fetch_adapter_2.as_option(),
                         worktree_root: None,
                         use_worktree_new: false,
                         format,
@@ -3743,6 +3813,7 @@ fn cmd_stash_list(cli_session: &crate::session::CliSession, args: &[String]) -> 
             };
             if options.combined_patch {
                 write_stash_list_combined_patch(
+                    &cli_session.remote_policy,
                     &mut io::stdout(),
                     &db,
                     format,
@@ -3751,6 +3822,7 @@ fn cmd_stash_list(cli_session: &crate::session::CliSession, args: &[String]) -> 
                 )?;
             } else {
                 write_stash_list_patch(
+                    &cli_session.remote_policy,
                     &mut io::stdout(),
                     &common_git_dir,
                     &db,
@@ -4048,6 +4120,7 @@ fn stash_list_age_filters_match(commit: &Commit, options: &StashListOptions) -> 
 }
 
 fn write_stash_list_patch(
+    policy: &sley_remote::RemotePolicy,
     stdout: &mut impl Write,
     common_git_dir: &Path,
     db: &FileObjectDatabase,
@@ -4070,6 +4143,7 @@ fn write_stash_list_patch(
         .unwrap_or(7)
         .min(format.hex_len());
     for entry in &entries {
+        let lazy_fetch_adapter_3 = crate::diff_lazy_fetch(policy, lazy_fetch);
         let options = DiffRenderOptions {
             line_indicators: sley_diff_merge::render::LineIndicators::default(),
             suppress_blank_empty: false,
@@ -4077,7 +4151,7 @@ fn write_stash_list_patch(
             anchors: &[],
             allow_textconv: false,
             db,
-            lazy_fetch: crate::diff_lazy_fetch(lazy_fetch),
+            lazy_fetch: lazy_fetch_adapter_3.as_option(),
             worktree_root: None,
             use_worktree_new: false,
             format,
@@ -4110,6 +4184,7 @@ fn write_stash_list_patch(
 }
 
 fn write_stash_list_combined_patch(
+    policy: &sley_remote::RemotePolicy,
     stdout: &mut impl Write,
     db: &FileObjectDatabase,
     format: ObjectFormat,
@@ -4145,9 +4220,9 @@ fn write_stash_list_combined_patch(
         let Some((_, index_oid)) = index_entry else {
             continue;
         };
-        let base_content = merge_read_blob(db, base_oid, lazy_fetch)?;
-        let index_content = merge_read_blob(db, index_oid, lazy_fetch)?;
-        let result_content = merge_read_blob(db, result_oid, lazy_fetch)?;
+        let base_content = merge_read_blob(policy, db, base_oid, lazy_fetch)?;
+        let index_content = merge_read_blob(policy, db, index_oid, lazy_fetch)?;
+        let result_content = merge_read_blob(policy, db, result_oid, lazy_fetch)?;
         let mut body = Vec::new();
         if !sley_diff_merge::render::render_combined(
             &mut body,
@@ -4399,10 +4474,14 @@ fn stash_export_identity() -> Vec<u8> {
 /// the stash commit oid without touching `refs/stash`, `None` when the tree
 /// is clean.
 pub(crate) fn create_stash_for_autostash_at(
+    original_cwd: Option<&std::path::Path>,
+    precompose: sley_core::PrecomposeUnicode,
     git_dir: &Path,
     cwd: &Path,
 ) -> Result<Option<ObjectId>> {
     Ok(create_stash_commit_at(
+        original_cwd,
+        precompose,
         git_dir,
         cwd,
         cwd,
@@ -4449,6 +4528,8 @@ pub(crate) fn store_stash_commit_at(
 /// `git stash apply <oid>` with all output suppressed; `Ok(false)` when the
 /// stash cannot be applied cleanly (the caller stores it instead).
 pub(crate) fn apply_stash_commit_quietly_at(
+    original_cwd: Option<&std::path::Path>,
+    policy: &sley_remote::RemotePolicy,
     git_dir: &Path,
     worktree_root: &Path,
     stash_oid: &ObjectId,
@@ -4506,6 +4587,8 @@ pub(crate) fn apply_stash_commit_quietly_at(
         style: stash_apply_conflict_style(git_dir),
     };
     match apply_stash_via_merge(
+        original_cwd,
+        policy,
         &db,
         format,
         &stash_state,
@@ -4525,7 +4608,13 @@ pub(crate) fn apply_stash_commit_quietly_at(
         let Ok(untracked_commit) = Commit::parse(format, &untracked_object.body) else {
             return Ok(false);
         };
-        restore_stash_tree_to_worktree(worktree_root, &db, format, &untracked_commit.tree)?;
+        restore_stash_tree_to_worktree(
+            original_cwd,
+            worktree_root,
+            &db,
+            format,
+            &untracked_commit.tree,
+        )?;
     }
     Ok(true)
 }

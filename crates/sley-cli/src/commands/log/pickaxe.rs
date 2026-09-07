@@ -1,5 +1,4 @@
 use super::*;
-use {sley_diff_merge, sley_object, sley_rev};
 
 pub(super) enum PickaxeSpec {
     /// `-S<string>`: count occurrences of the needle in the old vs new blob; a

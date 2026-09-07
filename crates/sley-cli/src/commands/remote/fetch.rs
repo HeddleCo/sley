@@ -39,6 +39,7 @@ pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String
     let mut source = None::<String>;
     let mut refspecs = Vec::new();
     let mut options = FetchOptions {
+        policy: cli_session.remote_policy.clone(),
         quiet: false,
         progress: None,
         auto_follow_tags: true,
@@ -450,27 +451,30 @@ pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String
             return Err(GitError::Exit(128));
         }
         let remotes = fetch_all_remote_names(config);
-        fetch_multiple_remotes(FetchMultipleRequest {
-            git_dir,
-            format,
-            worktree_root: cwd,
-            config,
-            current_branch: current_branch.as_deref(),
-            resolution: context.resolution(),
-            command_context: &context,
-            transport_config: &transport_config,
-            remotes,
-            refspecs: &refspecs,
-            options: &options,
-            prefetch,
-            filter_option_explicit,
-            recurse_submodules_cli,
-            recurse_submodules_default,
-            submodule_prefix: &submodule_prefix,
-            jobs,
-            server_options: &server_options,
-            server_options_from_cli,
-        })?;
+        fetch_multiple_remotes(
+            &cli_session.remote_policy,
+            FetchMultipleRequest {
+                git_dir,
+                format,
+                worktree_root: cwd,
+                config,
+                current_branch: current_branch.as_deref(),
+                resolution: context.resolution(),
+                command_context: &context,
+                transport_config: &transport_config,
+                remotes,
+                refspecs: &refspecs,
+                options: &options,
+                prefetch,
+                filter_option_explicit,
+                recurse_submodules_cli,
+                recurse_submodules_default,
+                submodule_prefix: &submodule_prefix,
+                jobs,
+                server_options: &server_options,
+                server_options_from_cli,
+            },
+        )?;
         if options.refetch {
             trace2_fetch_refetch_maintenance();
         }
@@ -484,27 +488,30 @@ pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String
         names.push(source.take().unwrap());
         names.append(&mut refspecs);
         let remotes = resolve_remote_or_group_names(config, &names)?;
-        fetch_multiple_remotes(FetchMultipleRequest {
-            git_dir,
-            format,
-            worktree_root: cwd,
-            config,
-            current_branch: current_branch.as_deref(),
-            resolution: context.resolution(),
-            command_context: &context,
-            transport_config: &transport_config,
-            remotes,
-            refspecs: &refspecs,
-            options: &options,
-            prefetch,
-            filter_option_explicit,
-            recurse_submodules_cli,
-            recurse_submodules_default,
-            submodule_prefix: &submodule_prefix,
-            jobs,
-            server_options: &server_options,
-            server_options_from_cli,
-        })?;
+        fetch_multiple_remotes(
+            &cli_session.remote_policy,
+            FetchMultipleRequest {
+                git_dir,
+                format,
+                worktree_root: cwd,
+                config,
+                current_branch: current_branch.as_deref(),
+                resolution: context.resolution(),
+                command_context: &context,
+                transport_config: &transport_config,
+                remotes,
+                refspecs: &refspecs,
+                options: &options,
+                prefetch,
+                filter_option_explicit,
+                recurse_submodules_cli,
+                recurse_submodules_default,
+                submodule_prefix: &submodule_prefix,
+                jobs,
+                server_options: &server_options,
+                server_options_from_cli,
+            },
+        )?;
         if options.refetch {
             trace2_fetch_refetch_maintenance();
         }
@@ -517,17 +524,20 @@ pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String
         sley_remote::plan_fetch_repository(config, current_branch.as_deref(), source.as_deref());
     let source = repository_plan.remote;
     if options.negotiate_only {
-        return run_negotiate_only(NegotiateOnlyRequest {
-            git_dir,
-            format,
-            config,
-            transport_config: &transport_config,
-            source: &source,
-            options: &options,
-            recurse_submodules_cli,
-            cwd,
-            resolution: context.resolution(),
-        });
+        return run_negotiate_only(
+            &cli_session.remote_policy,
+            NegotiateOnlyRequest {
+                git_dir,
+                format,
+                config,
+                transport_config: &transport_config,
+                source: &source,
+                options: &options,
+                recurse_submodules_cli,
+                cwd,
+                resolution: context.resolution(),
+            },
+        );
     }
     // When no refspecs are given on the command line and the current branch's
     // `branch.<name>.remote` is the remote we're fetching, git's get_ref_map adds
@@ -575,6 +585,7 @@ pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String
     // Colon / mixed refspecs (`<oid>:refs/heads/copy`, plus named refs) still
     // need the protocol-v0 unadvertised gate (t5516 #99 fetch exact oid).
     reject_exact_oid_sources_if_disallowed(
+        &cli_session.remote_policy,
         format,
         &source,
         &effective_refspecs,
@@ -639,25 +650,28 @@ pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String
         recurse_submodules_cli,
         recurse_submodules_default,
     );
-    fetch_populated_submodules_after_superproject(FetchSubmoduleRequest {
-        git_dir,
-        format,
-        worktree_root: cwd,
-        runtime_cwd: cwd,
-        config,
-        recurse_submodules,
-        default_recurse_submodules: recurse_submodules_default,
-        source: &source,
-        changed_gitlinks: changed_gitlinks_for_fetch(
+    fetch_populated_submodules_after_superproject(
+        &cli_session.remote_policy,
+        FetchSubmoduleRequest {
             git_dir,
             format,
-            &before_fetch_refs,
-            &outcome,
-        )?,
-        options: &options,
-        submodule_prefix: &submodule_prefix,
-        jobs,
-    })?;
+            worktree_root: cwd,
+            runtime_cwd: cwd,
+            config,
+            recurse_submodules,
+            default_recurse_submodules: recurse_submodules_default,
+            source: &source,
+            changed_gitlinks: changed_gitlinks_for_fetch(
+                git_dir,
+                format,
+                &before_fetch_refs,
+                &outcome,
+            )?,
+            options: &options,
+            submodule_prefix: &submodule_prefix,
+            jobs,
+        },
+    )?;
     Ok(())
 }
 
@@ -683,7 +697,10 @@ struct FetchMultipleRequest<'a> {
     server_options_from_cli: bool,
 }
 
-fn fetch_multiple_remotes(req: FetchMultipleRequest<'_>) -> Result<()> {
+fn fetch_multiple_remotes(
+    policy: &sley_remote::RemotePolicy,
+    req: FetchMultipleRequest<'_>,
+) -> Result<()> {
     if req.server_options_from_cli && configured_legacy_protocol(Some(req.config)) {
         eprintln!("fatal: server options require protocol version 2 or later");
         eprintln!("fatal: see protocol.version in 'git help config' for more details");
@@ -762,25 +779,28 @@ fn fetch_multiple_remotes(req: FetchMultipleRequest<'_>) -> Result<()> {
             req.recurse_submodules_cli,
             req.recurse_submodules_default,
         );
-        fetch_populated_submodules_after_superproject(FetchSubmoduleRequest {
-            git_dir: req.git_dir,
-            format: req.format,
-            worktree_root: req.worktree_root,
-            runtime_cwd: req.resolution.cwd,
-            config: req.config,
-            recurse_submodules,
-            default_recurse_submodules: req.recurse_submodules_default,
-            source: &remote,
-            changed_gitlinks: changed_gitlinks_for_fetch(
-                req.git_dir,
-                req.format,
-                &before_fetch_refs,
-                &outcome,
-            )?,
-            options: &remote_options,
-            submodule_prefix: req.submodule_prefix,
-            jobs: req.jobs,
-        })?;
+        fetch_populated_submodules_after_superproject(
+            policy,
+            FetchSubmoduleRequest {
+                git_dir: req.git_dir,
+                format: req.format,
+                worktree_root: req.worktree_root,
+                runtime_cwd: req.resolution.cwd,
+                config: req.config,
+                recurse_submodules,
+                default_recurse_submodules: req.recurse_submodules_default,
+                source: &remote,
+                changed_gitlinks: changed_gitlinks_for_fetch(
+                    req.git_dir,
+                    req.format,
+                    &before_fetch_refs,
+                    &outcome,
+                )?,
+                options: &remote_options,
+                submodule_prefix: req.submodule_prefix,
+                jobs: req.jobs,
+            },
+        )?;
     }
     if failed {
         return Err(GitError::Exit(1));
@@ -971,6 +991,7 @@ impl Drop for CurrentDirGuard {
 }
 
 pub(crate) fn fetch_populated_submodules_after_superproject(
+    policy: &sley_remote::RemotePolicy,
     req: FetchSubmoduleRequest<'_>,
 ) -> Result<()> {
     if req.recurse_submodules == FetchRecurseSubmodules::Off {
@@ -1055,8 +1076,12 @@ pub(crate) fn fetch_populated_submodules_after_superproject(
         let nested_transport_config =
             transport_policy_config_for_paths(fetch_cwd, Some(&sub_git_dir))?;
         let _guard = CurrentDirGuard::enter(fetch_cwd, req.runtime_cwd)?;
-        let nested_context =
-            RemoteCommandContext::from_explicit(fetch_cwd, &sub_git_dir, nested_config.clone());
+        let nested_context = RemoteCommandContext::from_explicit(
+            policy,
+            fetch_cwd,
+            &sub_git_dir,
+            nested_config.clone(),
+        );
         let resolution = nested_context.resolution();
         let before_sub_refs = fetch_ref_snapshot(&sub_git_dir, sub_format)?;
         let outcome = fetch_one_source_with_outcome(
@@ -1105,33 +1130,37 @@ pub(crate) fn fetch_populated_submodules_after_superproject(
         } else {
             req.recurse_submodules
         };
-        fetch_populated_submodules_after_superproject(FetchSubmoduleRequest {
-            git_dir: &sub_git_dir,
-            format: sub_format,
-            worktree_root: &submodule_root,
-            runtime_cwd: fetch_cwd,
-            config: &nested_config,
-            recurse_submodules: nested_recurse_submodules,
-            default_recurse_submodules: nested_default_recurse_submodules,
-            source: &sub_source,
-            changed_gitlinks: nested_changed_gitlinks,
-            options: &sub_options,
-            submodule_prefix: &nested_prefix,
-            jobs,
-        })?;
+        fetch_populated_submodules_after_superproject(
+            policy,
+            FetchSubmoduleRequest {
+                git_dir: &sub_git_dir,
+                format: sub_format,
+                worktree_root: &submodule_root,
+                runtime_cwd: fetch_cwd,
+                config: &nested_config,
+                recurse_submodules: nested_recurse_submodules,
+                default_recurse_submodules: nested_default_recurse_submodules,
+                source: &sub_source,
+                changed_gitlinks: nested_changed_gitlinks,
+                options: &sub_options,
+                submodule_prefix: &nested_prefix,
+                jobs,
+            },
+        )?;
     }
     for changed in req
         .changed_gitlinks
         .iter()
         .filter(|changed| !seen_submodules.contains(&changed.path))
     {
-        fetch_changed_submodule_after_superproject(&req, changed, jobs)?;
+        fetch_changed_submodule_after_superproject(policy, &req, changed, jobs)?;
     }
     let _ = (req.git_dir, req.format, req.source);
     Ok(())
 }
 
 fn fetch_changed_submodule_after_superproject(
+    policy: &sley_remote::RemotePolicy,
     req: &FetchSubmoduleRequest<'_>,
     changed: &ChangedGitlink,
     jobs: Option<usize>,
@@ -1151,7 +1180,7 @@ fn fetch_changed_submodule_after_superproject(
         return Ok(());
     }
     let Some((sub_git_dir, submodule_root, display_path)) =
-        resolve_changed_submodule_fetch_target(req, changed)?
+        resolve_changed_submodule_fetch_target(policy, req, changed)?
     else {
         return Ok(());
     };
@@ -1182,7 +1211,7 @@ fn fetch_changed_submodule_after_superproject(
     let nested_transport_config = transport_policy_config_for_paths(fetch_cwd, Some(&sub_git_dir))?;
     let _guard = CurrentDirGuard::enter(fetch_cwd, req.runtime_cwd)?;
     let nested_context =
-        RemoteCommandContext::from_explicit(fetch_cwd, &sub_git_dir, nested_config.clone());
+        RemoteCommandContext::from_explicit(policy, fetch_cwd, &sub_git_dir, nested_config.clone());
     let resolution = nested_context.resolution();
     let before_sub_refs = fetch_ref_snapshot(&sub_git_dir, sub_format)?;
     let outcome = fetch_one_source_with_outcome(
@@ -1222,20 +1251,23 @@ fn fetch_changed_submodule_after_superproject(
     } else {
         req.recurse_submodules
     };
-    fetch_populated_submodules_after_superproject(FetchSubmoduleRequest {
-        git_dir: &sub_git_dir,
-        format: sub_format,
-        worktree_root: &submodule_root,
-        runtime_cwd: fetch_cwd,
-        config: &nested_config,
-        recurse_submodules: nested_recurse_submodules,
-        default_recurse_submodules: mode,
-        source: &sub_source,
-        changed_gitlinks: nested_changed_gitlinks,
-        options: &sub_options,
-        submodule_prefix: &nested_prefix,
-        jobs,
-    })
+    fetch_populated_submodules_after_superproject(
+        policy,
+        FetchSubmoduleRequest {
+            git_dir: &sub_git_dir,
+            format: sub_format,
+            worktree_root: &submodule_root,
+            runtime_cwd: fetch_cwd,
+            config: &nested_config,
+            recurse_submodules: nested_recurse_submodules,
+            default_recurse_submodules: mode,
+            source: &sub_source,
+            changed_gitlinks: nested_changed_gitlinks,
+            options: &sub_options,
+            submodule_prefix: &nested_prefix,
+            jobs,
+        },
+    )
 }
 
 fn resolve_submodule_git_dir(git_dir: &Path, submodule_root: &Path, path: &str) -> Option<PathBuf> {
@@ -1246,6 +1278,7 @@ fn resolve_submodule_git_dir(git_dir: &Path, submodule_root: &Path, path: &str) 
 }
 
 fn resolve_changed_submodule_fetch_target(
+    policy: &sley_remote::RemotePolicy,
     req: &FetchSubmoduleRequest<'_>,
     changed: &ChangedGitlink,
 ) -> Result<Option<(PathBuf, PathBuf, String)>> {
@@ -1256,6 +1289,7 @@ fn resolve_changed_submodule_fetch_target(
         return Ok(Some((sub_git_dir, submodule_root, changed.path.clone())));
     }
     let Some(name) = submodule_name_for_path_at_commit(
+        policy,
         req.git_dir,
         req.format,
         &changed.super_oid,
@@ -1433,6 +1467,7 @@ fn changed_gitlinks_for_commit(
 }
 
 fn submodule_name_for_path_at_commit(
+    policy: &sley_remote::RemotePolicy,
     git_dir: &Path,
     format: ObjectFormat,
     commit_oid: &ObjectId,
@@ -1444,7 +1479,7 @@ fn submodule_name_for_path_at_commit(
         ObjectType::Commit => Commit::parse_ref(format, &object.body)?,
         ObjectType::Tag => {
             let tag = Tag::parse_ref(format, &object.body)?;
-            return submodule_name_for_path_at_commit(git_dir, format, &tag.object, path);
+            return submodule_name_for_path_at_commit(policy, git_dir, format, &tag.object, path);
         }
         _ => return Ok(None),
     };
@@ -1457,7 +1492,8 @@ fn submodule_name_for_path_at_commit(
     // Partial clones omit the `.gitmodules` blob until demanded. Use the same
     // lazy-promisor path as cat-file so on-demand submodule recursion can
     // resolve names (t5616 "lazily fetched .gitmodules works").
-    let gitmodules = crate::read_object_maybe_prefetch_promisor(&db, &gitmodules_oid, true)?;
+    let gitmodules =
+        crate::read_object_maybe_prefetch_promisor(policy, &db, &gitmodules_oid, true)?;
     if gitmodules.object_type != ObjectType::Blob {
         return Ok(None);
     }
@@ -1630,10 +1666,10 @@ fn fetch_raw_oid_refspecs(
     };
     // Bare-OID shortcut skips the general fetch planner's mark_complete pass;
     // run it here so graph-only local tips still die (t5330 #4).
-    sley_remote::mark_complete_local_refs(git_dir, format)?;
+    sley_remote::mark_complete_local_refs(&options.policy, git_dir, format)?;
     // Protocol v0 rejects unadvertised exact-OID wants unless uploadpack
     // allow*sha1inwant permits them (t5516 #101-#104, #106).
-    reject_raw_oid_wants_if_disallowed(config, &remote_git_dir, format, &wants)?;
+    reject_raw_oid_wants_if_disallowed(&options.policy, config, &remote_git_dir, format, &wants)?;
     // A filtered fetch omits objects, so its pack is only valid as a promisor
     // pack — exactly as for an already-promisor remote.
     let promisor = config
@@ -1657,6 +1693,7 @@ fn fetch_raw_oid_refspecs(
         _ => None,
     };
     sley_remote::install_fetch_pack_via_local_upload_pack(
+        &options.policy,
         git_dir,
         &remote_git_dir,
         format,
@@ -1705,6 +1742,7 @@ fn exact_oid_sources_from_refspecs(format: ObjectFormat, refspecs: &[String]) ->
 /// `fetch_raw_oid_refspecs` already covers pure bare-OID lists; this catches
 /// `$oid:refs/heads/copy` (and mixes with named refs) used by t5516 #99.
 fn reject_exact_oid_sources_if_disallowed(
+    policy: &sley_remote::RemotePolicy,
     format: ObjectFormat,
     source: &str,
     refspecs: &[String],
@@ -1721,12 +1759,13 @@ fn reject_exact_oid_sources_if_disallowed(
     else {
         return Ok(());
     };
-    reject_raw_oid_wants_if_disallowed(config, &remote_git_dir, format, &wants)
+    reject_raw_oid_wants_if_disallowed(policy, config, &remote_git_dir, format, &wants)
 }
 
 /// Client-side allowtip/allowreachable/allowany gate for bare exact-OID wants
 /// on the protocol-v0 local path (mirrors fetch-pack's unadvertised check).
 fn reject_raw_oid_wants_if_disallowed(
+    policy: &sley_remote::RemotePolicy,
     client_config: &GitConfig,
     remote_git_dir: &Path,
     format: ObjectFormat,
@@ -1740,7 +1779,7 @@ fn reject_raw_oid_wants_if_disallowed(
     if !protocol_v0 {
         return Ok(());
     }
-    let advertisements = sley_remote::local_fetch_advertisements(remote_git_dir, format)?;
+    let advertisements = sley_remote::local_fetch_advertisements(policy, remote_git_dir, format)?;
     let advertised_tips: std::collections::HashSet<ObjectId> = advertisements
         .iter()
         .filter(|ad| !ad.name.ends_with("^{}"))
@@ -1906,7 +1945,7 @@ fn fetch_one_source_with_outcome(
         return Ok(sley_remote::FetchOutcome::default());
     }
     let resolved = sley_remote::resolve_remote(resolution, source)?;
-    check_transport_allowed_url(&resolved.url, Some(config))?;
+    check_transport_allowed_url(&command_context.remote_policy, &resolved.url, Some(config))?;
     let fetch_source = match resolved.transport {
         RemoteTransport::Http | RemoteTransport::Https => {
             sley_remote::FetchSource::Http(parse_remote_url(&resolved.url)?)
@@ -1984,6 +2023,7 @@ fn maybe_write_fetch_commit_graph(
         return Ok(());
     }
     let nested_session = crate::session::CliSession::for_repository_paths(
+        &command_context.remote_policy,
         command_context.cwd().to_path_buf(),
         git_dir.to_path_buf(),
     );
@@ -3107,9 +3147,13 @@ pub(super) fn ls_remote_resolved_url(
     Ok(context.resolved_remote(repository)?.url)
 }
 
-pub(super) fn check_transport_allowed_url(url: &str, config: Option<&GitConfig>) -> Result<()> {
+pub(super) fn check_transport_allowed_url(
+    remote_policy: &sley_remote::RemotePolicy,
+    url: &str,
+    config: Option<&GitConfig>,
+) -> Result<()> {
     let scheme = sley_remote::transport_scheme_for_url(url);
-    match sley_remote::check_transport_allowed(&scheme, config, None) {
+    match sley_remote::check_transport_allowed(&scheme, config, &remote_policy.transport) {
         Ok(()) => Ok(()),
         Err(err) => {
             eprintln!("fatal: {err}");
@@ -3134,7 +3178,10 @@ struct NegotiateOnlyRequest<'a> {
 ///
 /// Mirrors builtin/fetch.c's negotiate-only branch and transport.c's v2
 /// `wait-for-done` negotiation. Prints one ACKed oid per stdout line.
-fn run_negotiate_only(req: NegotiateOnlyRequest<'_>) -> Result<()> {
+fn run_negotiate_only(
+    policy: &sley_remote::RemotePolicy,
+    req: NegotiateOnlyRequest<'_>,
+) -> Result<()> {
     match req.recurse_submodules_cli {
         FetchRecurseSubmodules::Off | FetchRecurseSubmodules::Default => {}
         FetchRecurseSubmodules::On | FetchRecurseSubmodules::OnDemand => {
@@ -3177,15 +3224,24 @@ fn run_negotiate_only(req: NegotiateOnlyRequest<'_>) -> Result<()> {
 
     let resolved = resolve_remote_fetch_url(req.config, req.source);
     let rewritten = rewrite_url_with_config(req.transport_config, &resolved, false);
-    check_transport_allowed_url(&rewritten, Some(req.transport_config))?;
+    check_transport_allowed_url(&req.options.policy, &rewritten, Some(req.transport_config))?;
 
     let acked = if let Ok(remote_git_dir) =
         sley_remote::resolve_local_remote_git_dir(req.resolution, &rewritten)
     {
-        sley_remote::negotiate_only_local(req.git_dir, &remote_git_dir, req.format, &tip_oids)?
+        sley_remote::negotiate_only_local(
+            policy,
+            req.git_dir,
+            &remote_git_dir,
+            req.format,
+            &tip_oids,
+        )?
     } else if sley_remote::remote_url_is_http(&rewritten).unwrap_or(false) {
         let remote = sley_transport::parse_remote_url(&rewritten)?;
-        let client = sley_remote::new_http_client();
+        let client = sley_remote::new_http_client_with_config(
+            &req.options.policy.transport,
+            Some(req.transport_config),
+        );
         let mut credentials = sley_remote::NoCredentials;
         sley_remote::negotiate_only_http(
             &client,

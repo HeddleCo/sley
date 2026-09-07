@@ -1,6 +1,6 @@
 use crate::commands;
 use crate::setup;
-use crate::{GlobalConfigOverride, apply_global_options, session, sley_core};
+use crate::{GlobalConfigOverride, apply_global_options, session};
 use sley::{GitError, Result};
 use sley_protocol::set_packet_trace_identity;
 use std::env;
@@ -212,13 +212,13 @@ fn reapply_global_options(
     );
     let mut args = nested.args.to_vec();
     match cli_session.repository_snapshot() {
-        Ok(_) => {
+        Ok(snapshot) => {
             if args.len() > 1 {
-                sley_core::precompose_argv_if_needed(&mut args[1..]);
+                snapshot.config.precompose_unicode().argv(&mut args[1..]);
             }
         }
         Err(GitError::NotFound(_)) => {
-            // Snapshot selection already disabled precomposition.
+            // No repository configuration means no path precomposition.
         }
         Err(err) => return Err(crate::report_config_setup_error(err)),
     }
@@ -551,7 +551,9 @@ fn dispatch_command(
         "switch" => commands::checkout::cmd_switch(cli_session, &args[1..]),
         "tag" => commands::tag::cmd_tag(cli_session, &args[1..]),
         #[cfg(feature = "testkit")]
-        "testkit" => commands::utility::cmd_testkit(&args[1..]),
+        "testkit" => {
+            commands::utility::cmd_testkit(cli_session.original_cwd.as_deref(), &args[1..])
+        }
         "unpack-file" => commands::utility::cmd_unpack_file(cli_session, &args[1..]),
         "update-server-info" => commands::refs::cmd_update_server_info(cli_session, &args[1..]),
         "var" => commands::utility::cmd_var(cli_session, &args[1..]),

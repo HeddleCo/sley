@@ -1,7 +1,6 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
 use crate::*;
-use sley_rev;
 
 pub(crate) fn cmd_commit_tree(
     cli_session: &crate::session::CliSession,

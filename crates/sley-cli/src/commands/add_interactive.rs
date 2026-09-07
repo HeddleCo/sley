@@ -14,7 +14,6 @@ use std::env;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use {sley_config, sley_core, sley_worktree};
 
 use sley::GitConfig;
 use sley::{GitError, Result};

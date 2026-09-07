@@ -2,7 +2,6 @@
 #![allow(clippy::expect_used)]
 
 use crate::*;
-use {sley_refs, sley_rev};
 
 pub(super) struct BranchVerboseListOptions {
     pub(crate) mode: BranchListMode,

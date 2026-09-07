@@ -48,11 +48,14 @@ pub fn short_status_count_with_options(
     format: ObjectFormat,
     options: ShortStatusOptions,
 ) -> Result<usize> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     if !options.include_ignored
         && let Some(count) = short_status_borrowed_head_matches_index_count_if_possible(
+            precompose,
             worktree_root,
             git_dir,
             format,
@@ -327,6 +330,8 @@ pub fn worktree_entry_state(
     expected_mode: u32,
     index_probe: Option<&IndexStatProbe>,
 ) -> Result<WorktreeEntryState> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let path = path.as_ref();
     if path.is_absolute() {
         return Err(GitError::InvalidPath(format!(
@@ -334,7 +339,7 @@ pub fn worktree_entry_state(
             path.display()
         )));
     }
-    let git_path = git_path_bytes(path)?;
+    let git_path = git_path_bytes(precompose, path)?;
     worktree_entry_state_by_git_path(
         worktree_root,
         git_dir,
@@ -421,12 +426,15 @@ pub fn stream_short_status_with_database<F>(
 where
     F: for<'a> FnMut(ShortStatusRow<'a>) -> Result<StreamControl>,
 {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let custom_reference = options.reference.filter(|reference| *reference != "HEAD");
     if custom_reference.is_none()
         && !options.include_ignored
         && let Some(()) = stream_short_status_borrowed_head_matches_index_if_possible(
+            precompose,
             worktree_root,
             git_dir,
             format,
@@ -465,6 +473,8 @@ pub fn collect_short_status_with_database(
     db: &FileObjectDatabase,
     options: ShortStatusOptions,
 ) -> Result<Vec<ShortStatusEntry>> {
+    let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
+
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     // A non-HEAD reference (e.g. amend's HEAD^1) must not use the
@@ -473,6 +483,7 @@ pub fn collect_short_status_with_database(
     if custom_reference.is_none()
         && !options.include_ignored
         && let Some(entries) = short_status_borrowed_head_matches_index_if_possible(
+            precompose,
             worktree_root,
             git_dir,
             format,
@@ -519,6 +530,7 @@ pub fn collect_short_status_with_database(
         let mut entries = entries?;
         entries.retain(|entry| !unmerged_paths.contains(&entry.path));
         let untracked_paths = status_untracked_paths_from_index(
+            precompose,
             worktree_root,
             git_dir,
             &parsed_index,
@@ -608,6 +620,7 @@ pub fn collect_short_status_with_database(
         let ignored_directory_rows = matches!(options.ignored_mode, StatusIgnoredMode::Matching)
             || !matches!(options.untracked_mode, StatusUntrackedMode::All);
         let ignored_paths = ignored_untracked_paths(
+            precompose,
             worktree_root,
             git_dir,
             &index,
@@ -625,6 +638,7 @@ pub fn collect_short_status_with_database(
                 let mut rolled = BTreeSet::new();
                 for path in ignored_paths {
                     let path = ignored_traditional_rollup_path(
+                        precompose,
                         worktree_root,
                         git_dir,
                         &path,
@@ -1189,6 +1203,7 @@ pub(crate) fn short_status_tracked_only(
 }
 
 pub(crate) fn short_status_borrowed_head_matches_index_if_possible(
+    precompose: sley_core::PrecomposeUnicode,
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -1354,6 +1369,7 @@ pub(crate) fn short_status_borrowed_head_matches_index_if_possible(
         let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
         let untracked_start = Instant::now();
         let untracked_paths = status_untracked_paths_from_borrowed_index(
+            precompose,
             worktree_root,
             git_dir,
             &borrowed,
@@ -1402,6 +1418,7 @@ pub(crate) fn short_status_borrowed_head_matches_index_if_possible(
                         let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
                         let start = Instant::now();
                         let paths = status_untracked_paths_from_borrowed_index(
+                            precompose,
                             worktree_root,
                             git_dir,
                             &borrowed,
@@ -1449,6 +1466,7 @@ pub(crate) fn short_status_borrowed_head_matches_index_if_possible(
         let untracked = executor.spawn(scope, "status-untracked", || -> Result<Vec<Vec<u8>>> {
             let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
             status_untracked_paths_from_borrowed_index(
+                precompose,
                 worktree_root,
                 git_dir,
                 &borrowed,
@@ -1471,6 +1489,7 @@ pub(crate) fn short_status_borrowed_head_matches_index_if_possible(
 }
 
 pub(crate) fn stream_short_status_borrowed_head_matches_index_if_possible<F>(
+    precompose: sley_core::PrecomposeUnicode,
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -1655,6 +1674,7 @@ where
         let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
         let untracked_start = Instant::now();
         stream_status_untracked_paths_from_borrowed_index(
+            precompose,
             worktree_root,
             git_dir,
             &borrowed,
@@ -1685,6 +1705,7 @@ where
                     ignores.emit_memory_profile("after_untracked_ignore");
                     let start = Instant::now();
                     let paths = status_untracked_paths_from_borrowed_index(
+                        precompose,
                         worktree_root,
                         git_dir,
                         &borrowed,
@@ -1780,6 +1801,7 @@ where
 }
 
 pub(crate) fn short_status_borrowed_head_matches_index_count_if_possible(
+    precompose: sley_core::PrecomposeUnicode,
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -1863,6 +1885,7 @@ pub(crate) fn short_status_borrowed_head_matches_index_count_if_possible(
         let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
         let untracked_start = Instant::now();
         let untracked_count = status_untracked_count_from_borrowed_index(
+            precompose,
             worktree_root,
             git_dir,
             &borrowed,
@@ -1905,6 +1928,7 @@ pub(crate) fn short_status_borrowed_head_matches_index_count_if_possible(
                     let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
                     let start = Instant::now();
                     let count = status_untracked_count_from_borrowed_index(
+                        precompose,
                         worktree_root,
                         git_dir,
                         &borrowed,

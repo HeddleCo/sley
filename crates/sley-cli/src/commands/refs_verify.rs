@@ -6,7 +6,7 @@
 //! engine backs `git fsck --references`.
 
 use crate::*;
-use sley_formats;
+
 use sley_fsck::SeverityConfig;
 use sley_fsck::content::{MsgId, Severity};
 use std::fs;

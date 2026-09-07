@@ -1,7 +1,6 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
 use crate::*;
-use {sley_core, sley_index, sley_object, sley_odb, sley_pack, sley_refs, sley_worktree};
 
 use super::commit_graph::{OpenResult, open_commit_graph_bytes, verify_commit_graph_bytes};
 

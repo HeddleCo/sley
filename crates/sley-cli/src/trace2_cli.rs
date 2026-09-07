@@ -1,13 +1,12 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
-use crate::sley_config::{ConfigEntry, ConfigSection};
 use sley::{GitConfig, Result};
+use sley_config::{ConfigEntry, ConfigSection};
 use std::env;
 
 use crate::commands::remote::repo_current_branch_name;
 use crate::global_options::injected_config_parameters;
 use crate::repo_paths::common_git_dir_for_git_dir;
 use crate::session;
-use crate::sley_core;
 
 fn trace2_target_enabled() -> bool {
     env::var_os("GIT_TRACE2").is_some()
@@ -73,11 +72,10 @@ fn trace2_dispatch_config(cli_session: &session::CliSession) -> Result<GitConfig
         .as_deref()
         .and_then(|git_dir| common_git_dir_for_git_dir(git_dir).ok());
     let branch = git_dir.as_deref().and_then(repo_current_branch_name);
-    let context = crate::sley_config::ConfigIncludeContext::new(common_git_dir.clone(), branch);
-    let mut config =
-        crate::sley_config::load_pre_dispatch_config(common_git_dir.as_deref(), &context)?;
+    let context = sley_config::ConfigIncludeContext::new(common_git_dir.clone(), branch);
+    let mut config = sley_config::load_pre_dispatch_config(common_git_dir.as_deref(), &context)?;
     let parameters = injected_config_parameters()?;
-    crate::sley_config::append_injected_config_sections_with_includes(
+    sley_config::append_injected_config_sections_with_includes(
         &mut config,
         &parameters,
         &context,

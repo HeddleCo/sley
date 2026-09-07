@@ -1,7 +1,6 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 #![allow(clippy::expect_used)]
 
-use sley_core;
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::commands::cli_options::{cli_usage_error, last_tri_state_bool, opt_bool, opt_str};
@@ -1186,7 +1185,12 @@ pub(crate) fn run_repack(
         reftable_lock_timeout: reftable_lock_timeout_override()?,
         has_promisor_remote: Some(&sley_remote::config_has_promisor_remote),
         hydrate_promisor_remotes: Some(&mut |dir: &Path, format, roots| {
-            sley_remote::hydrate_reachable_from_local_promisor_remotes(dir, format, roots)
+            sley_remote::hydrate_reachable_from_local_promisor_remotes(
+                &cli_session.remote_policy,
+                dir,
+                format,
+                roots,
+            )
         }),
     };
     gc_repack::run_repack(

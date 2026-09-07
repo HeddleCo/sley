@@ -51,7 +51,7 @@ impl BranchCommandContext {
         self.repository.object_format()
     }
 
-    pub(super) fn objects(&self) -> &crate::sley_odb::FileObjectDatabase {
+    pub(super) fn objects(&self) -> &sley_odb::FileObjectDatabase {
         self.repository.object_database()
     }
 }

@@ -53,7 +53,15 @@ pub(crate) fn cmd_mergetool(
 
     let mut failed = false;
     for conflict in conflicts {
-        if !run_one_mergetool_path(&repo, config, &options, &tool, &conflict, lazy_fetch)? {
+        if !run_one_mergetool_path(
+            &cli_session.remote_policy,
+            &repo,
+            config,
+            &options,
+            &tool,
+            &conflict,
+            lazy_fetch,
+        )? {
             failed = true;
         }
     }
@@ -210,6 +218,7 @@ fn order_mergetool_paths(
 }
 
 fn run_one_mergetool_path(
+    policy: &sley_remote::RemotePolicy,
     repo: &RepositoryContext,
     config: &GitConfig,
     options: &MergetoolOptions,
@@ -226,7 +235,8 @@ fn run_one_mergetool_path(
         return resolve_gitlink_conflict(repo, conflict, &merged);
     }
 
-    let materialized = materialize_mergetool_files(repo, config, conflict, &merged, lazy_fetch)?;
+    let materialized =
+        materialize_mergetool_files(policy, repo, config, conflict, &merged, lazy_fetch)?;
     if should_prompt(config, options) {
         print!(
             "Hit return to start merge resolution tool ({}) for '{}': ",
@@ -250,6 +260,7 @@ fn run_one_mergetool_path(
 }
 
 fn materialize_mergetool_files(
+    policy: &sley_remote::RemotePolicy,
     repo: &RepositoryContext,
     config: &GitConfig,
     conflict: &UnmergedPath,
@@ -279,6 +290,7 @@ fn materialize_mergetool_files(
     let remote = parent.join(format!("{stem}_REMOTE_{}", std::process::id()));
     let base = parent.join(format!("{stem}_BASE_{}", std::process::id()));
     write_stage_file(
+        policy,
         config,
         repo.objects(),
         conflict.local.as_ref(),
@@ -286,6 +298,7 @@ fn materialize_mergetool_files(
         lazy_fetch,
     )?;
     write_stage_file(
+        policy,
         config,
         repo.objects(),
         conflict.remote.as_ref(),
@@ -293,6 +306,7 @@ fn materialize_mergetool_files(
         lazy_fetch,
     )?;
     write_stage_file(
+        policy,
         config,
         repo.objects(),
         conflict.base.as_ref(),
@@ -311,15 +325,17 @@ fn materialize_mergetool_files(
 }
 
 fn write_stage_file(
+    policy: &sley_remote::RemotePolicy,
     config: &GitConfig,
     db: &FileObjectDatabase,
     entry: Option<&IndexEntry>,
     path: &Path,
     lazy_fetch: bool,
 ) -> Result<()> {
+    let lazy_fetch_adapter_1 = crate::diff_lazy_fetch(policy, lazy_fetch);
     let mut content = match entry {
         Some(entry) if entry.mode == 0o160000 => entry.oid.to_string().into_bytes(),
-        Some(entry) => read_blob(db, &entry.oid, crate::diff_lazy_fetch(lazy_fetch))?,
+        Some(entry) => read_blob(db, &entry.oid, lazy_fetch_adapter_1.as_option())?,
         None => Vec::new(),
     };
     if entry.is_some_and(|entry| entry.mode & sley_index::GIT_MODE_TYPE_MASK == 0o100000)
