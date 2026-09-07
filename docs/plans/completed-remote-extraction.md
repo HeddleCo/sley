@@ -120,3 +120,25 @@ hack; large fns mixing orchestration+output (3 fetch fns have subtle divergences
 `core.sshCommand`; `GitError::Exit` is a CLI concept (return typed outcomes);
 HTTP v2 unsupported (`http_advertised_refs` :9758 errors on v2) — encode as
 explicit `Unsupported`.
+
+## Post-extraction: virtual object stores
+
+Smart-HTTP exact-action push no longer requires a materialized Git object
+directory. `HttpPushActionsRequest<R>` accepts any `R: ObjectReader + Sync`, and
+the existing repository-backed `push_actions_with_http_client` path adapts a
+`FileObjectDatabase` into that engine. Reachability, thin-pack selection and
+receive-pack request generation remain streaming through `Write`.
+
+Callers that reconcile remote refs before choosing actions use
+`observe_http_receive_pack`, inspect the returned operation-scoped
+`HttpReceivePackObservation`, then consume it with
+`push_http_actions_with_reader_from_observation`. This is the authoritative
+receive-pack advertisement for that operation: execution does not issue a
+second discovery request, while the exact old ids remain receive-pack CAS
+preconditions. Observations are deliberately non-cloneable and consumed once.
+
+The new end-to-end reader seam is transport-honest: it covers smart HTTP. The
+lower pack/body writer is transport-neutral and generic over `ObjectReader`, so
+SSH and `git://` can adopt it when their live receive-pack session tokens are
+made public without pretending a detached ref listing can replace their
+in-stream advertisement.

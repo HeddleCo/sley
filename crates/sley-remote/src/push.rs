@@ -18,6 +18,8 @@
 //! push-planning helpers are shared (the CLI's SSH path calls the same `pub`
 //! functions) so there is a single implementation.
 
+#[cfg(feature = "http")]
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
@@ -28,6 +30,8 @@ use sley_config::GitConfig;
 use sley_core::{
     CancelFlag, DynCancelFlag, GitError, ObjectFormat, ObjectId, Result, redact_url_for_display,
 };
+#[cfg(feature = "http")]
+use sley_object::Commit;
 use sley_object::ObjectType;
 use sley_odb::{
     FileObjectDatabase, ObjectReader, RawPackInstallOptions, build_and_install_reachable_pack,
@@ -422,6 +426,78 @@ pub struct PushActionRequest<'a> {
     pub plan: &'a PushActionPlan,
 }
 
+/// Exact push inputs whose objects come from a caller-owned store rather than
+/// `$GIT_DIR/objects`.
+///
+/// This is the storage-independent push seam used by projections and other
+/// virtual repositories. Ref intent remains an exact [`PushActionPlan`]; Sley
+/// still owns receive-pack capability negotiation, ancestry validation, pack
+/// generation, transport, cancellation, and result validation.
+#[derive(Clone, Copy)]
+#[cfg(feature = "http")]
+pub struct HttpPushActionsRequest<'a, R>
+where
+    R: ObjectReader,
+{
+    /// Objects reachable from the action plan's new tips.
+    pub objects: &'a R,
+    /// Object format used by the reader and remote.
+    pub format: ObjectFormat,
+    /// Configuration used for transport policy and smart-HTTP behavior.
+    pub config: &'a GitConfig,
+    /// Already-resolved smart-HTTP destination.
+    pub remote_url: &'a RemoteUrl,
+    /// Caller-authored exact ref actions.
+    pub plan: &'a PushActionPlan,
+}
+
+/// Inputs for one smart-HTTP receive-pack observation.
+#[cfg(feature = "http")]
+#[derive(Clone, Copy)]
+pub struct HttpReceivePackObservationRequest<'a> {
+    pub remote_url: &'a RemoteUrl,
+    pub format: ObjectFormat,
+    pub config: &'a GitConfig,
+}
+
+/// One operation-scoped smart-HTTP receive-pack advertisement.
+///
+/// The value is intentionally consumed by push execution: advertisements are
+/// never cached or silently reused across operations. Callers may inspect
+/// [`Self::refs`] to reconcile desired ref actions, then hand this exact value
+/// back to Sley so execution does not perform a second discovery request.
+#[cfg(feature = "http")]
+pub struct HttpReceivePackObservation<'client> {
+    remote_url: RemoteUrl,
+    format: ObjectFormat,
+    features: ReceivePackFeatures,
+    refs: Vec<RefAdvertisement>,
+    http_client: HttpObservationClient<'client>,
+}
+
+#[cfg(feature = "http")]
+enum HttpObservationClient<'client> {
+    Borrowed(&'client dyn HttpClient),
+    Owned(crate::http::HttpOperationBatch),
+}
+
+#[cfg(feature = "http")]
+impl HttpObservationClient<'_> {
+    fn client(&self) -> &dyn HttpClient {
+        match self {
+            Self::Borrowed(client) => *client,
+            Self::Owned(batch) => batch.client(),
+        }
+    }
+}
+
+#[cfg(feature = "http")]
+impl HttpReceivePackObservation<'_> {
+    pub fn refs(&self) -> &[RefAdvertisement] {
+        &self.refs
+    }
+}
+
 /// Mutable seams used while pushing.
 pub struct PushServices<'a> {
     /// Credential source for authenticated transports.
@@ -512,11 +588,163 @@ pub fn push_actions(
 #[cfg(feature = "http")]
 pub fn push_actions_with_http_client(
     request: PushActionRequest<'_>,
-    mut services: PushServices<'_>,
+    services: PushServices<'_>,
     http_client: Option<&dyn HttpClient>,
 ) -> Result<PushOutcome> {
+    if let PushDestination::Http(remote_url) = request.destination {
+        let objects = FileObjectDatabase::from_git_dir(request.common_git_dir, request.format);
+        return push_http_actions_with_reader(
+            HttpPushActionsRequest {
+                objects: &objects,
+                format: request.format,
+                config: request.config,
+                remote_url,
+                plan: request.plan,
+            },
+            services,
+            http_client,
+        );
+    }
+    let mut services = services;
     let plan = plan_push_actions_impl(request, &mut services, http_client)?;
     execute_push_action_plan_impl(request, &mut services, plan, http_client)
+}
+
+/// Observe a smart-HTTP receive-pack endpoint once for reconciliation followed
+/// by push execution.
+#[cfg(feature = "http")]
+pub fn observe_http_receive_pack<'client>(
+    request: HttpReceivePackObservationRequest<'_>,
+    credentials: &mut dyn CredentialProvider,
+    http_client: Option<&'client dyn HttpClient>,
+) -> Result<HttpReceivePackObservation<'client>> {
+    crate::protocol::check_transport_allowed(
+        crate::protocol::transport_scheme_for_remote(request.remote_url),
+        Some(request.config),
+        None,
+    )
+    .map_err(crate::protocol::transport_policy_git_error)?;
+    let (discovered, http_client) = match http_client {
+        Some(client) => (
+            crate::http::http_service_advertisements(
+                client,
+                request.remote_url,
+                request.format,
+                GitService::ReceivePack,
+                credentials,
+                Some(request.config),
+            )?,
+            HttpObservationClient::Borrowed(client),
+        ),
+        None => {
+            let batch = crate::http::HttpOperationBatch::new();
+            let discovered = crate::http::http_service_advertisements(
+                batch.client(),
+                request.remote_url,
+                request.format,
+                GitService::ReceivePack,
+                credentials,
+                Some(request.config),
+            )?;
+            (discovered, HttpObservationClient::Owned(batch))
+        }
+    };
+    let features = advertised_receive_pack_features(&discovered.set.refs)?;
+    verify_remote_object_format(&features, request.format)?;
+    Ok(HttpReceivePackObservation {
+        remote_url: request.remote_url.clone(),
+        format: request.format,
+        features,
+        refs: discovered.set.refs,
+        http_client,
+    })
+}
+
+/// Execute exact ref actions from any [`ObjectReader`] using a previously
+/// observed smart-HTTP receive-pack advertisement.
+///
+/// Consuming `observation` prevents accidental reuse after the remote may have
+/// moved. Exact old-object expectations are checked against the observation
+/// before pack generation; receive-pack enforces the same values atomically.
+#[cfg(feature = "http")]
+pub fn push_http_actions_with_reader_from_observation<R>(
+    request: HttpPushActionsRequest<'_, R>,
+    services: PushServices<'_>,
+    observation: HttpReceivePackObservation<'_>,
+) -> Result<PushOutcome>
+where
+    R: ObjectReader + Sync,
+{
+    if request.format != observation.format {
+        return Err(GitError::InvalidObjectId(format!(
+            "receive-pack observation uses {}, push uses {}",
+            observation.format.name(),
+            request.format.name()
+        )));
+    }
+    if request.remote_url != &observation.remote_url {
+        return Err(GitError::InvalidFormat(
+            "receive-pack observation belongs to a different remote".into(),
+        ));
+    }
+    validate_push_options(&observation.features, &request.plan.options)?;
+    let commands = receive_pack_commands_from_action_plan(request.format, request.plan)?;
+    validate_commands_against_observation(request.format, &commands, &observation.refs)?;
+    let command_forces = commands
+        .iter()
+        .cloned()
+        .zip(request.plan.commands.iter())
+        .map(|(command, planned)| (command, request.plan.options.force || planned.force))
+        .collect::<Vec<_>>();
+    reject_non_fast_forward_pushes_with_reader(request.objects, request.format, &command_forces)?;
+    if commands.is_empty() {
+        return Ok(PushOutcome::default());
+    }
+    let HttpReceivePackObservation {
+        remote_url,
+        format: _,
+        features,
+        refs,
+        http_client,
+    } = observation;
+    let client = http_client.client();
+    execute_push_http(
+        request.objects,
+        request.format,
+        request.config,
+        &request.plan.options,
+        services.credentials,
+        services.progress,
+        services.cancel,
+        client,
+        commands,
+        remote_url,
+        features,
+        refs,
+        request.plan.pack_objects.clone(),
+    )
+}
+
+/// Discover and execute exact smart-HTTP ref actions from any [`ObjectReader`].
+#[cfg(feature = "http")]
+pub fn push_http_actions_with_reader<R>(
+    request: HttpPushActionsRequest<'_, R>,
+    services: PushServices<'_>,
+    http_client: Option<&dyn HttpClient>,
+) -> Result<PushOutcome>
+where
+    R: ObjectReader + Sync,
+{
+    let observation = observe_http_receive_pack(
+        HttpReceivePackObservationRequest {
+            remote_url: request.remote_url,
+            format: request.format,
+            config: request.config,
+        },
+        services.credentials,
+        http_client,
+    )?;
+    push_http_actions_with_reader_from_observation(request, services, observation)
 }
 
 /// Negotiate with the remote and compute the receive-pack command list without
@@ -843,7 +1071,10 @@ fn execute_push_plan_impl(
                 fallback_batch.client()
             };
             execute_push_http(
-                request,
+                &FileObjectDatabase::from_git_dir(request.common_git_dir, request.format),
+                request.format,
+                request.config,
+                request.options,
                 services.credentials,
                 ctx.progress,
                 ctx.cancel,
@@ -955,16 +1186,7 @@ fn plan_push_http(request: PushHttpRequest<'_>) -> Result<PushPlan> {
     let advertisement_set = discovered.set;
     let features = advertised_receive_pack_features(&advertisement_set.refs)?;
     verify_remote_object_format(&features, format)?;
-    if options.atomic && !features.atomic {
-        return Err(GitError::InvalidFormat(
-            "receive-pack feature 'atomic' was not advertised".into(),
-        ));
-    }
-    if !options.push_options.is_empty() && !features.push_options {
-        return Err(GitError::InvalidFormat(
-            "receive-pack feature 'push-options' was not advertised".into(),
-        ));
-    }
+    validate_push_options(&features, options)?;
 
     let local_store = FileRefStore::new(git_dir, format);
     let mut local_refs = local_push_source_refs(&local_store, format)?;
@@ -1028,8 +1250,11 @@ fn plan_push_http(request: PushHttpRequest<'_>) -> Result<PushPlan> {
 
 #[cfg(feature = "http")]
 #[allow(clippy::too_many_arguments)]
-fn execute_push_http(
-    request: PushRequest<'_>,
+fn execute_push_http<R>(
+    objects: &R,
+    format: ObjectFormat,
+    config: &GitConfig,
+    options: &PushOptions,
     credentials: &mut dyn CredentialProvider,
     progress: &mut dyn ProgressSink,
     cancel: CancelFlag<'_>,
@@ -1039,30 +1264,32 @@ fn execute_push_http(
     features: ReceivePackFeatures,
     advertisements: Vec<RefAdvertisement>,
     pack_objects: Vec<ObjectId>,
-) -> Result<PushOutcome> {
+) -> Result<PushOutcome>
+where
+    R: ObjectReader + Sync,
+{
     let _ = progress;
-    let local_db = FileObjectDatabase::from_git_dir(request.common_git_dir, request.format);
     let pack_request = PushPackRequest {
-        local_db: &local_db,
-        format: request.format,
+        local_db: objects,
+        format,
         commands: &commands,
         pack_objects: &pack_objects,
         remote_advertisements: &advertisements,
         features: &features,
         options: receive_pack_push_options(
             &features,
-            request.format,
-            request.options.quiet,
-            request.options.atomic,
-            &request.options.push_options,
+            format,
+            options.quiet,
+            options.atomic,
+            &options.push_options,
         ),
-        thin: request.options.thin.wants_thin(),
+        thin: options.thin.wants_thin(),
     };
     let url = http_smart_rpc_url(&remote_url, GitService::ReceivePack)?;
     let content_type = smart_http_rpc_request_content_type(GitService::ReceivePack)?;
-    let post_buffer = http_post_buffer(request.config);
+    let post_buffer = http_post_buffer(config);
     let git_protocol = crate::http::http_git_protocol_header_value_for_service(
-        Some(request.config),
+        Some(config),
         GitService::ReceivePack,
     )?;
     let mut response = crate::http::http_send_with_auth(&remote_url, credentials, |auth| {
@@ -1086,7 +1313,7 @@ fn execute_push_http(
     let mut remote_progress = Vec::new();
     let report = if features.report_status || features.report_status_v2 {
         let report = read_receive_pack_push_report_with_progress(
-            request.format,
+            format,
             &mut response.body,
             features.report_status_v2,
             features.side_band_64k,
@@ -1101,7 +1328,7 @@ fn execute_push_http(
         // legitimate one needs.
         read_to_end_bounded(
             &mut response.body,
-            crate::transport_limits_from_config(Some(request.config)).receive_pack_response(),
+            crate::transport_limits_from_config(Some(config)).receive_pack_response(),
         )?;
         None
     };
@@ -1151,15 +1378,18 @@ fn parse_post_buffer(raw: &str) -> Option<usize> {
 /// fully in memory. A genuine generation failure is surfaced in preference to a
 /// downstream transport error on a truncated body.
 #[cfg(feature = "http")]
-fn send_receive_pack_body(
+fn send_receive_pack_body<R>(
     client: &dyn HttpClient,
     url: &str,
     content_type: &str,
     headers: &[(&str, &str)],
-    pack_request: &PushPackRequest<'_>,
+    pack_request: &PushPackRequest<'_, R>,
     post_buffer: usize,
     cancel: CancelFlag<'_>,
-) -> Result<HttpResponse> {
+) -> Result<HttpResponse>
+where
+    R: ObjectReader + Sync,
+{
     std::thread::scope(|scope| {
         let (mut reader, writer) = std::io::pipe().map_err(|err| GitError::Io(err.to_string()))?;
         let generator = scope.spawn(move || -> Result<()> {
@@ -2174,6 +2404,58 @@ fn advertised_receive_pack_features(
         .map(|advertisement| parse_receive_pack_features(&advertisement.capabilities))
         .transpose()
         .map(Option::unwrap_or_default)
+}
+
+#[cfg(feature = "http")]
+fn validate_push_options(features: &ReceivePackFeatures, options: &PushOptions) -> Result<()> {
+    if options.atomic && !features.atomic {
+        return Err(GitError::InvalidFormat(
+            "receive-pack feature 'atomic' was not advertised".into(),
+        ));
+    }
+    if !options.push_options.is_empty() && !features.push_options {
+        return Err(GitError::InvalidFormat(
+            "receive-pack feature 'push-options' was not advertised".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Fail before object traversal when exact CAS intent was authored against a
+/// different receive-pack observation. The remote still validates these same
+/// old ids, so a concurrent move remains safely rejected at receive-pack time.
+#[cfg(feature = "http")]
+fn validate_commands_against_observation(
+    format: ObjectFormat,
+    commands: &[ReceivePackCommand],
+    advertisements: &[RefAdvertisement],
+) -> Result<()> {
+    let advertised = advertisements
+        .iter()
+        .filter(|reference| !reference.name.ends_with("^{}"))
+        .map(|reference| (reference.name.as_str(), reference.oid))
+        .collect::<HashMap<_, _>>();
+    let zero = ObjectId::null(format);
+    for command in commands {
+        let observed = advertised.get(command.name.as_str()).copied();
+        let expectation_matches = if command.new_id.is_null() && command.old_id.is_null() {
+            // A zero-old delete is deliberately unconditional.
+            true
+        } else if command.old_id.is_null() {
+            observed.is_none()
+        } else {
+            observed == Some(command.old_id)
+        };
+        if !expectation_matches {
+            return Err(GitError::Command(format!(
+                "failed to push {}: expected {}, observed {}",
+                command.name,
+                command.old_id,
+                observed.unwrap_or(zero)
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Reject a push whose object format disagrees with the remote's advertised
@@ -3222,6 +3504,77 @@ pub fn reject_non_fast_forward_pushes(
     Ok(())
 }
 
+/// Storage-independent non-fast-forward validation for exact push actions.
+///
+/// Unlike [`reject_non_fast_forward_pushes`], this walk does not consult a
+/// repository commit-graph. It follows commit parents directly through the
+/// supplied reader, including that reader's shallow/graft boundaries.
+#[cfg(feature = "http")]
+fn reject_non_fast_forward_pushes_with_reader<R>(
+    objects: &R,
+    format: ObjectFormat,
+    command_forces: &[(ReceivePackCommand, bool)],
+) -> Result<()>
+where
+    R: ObjectReader,
+{
+    for (command, force) in command_forces {
+        if push_command_is_non_fast_forward_with_reader(objects, format, command, *force)? {
+            let short = command.name.trim_start_matches("refs/heads/");
+            return Err(GitError::Command(format!(
+                "failed to push some refs: non-fast-forward update to {short}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "http")]
+fn push_command_is_non_fast_forward_with_reader<R>(
+    objects: &R,
+    format: ObjectFormat,
+    command: &ReceivePackCommand,
+    force: bool,
+) -> Result<bool>
+where
+    R: ObjectReader,
+{
+    if force
+        || !command.name.starts_with("refs/heads/")
+        || command.old_id.is_null()
+        || command.new_id.is_null()
+    {
+        return Ok(false);
+    }
+    if command.old_id == command.new_id {
+        return Ok(false);
+    }
+    let mut seen = HashSet::new();
+    let mut pending = VecDeque::from([command.new_id]);
+    while let Some(oid) = pending.pop_front() {
+        if !seen.insert(oid) {
+            continue;
+        }
+        let object = objects.read_object(&oid)?;
+        if object.object_type != ObjectType::Commit {
+            return Err(GitError::InvalidObject(format!(
+                "expected commit {oid}, found {}",
+                object.object_type.as_str()
+            )));
+        }
+        let parents = sley_odb::grafted_parents(
+            objects,
+            &oid,
+            Commit::parse_ref(format, &object.body)?.parents,
+        );
+        if parents.contains(&command.old_id) {
+            return Ok(false);
+        }
+        pending.extend(parents);
+    }
+    Ok(true)
+}
+
 fn push_command_is_non_fast_forward(
     common_git_dir: &Path,
     local_db: &FileObjectDatabase,
@@ -3271,13 +3624,17 @@ mod tests {
     use std::io::Write;
     #[cfg(feature = "http")]
     use std::net::TcpListener;
+    #[cfg(feature = "http")]
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use sley_formats::RepositoryLayout;
     use sley_object::{BString, Commit, EncodedObject, ObjectType, Tree, TreeEntry};
     use sley_odb::{FileObjectDatabase, ObjectReplacements, ObjectWriter};
     #[cfg(feature = "http")]
-    use sley_protocol::{GitService, ProtocolVersion, RefAdvertisementSet};
+    use sley_protocol::{
+        GitService, ProtocolVersion, RefAdvertisementSet, parse_receive_pack_push_request,
+    };
     use sley_protocol::{
         ReceivePackCommandStatus, ReceivePackUnpackStatus, SideBandChannel, SideBandPacket,
         write_receive_pack_report_status, write_sideband_stream,
@@ -3292,6 +3649,57 @@ mod tests {
     use crate::{NoCredentials, SilentProgress};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(feature = "http")]
+    #[derive(Default)]
+    struct MapObjectReader {
+        objects: HashMap<ObjectId, Arc<EncodedObject>>,
+    }
+
+    #[cfg(feature = "http")]
+    impl ObjectReader for MapObjectReader {
+        fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
+            self.objects
+                .get(oid)
+                .cloned()
+                .ok_or_else(|| GitError::not_found(format!("object {oid}")))
+        }
+    }
+
+    #[cfg(feature = "http")]
+    fn insert_map_object(reader: &mut MapObjectReader, object: EncodedObject) -> ObjectId {
+        let object = Arc::new(object);
+        let oid = object
+            .object_id(ObjectFormat::Sha1)
+            .expect("test object should hash");
+        reader.objects.insert(oid, object);
+        oid
+    }
+
+    #[cfg(feature = "http")]
+    fn insert_map_commit(
+        reader: &mut MapObjectReader,
+        tree: ObjectId,
+        parents: Vec<ObjectId>,
+        message: &str,
+    ) -> ObjectId {
+        let identity = b"Test User <test@example.invalid> 1 +0000".to_vec();
+        insert_map_object(
+            reader,
+            EncodedObject::new(
+                ObjectType::Commit,
+                Commit {
+                    tree,
+                    parents,
+                    author: identity.clone(),
+                    committer: identity,
+                    encoding: None,
+                    message: format!("{message}\n").into_bytes(),
+                }
+                .write(),
+            ),
+        )
+    }
 
     fn temp_repo(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -3421,6 +3829,50 @@ mod tests {
     }
 
     #[cfg(feature = "http")]
+    fn http_update_push_bodies(old: ObjectId) -> (Vec<u8>, Vec<u8>) {
+        let mut discovery = Vec::new();
+        write_service_discovery_response(
+            &mut discovery,
+            &ServiceDiscoveryResponse {
+                announcement: ServiceAnnouncement {
+                    service: GitService::ReceivePack,
+                },
+                payload: ServiceDiscoveryPayload::AdvertisedRefs(RefAdvertisementSet {
+                    protocol: ProtocolVersion::V0,
+                    refs: vec![RefAdvertisement {
+                        oid: old,
+                        name: "refs/heads/main".into(),
+                        capabilities: vec![
+                            sley_core::Capability {
+                                name: "report-status".into(),
+                                value: None,
+                            },
+                            sley_core::Capability {
+                                name: "ofs-delta".into(),
+                                value: None,
+                            },
+                        ],
+                    }],
+                    shallow: Vec::new(),
+                }),
+            },
+        )
+        .expect("discovery response should encode");
+        let mut result = Vec::new();
+        write_receive_pack_report_status(
+            &mut result,
+            &ReceivePackReportStatus {
+                unpack: ReceivePackUnpackStatus::Ok,
+                commands: vec![ReceivePackCommandStatus::Ok {
+                    name: "refs/heads/main".into(),
+                }],
+            },
+        )
+        .expect("receive-pack result should encode");
+        (discovery, result)
+    }
+
+    #[cfg(feature = "http")]
     fn run_http_delete_push(
         git_dir: &Path,
         remote: RemoteUrl,
@@ -3494,7 +3946,7 @@ mod tests {
     fn serve_http_push(
         discovery: Vec<u8>,
         result: Vec<u8>,
-    ) -> (RemoteUrl, std::thread::JoinHandle<()>) {
+    ) -> (RemoteUrl, std::thread::JoinHandle<Vec<u8>>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("test server should bind");
         let address = listener
             .local_addr()
@@ -3502,6 +3954,7 @@ mod tests {
         let remote = parse_remote_url(&format!("http://{address}/repo.git"))
             .expect("default-client remote should parse");
         let server = std::thread::spawn(move || {
+            let mut post_request = Vec::new();
             let responses = [
                 (
                     "GET ",
@@ -3518,6 +3971,9 @@ mod tests {
                     "expected {method} request, got {}",
                     String::from_utf8_lossy(&request[..request.len().min(16)])
                 );
+                if method == "POST " {
+                    post_request = request;
+                }
                 write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -3526,6 +3982,7 @@ mod tests {
                 .expect("response headers should write");
                 stream.write_all(&body).expect("response body should write");
             }
+            post_request
         });
         (remote, server)
     }
@@ -3559,6 +4016,123 @@ mod tests {
         server.join().expect("test server should complete");
         assert_eq!(outcome.commands.len(), 1);
         assert!(outcome.report.is_some());
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn repository_backed_http_actions_adapt_file_odb_to_reader_engine() {
+        let git_dir = temp_repo("http-file-reader-adapter");
+        let old = write_commit(&git_dir, Vec::new(), "remote tip");
+        let new = write_commit(&git_dir, vec![old], "local tip");
+        let (discovery, result) = http_update_push_bodies(old);
+        let (remote, server) = serve_http_push(discovery, result);
+        let destination = PushDestination::Http(remote);
+        let plan = PushActionPlan::from_actions(
+            vec![PushAction::Update {
+                dst: "refs/heads/main".into(),
+                old,
+                new,
+            }],
+            default_options(),
+        );
+        let config = GitConfig::default();
+        let mut credentials = NoCredentials;
+        let mut progress = SilentProgress;
+
+        let outcome = push_actions_with_http_client(
+            PushActionRequest {
+                git_dir: &git_dir,
+                common_git_dir: &git_dir,
+                format: ObjectFormat::Sha1,
+                config: &config,
+                remote: "origin",
+                destination: &destination,
+                plan: &plan,
+            },
+            PushServices {
+                credentials: &mut credentials,
+                progress: &mut progress,
+                cancel: CancelFlag::never(),
+            },
+            None,
+        )
+        .expect("repository-backed exact push should succeed");
+
+        server.join().expect("test server should complete");
+        assert_eq!(outcome.commands[0].new_id, new);
+        assert!(outcome.report.is_some());
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn observed_http_push_streams_from_custom_reader_without_second_discovery() {
+        let format = ObjectFormat::Sha1;
+        let mut objects = MapObjectReader::default();
+        let tree = insert_map_object(
+            &mut objects,
+            EncodedObject::new(ObjectType::Tree, Tree { entries: vec![] }.write()),
+        );
+        let old = insert_map_commit(&mut objects, tree, Vec::new(), "remote tip");
+        let new = insert_map_commit(&mut objects, tree, vec![old], "projected tip");
+
+        let (discovery, result) = http_update_push_bodies(old);
+        // This fixture accepts exactly GET discovery + POST receive-pack. A
+        // second discovery causes the asserted request order to fail.
+        let (remote, server) = serve_http_push(discovery, result);
+        let config = GitConfig::default();
+        let mut credentials = NoCredentials;
+        let observation = observe_http_receive_pack(
+            HttpReceivePackObservationRequest {
+                remote_url: &remote,
+                format,
+                config: &config,
+            },
+            &mut credentials,
+            None,
+        )
+        .expect("receive-pack should be observed");
+        assert_eq!(observation.refs().len(), 1);
+        assert_eq!(observation.refs()[0].oid, old);
+
+        let plan = PushActionPlan::from_actions(
+            vec![PushAction::Update {
+                dst: "refs/heads/main".into(),
+                old,
+                new,
+            }],
+            default_options(),
+        );
+        let mut progress = SilentProgress;
+        let outcome = push_http_actions_with_reader_from_observation(
+            HttpPushActionsRequest {
+                objects: &objects,
+                format,
+                config: &config,
+                remote_url: &remote,
+                plan: &plan,
+            },
+            PushServices {
+                credentials: &mut credentials,
+                progress: &mut progress,
+                cancel: CancelFlag::never(),
+            },
+            observation,
+        )
+        .expect("custom-reader push should succeed");
+
+        let request = server.join().expect("test server should complete");
+        let body_start = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|offset| offset + 4)
+            .expect("POST should contain a header terminator");
+        let received = parse_receive_pack_push_request(format, &request[body_start..], false)
+            .expect("custom-reader receive-pack request should parse");
+        assert_eq!(outcome.commands.len(), 1);
+        assert_eq!(outcome.commands[0].new_id, new);
+        assert!(outcome.report.is_some());
+        assert_eq!(received.commands.commands, outcome.commands);
+        assert!(received.packfile.starts_with(b"PACK"));
     }
 
     #[test]

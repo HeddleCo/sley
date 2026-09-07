@@ -129,6 +129,11 @@ adapter ([ADR 0002](docs/adr/0002-streaming-io-house-rule.md)). Clustered
 upstream/parity work by engine is tracked in
 [`docs/ROADMAP_ENGINES.md`](docs/ROADMAP_ENGINES.md).
 
+`sley-remote` also exposes smart-HTTP exact-action push from a caller-supplied
+`ObjectReader`, including a single-use receive-pack observation for callers
+that reconcile refs before pushing. This lets virtual repositories stream Git
+packs without first materializing `$GIT_DIR/objects`.
+
 ## Documentation
 
 | Document | Purpose |

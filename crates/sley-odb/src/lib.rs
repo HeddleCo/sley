@@ -56,6 +56,18 @@ pub struct ReusablePackCandidate {
 pub trait ObjectReader {
     fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>>;
 
+    /// Test object presence without requiring callers to materialize its body.
+    ///
+    /// Readers backed by an index should override this. The default preserves
+    /// the exact [`Self::read_object`] semantics for virtual readers.
+    fn contains(&self, oid: &ObjectId) -> Result<bool> {
+        match self.read_object(oid) {
+            Ok(_) => Ok(true),
+            Err(GitError::NotFound(_)) => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
     /// Return existing packs that may contain entries for `object_ids`.
     ///
     /// Pack-backed readers can override this to let transfer-pack generation
