@@ -269,7 +269,7 @@ mod shallow;
 pub use shallow::{apply_shallow_info, read_shallow, write_shallow};
 
 mod capabilities;
-pub use capabilities::{RemoteTransportKind, TransportCapabilities};
+pub use capabilities::RemoteTransportKind;
 
 mod protocol;
 pub use protocol::{

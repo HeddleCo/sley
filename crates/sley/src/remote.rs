@@ -70,11 +70,6 @@ impl RemoteContext {
         &self.config
     }
 
-    /// Transport capabilities of the linked `sley-remote` build.
-    pub fn transport_capabilities(&self) -> sley_remote::TransportCapabilities {
-        sley_remote::TransportCapabilities::current()
-    }
-
     /// Rewritten fetch URL (`remote.<name>.url` + `url.*.insteadOf`).
     pub fn fetch_url(&self) -> String {
         sley_remote::fetch_url(&self.config, &self.remote)
@@ -468,8 +463,5 @@ mod tests {
             ctx.fetch_transport_kind().expect("kind"),
             Some(sley_remote::RemoteTransportKind::Http)
         );
-        assert!(ctx.transport_capabilities().http_protocol_v2_fetch);
-        assert!(ctx.transport_capabilities().ssh_fetch);
-        assert!(ctx.transport_capabilities().thin_pack_push);
     }
 }

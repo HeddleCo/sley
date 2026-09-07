@@ -31,8 +31,6 @@
 //! * [`OpenOptions::respect_environment`] / [`Repository::open_from_environment`]
 //!   — honor `GIT_DIR`, `GIT_WORK_TREE`, and related discovery env vars.
 //! * [`notes`] — git notes read/write for round-trip fidelity.
-//! * [`Repository::capabilities`] / [`Repository::transport_capabilities`] —
-//!   capability probes before calling in.
 //!
 //! For power users the engine crates are re-exported under [`plumbing`] (and the
 //! most common types are re-exported at the crate root), so a single
@@ -52,7 +50,6 @@
 //! # }
 //! ```
 
-mod capabilities;
 mod config_edit;
 mod diff;
 /// Hook engine ([`sley_hooks`]) — traditional `$GIT_DIR/hooks/<name>` scripts
@@ -182,7 +179,6 @@ pub use sley_worktree::{
     SubmoduleStatus, WorktreeEntryState, write_metadata_file_atomic,
 };
 
-pub use capabilities::RepositoryCapabilities;
 pub use config_edit::{
     ConfigEdit, ConfigEditError, ConfigEditPlan, ConfigEditScope, ConfigRemote, ConfigSectionEntry,
     ConfigSectionId, ConfigSnapshot, ConfigSource, ConfigStackOptions, ConfigStackView,
@@ -195,7 +191,7 @@ pub use hooks::{
 };
 pub use index_io::{IndexError, IndexWriteError, IndexWriteOptions, IndexWriteResult};
 pub use local_clone::{LocalCloneOptions, LocalCloneSummary, clone_local_to_bare};
-pub use objects::{BlobFetchOptions, BlobStore, LoadedObject};
+pub use objects::{BlobStore, LoadedObject};
 pub use pack_plan::{
     PreparedReachablePack, PreparedReachablePackFile, ReachablePackPlan, ReachablePackPlanBuilder,
     ReachablePackSummary,
@@ -206,9 +202,7 @@ pub use refs::{
 };
 pub use refspec::{NegativeRefSpec, RefSpec};
 pub use rev_graph::{ReachableCommit, ReachableCommitOptions, RevGraph};
-pub use status_plan::{
-    OwnedStatusRow, StatusCacheKey, StatusCode, StatusPlan, StatusPlanBuilder, StatusRow,
-};
+pub use status_plan::{OwnedStatusRow, StatusCode, StatusPlan, StatusPlanBuilder, StatusRow};
 pub use tags::{
     TagQueryEntry, TagQueryError, TagQueryOptions, TagQueryOutcome, TagQueryResult,
     TagQueryRevisionKind,
@@ -1849,22 +1843,16 @@ mod tests {
         let repo = Repository::init(temp.path()).expect("init");
         let blob_oid = repo.write_blob(b"payload").expect("write blob");
 
-        let bytes = repo
-            .blobs()
-            .read_or_fetch_blocking(blob_oid, BlobFetchOptions::from_remote("origin"))
-            .expect("read local blob");
+        let bytes = repo.blobs().read(blob_oid).expect("read local blob");
         assert_eq!(bytes, b"payload");
 
         let missing = ObjectId::null(repo.object_format());
-        let err = repo
-            .blobs()
-            .read_or_fetch_blocking(missing, BlobFetchOptions::from_remote("origin"))
-            .expect_err("missing blob");
+        let err = repo.blobs().read(missing).expect_err("missing blob");
         match err.not_found_kind() {
             Some(NotFoundKind::Object { oid, kind, context }) => {
                 assert_eq!(*oid, missing);
                 assert_eq!(*kind, MissingObjectKind::Blob);
-                assert_eq!(*context, Some(MissingObjectContext::RemoteBoundary));
+                assert_eq!(*context, Some(MissingObjectContext::Read));
             }
             other => panic!("expected typed missing blob, got {other:?}"),
         }
@@ -1872,13 +1860,8 @@ mod tests {
         let status = repo
             .status_plan()
             .include_untracked(false)
-            .reuse_index_cache("health")
             .build()
             .expect("status plan");
-        assert_eq!(
-            status.cache_key().map(StatusCacheKey::as_str),
-            Some("health")
-        );
         assert_eq!(status.count().expect("count status"), 0);
         assert!(status.collect().expect("collect status").is_empty());
 
@@ -2320,20 +2303,13 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_reflect_repo_state() {
+    fn concrete_repository_state_queries() {
         let temp = TempDir::new();
         let repo = Repository::init(temp.path()).expect("init");
-        let caps = repo.capabilities();
-        assert!(caps.annotated_tags);
-        assert!(caps.config_includes);
-        assert!(caps.hasconfig_include_if);
-        assert!(caps.notes);
-        assert!(caps.index);
-        assert!(!caps.shallow);
-        assert!(!caps.sha256);
-
+        assert!(!repo.is_shallow());
+        assert_eq!(repo.object_format(), ObjectFormat::Sha1);
         fs::write(repo.git_dir().join("shallow"), b"").expect("shallow");
-        assert!(repo.capabilities().shallow);
+        assert!(repo.is_shallow());
     }
 
     #[test]
