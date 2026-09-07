@@ -57,14 +57,14 @@ fn add_edit_patch(cli_session: &crate::session::CliSession, paths: &[PathBuf]) -
         .args(&diff_args)
         .current_dir(&context.cwd)
         .output()
-        .map_err(|e| GitError::from(e))?;
+        .map_err(GitError::from)?;
     // diff-files exits 1 when differences exist; treat that as success.
     if !diff_out.status.success() && diff_out.status.code() != Some(1) {
         let _ = io::stderr().write_all(&diff_out.stderr);
         eprintln!("fatal: could not generate patch for editing");
         return Err(crate::cli_exit(128));
     }
-    fs::write(&patch_path, &diff_out.stdout).map_err(|e| GitError::from(e))?;
+    fs::write(&patch_path, &diff_out.stdout).map_err(GitError::from)?;
 
     if let Err(_err) = crate::commands::replay::launch_editor(&context.git_dir, &patch_path) {
         // Match git's `die(_("editing patch failed"))`.
@@ -92,7 +92,7 @@ fn add_edit_patch(cli_session: &crate::session::CliSession, paths: &[PathBuf]) -
         ])
         .current_dir(&context.cwd)
         .status()
-        .map_err(|e| GitError::from(e))?;
+        .map_err(GitError::from)?;
     if !apply_status.success() {
         eprintln!("fatal: could not apply '{}'", patch_path.to_string_lossy());
         let _ = fs::remove_file(&patch_path);

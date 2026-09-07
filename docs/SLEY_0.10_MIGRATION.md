@@ -54,7 +54,9 @@ Repository discovery lives at `sley_formats::discovery`, and worktree layout
 resolution at `sley_formats::worktree_root_for_git_dir`. Their existing
 `sley_worktree` re-exports remain available. Opening, discovering, reading and
 writing a bare repository no longer requires the worktree engine. No crate was
-merged or removed; the CLI and all oracle scripts remain enrolled.
+merged or removed; the CLI and all oracle scripts remain enrolled. The mandatory
+normal-dependency closure falls from 26 to 16 Sley nodes, counting the facade
+itself (manifest traversal excluding optional and development edges).
 
 ## Repository and operation policy (rank 1)
 
@@ -299,3 +301,29 @@ host-specific error through `CallbackError`; custom HTTP/authentication behavior
 is unchanged. Exhaustive `GitError` matches need the new variants. Neither consumer
 was repinned or built by this change; adopting 0.10 requires their own compilation
 and error-path tests.
+
+
+## Removal inventory and retained historical references
+
+A whole-repository source/path sweep accompanies compilation. Each group below
+has no live Rust caller or workflow/gate invocation remaining:
+
+- `StatusCacheKey`, its conversions/accessors, `StatusPlanBuilder::reuse_index_cache`,
+  and `StatusPlan::cache_key`.
+- `BlobFetchOptions`, `BlobStore::read_or_fetch`, and `read_or_fetch_blocking`.
+- `RepositoryCapabilities` (including deleted `crates/sley/src/capabilities.rs`),
+  `TransportCapabilities`, and both `transport_capabilities` accessors.
+- The broad `sley::plumbing` re-export module and its consumer imports.
+- Namespace, precomposition, and original-CWD global setters/getters and the
+  ambient namespace/transport environment reads moved to `sley_cli::session`.
+- `GitError::{Io,Exit,Cli}` and the core CLI status constructors/mapping.
+
+The historical architecture audit, July reviews, and completed/pre-alpha plans
+retain old names as records of their revisions; the audit points here for the
+implemented migration. The old capability file link is pinned to the audited
+revision. `scripts/split_remote_cmds.py` is an uninvoked historical extraction
+script whose input `remote_cmds.rs` no longer exists; its embedded old exit name
+is not a live generator/build path. It is retained within the task's restriction
+on editing orchestration scripts. The live parity checklist and API doc links
+were updated. No floor, prerequisite, selection, comparison rule, or test was
+removed to accommodate these deletions.

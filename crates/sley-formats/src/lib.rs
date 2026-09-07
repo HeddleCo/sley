@@ -3949,7 +3949,7 @@ fn hash_function_id(format: ObjectFormat) -> u32 {
 ///    ordinary non-bare layout) — returned verbatim, not canonicalised;
 /// 4. otherwise the repository is bare and `Ok(None)` is returned.
 ///
-/// `Ok(None)` means specifically "bare" (case 0 or case 4). A [`GitError::Io`] is
+/// `Ok(None)` means specifically "bare" (case 0 or case 4). A [`GitError::IoKind`] is
 /// returned if a path that should exist cannot be canonicalised, and a
 /// [`GitError::InvalidPath`] if a `.git` directory has no parent (a malformed
 /// layout).

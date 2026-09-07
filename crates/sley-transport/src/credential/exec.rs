@@ -274,7 +274,7 @@ pub(crate) fn run_helper_process(
         Stdio::null()
     });
     let deadline = options.timeout.map(|timeout| Instant::now() + timeout);
-    let mut child = command.spawn().map_err(|e| GitError::from(e))?;
+    let mut child = command.spawn().map_err(GitError::from)?;
     let op_type = if want_output {
         CredentialOpType::Helper
     } else {

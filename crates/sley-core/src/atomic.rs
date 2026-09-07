@@ -132,7 +132,7 @@ impl LockFile {
 
     /// Publish onto `target`: rename the lock over it. On rename failure the
     /// lock file is removed and the original error surfaces as
-    /// [`GitError::Io`], matching the pre-existing dance's cleanup order.
+    /// [`GitError::IoKind`], matching the pre-existing dance's cleanup order.
     pub fn persist_into(mut self, target: &Path) -> Result<()> {
         self.armed = false;
         let _ = self.file.take();

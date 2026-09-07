@@ -81,7 +81,7 @@ pub fn cli_reported_status(error: &GitError) -> Option<i32> {
 pub fn cli_exit_code(error: &GitError) -> i32 {
     cli_reported_status(error)
         .or_else(|| outcome(error).map(|outcome| outcome.status))
-        .unwrap_or_else(|| match error {
+        .unwrap_or(match error {
             GitError::Cancelled => 130,
             GitError::RemoteHelperAborted { .. } => 128,
             _ => 1,

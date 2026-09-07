@@ -187,12 +187,12 @@ pub fn credential_announce_capabilities(
     credential: &GitCredential,
     writer: &mut impl Write,
 ) -> Result<()> {
-    writeln!(writer, "version 0").map_err(|e| GitError::from(e))?;
+    writeln!(writer, "version 0").map_err(GitError::from)?;
     if credential.capa_authtype.request_initial {
-        writeln!(writer, "capability authtype").map_err(|e| GitError::from(e))?;
+        writeln!(writer, "capability authtype").map_err(GitError::from)?;
     }
     if credential.capa_state.request_initial {
-        writeln!(writer, "capability state").map_err(|e| GitError::from(e))?;
+        writeln!(writer, "capability state").map_err(GitError::from)?;
     }
     Ok(())
 }
@@ -392,7 +392,7 @@ fn write_item(
              If this is intended, set `credential.protectProtocol=false`"
         )));
     }
-    writeln!(writer, "{key}={value}").map_err(|e| GitError::from(e))?;
+    writeln!(writer, "{key}={value}").map_err(GitError::from)?;
     Ok(())
 }
 

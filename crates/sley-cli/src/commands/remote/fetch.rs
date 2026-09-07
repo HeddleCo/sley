@@ -820,9 +820,9 @@ fn print_fetch_failure(remote: &str, err: &GitError, parallel_fetch: bool) {
 
 fn print_fetch_failure_detail(err: &GitError) {
     match err {
-        _ if crate::cli_reported_status(&err).is_some() => {}
+        _ if crate::cli_reported_status(err).is_some() => {}
         GitError::Command(message) => eprintln!("{message}"),
-        _ if crate::cli_message(&err).is_some() => eprintln!("{err}"),
+        _ if crate::cli_message(err).is_some() => eprintln!("{err}"),
         other => eprintln!("{other}"),
     }
 }

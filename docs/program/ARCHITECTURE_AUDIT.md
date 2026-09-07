@@ -4,6 +4,10 @@ Recorded on 2026-09-07 against Sley 0.9.0, `38b8b5cd`. The workspace map and
 finding/evidence structure follow [Heddle's audit on its clean-cut
 branch](https://github.com/HeddleCo/heddle/blob/bc029f475faae3eda5182d4d2ac63ed3a8c6e01a/docs/program/ARCHITECTURE_AUDIT.md).
 
+This is the historical 0.9 audit. Its ranked breaking cuts are implemented by
+the subsequent [0.10 embedding migration](../SLEY_0.10_MIGRATION.md); the findings
+and evidence below remain a record of the audited revision.
+
 ## Core intent and verdict
 
 Sley's irreducible job is to understand and exchange Git data: object identity
@@ -102,7 +106,7 @@ async wrapper around a synchronous local read; choosing a remote changes the
 missing-object context, not whether objects are fetched. These are speculative
 API commitments, not implemented capabilities.
 
-[`RepositoryCapabilities`](../../crates/sley/src/capabilities.rs) mixes support
+[`RepositoryCapabilities`](https://github.com/HeddleCo/sley/blob/38b8b5cd/crates/sley/src/capabilities.rs) mixes support
 with repository state: `current().shallow` is true, while
 `Repository::capabilities().shallow` reports whether this repository is shallow.
 Several other fields are unconditional true values.
