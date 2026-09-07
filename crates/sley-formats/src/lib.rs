@@ -3969,7 +3969,7 @@ pub fn worktree_root_for_git_dir(git_dir: &Path) -> Result<Option<PathBuf>> {
             if let Some(worktree) = worktree_git_file.parent() {
                 return fs::canonicalize(worktree)
                     .map(Some)
-                    .map_err(|err| GitError::Io(err.to_string()));
+                    .map_err(GitError::from);
             }
         }
     }
@@ -3990,7 +3990,7 @@ pub fn worktree_root_for_git_dir(git_dir: &Path) -> Result<Option<PathBuf>> {
             };
             return fs::canonicalize(worktree)
                 .map(Some)
-                .map_err(|err| GitError::Io(err.to_string()));
+                .map_err(GitError::from);
         }
     }
     if git_dir.file_name().and_then(|name| name.to_str()) != Some(".git") {

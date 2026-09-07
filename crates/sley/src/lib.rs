@@ -974,7 +974,7 @@ impl Repository {
         let path = self.common_dir.join("config");
         match GitConfig::read(&path) {
             Ok(config) => Ok(config),
-            Err(GitError::Io(_) | GitError::IoKind { .. } | GitError::NotFound(_)) => {
+            Err(GitError::IoKind { .. } | GitError::NotFound(_)) => {
                 Ok(GitConfig::default())
             }
             Err(err) => Err(err),
@@ -1400,7 +1400,7 @@ fn read_object_format(common_dir: &Path) -> Result<ObjectFormat> {
     let config_path = common_dir.join("config");
     match GitConfig::read(&config_path) {
         Ok(config) => config.repository_object_format(),
-        Err(GitError::Io(_) | GitError::IoKind { .. } | GitError::NotFound(_)) => {
+        Err(GitError::IoKind { .. } | GitError::NotFound(_)) => {
             Ok(ObjectFormat::Sha1)
         }
         Err(err) => Err(err),

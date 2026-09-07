@@ -641,11 +641,11 @@ fn remove_incremental_midx_dir(pack_dir: &Path) -> Result<()> {
     let preserve_empty_dir = midx_dir.exists();
     match fs::remove_dir_all(&midx_dir) {
         Ok(()) if preserve_empty_dir => {
-            fs::create_dir_all(&midx_dir).map_err(|err| GitError::Io(err.to_string()))
+            fs::create_dir_all(&midx_dir).map_err(GitError::from)
         }
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(GitError::Io(err.to_string())),
+        Err(err) => Err(GitError::from(err)),
     }
 }
 

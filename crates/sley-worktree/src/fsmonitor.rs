@@ -73,10 +73,10 @@ impl FsmonitorDaemonSession {
         if self.wait_for_state(FsmonitorDaemonState::NotListening, timeout)? {
             Ok(())
         } else {
-            Err(GitError::Io(format!(
+            Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!(
                 "fsmonitor daemon did not stop within {} seconds",
                 timeout.as_secs()
-            )))
+            ) })
         }
     }
 
@@ -125,31 +125,31 @@ mod platform {
             {
                 Ok(FsmonitorDaemonState::NotListening)
             }
-            Err(err) => Err(GitError::Io(format!(
+            Err(err) => Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!(
                 "could not connect to fsmonitor IPC endpoint '{}': {err}",
                 path.display()
-            ))),
+            ) }),
         }
     }
 
     pub(super) fn serve(path: &Path, token: &str) -> Result<()> {
         if state(path)? == FsmonitorDaemonState::Listening {
-            return Err(GitError::Io(format!(
+            return Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!(
                 "fsmonitor daemon is already listening on '{}'",
                 path.display()
-            )));
+            ) });
         }
         remove_stale_endpoint(path)?;
         let alias = prepare_endpoint_alias(path)?;
         let address = alias.join(
             path.file_name()
-                .ok_or_else(|| GitError::Io("invalid fsmonitor IPC path".into()))?,
+                .ok_or_else(|| GitError::IoKind { kind: std::io::ErrorKind::Other, message: "invalid fsmonitor IPC path".into() })?,
         );
         let listener = UnixListener::bind(&address).map_err(|err| {
-            GitError::Io(format!(
+            GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!(
                 "could not create fsmonitor IPC endpoint '{}': {err}",
                 path.display()
-            ))
+            ) }
         })?;
         let _cleanup = SocketCleanup {
             endpoint: path.to_path_buf(),
@@ -157,7 +157,7 @@ mod platform {
         };
         listener
             .set_nonblocking(true)
-            .map_err(|err| GitError::Io(err.to_string()))?;
+            .map_err(GitError::from)?;
 
         loop {
             // A Scalar enlistment can be deleted without an explicit `stop`.
@@ -174,18 +174,18 @@ mod platform {
                     continue;
                 }
                 Err(err) => {
-                    return Err(GitError::Io(format!(
+                    return Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!(
                         "could not accept fsmonitor IPC client: {err}"
-                    )));
+                    ) });
                 }
             };
             stream
                 .set_nonblocking(true)
-                .map_err(|err| GitError::Io(err.to_string()))?;
+                .map_err(GitError::from)?;
             let request = read_packetized(&mut stream);
             stream
                 .set_nonblocking(false)
-                .map_err(|err| GitError::Io(err.to_string()))?;
+                .map_err(GitError::from)?;
             match request {
                 Ok(Some(command)) if command == b"quit" => {
                     write_flush(&mut stream)?;
@@ -215,9 +215,9 @@ mod platform {
                             | io::ErrorKind::TimedOut
                     ) => {}
                 Err(err) => {
-                    return Err(GitError::Io(format!(
+                    return Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!(
                         "could not read fsmonitor IPC request: {err}"
-                    )));
+                    ) });
                 }
             }
         }
@@ -226,7 +226,7 @@ mod platform {
     pub(super) fn request_stop(path: &Path) -> Result<()> {
         let address = endpoint_address(path)?;
         let mut stream = UnixStream::connect(address)
-            .map_err(|err| GitError::Io(format!("fsmonitor--daemon is not running: {err}")))?;
+            .map_err(|err| GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!("fsmonitor--daemon is not running: {err}") })?;
         write_packet(&mut stream, b"quit")?;
         write_flush(&mut stream)?;
         // The server replies with a flush packet and closes the connection.
@@ -238,10 +238,10 @@ mod platform {
         match fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(GitError::Io(format!(
+            Err(err) => Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!(
                 "could not remove stale fsmonitor IPC endpoint '{}': {err}",
                 path.display()
-            ))),
+            ) }),
         }
     }
 
@@ -252,14 +252,14 @@ mod platform {
         let alias = endpoint_alias(path)?;
         Ok(alias.join(
             path.file_name()
-                .ok_or_else(|| GitError::Io("invalid fsmonitor IPC path".into()))?,
+                .ok_or_else(|| GitError::IoKind { kind: std::io::ErrorKind::Other, message: "invalid fsmonitor IPC path".into() })?,
         ))
     }
 
     fn endpoint_alias(path: &Path) -> Result<PathBuf> {
         let git_dir = path
             .parent()
-            .ok_or_else(|| GitError::Io("invalid fsmonitor IPC path".into()))?;
+            .ok_or_else(|| GitError::IoKind { kind: std::io::ErrorKind::Other, message: "invalid fsmonitor IPC path".into() })?;
         let mut hash = 0xcbf2_9ce4_8422_2325_u64;
         for byte in git_dir.as_os_str().as_bytes() {
             hash ^= u64::from(*byte);
@@ -267,10 +267,10 @@ mod platform {
         }
         let alias = PathBuf::from(format!("/tmp/.sley-fsmonitor-{hash:016x}"));
         match fs::symlink_metadata(&alias) {
-            Ok(metadata) if !metadata.file_type().is_symlink() => Err(GitError::Io(format!(
+            Ok(metadata) if !metadata.file_type().is_symlink() => Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!(
                 "fsmonitor IPC alias '{}' is not a symbolic link",
                 alias.display()
-            ))),
+            ) }),
             Ok(_) => {
                 let target = match fs::read_link(&alias) {
                     Ok(target) => target,
@@ -278,22 +278,22 @@ mod platform {
                     // Treat a removal between the metadata probe and readlink
                     // like Git's IPC_STATE__PATH_NOT_FOUND, not an I/O error.
                     Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(alias),
-                    Err(err) => return Err(GitError::Io(err.to_string())),
+                    Err(err) => return Err(GitError::from(err)),
                 };
                 if target == git_dir {
                     Ok(alias)
                 } else {
-                    Err(GitError::Io(format!(
+                    Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!(
                         "fsmonitor IPC alias '{}' points to an unexpected repository",
                         alias.display()
-                    )))
+                    ) })
                 }
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(alias),
-            Err(err) => Err(GitError::Io(format!(
+            Err(err) => Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!(
                 "could not inspect fsmonitor IPC alias '{}': {err}",
                 alias.display()
-            ))),
+            ) }),
         }
     }
 
@@ -302,12 +302,12 @@ mod platform {
         if fs::symlink_metadata(&alias).is_err() {
             let git_dir = path
                 .parent()
-                .ok_or_else(|| GitError::Io("invalid fsmonitor IPC path".into()))?;
+                .ok_or_else(|| GitError::IoKind { kind: std::io::ErrorKind::Other, message: "invalid fsmonitor IPC path".into() })?;
             symlink(git_dir, &alias).map_err(|err| {
-                GitError::Io(format!(
+                GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!(
                     "could not create fsmonitor IPC alias '{}': {err}",
                     alias.display()
-                ))
+                ) }
             })?;
         }
         Ok(alias)
@@ -397,18 +397,18 @@ mod platform {
     fn write_packet(stream: &mut UnixStream, payload: &[u8]) -> Result<()> {
         let length = payload.len().saturating_add(4);
         if length > 0xffff {
-            return Err(GitError::Io("fsmonitor IPC packet is too large".into()));
+            return Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: "fsmonitor IPC packet is too large".into() });
         }
         stream
             .write_all(format!("{length:04x}").as_bytes())
             .and_then(|()| stream.write_all(payload))
-            .map_err(|err| GitError::Io(format!("could not write fsmonitor IPC response: {err}")))
+            .map_err(|err| GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!("could not write fsmonitor IPC response: {err}") })
     }
 
     fn write_flush(stream: &mut UnixStream) -> Result<()> {
         stream
             .write_all(b"0000")
-            .map_err(|err| GitError::Io(format!("could not flush fsmonitor IPC response: {err}")))
+            .map_err(|err| GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!("could not flush fsmonitor IPC response: {err}") })
     }
 }
 

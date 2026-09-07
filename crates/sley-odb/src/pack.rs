@@ -113,7 +113,7 @@ impl ObjectWriter for ObjectDatabase {
         let oid = object.object_id(self.format)?;
         self.objects
             .lock()
-            .map_err(|_| GitError::Io("object cache lock poisoned".into()))?
+            .map_err(|_| GitError::IoKind { kind: std::io::ErrorKind::Other, message: "object cache lock poisoned".into() })?
             .entry(oid)
             .or_insert_with(|| Arc::new(object));
         Ok(oid)
@@ -2097,10 +2097,10 @@ pub(crate) fn freshen_file_mtime(path: &Path) -> Result<bool> {
     let file = match fs::OpenOptions::new().read(true).open(path) {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(GitError::Io(err.to_string())),
+        Err(err) => return Err(GitError::from(err)),
     };
     file.set_modified(std::time::SystemTime::now())
-        .map_err(|err| GitError::Io(err.to_string()))?;
+        .map_err(GitError::from)?;
     Ok(true)
 }
 

@@ -1287,7 +1287,7 @@ fn read_contents_file(cwd: &Path, spec: &str) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
         io::stdin()
             .read_to_end(&mut buf)
-            .map_err(|err| GitError::Io(err.to_string()))?;
+            .map_err(GitError::from)?;
         return Ok(buf);
     }
     let path = Path::new(spec);

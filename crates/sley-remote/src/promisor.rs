@@ -129,7 +129,7 @@ pub fn apply_promisor_remote_field_updates(
     let mut contents = match fs::read(&path) {
         Ok(contents) => contents,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(err) => return Err(GitError::Io(err.to_string())),
+        Err(err) => return Err(GitError::from(err)),
     };
     for update in updates {
         let mut editor = RawConfigEditor::new(
@@ -142,7 +142,7 @@ pub fn apply_promisor_remote_field_updates(
         contents = editor.into_bytes();
     }
     write_config_file_locked(&path, &contents, ConfigFileWriteOptions::default())
-        .map_err(|err| GitError::Io(err.to_string()))
+        .map_err(GitError::from)
 }
 
 /// Construct the concrete partial-clone filter for `--filter=auto` from the

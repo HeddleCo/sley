@@ -480,7 +480,7 @@ fn filter_display_diff(filter: &str, input: &str) -> Result<String> {
     }
     let output = child
         .wait_with_output()
-        .map_err(|e| GitError::Io(e.to_string()))?;
+        .map_err(|e| GitError::from(e))?;
     if !output.status.success() {
         eprintln!("error: failed to run '{filter}'");
         return Err(GitError::Exit(1));
@@ -877,7 +877,7 @@ fn run_add_patch_with_result(
     // git's `parse_diff` errors with "could not parse diff" (exit 1) when the
     // spawned `diff-files` fails — e.g. an invalid `--diff-algorithm` (t3701 #69).
     let (diff, diff_ok) =
-        run_capture_status(&args, None).map_err(|e| GitError::Io(e.to_string()))?;
+        run_capture_status(&args, None).map_err(|e| GitError::from(e))?;
     if !diff_ok {
         eprintln!("error: could not parse diff");
         return Err(GitError::Exit(1));
@@ -2058,7 +2058,7 @@ fn apply_file_via_patch(fd: &FileDiff, mode: PatchMode, stdin: &mut impl BufRead
     // Worktree-only modes: a single forward `apply` against the working tree.
     let args: Vec<&str> = vec!["apply"];
     let (_out, ok) =
-        run_capture_status(&args, Some(patch)).map_err(|e| GitError::Io(e.to_string()))?;
+        run_capture_status(&args, Some(patch)).map_err(|e| GitError::from(e))?;
     if !ok {
         eprintln!("error: 'git apply' failed");
     }
@@ -2140,7 +2140,7 @@ fn apply_file_to_index(fd: &FileDiff) -> Result<()> {
             .args(["update-index", "--force-remove", &fd.path])
             .stdin(Stdio::null())
             .status()
-            .map_err(|e| GitError::Io(e.to_string()))?;
+            .map_err(|e| GitError::from(e))?;
         if !status.success() {
             return Err(GitError::Exit(1));
         }
@@ -2166,7 +2166,7 @@ fn apply_file_to_index(fd: &FileDiff) -> Result<()> {
                 .args(["update-index", "--cacheinfo", &mode, &oid, &fd.path])
                 .stdin(Stdio::null())
                 .status()
-                .map_err(|e| GitError::Io(e.to_string()))?;
+                .map_err(|e| GitError::from(e))?;
             if !status.success() {
                 return Err(GitError::Exit(1));
             }
@@ -2186,7 +2186,7 @@ fn apply_file_to_index(fd: &FileDiff) -> Result<()> {
             .args(["update-index", "--cacheinfo", "160000", oid, &fd.path])
             .stdin(Stdio::null())
             .status()
-            .map_err(|e| GitError::Io(e.to_string()))?;
+            .map_err(|e| GitError::from(e))?;
         if !status.success() {
             return Err(GitError::Exit(1));
         }
@@ -2204,7 +2204,7 @@ fn apply_file_to_index(fd: &FileDiff) -> Result<()> {
         &["hash-object", "-w", "--stdin"],
         Some(new_content.as_bytes()),
     )
-    .map_err(|e| GitError::Io(e.to_string()))?;
+    .map_err(|e| GitError::from(e))?;
     let oid = String::from_utf8_lossy(&oid).trim().to_string();
     // Stage mode. For a mode-change file the diff's `index` line carries no mode,
     // so `fd.mode` is the default 100644: use the explicit `mode_change` new mode
@@ -2220,7 +2220,7 @@ fn apply_file_to_index(fd: &FileDiff) -> Result<()> {
         .args(["update-index", "--cacheinfo", &mode, &oid, &fd.path])
         .stdin(Stdio::null())
         .status()
-        .map_err(|e| GitError::Io(e.to_string()))?;
+        .map_err(|e| GitError::from(e))?;
     if !status.success() {
         return Err(GitError::Exit(1));
     }
@@ -2238,7 +2238,7 @@ fn apply_file_to_index_reverse(fd: &FileDiff) -> Result<()> {
     {
         let args = ["update-index", "--cacheinfo", "160000", oid, &fd.path];
         let (_out, ok) =
-            run_capture_status(&args, None).map_err(|e| GitError::Io(e.to_string()))?;
+            run_capture_status(&args, None).map_err(|e| GitError::from(e))?;
         if !ok {
             return Err(GitError::Exit(1));
         }
@@ -2254,7 +2254,7 @@ fn apply_file_to_index_reverse(fd: &FileDiff) -> Result<()> {
             .args(["update-index", "--force-remove", &fd.path])
             .stdin(Stdio::null())
             .status()
-            .map_err(|e| GitError::Io(e.to_string()))?;
+            .map_err(|e| GitError::from(e))?;
         if !status.success() {
             return Err(GitError::Exit(1));
         }
@@ -2264,11 +2264,11 @@ fn apply_file_to_index_reverse(fd: &FileDiff) -> Result<()> {
         &["hash-object", "-w", "--stdin"],
         Some(new_content.as_bytes()),
     )
-    .map_err(|e| GitError::Io(e.to_string()))?;
+    .map_err(|e| GitError::from(e))?;
     let oid = String::from_utf8_lossy(&oid).trim().to_string();
     let mode = format!("{:o}", fd.mode);
     let args = ["update-index", "--cacheinfo", &mode, &oid, &fd.path];
-    let (_out, ok) = run_capture_status(&args, None).map_err(|e| GitError::Io(e.to_string()))?;
+    let (_out, ok) = run_capture_status(&args, None).map_err(|e| GitError::from(e))?;
     if !ok {
         return Err(GitError::Exit(1));
     }

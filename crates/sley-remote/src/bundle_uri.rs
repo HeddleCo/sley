@@ -468,7 +468,7 @@ fn download_bundle_uri_to_temp(client: &dyn HttpClient, uri: &str) -> Result<Pat
         return Ok(temp);
     }
     let source = uri.strip_prefix("file://").unwrap_or(uri);
-    fs::copy(source, &temp).map_err(|err| GitError::Io(err.to_string()))?;
+    fs::copy(source, &temp).map_err(GitError::from)?;
     Ok(temp)
 }
 
@@ -501,12 +501,12 @@ fn download_http_bundle_uri(client: &dyn HttpClient, uri: &str, dest: &Path) -> 
     let result = (|| -> Result<()> {
         let mut response = client.get(uri, &[])?;
         http_check_status(&response, uri)?;
-        let mut output = fs::File::create(dest).map_err(|err| GitError::Io(err.to_string()))?;
+        let mut output = fs::File::create(dest).map_err(GitError::from)?;
         std::io::copy(&mut response.body, &mut output)
-            .map_err(|err| GitError::Io(err.to_string()))?;
+            .map_err(GitError::from)?;
         output
             .flush()
-            .map_err(|err| GitError::Io(err.to_string()))?;
+            .map_err(GitError::from)?;
         Ok(())
     })();
     if result.is_err() {

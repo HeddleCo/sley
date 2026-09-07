@@ -56,7 +56,7 @@ fn run() -> Result<(), GitError> {
     }
 
     if let Some(out) = options.out.as_ref() {
-        write_json(out, &options, &timings).map_err(|err| GitError::Io(err.to_string()))?;
+        write_json(out, &options, &timings).map_err(GitError::from)?;
     } else if options.repeat == 0 {
         let mut stdout = io::stdout().lock();
         run_once(&options, &mut stdout)?;
@@ -145,7 +145,7 @@ impl HarnessRepo {
                     entry.worktree as char,
                     String::from_utf8_lossy(entry.path)
                 )
-                .map_err(|err| GitError::Io(err.to_string()))?;
+                .map_err(GitError::from)?;
                 Ok(sley_worktree::StreamControl::Continue)
             },
         )
@@ -178,7 +178,7 @@ impl HarnessRepo {
                 &hex[..width],
                 String::from_utf8_lossy(subject)
             )
-            .map_err(|err| GitError::Io(err.to_string()))?;
+            .map_err(GitError::from)?;
         }
         Ok(())
     }
@@ -192,7 +192,7 @@ impl HarnessRepo {
             } else {
                 ' '
             };
-            writeln!(out, "{marker} {name}").map_err(|err| GitError::Io(err.to_string()))?;
+            writeln!(out, "{marker} {name}").map_err(GitError::from)?;
         }
         Ok(())
     }
@@ -200,14 +200,14 @@ impl HarnessRepo {
     fn tag_list(&self, out: &mut impl Write) -> Result<(), GitError> {
         let names = self.refs.list_short_ref_names_with_prefix("refs/tags/")?;
         for name in names {
-            writeln!(out, "{name}").map_err(|err| GitError::Io(err.to_string()))?;
+            writeln!(out, "{name}").map_err(GitError::from)?;
         }
         Ok(())
     }
 
     fn rev_parse_short_head(&self, out: &mut impl Write) -> Result<(), GitError> {
         writeln!(out, "{}", self.abbrev_oid(&self.head_oid()?)?)
-            .map_err(|err| GitError::Io(err.to_string()))
+            .map_err(GitError::from)
     }
 
     fn branch_force_write(&self, branch: &str, start: &str) -> Result<(), GitError> {

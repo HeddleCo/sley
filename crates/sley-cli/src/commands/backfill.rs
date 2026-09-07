@@ -50,7 +50,7 @@ pub(crate) fn cmd_backfill(
     let mut rev_args = options.remaining.clone();
     if options.stdin {
         for line in io::stdin().lock().lines() {
-            let line = line.map_err(|err| GitError::Io(err.to_string()))?;
+            let line = line.map_err(GitError::from)?;
             let line = line.trim();
             if !line.is_empty() {
                 rev_args.push(line.to_string());
@@ -646,7 +646,7 @@ fn load_sparse_matcher(git_dir: &Path, config: &GitConfig) -> Result<SparseMatch
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Err(GitError::Command("problem loading sparse-checkout".into()));
         }
-        Err(err) => return Err(GitError::Io(err.to_string())),
+        Err(err) => return Err(GitError::from(err)),
     };
     let patterns = contents
         .split(|&b| b == b'\n')

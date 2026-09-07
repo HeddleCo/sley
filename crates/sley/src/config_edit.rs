@@ -789,7 +789,7 @@ impl Repository {
             Ok(config) => Ok(config
                 .get_bool("extensions", None, "worktreeConfig")
                 .unwrap_or(false)),
-            Err(GitError::Io(_) | GitError::IoKind { .. } | GitError::NotFound(_)) => Ok(false),
+            Err(GitError::IoKind { .. } | GitError::NotFound(_)) => Ok(false),
             Err(err) => Err(ConfigEditError::from_git_error(err)),
         }
     }
@@ -1200,7 +1200,6 @@ fn path_starts_with(path: &Path, root: &Path) -> bool {
 impl ConfigEditError {
     fn from_git_error(err: GitError) -> Self {
         match err {
-            GitError::Io(message) => Self::Io(std::io::Error::other(message)),
             GitError::IoKind { kind, message } => Self::Io(std::io::Error::new(kind, message)),
             GitError::InvalidFormat(message)
             | GitError::InvalidPath(message)

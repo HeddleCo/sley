@@ -536,13 +536,13 @@ pub fn invocation_git_dir<E: SetupEnvironment>(env: &E) -> Result<PathBuf> {
             && let Some(target) = super::read_gitdir_link(&resolved)?
             && super::is_git_dir(&target)
         {
-            return fs::canonicalize(target).map_err(|err| GitError::Io(err.to_string()));
+            return fs::canonicalize(target).map_err(GitError::from);
         }
         return Ok(resolved);
     }
     if env.explicit_bare() {
         if super::is_git_dir(&cwd) {
-            return fs::canonicalize(cwd).map_err(|err| GitError::Io(err.to_string()));
+            return fs::canonicalize(cwd).map_err(GitError::from);
         }
         return Err(GitError::repository_not_found("not a git repository"));
     }
@@ -563,7 +563,7 @@ pub fn effective_worktree_for_git_dir<E: SetupEnvironment>(
         let work_tree = super::resolve_path_from_cwd(env.cwd(), &work_tree);
         return fs::canonicalize(work_tree)
             .map(Some)
-            .map_err(|err| GitError::Io(err.to_string()));
+            .map_err(GitError::from);
     }
     if env.explicit_git_dir().is_some() {
         let setup = setup_git_directory(env).ok_or_else(|| {
@@ -602,7 +602,7 @@ pub fn optional_worktree_from_config<E: SetupEnvironment>(
         let work_tree = super::resolve_path_from_cwd(env.cwd(), &work_tree);
         return fs::canonicalize(work_tree)
             .map(Some)
-            .map_err(|err| GitError::Io(err.to_string()));
+            .map_err(GitError::from);
     }
 
     match policy {
@@ -711,11 +711,11 @@ fn canonicalize_configured_worktree(git_dir: &Path, worktree: &str) -> Result<Pa
     } else {
         git_dir.join(worktree)
     };
-    fs::canonicalize(worktree).map_err(|err| GitError::Io(err.to_string()))
+    fs::canonicalize(worktree).map_err(GitError::from)
 }
 
 fn canonicalize_cwd(cwd: &Path) -> Result<PathBuf> {
-    fs::canonicalize(cwd).map_err(|err| GitError::Io(err.to_string()))
+    fs::canonicalize(cwd).map_err(GitError::from)
 }
 
 fn implicit_worktree_disabled() -> bool {
@@ -743,7 +743,7 @@ fn linked_worktree_root(git_dir: &Path) -> Result<Option<PathBuf>> {
     };
     fs::canonicalize(worktree)
         .map(Some)
-        .map_err(|err| GitError::Io(err.to_string()))
+        .map_err(GitError::from)
 }
 
 /// Read `core.bare` / `core.worktree` from `<commondir>/config` (and

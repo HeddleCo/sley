@@ -57,14 +57,14 @@ fn add_edit_patch(cli_session: &crate::session::CliSession, paths: &[PathBuf]) -
         .args(&diff_args)
         .current_dir(&context.cwd)
         .output()
-        .map_err(|e| GitError::Io(e.to_string()))?;
+        .map_err(|e| GitError::from(e))?;
     // diff-files exits 1 when differences exist; treat that as success.
     if !diff_out.status.success() && diff_out.status.code() != Some(1) {
         let _ = io::stderr().write_all(&diff_out.stderr);
         eprintln!("fatal: could not generate patch for editing");
         return Err(GitError::Exit(128));
     }
-    fs::write(&patch_path, &diff_out.stdout).map_err(|e| GitError::Io(e.to_string()))?;
+    fs::write(&patch_path, &diff_out.stdout).map_err(|e| GitError::from(e))?;
 
     if let Err(_err) = crate::commands::replay::launch_editor(&context.git_dir, &patch_path) {
         // Match git's `die(_("editing patch failed"))`.
@@ -75,7 +75,7 @@ fn add_edit_patch(cli_session: &crate::session::CliSession, paths: &[PathBuf]) -
 
     let meta = fs::metadata(&patch_path).map_err(|e| {
         eprintln!("fatal: could not stat '{}'", patch_path.to_string_lossy());
-        GitError::Io(e.to_string())
+        GitError::from(e)
     })?;
     if meta.len() == 0 {
         eprintln!("fatal: empty patch. aborted");
@@ -92,7 +92,7 @@ fn add_edit_patch(cli_session: &crate::session::CliSession, paths: &[PathBuf]) -
         ])
         .current_dir(&context.cwd)
         .status()
-        .map_err(|e| GitError::Io(e.to_string()))?;
+        .map_err(|e| GitError::from(e))?;
     if !apply_status.success() {
         eprintln!("fatal: could not apply '{}'", patch_path.to_string_lossy());
         let _ = fs::remove_file(&patch_path);

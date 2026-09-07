@@ -643,7 +643,7 @@ impl ObjectQuery<'_> {
     fn resolve_index_entry(&self, stage: u8, path: &str) -> Result<(ObjectId, u32)> {
         let index_path = sley_worktree::repository_index_path(self.view.git_dir());
         let bytes =
-            std::fs::read(&index_path).map_err(|err| GitError::Io(format!("read index: {err}")))?;
+            std::fs::read(&index_path).map_err(|err| GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!("read index: {err}") })?;
         let index = sley_index::Index::parse(&bytes, self.view.format())?;
         let want = path.as_bytes();
         for entry in &index.entries {
@@ -1300,7 +1300,7 @@ fn read_batch_record<'a, R: BufRead>(
     buffer.clear();
     let read = reader
         .read_until(delimiter, buffer)
-        .map_err(|err| GitError::Io(err.to_string()))?;
+        .map_err(GitError::from)?;
     if read == 0 {
         return Ok(None);
     }

@@ -946,10 +946,10 @@ fn default_hook_cwd() -> Option<PathBuf> {
 
 fn hook_cwd_for_git_dir(git_dir: &Path) -> Result<PathBuf> {
     if let Some(work_tree) = environment_work_tree() {
-        let cwd = env::current_dir().map_err(|err| GitError::Io(err.to_string()))?;
+        let cwd = env::current_dir().map_err(GitError::from)?;
         let resolved = resolve_path_from_cwd(&cwd, &work_tree);
         return fs::canonicalize(resolved)
-            .map_err(|err| GitError::Io(err.to_string()))
+            .map_err(GitError::from)
             .or_else(|_| Ok(resolve_path_from_cwd(&cwd, &work_tree)));
     }
     match worktree_root_for_git_dir(git_dir) {

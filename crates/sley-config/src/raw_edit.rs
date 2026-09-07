@@ -137,6 +137,16 @@ impl std::error::Error for ConfigFileWriteError {
     }
 }
 
+impl From<ConfigFileWriteError> for sley_core::GitError {
+    fn from(error: ConfigFileWriteError) -> Self {
+        let kind = match &error {
+            ConfigFileWriteError::ExistingLock(_) => std::io::ErrorKind::AlreadyExists,
+            ConfigFileWriteError::Io { source, .. } => source.kind(),
+        };
+        Self::IoKind { kind, message: error.to_string() }
+    }
+}
+
 impl ConfigFileWriteError {
     fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
         Self::Io {

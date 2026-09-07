@@ -1736,7 +1736,7 @@ pub(crate) fn cmd_update_ref(
             trace_reference_fsync_counter(reftable_fsync_count);
             Ok(())
         }
-        Err(GitError::Io(message))
+        Err(GitError::IoKind { message, .. })
             if message.starts_with(&format!("could not lock ref {tx_name}: ")) =>
         {
             let prefix = format!("could not lock ref {tx_name}: ");

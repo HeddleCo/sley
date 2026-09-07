@@ -246,7 +246,7 @@ pub fn read_bisect_terms(git_dir: impl AsRef<Path>) -> Result<BisectTerms> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Ok(BisectTerms::default());
         }
-        Err(err) => return Err(GitError::Io(err.to_string())),
+        Err(err) => return Err(GitError::from(err)),
     };
     let mut lines = contents.lines();
     let bad = match lines.next() {
@@ -3173,7 +3173,7 @@ fn load_commit_graph_map_inner(
     if single.exists() {
         let bytes = match fs::read(&single) {
             Ok(bytes) => bytes,
-            Err(err) => return Err(GitError::Io(err.to_string())),
+            Err(err) => return Err(GitError::from(err)),
         };
         // Hash-version mismatch is a soft error: warn once and fall back to
         // object reads, matching `load_commit_graph_one` (graph stays usable
@@ -3469,7 +3469,7 @@ fn load_commit_graph_chain(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Ok(HashMap::new());
         }
-        Err(err) => return Err(GitError::Io(err.to_string())),
+        Err(err) => return Err(GitError::from(err)),
     };
     let mut merged: HashMap<ObjectId, GraphCommit> = HashMap::new();
     for line in contents.lines() {
@@ -3480,7 +3480,7 @@ fn load_commit_graph_chain(
         let layer = info
             .join("commit-graphs")
             .join(format!("graph-{hash}.graph"));
-        let bytes = fs::read(&layer).map_err(|err| GitError::Io(err.to_string()))?;
+        let bytes = fs::read(&layer).map_err(GitError::from)?;
         let graph = match CommitGraph::parse(&bytes, format) {
             Ok(graph) => graph,
             Err(err) => {
@@ -3549,7 +3549,7 @@ fn load_commit_graph_bloom_chain(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Ok(HashMap::new());
         }
-        Err(err) => return Err(GitError::Io(err.to_string())),
+        Err(err) => return Err(GitError::from(err)),
     };
     let mut layers = Vec::new();
     let chain_dir = info.join("commit-graphs");
@@ -3559,7 +3559,7 @@ fn load_commit_graph_bloom_chain(
             continue;
         }
         let layer = chain_dir.join(format!("graph-{hash}.graph"));
-        let bytes = fs::read(&layer).map_err(|err| GitError::Io(err.to_string()))?;
+        let bytes = fs::read(&layer).map_err(GitError::from)?;
         let graph = match CommitGraph::parse(&bytes, format) {
             Ok(graph) => graph,
             Err(err) => {
@@ -6357,7 +6357,7 @@ fn resolve_index_path<R: ObjectReader>(
                 "path '{path}' is not in the index"
             )));
         }
-        Err(err) => return Err(GitError::Io(err.to_string())),
+        Err(err) => return Err(GitError::from(err)),
     };
     let index = Index::parse(&bytes, format)?;
     let mut path_exists = false;

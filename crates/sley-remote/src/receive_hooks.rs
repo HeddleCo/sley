@@ -425,13 +425,13 @@ fn spawn_hook(
     }
     let mut child = command
         .spawn()
-        .map_err(|err| GitError::Io(format!("cannot spawn hook {}: {err}", path.display())))?;
+        .map_err(|err| GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!("cannot spawn hook {}: {err}", path.display()) })?;
     if let Some(input) = stdin
         && let Some(mut hook_stdin) = child.stdin.take()
     {
         let _ = hook_stdin.write_all(input);
     }
-    let status = child.wait().map_err(|err| GitError::Io(err.to_string()))?;
+    let status = child.wait().map_err(GitError::from)?;
     if capture_stderr {
         if let Some(mut stdout) = child.stdout.take() {
             let _ = std::io::copy(&mut stdout, remote_stderr);

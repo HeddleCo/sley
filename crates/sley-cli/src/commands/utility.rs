@@ -800,9 +800,7 @@ fn write_unpack_file_temp(contents: &[u8]) -> Result<PathBuf> {
             Err(err) => return Err(err),
         }
     }
-    Err(GitError::Io(
-        "unable to create temporary unpack file".into(),
-    ))
+    Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: "unable to create temporary unpack file".into() })
 }
 
 pub(crate) fn cmd_show_index(
@@ -1162,7 +1160,7 @@ impl Mailmap {
         match fs::read(path) {
             Ok(bytes) => self.add_bytes(&bytes),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(GitError::Io(err.to_string())),
+            Err(err) => Err(GitError::from(err)),
         }
     }
 
@@ -1174,7 +1172,7 @@ impl Mailmap {
             Ok(metadata) if metadata.file_type().is_symlink() => Ok(()),
             Ok(_) => self.add_file(path),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(GitError::Io(err.to_string())),
+            Err(err) => Err(GitError::from(err)),
         }
     }
 

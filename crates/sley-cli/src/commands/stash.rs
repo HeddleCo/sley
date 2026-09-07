@@ -1780,7 +1780,7 @@ fn stash_selected_patch(pathspecs: &[String]) -> Result<Vec<u8>> {
     let output = Command::new(env::current_exe().unwrap_or_else(|_| PathBuf::from("sley")))
         .args(args)
         .output()
-        .map_err(|err| GitError::Io(err.to_string()))?;
+        .map_err(GitError::from)?;
     if !output.status.success() {
         return Err(GitError::Exit(output.status.code().unwrap_or(1)));
     }
@@ -1792,13 +1792,13 @@ fn stash_reverse_apply_selected_patch(patch: &[u8]) -> Result<()> {
         .args(["apply", "-R"])
         .stdin(Stdio::piped())
         .spawn()
-        .map_err(|err| GitError::Io(err.to_string()))?;
+        .map_err(GitError::from)?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(patch)
-            .map_err(|err| GitError::Io(err.to_string()))?;
+            .map_err(GitError::from)?;
     }
-    let status = child.wait().map_err(|err| GitError::Io(err.to_string()))?;
+    let status = child.wait().map_err(GitError::from)?;
     if !status.success() {
         return Err(GitError::Exit(status.code().unwrap_or(1)));
     }

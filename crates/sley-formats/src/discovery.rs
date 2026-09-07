@@ -231,7 +231,7 @@ fn discover_ancestors_with_device(
         start.to_path_buf()
     } else {
         env::current_dir()
-            .map_err(|err| GitError::Io(err.to_string()))?
+            .map_err(GitError::from)?
             .join(start)
     };
     let start_device = (!options.across_filesystem)
@@ -296,7 +296,7 @@ fn resolve_candidate(
             return Ok(None);
         }
         let target = if canonicalize_gitfile {
-            fs::canonicalize(target).map_err(|err| GitError::Io(err.to_string()))?
+            fs::canonicalize(target).map_err(GitError::from)?
         } else {
             target
         };
@@ -412,7 +412,7 @@ pub fn resolve_explicit_git_dir(start: &Path, git_dir: &Path) -> Result<PathBuf>
         && let Some(target) = read_gitdir_link(&resolved)?
         && is_git_dir(&target)
     {
-        return fs::canonicalize(target).map_err(|err| GitError::Io(err.to_string()));
+        return fs::canonicalize(target).map_err(GitError::from);
     }
     Ok(resolved)
 }

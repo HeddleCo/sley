@@ -296,7 +296,7 @@ pub(crate) fn write_combined_raw(
         combined_engine_options(ctx),
         z,
     )
-    .map_err(|error| GitError::Io(error.to_string()))?;
+    .map_err(GitError::from)?;
     Ok(())
 }
 
@@ -315,7 +315,7 @@ pub(crate) fn write_combined_name_status(
         all_paths,
         z,
     )
-    .map_err(|error| GitError::Io(error.to_string()))?;
+    .map_err(GitError::from)?;
     Ok(())
 }
 
@@ -377,7 +377,7 @@ pub(crate) fn write_combined_patch(
         &parent_refs,
         combined_engine_options(ctx),
     )
-    .map_err(|error| GitError::Io(error.to_string()))?;
+    .map_err(GitError::from)?;
     Ok(outcome.records_written != 0)
 }
 

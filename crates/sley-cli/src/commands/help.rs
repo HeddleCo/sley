@@ -833,7 +833,7 @@ fn open_html_doc(cli_session: &crate::session::CliSession, name: &str) -> Result
     let status = Command::new(&browser_cmd)
         .arg(&target)
         .status()
-        .map_err(|err| GitError::Io(err.to_string()))?;
+        .map_err(GitError::from)?;
     if status.success() {
         Ok(())
     } else {

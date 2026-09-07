@@ -897,7 +897,7 @@ fn self_sley_fetch(path: &Path, remote: &str) -> Result<std::process::ExitStatus
     command
         .current_dir(path)
         .status()
-        .map_err(|err| GitError::Io(err.to_string()))
+        .map_err(GitError::from)
 }
 
 /// git's `remote_submodule_branch`: `submodule.<name>.branch` from
@@ -1041,7 +1041,7 @@ fn run_submodule_update_command(
     let status = command
         .current_dir(path)
         .status()
-        .map_err(|err| GitError::Io(err.to_string()))?;
+        .map_err(GitError::from)?;
 
     if !status.success() {
         match strategy.kind {
@@ -1123,7 +1123,7 @@ fn recurse_submodule_update(
     let status = command
         .current_dir(submodule_root)
         .status()
-        .map_err(|err| GitError::Io(err.to_string()))?;
+        .map_err(GitError::from)?;
     if status.success() {
         return Ok(UpdateOutcome::Done);
     }
@@ -1684,7 +1684,7 @@ fn recurse_submodule_sync(submodule_root: &Path, display: &str, quiet: bool) -> 
     let status = command
         .current_dir(submodule_root)
         .status()
-        .map_err(|err| GitError::Io(err.to_string()))?;
+        .map_err(GitError::from)?;
     if status.success() {
         return Ok(());
     }
@@ -1899,7 +1899,7 @@ fn recurse_submodule_absorbgitdirs(sub_root: &Path, display: &str, quiet: bool) 
     let status = command
         .current_dir(sub_root)
         .status()
-        .map_err(|err| GitError::Io(err.to_string()))?;
+        .map_err(GitError::from)?;
     if status.success() {
         return Ok(());
     }
@@ -2206,7 +2206,7 @@ fn summary_worktree_side(
     let metadata = match fs::symlink_metadata(&worktree_path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(GitError::Io(err.to_string())),
+        Err(err) => return Err(GitError::from(err)),
     };
     let file_type = metadata.file_type();
     if file_type.is_dir() {
@@ -2900,7 +2900,7 @@ fn run_submodule_foreach_command(
     let status = command
         .current_dir(&submodule_root)
         .status()
-        .map_err(|err| GitError::Io(err.to_string()))?;
+        .map_err(GitError::from)?;
     if status.success() {
         return Ok(());
     }

@@ -677,7 +677,7 @@ fn write_index_pack_output(path: &Path, index: &[u8]) -> Result<()> {
     // `index-pack -o <path>` is an explicit caller-chosen output. Upstream's
     // test suite reuses that path across different packs, so replace any prior
     // file instead of treating it like a content-addressed object component.
-    fs::write(path, index).map_err(|err| GitError::Io(err.to_string()))
+    fs::write(path, index).map_err(GitError::from)
 }
 
 fn index_pack_usage<T>() -> Result<T> {
@@ -2038,7 +2038,6 @@ pub(crate) fn cmd_pack_refs(
         }
         store.compact_reftable_stack().map_err(|err| {
             let locked = match &err {
-                GitError::Io(message) => message.contains("File exists"),
                 // Structured create errors surface lock contention by kind.
                 GitError::IoKind {
                     kind: std::io::ErrorKind::AlreadyExists,
@@ -2303,7 +2302,7 @@ pub(crate) fn cmd_prune(cli_session: &crate::session::CliSession, args: &[String
             match fs::remove_file(path) {
                 Ok(()) => {}
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => return Err(GitError::Io(err.to_string())),
+                Err(err) => return Err(GitError::from(err)),
             }
         }
     }

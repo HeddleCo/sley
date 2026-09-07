@@ -1268,7 +1268,7 @@ pub(crate) fn apply_moved_gitlink_gitdirs(moves: &[GitlinkGitdirMove]) -> Result
                     &editor.into_bytes(),
                     sley_config::raw_edit::ConfigFileWriteOptions::default(),
                 )
-                .map_err(|err| GitError::Io(err.to_string()))?;
+                .map_err(GitError::from)?;
             }
             sley_config::raw_edit::RawEditOutcome::NothingSet => {}
         }

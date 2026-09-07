@@ -1694,7 +1694,7 @@ pub(crate) fn cmd_fmt_merge_msg(
             input
         }
         Some(path) => {
-            fs::read(path).map_err(|err| GitError::Io(format!("cannot open '{}': {err}", path)))?
+            fs::read(path).map_err(|err| GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!("cannot open '{}': {err}", path) })?
         }
     };
 

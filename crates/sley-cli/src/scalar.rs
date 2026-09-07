@@ -511,7 +511,7 @@ fn edit_global_config(edit: impl FnOnce(&mut GitConfig)) -> Result<()> {
     )
     .map_err(|error| match error {
         sley_config::raw_edit::ConfigFileEditError::Edit(error) => error,
-        sley_config::raw_edit::ConfigFileEditError::Write(error) => GitError::Io(error.to_string()),
+        sley_config::raw_edit::ConfigFileEditError::Write(error) => GitError::from(error),
     })
 }
 

@@ -1091,7 +1091,7 @@ pub(crate) fn remove_pack_bitmap_sidecars(common_git_dir: &Path) -> Result<()> {
             match fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(GitError::Io(err.to_string())),
+                Err(err) => return Err(GitError::from(err)),
             }
         }
     }

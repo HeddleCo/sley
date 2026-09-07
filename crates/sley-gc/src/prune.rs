@@ -515,7 +515,7 @@ pub fn prune_packed_loose_objects(
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(GitError::Io(err.to_string())),
+            Err(err) => return Err(GitError::from(err)),
         }
     }
     if !dry_run {
@@ -649,7 +649,7 @@ pub fn prune_shallow_file(
         match fs::remove_file(path) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(GitError::Io(err.to_string())),
+            Err(err) => return Err(GitError::from(err)),
         }
     } else {
         let mut out = retained.join("\n");

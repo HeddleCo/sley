@@ -176,7 +176,7 @@ fn read_repo_paths(cli_session: &crate::session::CliSession, key: &str) -> Resul
     let context = ConfigIncludeContext::new(common_git_dir.clone(), branch);
 
     let mut config = sley_config::load_pre_dispatch_config(common_git_dir.as_deref(), &context)
-        .map_err(|err| GitError::Io(err.to_string()))?;
+        .map_err(GitError::from)?;
     let parameters = injected_config_parameters()?;
     sley_config::append_injected_config_sections_with_includes(
         &mut config,
@@ -184,7 +184,7 @@ fn read_repo_paths(cli_session: &crate::session::CliSession, key: &str) -> Resul
         &context,
         cli_session.cwd(),
     )
-    .map_err(|err| GitError::Io(err.to_string()))?;
+    .map_err(GitError::from)?;
 
     let entries = config.get_all(section, subsection.as_deref(), variable);
     if entries.is_empty() {
@@ -228,7 +228,7 @@ fn split_canonical_key(canonical: &str) -> (&str, Option<String>, &str) {
 /// implementation, with the repository-local environment sanitized.
 fn run_command_on_repo(path: &str, child_args: &[String]) -> Result<i32> {
     let abspath = interpolate_path(path);
-    let exe = env::current_exe().map_err(|err| GitError::Io(err.to_string()))?;
+    let exe = env::current_exe().map_err(GitError::from)?;
     let mut child = ProcessCommand::new(exe);
     for var in LOCAL_REPO_ENV {
         child.env_remove(var);
@@ -237,7 +237,7 @@ fn run_command_on_repo(path: &str, child_args: &[String]) -> Result<i32> {
     child.args(child_args);
     let status = child
         .status()
-        .map_err(|err| GitError::Io(err.to_string()))?;
+        .map_err(GitError::from)?;
     Ok(status.code().unwrap_or(1))
 }
 

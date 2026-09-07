@@ -1834,9 +1834,9 @@ impl HttpClient for UreqHttpClient {
                 .into_iter()
                 .map(|handle| {
                     handle.join().map_err(|_| {
-                        GitError::Io(format!(
+                        GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!(
                             "HTTP range request to {url} failed: worker panicked"
-                        ))
+                        ) }
                     })?
                 })
                 .collect::<Result<Vec<_>>>()
@@ -1941,18 +1941,18 @@ fn download_packfile_range(
     let range = format!("bytes={start}-{end}");
     let mut response = client.get(url, &[("Range", &range)])?;
     if response.status != 206 {
-        return Err(GitError::Io(format!(
+        return Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!(
             "HTTP range request to {url} returned status {}",
             response.status
-        )));
+        ) });
     }
     let expected = end - start + 1;
     let mut file = tempfile::tempfile()?;
     let written = std::io::copy(&mut response.body.by_ref().take(expected + 1), &mut file)?;
     if written != expected {
-        return Err(GitError::Io(format!(
+        return Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!(
             "HTTP range request to {url} returned {written} bytes, expected {expected}"
-        )));
+        ) });
     }
     file.seek(SeekFrom::Start(0))?;
     Ok((index, file))
@@ -2049,9 +2049,9 @@ impl UreqHttpClient {
                         .map_err(|err| http_transport_error(&current, &err))?
                 }
                 other => {
-                    return Err(GitError::Io(format!(
+                    return Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!(
                         "HTTP request to {current} failed: unsupported method {other}"
-                    )));
+                    ) });
                 }
             };
             let parts = http_response_parts_from_ureq(response);
@@ -2074,9 +2074,9 @@ impl UreqHttpClient {
                 body: parts.body,
             });
         }
-        Err(GitError::Io(format!(
+        Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!(
             "HTTP request to {url} failed: too many redirects"
-        )))
+        ) })
     }
 }
 
@@ -2129,9 +2129,9 @@ fn http_response_parts_from_ureq(response: ureq::http::Response<ureq::Body>) -> 
 #[cfg(feature = "http-client")]
 fn resolve_redirect_url(current: &str, location: Option<&str>) -> Result<String> {
     let Some(location) = location.filter(|value| !value.is_empty()) else {
-        return Err(GitError::Io(format!(
+        return Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!(
             "HTTP request to {current} failed: redirect with no Location"
-        )));
+        ) });
     };
     if location.contains("://") {
         return Ok(location.to_string());
@@ -2179,9 +2179,9 @@ fn check_http_layer_scheme_allowed(
     if http_layer_scheme_allowed(&scheme, from_user, policy, config) {
         return Ok(());
     }
-    Err(GitError::Io(format!(
+    Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!(
         "Protocol \"{scheme}\" not supported or disabled in libcurl"
-    )))
+    ) })
 }
 
 #[cfg(feature = "http-client")]
@@ -2335,7 +2335,7 @@ fn curl_trace_enabled() -> bool {
 /// including the offending `url` in the message.
 #[cfg(feature = "http-client")]
 fn http_transport_error(url: &str, err: &ureq::Error) -> GitError {
-    GitError::Io(format!("HTTP request to {url} failed: {err}"))
+    GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!("HTTP request to {url} failed: {err}") }
 }
 
 // Small private framing helpers, duplicated verbatim from git-protocol so the

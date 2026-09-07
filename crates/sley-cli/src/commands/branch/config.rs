@@ -160,7 +160,7 @@ pub(super) fn write_raw_repo_config(git_dir: &Path, bytes: Vec<u8>) -> Result<()
             );
             Err(GitError::Exit(255))
         }
-        Err(err) => Err(GitError::Io(err.to_string())),
+        Err(err) => Err(GitError::from(err)),
     }
 }
 

@@ -320,7 +320,7 @@ pub(crate) fn run_shell_alias(
     }
     let status = process
         .status()
-        .map_err(|err| GitError::Io(err.to_string()))?;
+        .map_err(GitError::from)?;
     if status.success() {
         Ok(())
     } else {

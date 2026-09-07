@@ -76,7 +76,7 @@ pub fn clone_local_to_bare(
     let dest_path = dest.as_ref();
     let source_repo = open_source(source_path)?;
     std::fs::create_dir_all(dest_path)
-        .map_err(|err| GitError::Io(format!("create {}: {err}", dest_path.display())))?;
+        .map_err(|err| GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!("create {}: {err}", dest_path.display()) })?;
     let target = match Repository::open(dest_path) {
         Ok(repo) => repo,
         Err(_) => Repository::init_bare(dest_path)?,

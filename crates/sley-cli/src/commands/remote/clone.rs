@@ -3459,10 +3459,10 @@ fn copy_or_link_local_object_directory(
             match fs::hard_link(&source, &destination) {
                 Ok(()) => continue,
                 Err(err) if matches!(mode, LocalObjectInstall::Hardlink { required: true }) => {
-                    return Err(GitError::Io(format!(
+                    return Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!(
                         "failed to create link '{}': {err}",
                         destination.display()
-                    )));
+                    ) });
                 }
                 Err(_) => *hardlink = false,
             }
@@ -3681,7 +3681,7 @@ fn recurse_clone_submodules(
         .env_remove("GIT_COMMON_DIR")
         .current_dir(destination)
         .status()
-        .map_err(|err| GitError::Io(err.to_string()))?;
+        .map_err(GitError::from)?;
     if !status.success() {
         return Err(GitError::Exit(1));
     }

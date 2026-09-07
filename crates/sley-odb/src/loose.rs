@@ -68,7 +68,7 @@ pub(crate) fn collect_loose_fanout_object_ids(
     let entries = match fs::read_dir(&fanout_dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(GitError::Io(err.to_string())),
+        Err(err) => return Err(GitError::from(err)),
     };
     let hex_len = format.hex_len();
     for object_entry in entries {
@@ -100,7 +100,7 @@ pub(crate) fn present_loose_fanouts(objects_dir: &Path) -> Result<HashSet<u8>> {
     let entries = match fs::read_dir(objects_dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(present),
-        Err(err) => return Err(GitError::Io(err.to_string())),
+        Err(err) => return Err(GitError::from(err)),
     };
     for entry in entries {
         let entry = entry?;
@@ -366,7 +366,7 @@ impl LooseObjectStore {
         match fs::metadata(path) {
             Ok(metadata) => Ok(Some(metadata.len())),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(GitError::Io(err.to_string())),
+            Err(err) => Err(GitError::from(err)),
         }
     }
 
@@ -383,7 +383,7 @@ impl LooseObjectStore {
         let compressed = match fs::read(&path) {
             Ok(compressed) => compressed,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(GitError::Io(err.to_string())),
+            Err(err) => return Err(GitError::from(err)),
         };
         match inflate_loose_header(&compressed)? {
             LooseHeader::Ok(header) => {
@@ -435,7 +435,7 @@ impl LooseObjectStore {
         let compressed = match fs::read(&path) {
             Ok(compressed) => compressed,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(GitError::Io(err.to_string())),
+            Err(err) => return Err(GitError::from(err)),
         };
         let mut decoder = ZlibDecoder::new(compressed.as_slice());
         let mut framed = Vec::new();
@@ -626,7 +626,7 @@ impl ObjectReader for LooseObjectStore {
                     MissingObjectContext::Read,
                 ));
             }
-            Err(err) => return Err(GitError::Io(err.to_string())),
+            Err(err) => return Err(GitError::from(err)),
         };
         let mut decoder = ZlibDecoder::new(compressed.as_slice());
         let mut framed = Vec::new();

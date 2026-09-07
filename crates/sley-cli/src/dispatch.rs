@@ -288,7 +288,7 @@ fn run_external_or_unknown(
         );
         let status = process
             .status()
-            .map_err(|err| GitError::Io(err.to_string()))?;
+            .map_err(GitError::from)?;
         return match status.code() {
             Some(0) => Ok(()),
             Some(code) => Err(GitError::Exit(code)),
@@ -620,7 +620,7 @@ fn cmd_info_path() -> Result<()> {
 fn git_exec_path() -> Result<PathBuf> {
     #[cfg(feature = "git-compat-i18n")]
     {
-        sley_i18n::materialize_git_i18n_helpers().map_err(|err| GitError::Io(err.to_string()))
+        sley_i18n::materialize_git_i18n_helpers().map_err(GitError::from)
     }
     #[cfg(not(feature = "git-compat-i18n"))]
     {
@@ -629,7 +629,7 @@ fn git_exec_path() -> Result<PathBuf> {
         {
             return Ok(parent.to_path_buf());
         }
-        env::current_dir().map_err(|err| GitError::Io(err.to_string()))
+        env::current_dir().map_err(GitError::from)
     }
 }
 

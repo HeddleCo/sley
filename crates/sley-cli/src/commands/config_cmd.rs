@@ -1595,7 +1595,7 @@ fn write_raw_config_file(path: &std::path::Path, bytes: Vec<u8>) -> Result<()> {
         &bytes,
         sley_config::raw_edit::ConfigFileWriteOptions::default(),
     )
-    .map_err(|err| GitError::Io(err.to_string()))
+    .map_err(GitError::from)
 }
 
 /// git's `section_name_is_ok`: a new section name must be non-empty, and the

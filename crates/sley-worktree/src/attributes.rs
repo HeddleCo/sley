@@ -371,7 +371,7 @@ pub(crate) fn read_per_directory_ignore_patterns_into_matcher(
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(GitError::Io(err.to_string())),
+        Err(err) => return Err(GitError::from(err)),
     };
     if metadata.file_type().is_symlink() {
         return Err(GitError::Command(format!(

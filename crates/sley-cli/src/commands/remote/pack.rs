@@ -1848,7 +1848,7 @@ fn push_on_demand_submodules(
         let status = command
             .current_dir(&submodule_root)
             .status()
-            .map_err(|err| GitError::Io(err.to_string()))?;
+            .map_err(GitError::from)?;
         if !status.success() {
             eprintln!("fatal: failed to push all needed submodules");
             return Err(GitError::Exit(status.code().unwrap_or(1)));

@@ -241,7 +241,7 @@ pub fn run_proc_receive_hook(input: ProcReceiveHookInput<'_>) -> Result<ProcRece
 
     let mut child = child
         .spawn()
-        .map_err(|err| GitError::Io(format!("cannot spawn proc-receive hook: {err}")))?;
+        .map_err(|err| GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!("cannot spawn proc-receive hook: {err}") })?;
 
     // Drain the hook's stderr while its pkt-line protocol is in flight.  A hook
     // may emit more than a pipe buffer before exiting, so waiting first can
@@ -266,11 +266,11 @@ pub fn run_proc_receive_hook(input: ProcReceiveHookInput<'_>) -> Result<ProcRece
     let mut stdin = child
         .stdin
         .take()
-        .ok_or_else(|| GitError::Io("proc-receive hook stdin unavailable".into()))?;
+        .ok_or_else(|| GitError::IoKind { kind: std::io::ErrorKind::Other, message: "proc-receive hook stdin unavailable".into() })?;
     let mut stdout = child
         .stdout
         .take()
-        .ok_or_else(|| GitError::Io("proc-receive hook stdout unavailable".into()))?;
+        .ok_or_else(|| GitError::IoKind { kind: std::io::ErrorKind::Other, message: "proc-receive hook stdout unavailable".into() })?;
 
     let mut hook_failed = false;
     let mut protocol_messages = Vec::new();
@@ -297,7 +297,7 @@ pub fn run_proc_receive_hook(input: ProcReceiveHookInput<'_>) -> Result<ProcRece
         if !hook_failed {
             stdin
                 .write_all(b"0000")
-                .map_err(|err| GitError::Io(err.to_string()))?;
+                .map_err(GitError::from)?;
         }
     }
 
@@ -324,7 +324,7 @@ pub fn run_proc_receive_hook(input: ProcReceiveHookInput<'_>) -> Result<ProcRece
             if !hook_failed {
                 stdin
                     .write_all(b"0000")
-                    .map_err(|err| GitError::Io(err.to_string()))?;
+                    .map_err(GitError::from)?;
             }
         }
     }
@@ -346,11 +346,11 @@ pub fn run_proc_receive_hook(input: ProcReceiveHookInput<'_>) -> Result<ProcRece
         }
     }
 
-    let status = child.wait().map_err(|err| GitError::Io(err.to_string()))?;
+    let status = child.wait().map_err(GitError::from)?;
     if let Some(hook_stderr) = hook_stderr {
         let hook_stderr = hook_stderr
             .join()
-            .map_err(|_| GitError::Io("proc-receive stderr reader panicked".into()))?;
+            .map_err(|_| GitError::IoKind { kind: std::io::ErrorKind::Other, message: "proc-receive stderr reader panicked".into() })?;
         input.remote_stderr.extend_from_slice(&hook_stderr);
     }
     for message in protocol_messages {

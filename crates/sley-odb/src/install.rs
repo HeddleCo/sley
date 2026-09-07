@@ -155,7 +155,7 @@ impl IncomingPackQuarantine {
                 for (promoted, staged) in moved.iter().rev() {
                     let _ = fs::rename(promoted, staged);
                 }
-                return Err(GitError::Io(err.to_string()));
+                return Err(GitError::from(err));
             }
             moved.push((destination, source));
         }
@@ -179,12 +179,10 @@ fn create_incoming_object_dir(objects_dir: &Path) -> Result<PathBuf> {
         match fs::create_dir(&object_dir) {
             Ok(()) => return Ok(object_dir),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(GitError::Io(err.to_string())),
+            Err(err) => return Err(GitError::from(err)),
         }
     }
-    Err(GitError::Io(
-        "could not create incoming object quarantine".into(),
-    ))
+    Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: "could not create incoming object quarantine".into() })
 }
 
 fn incoming_object_files(object_dir: &Path) -> Result<Vec<PathBuf>> {
@@ -392,7 +390,7 @@ where
     for _ in 0..PACK_RECEIVE_QUEUE_DEPTH {
         empty_sender
             .send(vec![0u8; PACK_RECEIVE_BUFFER_BYTES])
-            .map_err(|_| GitError::Io("could not initialize pack receive buffers".into()))?;
+            .map_err(|_| GitError::IoKind { kind: std::io::ErrorKind::Other, message: "could not initialize pack receive buffers".into() })?;
     }
 
     std::thread::scope(|scope| {
@@ -434,7 +432,7 @@ where
             loop {
                 cancel.check()?;
                 let mut chunk = empty_receiver.recv().map_err(|_| {
-                    GitError::Io("pack staging writer stopped before receive completed".into())
+                    GitError::IoKind { kind: std::io::ErrorKind::Other, message: "pack staging writer stopped before receive completed".into() }
                 })?;
                 let read = reader.read(&mut chunk)?;
                 if read == 0 {
@@ -468,7 +466,7 @@ where
                     }
                 }
                 filled_sender.send(chunk).map_err(|_| {
-                    GitError::Io("pack staging writer stopped before receive completed".into())
+                    GitError::IoKind { kind: std::io::ErrorKind::Other, message: "pack staging writer stopped before receive completed".into() }
                 })?;
                 if bytes.saturating_sub(last_progress) >= PACK_RECEIVE_PROGRESS_BYTES {
                     last_progress = bytes;
@@ -491,7 +489,7 @@ where
         drop(filled_sender);
         let write_result = match writer.join() {
             Ok(result) => result,
-            Err(_) => Err(GitError::Io("pack staging writer panicked".into())),
+            Err(_) => Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: "pack staging writer panicked".into() }),
         };
         let summary = receive_result?;
         write_result?;
@@ -636,7 +634,7 @@ impl RawPackStreamingInstall {
                 Err(_) if self.pack_path.exists() => {
                     let _ = fs::remove_file(&self.temp_pack_path);
                 }
-                Err(err) => return Err(GitError::Io(err.to_string())),
+                Err(err) => return Err(GitError::from(err)),
             }
             write_pack_component(&self.index_path, &built.index)?;
             let promisor_path = write_promisor_pack_sidecar(
@@ -1072,7 +1070,7 @@ impl FileObjectDatabase {
             Err(_) if pack_path.exists() => {
                 let _ = fs::remove_file(temp_pack_path);
             }
-            Err(err) => return Err(GitError::Io(err.to_string())),
+            Err(err) => return Err(GitError::from(err)),
         }
         write_pack_component(&index_path, index)?;
         let promisor_path = write_promisor_pack_sidecar(&pack_dir, &pack_name, options.promisor)?;
@@ -1323,7 +1321,7 @@ pub(crate) fn write_pack_component(path: &Path, bytes: &[u8]) -> Result<()> {
                 let _ = fs::remove_file(&temp_path);
                 Ok(())
             }
-            Err(err) => Err(GitError::Io(err.to_string())),
+            Err(err) => Err(GitError::from(err)),
         }
     })();
     if write_result.is_err() {
@@ -1358,7 +1356,7 @@ pub(crate) fn replace_pack_component(path: &Path, bytes: &[u8]) -> Result<()> {
                 fs::rename(&temp_path, path)?;
                 Ok(())
             }
-            Err(err) => Err(GitError::Io(err.to_string())),
+            Err(err) => Err(GitError::from(err)),
         }
     })();
     if write_result.is_err() {

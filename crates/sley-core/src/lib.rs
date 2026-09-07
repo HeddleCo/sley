@@ -1748,14 +1748,12 @@ impl fmt::Display for ResourceLimitKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitError {
-    Io(String),
     /// An I/O failure that preserves the [`std::io::ErrorKind`] of the
     /// underlying [`std::io::Error`].
     ///
     /// Produced by `From<std::io::Error>` so downstream code can branch on
     /// [`GitError::io_kind`] instead of sniffing rendered message text. The
-    /// legacy [`GitError::Io`](Self::Io) variant remains for hand-built
-    /// messages and compatibility this cycle.
+    /// same typed channel is used for manually described I/O failures.
     IoKind {
         kind: std::io::ErrorKind,
         message: String,
@@ -1805,7 +1803,6 @@ pub type Result<T> = std::result::Result<T, GitError>;
 impl fmt::Display for GitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io(msg) => write!(f, "io error: {msg}"),
             // Message text already carries the OS detail (`value.to_string()`
             // of the source error); keep the rendering identical to `Io`.
             Self::IoKind { kind: _, message } => write!(f, "io error: {message}"),
@@ -1928,8 +1925,7 @@ impl GitError {
     /// The preserved I/O [`std::io::ErrorKind`], when this error originated
     /// from (or was constructed with) an I/O error kind.
     ///
-    /// `None` for non-I/O variants and for the legacy string-only
-    /// [`GitError::Io`](Self::Io) form, whose kind was erased at construction.
+    /// `None` for non-I/O variants.
     pub fn io_kind(&self) -> Option<std::io::ErrorKind> {
         match self {
             Self::IoKind { kind, .. } => Some(*kind),
@@ -1951,7 +1947,6 @@ impl GitError {
     pub fn is_cancelled(&self) -> bool {
         match self {
             Self::Cancelled => true,
-            Self::Io(message) => message.contains("cancelled"),
             Self::IoKind { kind, message } => {
                 matches!(kind, std::io::ErrorKind::Interrupted) || message.contains("cancelled")
             }
@@ -2476,7 +2471,7 @@ mod tests {
             interrupted.is_cancelled(),
             "Interrupted kind is cancel-flavored"
         );
-        assert!(GitError::Io("operation cancelled".into()).is_cancelled());
+        assert!(GitError::IoKind { kind: ErrorKind::Interrupted, message: "operation cancelled".into() }.is_cancelled());
         assert!(!GitError::from(std::io::Error::other("disk full")).is_cancelled());
         assert_eq!(
             GitError::from(std::io::Error::other("disk full")).io_kind(),

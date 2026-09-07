@@ -245,7 +245,7 @@ fn writer_failure_stops_enumeration() {
     )
     .expect_err("writer failure must fail the pack");
     assert!(
-        matches!(err, GitError::Io(_) | GitError::IoKind { .. }),
+        matches!(err, GitError::IoKind { .. }),
         "got {err:?}"
     );
     assert!(

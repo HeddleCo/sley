@@ -731,10 +731,10 @@ fn run_archive_filter(command: &str, input: &[u8]) -> Result<Vec<u8>> {
         .stdin(std::process::Stdio::from(input_file))
         .stdout(std::process::Stdio::piped())
         .spawn()
-        .map_err(|err| GitError::Io(err.to_string()))?;
+        .map_err(GitError::from)?;
     let output = child
         .wait_with_output()
-        .map_err(|err| GitError::Io(err.to_string()))?;
+        .map_err(GitError::from)?;
     let _ = fs::remove_file(&input_path);
     if !output.status.success() {
         return Err(GitError::Exit(output.status.code().unwrap_or(128)));

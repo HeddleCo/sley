@@ -625,7 +625,7 @@ fn commit_graph_alternate_object_dirs(object_dir: &Path) -> Result<Vec<PathBuf>>
     let contents = match fs::read_to_string(&alternates) {
         Ok(contents) => contents,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(GitError::Io(err.to_string())),
+        Err(err) => return Err(GitError::from(err)),
     };
     let base = alternates.parent().unwrap_or(object_dir);
     Ok(contents
@@ -753,7 +753,7 @@ fn read_commit_graph_chain_hashes(path: &Path, format: ObjectFormat) -> Result<V
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(GitError::Io(err.to_string())),
+        Err(err) => return Err(GitError::from(err)),
     };
     contents
         .lines()
@@ -1062,7 +1062,7 @@ fn verify_split_commit_graph_chain(chain_path: &Path, format: ObjectFormat) -> R
                 eprintln!("error: unable to find all commit-graph files");
                 return Err(GitError::Exit(1));
             }
-            Err(err) => return Err(GitError::Io(err.to_string())),
+            Err(err) => return Err(GitError::from(err)),
         };
         let graph = match CommitGraph::parse(&graph_bytes, format) {
             Ok(graph) => graph,

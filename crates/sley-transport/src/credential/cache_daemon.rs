@@ -93,12 +93,12 @@ fn init_socket_directory(socket_path: &str) -> Result<PathBuf> {
         }
     } else {
         if let Some(grandparent) = parent.parent() {
-            std::fs::create_dir_all(grandparent).map_err(|err| GitError::Io(err.to_string()))?;
+            std::fs::create_dir_all(grandparent).map_err(GitError::from)?;
         }
         DirBuilder::new()
             .mode(0o700)
             .create(parent)
-            .map_err(|err| GitError::Io(err.to_string()))?;
+            .map_err(GitError::from)?;
     }
     let _ = std::env::set_current_dir(parent);
     Ok(PathBuf::from(socket_file))
@@ -127,11 +127,11 @@ fn serve_cache(socket_file: &Path, _debug: bool) -> Result<()> {
     use std::thread;
 
     let _socket_cleanup = SocketCleanup { socket_file };
-    let listener = unix_stream_listen(socket_file).map_err(|err| GitError::Io(err.to_string()))?;
+    let listener = unix_stream_listen(socket_file).map_err(GitError::from)?;
     {
         let mut out = io::stdout().lock();
-        writeln!(out, "ok").map_err(|err| GitError::Io(err.to_string()))?;
-        out.flush().map_err(|err| GitError::Io(err.to_string()))?;
+        writeln!(out, "ok").map_err(GitError::from)?;
+        out.flush().map_err(GitError::from)?;
     }
     // UnixListener has no portable accept timeout. Keep accept blocking on a
     // dedicated thread and use the channel timeout to service expirations.
@@ -157,7 +157,7 @@ fn serve_cache(socket_file: &Path, _debug: bool) -> Result<()> {
             Ok(Err(err)) => eprintln!("warning: accept failed: {err}"),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(GitError::Io("credential cache listener stopped".into()));
+                return Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: "credential cache listener stopped".into() });
             }
         }
     }
@@ -210,7 +210,7 @@ fn serve_one_client(
     let mut reader = io::BufReader::new(
         stream
             .try_clone()
-            .map_err(|err| GitError::Io(err.to_string()))?,
+            .map_err(GitError::from)?,
     );
     let mut writer = stream;
     let mut credential = GitCredential::default();
@@ -256,28 +256,28 @@ fn write_get_response(
     writer: &mut UnixStream,
 ) -> Result<()> {
     let item = &entry.item;
-    writeln!(writer, "capability[]=authtype").map_err(|err| GitError::Io(err.to_string()))?;
+    writeln!(writer, "capability[]=authtype").map_err(GitError::from)?;
     if let Some(username) = &item.username {
-        writeln!(writer, "username={username}").map_err(|err| GitError::Io(err.to_string()))?;
+        writeln!(writer, "username={username}").map_err(GitError::from)?;
     }
     if let Some(password) = &item.password {
-        writeln!(writer, "password={password}").map_err(|err| GitError::Io(err.to_string()))?;
+        writeln!(writer, "password={password}").map_err(GitError::from)?;
     }
     if credential_has_capability(&request.capa_authtype, CredentialOpType::Response) {
         if let Some(authtype) = &item.authtype {
-            writeln!(writer, "authtype={authtype}").map_err(|err| GitError::Io(err.to_string()))?;
+            writeln!(writer, "authtype={authtype}").map_err(GitError::from)?;
         }
         if let Some(token) = &item.credential {
-            writeln!(writer, "credential={token}").map_err(|err| GitError::Io(err.to_string()))?;
+            writeln!(writer, "credential={token}").map_err(GitError::from)?;
         }
     }
     if item.password_expiry_utc != TIME_MAX {
         writeln!(writer, "password_expiry_utc={}", item.password_expiry_utc)
-            .map_err(|err| GitError::Io(err.to_string()))?;
+            .map_err(GitError::from)?;
     }
     if let Some(token) = &item.oauth_refresh_token {
         writeln!(writer, "oauth_refresh_token={token}")
-            .map_err(|err| GitError::Io(err.to_string()))?;
+            .map_err(GitError::from)?;
     }
     Ok(())
 }

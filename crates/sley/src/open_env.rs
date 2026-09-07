@@ -28,7 +28,7 @@ pub(crate) struct EnvResolvedRepository {
 
 /// Discover or open a repository honoring process environment variables.
 pub(crate) fn resolve_repository(path: &Path, exact_path: bool) -> Result<EnvResolvedRepository> {
-    let cwd = env::current_dir().map_err(|err| GitError::Io(err.to_string()))?;
+    let cwd = env::current_dir().map_err(GitError::from)?;
     let relative_start = if path.as_os_str().is_empty() || path.is_absolute() {
         None
     } else {

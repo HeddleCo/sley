@@ -1899,7 +1899,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                 indent_heuristic,
             },
         )
-        .map_err(|error| GitError::Io(error.to_string()))?;
+        .map_err(GitError::from)?;
         if exit_code && (left.oid != right.oid || left.mode != right.mode) {
             return Err(GitError::Exit(1));
         }

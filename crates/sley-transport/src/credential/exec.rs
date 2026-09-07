@@ -274,7 +274,7 @@ pub(crate) fn run_helper_process(
         Stdio::null()
     });
     let deadline = options.timeout.map(|timeout| Instant::now() + timeout);
-    let mut child = command.spawn().map_err(|e| GitError::Io(e.to_string()))?;
+    let mut child = command.spawn().map_err(|e| GitError::from(e))?;
     let op_type = if want_output {
         CredentialOpType::Helper
     } else {
@@ -284,9 +284,9 @@ pub(crate) fn run_helper_process(
         && credential_write(credential, &mut stdin, op_type).is_err()
     {
         terminate_helper(&mut child);
-        return Err(GitError::Io(format!(
+        return Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!(
             "failed to write credential protocol input to helper '{helper}'"
-        )));
+        ) });
     }
     if !want_output {
         return match wait_for_exit(&mut child, deadline) {
@@ -296,9 +296,7 @@ pub(crate) fn run_helper_process(
     }
     let Some(stdout) = child.stdout.take() else {
         terminate_helper(&mut child);
-        return Err(GitError::Io(
-            "credential helper stdout was not piped".into(),
-        ));
+        return Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: "credential helper stdout was not piped".into() });
     };
     let output = read_bounded_output(&mut child, stdout, helper, deadline, options)?;
     match wait_for_exit(&mut child, deadline) {
@@ -343,7 +341,7 @@ fn read_bounded_output(
         }
         Ok(Err(err)) => {
             terminate_helper(child);
-            Err(GitError::Io(err.to_string()))
+            Err(GitError::from(err))
         }
         Err(_) => {
             terminate_helper(child);

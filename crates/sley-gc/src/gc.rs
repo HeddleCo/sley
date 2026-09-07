@@ -570,7 +570,7 @@ fn gc_remove_pack_stems(
             match fs::remove_file(path) {
                 Ok(()) => {}
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => return Err(GitError::Io(err.to_string())),
+                Err(err) => return Err(GitError::from(err)),
             }
         }
     }
@@ -844,7 +844,7 @@ fn gc_prune_expired_loose(
         match fs::remove_file(path) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(GitError::Io(err.to_string())),
+            Err(err) => return Err(GitError::from(err)),
         }
     }
     prune_packed_loose_objects(common_git_dir, format, false)?;
@@ -896,7 +896,7 @@ fn gc_pack_recent_unreachable_loose(
         match fs::remove_file(path) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(GitError::Io(err.to_string())),
+            Err(err) => return Err(GitError::from(err)),
         }
     }
     prune_empty_loose_object_dirs(&common_git_dir.join("objects"))?;
@@ -959,7 +959,7 @@ fn gc_remove_cruft_packs(common_git_dir: &Path) -> Result<()> {
             match fs::remove_file(path) {
                 Ok(()) => {}
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => return Err(GitError::Io(err.to_string())),
+                Err(err) => return Err(GitError::from(err)),
             }
         }
     }
@@ -970,7 +970,7 @@ fn remove_pack_garbage_file(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(GitError::Io(err.to_string())),
+        Err(err) => Err(GitError::from(err)),
     }
 }
 

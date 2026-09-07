@@ -1143,7 +1143,7 @@ fn rev_parse_index_contains(git_dir: &Path, format: ObjectFormat, path: &str) ->
     let bytes = match fs::read(rev_parse_repository_index_path(git_dir)) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(GitError::Io(err.to_string())),
+        Err(err) => return Err(GitError::from(err)),
     };
     let index = sley_index::Index::parse(&bytes, format)?;
     Ok(index
@@ -1189,7 +1189,6 @@ fn rev_parse_error_message(err: &GitError) -> String {
         | GitError::InvalidPath(msg)
         | GitError::Unsupported(msg)
         | GitError::Command(msg)
-        | GitError::Io(msg)
         | GitError::SidebandFatal(msg)
         | GitError::Transaction(msg)
         | GitError::Cli(_, msg) => msg.clone(),
@@ -2235,7 +2234,7 @@ fn git_path_base_dir(
     path: &str,
 ) -> Result<PathBuf> {
     if !git_dir.join("commondir").is_file() || !git_path_is_common(path) {
-        return fs::canonicalize(git_dir).map_err(|err| GitError::Io(err.to_string()));
+        return fs::canonicalize(git_dir).map_err(GitError::from);
     }
     cli_session.common_git_dir(git_dir)
 }

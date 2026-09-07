@@ -1420,7 +1420,7 @@ where
     R: ObjectReader + Sync,
 {
     std::thread::scope(|scope| {
-        let (mut reader, writer) = std::io::pipe().map_err(|err| GitError::Io(err.to_string()))?;
+        let (mut reader, writer) = std::io::pipe().map_err(GitError::from)?;
         let generator = scope.spawn(move || -> Result<()> {
             // `writer` is dropped at the end of this closure, signalling EOF to
             // the reader even on the error path.
@@ -1468,9 +1468,7 @@ where
 fn join_pack_generator(handle: std::thread::ScopedJoinHandle<'_, Result<()>>) -> Result<()> {
     match handle.join() {
         Ok(result) => result,
-        Err(_) => Err(GitError::Io(
-            "receive-pack body generator thread panicked".to_string(),
-        )),
+        Err(_) => Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: "receive-pack body generator thread panicked".into() }),
     }
 }
 
@@ -1482,7 +1480,7 @@ fn read_up_to(reader: &mut impl Read, cap: usize, out: &mut Vec<u8>) -> Result<(
         let want = (cap - out.len()).min(chunk.len());
         let read = reader
             .read(&mut chunk[..want])
-            .map_err(|err| GitError::Io(err.to_string()))?;
+            .map_err(GitError::from)?;
         if read == 0 {
             break;
         }
@@ -1751,12 +1749,10 @@ fn create_push_quarantine_object_dir(remote_common_git_dir: &Path) -> Result<Pat
                 return Ok(object_dir);
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(GitError::Io(err.to_string())),
+            Err(err) => return Err(GitError::from(err)),
         }
     }
-    Err(GitError::Io(
-        "could not create push quarantine object directory".into(),
-    ))
+    Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: "could not create push quarantine object directory".into() })
 }
 
 fn remote_excluded_tip_roots(
@@ -4391,7 +4387,7 @@ mod tests {
         ) -> Result<HttpResponse> {
             let mut buffered = Vec::new();
             body.read_to_end(&mut buffered)
-                .map_err(|err| GitError::Io(err.to_string()))?;
+                .map_err(GitError::from)?;
             *self.last.lock().expect("lock") = Some(("post_reader", buffered));
             Self::ok_response()
         }

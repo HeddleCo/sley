@@ -150,7 +150,7 @@ fn start_daemon(daemon: &FsmonitorDaemonSession, worktree: &Path, args: &DaemonA
     }
     let mut child = command
         .spawn()
-        .map_err(|err| GitError::Io(format!("could not start fsmonitor daemon: {err}")))?;
+        .map_err(|err| GitError::IoKind { kind: std::io::ErrorKind::Other, message: format!("could not start fsmonitor daemon: {err}") })?;
 
     let started = Instant::now();
     loop {
@@ -159,7 +159,7 @@ fn start_daemon(daemon: &FsmonitorDaemonSession, worktree: &Path, args: &DaemonA
         }
         if let Some(status) = child
             .try_wait()
-            .map_err(|err| GitError::Io(err.to_string()))?
+            .map_err(GitError::from)?
         {
             eprintln!("error: daemon terminated with status {status}");
             return Err(GitError::Exit(1));
@@ -208,7 +208,7 @@ fn status_daemon(daemon: &FsmonitorDaemonSession, worktree: &Path) -> Result<()>
 /// locate a sibling `sley` executable. Deliberately do not fall back to a
 /// sibling or PATH-resolved `git`: Scalar must never borrow installed Git.
 fn daemon_executable() -> Result<PathBuf> {
-    let current = env::current_exe().map_err(|err| GitError::Io(err.to_string()))?;
+    let current = env::current_exe().map_err(GitError::from)?;
     daemon_executable_from(
         &current,
         env::var_os("SLEY_BIN").map(PathBuf::from).as_deref(),
@@ -225,7 +225,7 @@ fn daemon_executable_from(current: &Path, configured: Option<&Path>) -> Result<P
     {
         let directory = current
             .parent()
-            .ok_or_else(|| GitError::Io("Scalar executable has no parent directory".into()))?;
+            .ok_or_else(|| GitError::IoKind { kind: std::io::ErrorKind::Other, message: "Scalar executable has no parent directory".into() })?;
         let mut sibling = directory.join("sley");
         if cfg!(windows) {
             sibling.set_extension("exe");
@@ -233,9 +233,7 @@ fn daemon_executable_from(current: &Path, configured: Option<&Path>) -> Result<P
         if sibling.is_file() {
             return Ok(sibling);
         }
-        return Err(GitError::Io(
-            "could not locate Sley beside the Scalar executable".into(),
-        ));
+        return Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: "could not locate Sley beside the Scalar executable".into() });
     }
     Ok(current.to_path_buf())
 }

@@ -617,9 +617,7 @@ fn checkout_temp_create_path(worktree_root: &Path) -> Result<(String, PathBuf)> 
             Err(err) => return Err(err),
         }
     }
-    Err(GitError::Io(
-        "unable to create temporary checkout file".into(),
-    ))
+    Err(GitError::IoKind { kind: std::io::ErrorKind::Other, message: "unable to create temporary checkout file".into() })
 }
 
 fn checkout_index_print_temp_record(
