@@ -327,3 +327,7 @@ is not a live generator/build path. It is retained within the task's restriction
 on editing orchestration scripts. The live parity checklist and API doc links
 were updated. No floor, prerequisite, selection, comparison rule, or test was
 removed to accommodate these deletions.
+
+The [finished verification record](program/SLEY_0.10_VERIFICATION.md) includes
+the full workspace run, negative isolation controls, exact namespace/Unicode
+oracle results, unchanged-baseline TAP comparison, and parity-floor evidence.
