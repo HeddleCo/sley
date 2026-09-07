@@ -1,13 +1,13 @@
 # sley
 
-An embeddable Rust Git-equivalent library with a thin, byte-compatible CLI
-wrapper.
+An embeddable Rust Git-equivalent library with a Git-compatible CLI and an
+upstream conformance harness.
 
 The pinned compatibility oracle is upstream Git 2.55.0. Repository semantics
-live in typed engine crates and the `sley::Repository` facade; the CLI owns
-argv/environment setup, terminal integration, dispatch, and Git-identical byte
-rendering. The curated conformance harness runs the oracle and Sley separately
-and compares exact TAP cells.
+live in typed engine crates, the `sley::Repository` facade, and remaining CLI
+command implementations. The CLI also owns argv/environment setup, terminal
+integration, dispatch, and Git-identical byte rendering. The curated conformance
+harness runs the oracle and Sley separately and compares exact TAP cells.
 
 This repository is not a complete Git replacement yet. Tracked gaps are
 explicit in [`PARITY.md`](PARITY.md).
@@ -120,14 +120,18 @@ Linux certification commands.
 
 ## Architecture
 
-Behavior lives in typed engine crates; the `sley::Repository` facade is the
-embedder entry point; `sley-cli` is a thin argv/setup/dispatch shell. Prefer
+The `sley::Repository` facade and engine crates are the embedder entry points.
+`sley-cli` still contains substantial command behavior alongside its
+argv/setup/dispatch and rendering code. Prefer
 table-driven CLI options (`sley-options`) and shared engines over per-command
 handlers ([ADR 0001](docs/adr/0001-cli-layer-engines.md)). Large payloads stream
 as pull `Read`/`Write` with cooperative cancel and sideband demux as a `Read`
 adapter ([ADR 0002](docs/adr/0002-streaming-io-house-rule.md)). Clustered
 upstream/parity work by engine is tracked in
 [`docs/ROADMAP_ENGINES.md`](docs/ROADMAP_ENGINES.md).
+
+The [first-principles audit](docs/program/ARCHITECTURE_AUDIT.md) records the
+current boundaries, safe deletions, and proposed consumer-coordinated cuts.
 
 `sley-remote` also exposes smart-HTTP exact-action push from a caller-supplied
 `ObjectReader`, including a single-use receive-pack observation for callers

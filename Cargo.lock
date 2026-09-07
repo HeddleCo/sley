@@ -1546,9 +1546,7 @@ name = "sley-cli"
 version = "0.9.0"
 dependencies = [
  "ctrlc",
- "encoding_rs",
  "filetime",
- "flate2",
  "pprof",
  "regex",
  "sley",

@@ -14,8 +14,8 @@ use std::sync::Arc;
 use crate::{ObjectReader, ObjectWriter, grafted_parents};
 
 use crate::install::{
-    REACHABLE_PACK_STREAMING_MIN_OBJECTS, replace_pack_component, write_pack_component,
-    write_promisor_pack_sidecar,
+    REACHABLE_PACK_STREAMING_MIN_OBJECTS, replace_pack_component, validate_pack_checksum,
+    write_pack_component, write_promisor_pack_sidecar,
 };
 use crate::loose::LooseObjectStore;
 use crate::pack::FileObjectDatabase;
@@ -2361,39 +2361,6 @@ pub fn install_geometric_repack_result(
         .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
         .collect();
     prune_stale_multi_pack_index(&pack_dir, format, &removed_stems)?;
-    Ok(())
-}
-
-fn validate_pack_checksum(
-    pack: &[u8],
-    format: ObjectFormat,
-    expected: &ObjectId,
-    context: &str,
-) -> Result<()> {
-    if expected.format() != format {
-        return Err(GitError::InvalidObjectId(format!(
-            "{context} checksum format does not match object format"
-        )));
-    }
-    let hash_len = format.raw_len();
-    if pack.len() < 12 + hash_len {
-        return Err(GitError::InvalidFormat(format!(
-            "{context} pack file too short"
-        )));
-    }
-    if &pack[..4] != b"PACK" {
-        return Err(GitError::InvalidFormat(format!(
-            "{context} pack file missing PACK signature"
-        )));
-    }
-    let trailer_offset = pack.len() - hash_len;
-    let actual = sley_core::digest_bytes(format, &pack[..trailer_offset])?;
-    let trailer = ObjectId::from_raw(format, &pack[trailer_offset..])?;
-    if &actual != expected || trailer != *expected {
-        return Err(GitError::InvalidFormat(format!(
-            "{context} pack checksum does not match generated pack"
-        )));
-    }
     Ok(())
 }
 
