@@ -21,11 +21,11 @@ support. `sley` defaults remain `mmap,fast-sha1`; `full` enables all facade
 features and rustls. Cargo features are additive: another dependency enabling a
 built-in-client or worktree feature will include it in the resolved build.
 
-For the 0.10 release:
+For the 0.11 release:
 
 ```toml
 [dependencies]
-sley = { version = "=0.10.0", default-features = false, features = ["remote"] }
+sley = { version = "=0.11.0", default-features = false, features = ["remote"] }
 ```
 
 Or depend directly on `sley-remote` with `default-features = false` and

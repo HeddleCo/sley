@@ -129,9 +129,9 @@ Hosted imports with a caller-supplied HTTP client (for example, a Reqwest
 adapter) need only:
 
 ```toml
-sley = { version = "=0.10.0", default-features = false, features = ["remote"] }
+sley = { version = "=0.11.0", default-features = false, features = ["remote"] }
 # Or use the orchestration crate directly:
-sley-remote = { version = "=0.10.0", default-features = false, features = ["http"] }
+sley-remote = { version = "=0.11.0", default-features = false, features = ["http"] }
 ```
 
 Implement `sley::remote::HttpClient` and pass `Some(&client)` to

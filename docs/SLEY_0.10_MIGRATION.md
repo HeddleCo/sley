@@ -35,19 +35,10 @@ instrumentation only when the remote dependency is already enabled:
 | `history-editing` | `TagCreate`, `Repository::write_annotated_tag`, `notes`, `Repository::{notes_ref,list_notes,iter_notes,read_note_for,read_note,read_note_bytes,write_notes}`. Includes `worktree` because the existing sequencing engine performs real worktree operations. |
 | `rendering` | `pretty`, `grep`, `diff_format`. |
 | `hooks` | `hooks`, `HookEnvironment`, `HookRun`, `KNOWN_HOOKS`, `cmd_hook`, `hook_exists`, `run_hook`, `run_hook_l`, `run_post_index_change_hook`, `run_reference_transaction_hook_at`, `run_traditional_hook_at`. Includes `worktree`. |
-| `remote` | `remote`, its root operation exports, `OperationContext`, `clone_repository`, and the repository remote methods. Includes the injectable smart-HTTP protocol surface, with no built-in client or worktree/hook engine. Checked-out-branch protection is retained in `sley-formats`. |
-| `default-http-client` | Built-in `UreqHttpClient`, HTTP client constructors and batches. Includes `remote`; select a `tls-*` feature for HTTPS. |
-| `full` | All the above plus `tls-rustls`. The compatibility CLI explicitly enables this feature. |
+| `remote` | `remote`, its root operation exports, `OperationContext`, `clone_repository`, and the repository remote methods. Includes `worktree,hooks` for live clone checkout, checked-out-branch protection and receive-pack hook behavior. |
+| `full` | All the above. The compatibility CLI explicitly enables this feature. |
 
-For hosted imports, use `default-features = false, features = ["remote"]` and
-pass `Some(&client)` to the injected-client APIs. Direct `sley-remote` consumers
-use `default-features = false, features = ["http"]`; `http` now enables only
-protocol orchestration. Its default feature set preserves the built-in client,
-rustls, and checkout. `sley-transport::{HttpClient,HttpResponse}` are available
-without any features; `UreqHttpClient` still requires `http-client` there.
-Omitting the client in a minimal HTTP build returns `GitError::Unsupported`.
-Clone without checkout works in minimal builds; checkout and receive-pack
-`updateInstead` require `worktree`. See [HTTP embedding](HTTP_EMBEDDING.md).
+The 0.11 feature split for injected HTTP clients is documented in [HTTP embedding](HTTP_EMBEDDING.md).
 
 The `sley::plumbing` module is removed entirely. Each old
 `sley::plumbing::sley_<engine>::Symbol` import becomes
