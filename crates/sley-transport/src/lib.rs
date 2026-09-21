@@ -1427,12 +1427,13 @@ fn parse_service_protocol_version(value: &str) -> Result<ProtocolVersion> {
 #[cfg(feature = "http-client")]
 pub const HTTP_USER_AGENT: &str = "git/2.54.0 (sley)";
 
-/// A buffered HTTP response whose body streams directly from the network.
+/// An HTTP response whose body streams directly from the network.
+///
+/// Available without the `http-client` feature.
 ///
 /// Note that *any* HTTP status (including 4xx/5xx) is reported here with a
 /// populated [`status`](HttpResponse::status); transport-level failures are
 /// reported as [`Err`] from the [`HttpClient`] methods instead.
-#[cfg(feature = "http-client")]
 pub struct HttpResponse {
     pub status: u16,
     pub content_type: Option<String>,
@@ -1443,18 +1444,20 @@ pub struct HttpResponse {
 
 /// Minimal byte-transport over HTTP(S) used to drive smart-HTTP git transport.
 ///
+/// Available without features; only the built-in `UreqHttpClient` requires
+/// `http-client`.
+///
 /// This is the injectable seam through which a host enforces network policy: an
 /// implementation owns the entire dial (DNS resolution, connect, TLS) for each
 /// `url`, so a host mirroring attacker-controlled public URLs can supply a client
 /// that validates the resolved IP and pins the connection to it, guarding against
-/// SSRF. The default fetch/clone path uses [`UreqHttpClient`]; see
+/// SSRF. The default fetch/clone path uses `UreqHttpClient`; see
 /// `sley_remote::fetch_with_http_client` / `clone_with_http_client` to inject one.
 ///
 /// Implementations must surface HTTP error statuses (401/403/404/5xx) as
 /// `Ok(HttpResponse { status, .. })` so callers can react to them (for example,
 /// retrying a 401 with credentials). Only genuine transport failures
 /// (DNS/connect/TLS/timeout/protocol) are reported as `Err`.
-#[cfg(feature = "http-client")]
 pub trait HttpClient {
     /// Issue a `GET` for `url`, sending the additional `headers`.
     fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<HttpResponse>;
@@ -1480,7 +1483,7 @@ pub trait HttpClient {
     /// transfer-encoding (no `Content-Length`), so large request bodies never
     /// have to be held in memory. The default implementation buffers `body` and
     /// delegates to [`HttpClient::post`]; transports that can stream the request
-    /// (e.g. [`UreqHttpClient`]) override this. Callers that need retry-on-auth
+    /// (e.g. `UreqHttpClient`) override this. Callers that need retry-on-auth
     /// must be able to regenerate `body` per attempt, since a reader is consumed
     /// once.
     fn post_reader(
@@ -1498,7 +1501,7 @@ pub trait HttpClient {
     ///
     /// The default is [`TransportLimits::default`], so a client that does
     /// not override this behaves exactly as it did before the limits became
-    /// configurable. [`UreqHttpClient`] overrides it with the limits it was
+    /// configurable. `UreqHttpClient` overrides it with the limits it was
     /// built from, which is what keeps a configured size ceiling and the
     /// deadline derived from it in agreement.
     fn limits(&self) -> TransportLimits {
@@ -1525,7 +1528,7 @@ impl Default for TransportPolicy {
     }
 }
 
-/// [`HttpClient`] backed by [`ureq`] with rustls + bundled Mozilla roots.
+/// [`HttpClient`] backed by [`ureq`]. HTTPS requires a `tls-*` feature.
 #[cfg(feature = "http-client")]
 pub struct UreqHttpClient {
     transport_policy: TransportPolicy,
@@ -1554,6 +1557,10 @@ const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// A few hundred bytes. A peer that cannot absorb them in 20s is stalled.
 #[cfg(feature = "http-client")]
 const HTTP_SEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Max time to receive response headers after sending the request.
+#[cfg(feature = "http-client")]
+const HTTP_RECV_RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Max time to await a `100 Continue`.
 ///
@@ -1594,6 +1601,7 @@ fn http_global_timeout(limits: TransportLimits) -> Duration {
             + HTTP_CONNECT_TIMEOUT.as_secs()
             + HTTP_SEND_REQUEST_TIMEOUT.as_secs()
             + HTTP_AWAIT_100_TIMEOUT.as_secs()
+            + HTTP_RECV_RESPONSE_TIMEOUT.as_secs()
             + 2 * http_body_timeout(limits).as_secs(),
     )
 }
@@ -1618,12 +1626,9 @@ fn http_timeouts(limits: TransportLimits) -> ureq::config::Timeouts {
         send_request: Some(HTTP_SEND_REQUEST_TIMEOUT),
         await_100: Some(HTTP_AWAIT_100_TIMEOUT),
         send_body: Some(body),
-        // ureq checks `recv_response` again throughout RecvBody, so a short
-        // header-only value here truncates large healthy bodies. Give both
-        // receive states the body budget. While awaiting headers ureq also
-        // checks the preceding `send_request` deadline, preserving the tighter
-        // 20-second stalled-header bound.
-        recv_response: Some(body),
+        // Ureq 3.4.2 applies this deadline while awaiting headers. Its
+        // separate RecvBody phase retains the size-derived transfer budget.
+        recv_response: Some(HTTP_RECV_RESPONSE_TIMEOUT),
         recv_body: Some(body),
     }
 }
@@ -1631,7 +1636,7 @@ fn http_timeouts(limits: TransportLimits) -> ureq::config::Timeouts {
 #[cfg(feature = "http-client")]
 fn ureq_agent(
     timeouts: ureq::config::Timeouts,
-    tls_config: Option<ureq::tls::TlsConfig>,
+    builder: ureq::config::ConfigBuilder<ureq::typestate::AgentScope>,
 ) -> ureq::Agent {
     // `http_status_as_error(false)` makes ureq deliver 4xx/5xx as a normal
     // response (carrying status + body) rather than an error, which is what
@@ -1639,7 +1644,7 @@ fn ureq_agent(
     //
     // `max_redirects(0)` disables automatic redirect following so each
     // Location can be checked against the configured protocol allow-list.
-    let mut builder = ureq::Agent::config_builder()
+    let builder = builder
         .http_status_as_error(false)
         .max_redirects(0)
         .user_agent(HTTP_USER_AGENT)
@@ -1652,9 +1657,6 @@ fn ureq_agent(
         .timeout_send_body(timeouts.send_body)
         .timeout_recv_response(timeouts.recv_response)
         .timeout_recv_body(timeouts.recv_body);
-    if let Some(tls_config) = tls_config {
-        builder = builder.tls_config(tls_config);
-    }
     builder.build().into()
 }
 
@@ -1685,7 +1687,7 @@ impl UreqHttpClient {
     /// `limits` is clamped on the way in, so this cannot build a client with
     /// an unbounded read or an unbounded wait however it is called.
     pub fn with_limits(limits: TransportLimits) -> Self {
-        Self::with_limits_and_tls_config(limits, ureq_tls_config())
+        Self::with_limits_and_config(limits, ureq_config_builder())
     }
 
     /// Build a rustls client that augments the bundled Mozilla roots with a PEM CA
@@ -1716,33 +1718,34 @@ impl UreqHttpClient {
             .provider(TlsProvider::Rustls)
             .root_certs(RootCerts::from(certificates))
             .build();
-        Ok(Self::with_limits_and_tls_config(
+        Ok(Self::with_limits_and_config(
             TransportLimits::default(),
-            Some(tls_config),
+            ureq::Agent::config_builder().tls_config(tls_config),
         ))
     }
 
-    fn with_limits_and_tls_config(
+    fn with_limits_and_config(
         limits: TransportLimits,
-        tls_config: Option<ureq::tls::TlsConfig>,
+        builder: ureq::config::ConfigBuilder<ureq::typestate::AgentScope>,
     ) -> Self {
         let limits = limits.clamped();
         Self {
             transport_policy: TransportPolicy::default(),
             protocol_config: None,
-            agent: ureq_agent(http_timeouts(limits), tls_config),
+            agent: ureq_agent(http_timeouts(limits), builder),
             limits,
         }
     }
 }
 
-/// Build explicit TLS settings when a non-default backend is selected.
+/// Configure TLS only when a backend is enabled; plain HTTP needs no TLS types.
 #[cfg(feature = "http-client")]
-fn ureq_tls_config() -> Option<ureq::tls::TlsConfig> {
+fn ureq_config_builder() -> ureq::config::ConfigBuilder<ureq::typestate::AgentScope> {
+    let builder = ureq::Agent::config_builder();
     #[cfg(feature = "tls-platform-verifier")]
     {
         use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
-        Some(
+        builder.tls_config(
             TlsConfig::builder()
                 .provider(TlsProvider::Rustls)
                 .root_certs(RootCerts::PlatformVerifier)
@@ -1752,7 +1755,7 @@ fn ureq_tls_config() -> Option<ureq::tls::TlsConfig> {
     #[cfg(all(feature = "tls-native-tls", not(feature = "tls-platform-verifier")))]
     {
         use ureq::tls::{TlsConfig, TlsProvider};
-        Some(
+        builder.tls_config(
             TlsConfig::builder()
                 .provider(TlsProvider::NativeTls)
                 .build(),
@@ -1763,8 +1766,8 @@ fn ureq_tls_config() -> Option<ureq::tls::TlsConfig> {
         all(feature = "tls-native-tls", not(feature = "tls-platform-verifier"))
     )))]
     {
-        // `tls-rustls` (and the default ureq rustls stack) need no explicit config.
-        None
+        // Rustls uses its defaults. With no TLS feature this is HTTP-only.
+        builder
     }
 }
 
@@ -3711,6 +3714,7 @@ mod http_timeout_tests {
                 + HTTP_CONNECT_TIMEOUT.as_secs()
                 + HTTP_SEND_REQUEST_TIMEOUT.as_secs()
                 + HTTP_AWAIT_100_TIMEOUT.as_secs()
+                + HTTP_RECV_RESPONSE_TIMEOUT.as_secs()
                 + 2 * http_body_timeout(limits).as_secs()
         );
     }
@@ -3727,7 +3731,7 @@ mod http_timeout_tests {
             ))
         );
         assert_eq!(timeouts.send_body, timeouts.recv_body);
-        assert_eq!(timeouts.recv_response, timeouts.recv_body);
+        assert_eq!(timeouts.recv_response, Some(HTTP_RECV_RESPONSE_TIMEOUT));
         assert_eq!(UreqHttpClient::new().limits(), TransportLimits::default());
     }
 
@@ -3749,7 +3753,7 @@ mod http_timeout_tests {
             ))
         );
         assert!(timeouts.recv_body > Some(http_body_timeout(TransportLimits::default())));
-        assert_eq!(timeouts.recv_response, timeouts.recv_body);
+        assert_eq!(timeouts.recv_response, Some(HTTP_RECV_RESPONSE_TIMEOUT));
     }
 
     /// The ceiling moves; it does not disappear. Every field stays set and

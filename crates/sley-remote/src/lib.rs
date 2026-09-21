@@ -86,7 +86,7 @@ pub use http_backend::{
 mod http;
 #[cfg(feature = "http")]
 pub use http::{
-    HttpFetchPackRequest, HttpOperationBatch, HttpServiceAdvertisements, HttpUploadPackDiscovery,
+    HttpFetchPackRequest, HttpServiceAdvertisements, HttpUploadPackDiscovery,
     NegotiatedPackResponse, http_advertised_refs, http_advertised_refs_with_limits,
     http_authorization_headers, http_check_status, http_discover_upload_pack,
     http_protocol_v2_fetch_response, http_send_with_auth, http_service_advertisements,
@@ -94,14 +94,17 @@ pub use http::{
     install_fetch_pack_via_http_protocol_v2_fetch,
     install_fetch_pack_via_http_protocol_v2_fetch_with_want_refs,
     install_fetch_pack_via_http_upload_pack, negotiate_fetch_pack_via_http_protocol_v2,
-    new_http_client, new_http_client_with_config, remote_url_is_http,
+    remote_url_is_http,
 };
 // Re-export the smart-HTTP client seam so out-of-crate hosts (e.g. weft) can
 // implement [`HttpClient`] to enforce network policy on the dial without a
 // direct `sley-transport` dependency. See `fetch_with_http_client` /
 // `clone_with_http_client`.
-#[cfg(feature = "http")]
-pub use sley_transport::{HttpClient, HttpResponse, UreqHttpClient};
+#[cfg(feature = "default-http-client")]
+pub use http::{HttpOperationBatch, new_http_client, new_http_client_with_config};
+#[cfg(feature = "default-http-client")]
+pub use sley_transport::UreqHttpClient;
+pub use sley_transport::{HttpClient, HttpResponse};
 
 mod ssh;
 pub use ssh::{
@@ -261,9 +264,12 @@ mod bundle_uri;
 #[cfg(feature = "http")]
 pub use bundle_uri::{
     BundleUriEntry, BundleUriList, bundle_uri_fetch_order, handshake_advertises_bundle_uri,
-    http_remote_bundle_uri_list, parse_bundle_uri_line, prefetch_advertised_bundle_uris,
+    http_remote_bundle_uri_list, parse_bundle_uri_line,
     prefetch_advertised_bundle_uris_with_client, transfer_bundle_uri_enabled,
 };
+
+#[cfg(feature = "default-http-client")]
+pub use bundle_uri::prefetch_advertised_bundle_uris;
 
 mod shallow;
 pub use shallow::{apply_shallow_info, read_shallow, write_shallow};

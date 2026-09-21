@@ -164,6 +164,10 @@ impl Repository {
     }
 
     /// Like [`Repository::fetch`], with a caller-provided smart-HTTP client.
+    ///
+    /// Available with `remote` alone. Pass `Some(client)` when
+    /// `default-http-client` is disabled; `None` then returns an unsupported
+    /// error for HTTP sources.
     pub fn fetch_with_http_client(
         &self,
         remote: impl Into<String>,

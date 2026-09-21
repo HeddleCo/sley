@@ -30,7 +30,7 @@ on:
         description: "Version to publish (must match the crates' Cargo.toml version)."
         type: string
         required: true
-        default: "0.6.0"
+        default: "0.11.0"
 
 concurrency:
   # Never run two real publishes concurrently — they would race on crates.io.

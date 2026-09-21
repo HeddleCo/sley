@@ -121,11 +121,10 @@ jobs:
       - name: Build (default features)
         run: cargo build --locked --workspace --tests
 
-      # 2. Keep the transport-free embedding surface honest. The all-feature
-      #    workspace lint below cannot see symbols accidentally left active only
-      #    when HTTP is disabled, so exercise that cfg branch explicitly.
-      - name: sley-remote minimal-feature Clippy
-        run: cargo clippy --locked -p sley-remote --all-targets --no-default-features --no-deps -- -D warnings
+      # 2. Check transport-free and injected-client builds separately; workspace
+      #    feature unification must not hide default HTTP or worktree dependencies.
+      - name: HTTP embedding feature isolation and regressions
+        run: bash scripts/check-http-embedding.sh
 
       # 3. Formatting is part of the release gate. Keep this check workspace-wide
       #    so a newly added crate cannot silently fall outside enforcement.

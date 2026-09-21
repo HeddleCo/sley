@@ -501,7 +501,7 @@ fn branch_checked_out_anywhere(git_dir: &Path, format: ObjectFormat, logical_ref
     if matches!(
         store.read_ref("HEAD").ok().flatten(),
         Some(RefTarget::Symbolic(target)) if target == logical_ref
-    ) && sley_worktree::worktree_root_for_git_dir(git_dir)
+    ) && sley_formats::worktree_root_for_git_dir(git_dir)
         .ok()
         .flatten()
         .is_some()

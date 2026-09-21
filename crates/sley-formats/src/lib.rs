@@ -10,6 +10,11 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod discovery;
+mod worktree_refs;
+pub use worktree_refs::{
+    SharedSymrefWorktree, common_git_dir_for_git_dir, find_shared_symref,
+    worktree_holding_rebase_update_ref, worktree_refs_in_use,
+};
 
 use sley_config::{ConfigEntry, ConfigSection, GitConfig};
 use sley_core::paths::{normalize_lexical, relative_path_lexical};

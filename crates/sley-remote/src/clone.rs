@@ -32,6 +32,7 @@
 //! SSH clone uses the same [`crate::fetch`] SSH dispatch as fetch; only the
 //! caller-side URL resolution and post-clone presentation stay in the CLI.
 
+#[cfg(feature = "worktree")]
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -40,10 +41,12 @@ use sley_core::{DynCancelFlag, GitError, ObjectFormat, ObjectId, Result};
 use sley_formats::{InitOptions, RefStorageFormat, RepositoryBootstrap};
 use sley_object::{Commit, ObjectType, Tree};
 use sley_odb::{FileObjectDatabase, ObjectReader};
-use sley_refs::{FileRefStore, RefTarget, RefUpdate, ReflogEntry};
-use sley_transport::RemoteUrl;
+#[cfg(feature = "worktree")]
+use sley_refs::ReflogEntry;
+use sley_refs::{FileRefStore, RefTarget, RefUpdate};
 #[cfg(feature = "http")]
-use sley_transport::{HttpClient, UreqHttpClient};
+use sley_transport::HttpClient;
+use sley_transport::RemoteUrl;
 
 #[cfg(not(feature = "http"))]
 use crate::fetch::fetch;
@@ -251,11 +254,13 @@ pub fn clone(
 /// Like [`clone`], but drives the smart-HTTP transport through a caller-provided
 /// [`HttpClient`] when `http_client` is `Some`.
 ///
-/// `None` is exactly [`clone`] (a default [`UreqHttpClient`]). A `Some` client
+/// `None` uses the default client when `default-http-client` is enabled, and
+/// otherwise returns `GitError::Unsupported` for HTTP sources. A `Some` client
 /// owns the entire dial for every smart-HTTP request the clone makes (ref
 /// advertisement, pack fetch, and the partial-clone checkout-blob top-up), so a
 /// host can enforce network policy such as SSRF validation when mirroring a
-/// public URL. Non-HTTP clone sources ignore it.
+/// public URL. Non-HTTP clone sources ignore it. Without `worktree`, set
+/// `checkout = false`; requests for checkout fail before destination creation.
 #[cfg(feature = "http")]
 pub fn clone_with_http_client(
     original_cwd: Option<&std::path::Path>,
@@ -272,6 +277,15 @@ fn clone_impl(
     services: CloneServices<'_>,
     #[cfg(feature = "http")] http_client: Option<&dyn HttpClient>,
 ) -> Result<CloneOutcome> {
+    #[cfg(not(feature = "worktree"))]
+    {
+        let _ = original_cwd;
+        if request.options.checkout {
+            return Err(GitError::Unsupported(
+                "clone checkout requires the worktree feature".into(),
+            ));
+        }
+    }
     let layout = RepositoryBootstrap::init(InitOptions {
         git_dir_override: request.git_dir_override.map(Path::to_path_buf),
         core_worktree: request.core_worktree.map(str::to_string),
@@ -364,6 +378,7 @@ fn clone_impl(
     if let Some(detached) = &request.options.detached_head {
         write_clone_remote_head(&store, request.options)?;
         if request.options.checkout {
+            #[cfg(feature = "worktree")]
             sley_worktree::checkout_detached_filtered(
                 original_cwd,
                 request.destination,
@@ -460,7 +475,7 @@ fn clone_impl(
     // branch, point the remote `HEAD`, then read the (now final) config for the
     // smudge-side checkout filters. Pointing `HEAD` only updates refs, so it does
     // not change the config `configure_branch` returns.
-    let checkout_config = (services.configure_branch)(&git_dir, request.options.checkout_branch)?;
+    let _checkout_config = (services.configure_branch)(&git_dir, request.options.checkout_branch)?;
     if request.options.checkout {
         #[cfg(feature = "http")]
         fetch_partial_clone_checkout_blobs(
@@ -495,6 +510,7 @@ fn clone_impl(
     }
     write_clone_remote_head(&store, request.options)?;
 
+    #[cfg(feature = "worktree")]
     if request.options.checkout {
         if request.options.sparse {
             // Default sparse-clone cone (`/*` + `!/*/`) — only top-level files
@@ -544,7 +560,7 @@ fn clone_impl(
                 request.format,
                 request.options.checkout_branch,
                 request.options.committer.clone(),
-                &checkout_config,
+                &_checkout_config,
             )?;
         }
     }
@@ -721,9 +737,8 @@ fn fetch_http_partial_clone_checkout_blobs(
             // deadlines derived from them follow the same settings the rest of
             // the request does.
             default_client =
-                UreqHttpClient::with_limits(crate::transport_limits_from_config(Some(config)))
-                    .with_protocol_policy(request.options.policy.transport.clone(), Some(config));
-            &default_client
+                crate::http::default_http_client(&request.options.policy.transport, Some(config))?;
+            default_client.as_ref()
         }
     };
     let discovered = crate::http::http_service_advertisements(

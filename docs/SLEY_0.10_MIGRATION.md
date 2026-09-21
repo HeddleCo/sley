@@ -1,7 +1,6 @@
 # Sley 0.10 embedding migration (breaking)
 
-This change requires Sley 0.10.0. Workspace versions remain 0.9.0 until the
-coordinated release bump. Heddle and Weft are not repinned or edited here.
+This change requires Sley 0.10.0. Heddle and Weft are not repinned or edited here.
 
 ## Speculative APIs removed (rank 3)
 
@@ -38,6 +37,8 @@ instrumentation only when the remote dependency is already enabled:
 | `hooks` | `hooks`, `HookEnvironment`, `HookRun`, `KNOWN_HOOKS`, `cmd_hook`, `hook_exists`, `run_hook`, `run_hook_l`, `run_post_index_change_hook`, `run_reference_transaction_hook_at`, `run_traditional_hook_at`. Includes `worktree`. |
 | `remote` | `remote`, its root operation exports, `OperationContext`, `clone_repository`, and the repository remote methods. Includes `worktree,hooks` for live clone checkout, checked-out-branch protection and receive-pack hook behavior. |
 | `full` | All the above. The compatibility CLI explicitly enables this feature. |
+
+The 0.11 feature split for injected HTTP clients is documented in [HTTP embedding](HTTP_EMBEDDING.md).
 
 The `sley::plumbing` module is removed entirely. Each old
 `sley::plumbing::sley_<engine>::Symbol` import becomes

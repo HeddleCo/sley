@@ -25,19 +25,20 @@ sley-refs.workspace = true
 sley-rev.workspace = true
 sley-sequencer = { workspace = true, optional = true }
 sley-worktree = { workspace = true, optional = true }
-sley-remote = { workspace = true, optional = true }
+sley-remote = { path = "../sley-remote", version = "0.11.0", optional = true, default-features = false }
 
 [features]
 default = ["mmap", "fast-sha1"]
 # Explicit porcelain surfaces. The compatibility executable enables full.
-worktree = ["dep:sley-worktree"]
+worktree = ["dep:sley-worktree", "sley-remote?/worktree"]
 history-editing = ["worktree", "dep:sley-sequencer", "dep:sley-notes"]
 rendering = ["dep:sley-pretty", "dep:sley-grep"]
 hooks = ["worktree", "dep:sley-hooks"]
-full = ["remote", "worktree", "history-editing", "rendering", "hooks"]
+full = ["remote", "tls-rustls", "worktree", "history-editing", "rendering", "hooks"]
 # Callable fetch/push/clone/ls-remote orchestration (heddle transport surface).
-# Opt in explicitly. Includes live checkout and receive-pack worktree behavior.
-remote = ["dep:sley-remote", "sley-remote/http", "worktree", "hooks"]
+# Opt in explicitly; callers supply the HTTP client unless enabled below.
+remote = ["dep:sley-remote", "sley-remote/http"]
+default-http-client = ["remote", "sley-remote/default-http-client"]
 # The (de)compression backend is the default-on zlib-rs (pure Rust, ~zlib-ng
 # speed, no C). The `pure-rust` miniz_oxide fallback lives on sley-odb / sley-pack
 # as a leaf-crate feature (`--no-default-features --features pure-rust`); it is
@@ -50,10 +51,10 @@ fast-sha1 = ["sley-core/fast-sha1", "sley-odb/fast-sha1"]
 # with unsafe; default-on for the facade while remaining opt-in on sley-odb.
 mmap = ["sley-odb/mmap"]
 # TLS backend for HTTPS remotes (forwarded to sley-remote / sley-transport).
-# Default remote/http uses rustls; enable one of these to override.
-tls-rustls = ["remote", "sley-remote/tls-rustls"]
-tls-native-tls = ["remote", "sley-remote/tls-native-tls"]
-tls-platform-verifier = ["remote", "sley-remote/tls-platform-verifier"]
+# `full` selects rustls; minimal remote builds have no built-in HTTP client.
+tls-rustls = ["default-http-client", "sley-remote/tls-rustls"]
+tls-native-tls = ["default-http-client", "sley-remote/tls-native-tls"]
+tls-platform-verifier = ["default-http-client", "sley-remote/tls-platform-verifier"]
 fetch-profile = [
     "sley-core/fetch-profile",
     "sley-odb/fetch-profile",

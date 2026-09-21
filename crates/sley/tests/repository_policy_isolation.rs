@@ -1,4 +1,4 @@
-#![cfg(feature = "remote")]
+#![cfg(all(feature = "remote", feature = "worktree"))]
 
 use std::sync::Barrier;
 

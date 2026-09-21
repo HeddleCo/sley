@@ -20,7 +20,7 @@ use sley_protocol::{
     smart_http_rpc_result_content_type, write_protocol_v2_command_request,
 };
 use sley_refs::{FileRefStore, RefTarget, RefUpdate};
-use sley_transport::{HttpClient, RemoteUrl, UreqHttpClient, http_smart_rpc_url};
+use sley_transport::{HttpClient, RemoteUrl, http_smart_rpc_url};
 
 use crate::CredentialProvider;
 use crate::http::{
@@ -308,6 +308,7 @@ fn ordered_bundle_entries(list: &BundleUriList) -> Vec<&BundleUriEntry> {
 /// * failures are best-effort: a bundle that cannot be downloaded or applied is
 ///   warned about (upstream's "failed to download bundle from URI" text) and the
 ///   remaining bundles / the normal negotiation still proceed.
+#[cfg(feature = "default-http-client")]
 pub fn prefetch_advertised_bundle_uris(
     policy: &crate::TransportPolicy,
     config: Option<&sley_config::GitConfig>,
@@ -315,11 +316,11 @@ pub fn prefetch_advertised_bundle_uris(
     format: ObjectFormat,
     list: &BundleUriList,
 ) -> Result<()> {
-    let client = UreqHttpClient::new().with_protocol_policy(policy.clone(), config);
+    let client = sley_transport::UreqHttpClient::new().with_protocol_policy(policy.clone(), config);
     prefetch_advertised_bundle_uris_with_client(&client, git_dir, format, list)
 }
 
-/// Native, injectable variant of [`prefetch_advertised_bundle_uris`].
+/// Native, injectable variant of `prefetch_advertised_bundle_uris`.
 ///
 /// Supplying the client keeps bundle prefetch available to embedders without
 /// consulting `PATH`, `GIT_EXEC_PATH`, an upstream Git build, or an installed

@@ -125,6 +125,24 @@ Porcelain is opt-in through `worktree`, `history-editing`, `rendering`, `hooks`,
 and `remote`; `full` enables the complete compatibility surface. See the
 [0.10 migration map](docs/SLEY_0.10_MIGRATION.md) for feature and import changes.
 
+Hosted imports with a caller-supplied HTTP client (for example, a Reqwest
+adapter) need only:
+
+```toml
+sley = { version = "=0.11.0", default-features = false, features = ["remote"] }
+# Or use the orchestration crate directly:
+sley-remote = { version = "=0.11.0", default-features = false, features = ["http"] }
+```
+
+Implement `sley::remote::HttpClient` and pass `Some(&client)` to
+`Repository::fetch_with_http_client_and_cancel`. `HttpResponse::body` remains a
+streaming `Read + Send`; override `post_reader` to stream request bodies too.
+These features pull in no `ureq`, TLS backend, worktree, hooks, or sequencer
+crate. Add `tls-rustls` (or another `tls-*` feature) for the built-in client,
+and `worktree` for clone checkout or receive-pack `updateInstead`.
+See the [HTTP embedding guide](docs/HTTP_EMBEDDING.md) for the feature matrix and
+adapter contract.
+
 The `sley::Repository` facade and engine crates are the embedder entry points.
 `sley-cli` still contains substantial command behavior alongside its
 argv/setup/dispatch and rendering code. Prefer
