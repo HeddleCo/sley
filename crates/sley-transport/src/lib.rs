@@ -1558,6 +1558,10 @@ const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 #[cfg(feature = "http-client")]
 const HTTP_SEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Max time to receive response headers after sending the request.
+#[cfg(feature = "http-client")]
+const HTTP_RECV_RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Max time to await a `100 Continue`.
 ///
 /// ureq's own default, kept as-is: a peer that never sends one is expected, and
@@ -1597,6 +1601,7 @@ fn http_global_timeout(limits: TransportLimits) -> Duration {
             + HTTP_CONNECT_TIMEOUT.as_secs()
             + HTTP_SEND_REQUEST_TIMEOUT.as_secs()
             + HTTP_AWAIT_100_TIMEOUT.as_secs()
+            + HTTP_RECV_RESPONSE_TIMEOUT.as_secs()
             + 2 * http_body_timeout(limits).as_secs(),
     )
 }
@@ -1621,12 +1626,9 @@ fn http_timeouts(limits: TransportLimits) -> ureq::config::Timeouts {
         send_request: Some(HTTP_SEND_REQUEST_TIMEOUT),
         await_100: Some(HTTP_AWAIT_100_TIMEOUT),
         send_body: Some(body),
-        // ureq checks `recv_response` again throughout RecvBody, so a short
-        // header-only value here truncates large healthy bodies. Give both
-        // receive states the body budget. While awaiting headers ureq also
-        // checks the preceding `send_request` deadline, preserving the tighter
-        // 20-second stalled-header bound.
-        recv_response: Some(body),
+        // Ureq 3.4.2 applies this deadline while awaiting headers. Its
+        // separate RecvBody phase retains the size-derived transfer budget.
+        recv_response: Some(HTTP_RECV_RESPONSE_TIMEOUT),
         recv_body: Some(body),
     }
 }
@@ -3712,6 +3714,7 @@ mod http_timeout_tests {
                 + HTTP_CONNECT_TIMEOUT.as_secs()
                 + HTTP_SEND_REQUEST_TIMEOUT.as_secs()
                 + HTTP_AWAIT_100_TIMEOUT.as_secs()
+                + HTTP_RECV_RESPONSE_TIMEOUT.as_secs()
                 + 2 * http_body_timeout(limits).as_secs()
         );
     }
@@ -3728,7 +3731,7 @@ mod http_timeout_tests {
             ))
         );
         assert_eq!(timeouts.send_body, timeouts.recv_body);
-        assert_eq!(timeouts.recv_response, timeouts.recv_body);
+        assert_eq!(timeouts.recv_response, Some(HTTP_RECV_RESPONSE_TIMEOUT));
         assert_eq!(UreqHttpClient::new().limits(), TransportLimits::default());
     }
 
@@ -3750,7 +3753,7 @@ mod http_timeout_tests {
             ))
         );
         assert!(timeouts.recv_body > Some(http_body_timeout(TransportLimits::default())));
-        assert_eq!(timeouts.recv_response, timeouts.recv_body);
+        assert_eq!(timeouts.recv_response, Some(HTTP_RECV_RESPONSE_TIMEOUT));
     }
 
     /// The ceiling moves; it does not disappear. Every field stays set and
