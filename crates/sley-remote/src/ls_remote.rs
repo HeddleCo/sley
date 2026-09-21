@@ -238,8 +238,8 @@ fn ls_remote_http(
     let client = match http_client {
         Some(client) => client,
         None => {
-            default_client = crate::http::HttpOperationBatch::with_config(policy, config);
-            default_client.client()
+            default_client = crate::http::default_http_client(policy, config)?;
+            default_client.as_ref()
         }
     };
     let (refs, features) =

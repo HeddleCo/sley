@@ -46,7 +46,7 @@ use sley_protocol::{
 };
 use sley_transport::{
     GitProtocolHeader, HttpClient, HttpResponse, RemoteTransport, RemoteUrl,
-    ServiceDiscoveryPayload, ServiceDiscoveryResponse, UreqHttpClient, encode_git_protocol_header,
+    ServiceDiscoveryPayload, ServiceDiscoveryResponse, encode_git_protocol_header,
     git_credential_basic_authorization, http_smart_info_refs_url, http_smart_rpc_url,
     parse_remote_url, read_service_discovery_response,
 };
@@ -55,6 +55,8 @@ use sley_protocol::{TransportLimits, read_to_end_bounded};
 
 use crate::credentials::{credential_request_for_url, http_url_credential};
 use crate::{CredentialProvider, ProgressSink, transport_limits_from_config};
+#[cfg(feature = "default-http-client")]
+use sley_transport::UreqHttpClient;
 
 #[cfg(feature = "fetch-profile")]
 struct FetchProfileSocketReader<'a, R: ?Sized> {
@@ -96,10 +98,12 @@ pub fn remote_url_is_http(url: &str) -> Result<bool> {
 }
 
 /// Reusable HTTP client for every smart-HTTP RPC in one remote operation.
+#[cfg(feature = "default-http-client")]
 pub struct HttpOperationBatch {
     client: UreqHttpClient,
 }
 
+#[cfg(feature = "default-http-client")]
 impl HttpOperationBatch {
     pub fn new() -> Self {
         Self {
@@ -123,23 +127,46 @@ impl HttpOperationBatch {
     }
 }
 
+#[cfg(feature = "default-http-client")]
 impl Default for HttpOperationBatch {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "default-http-client")]
 pub fn new_http_client() -> UreqHttpClient {
     UreqHttpClient::new()
 }
 
 /// [`new_http_client`] with the ceilings `config` asks for.
+#[cfg(feature = "default-http-client")]
 pub fn new_http_client_with_config(
     policy: &crate::TransportPolicy,
     config: Option<&GitConfig>,
 ) -> UreqHttpClient {
     UreqHttpClient::with_limits(transport_limits_from_config(config))
         .with_protocol_policy(policy.clone(), config)
+}
+
+/// Resolve an omitted injected client without ever silently selecting another
+/// transport backend in an HTTP-interface-only build.
+pub(crate) fn default_http_client(
+    policy: &crate::TransportPolicy,
+    config: Option<&GitConfig>,
+) -> Result<Box<dyn HttpClient + Send + Sync>> {
+    #[cfg(feature = "default-http-client")]
+    {
+        Ok(Box::new(new_http_client_with_config(policy, config)))
+    }
+    #[cfg(not(feature = "default-http-client"))]
+    {
+        let _ = (policy, config);
+        Err(GitError::Unsupported(
+            "no default HTTP client is enabled; supply an HttpClient or enable default-http-client"
+                .into(),
+        ))
+    }
 }
 
 /// Perform an HTTP request, retrying once with credential-provider-supplied
@@ -863,7 +890,7 @@ fn http_protocol_v2_fetch_post<C: HttpClient + ?Sized>(
 pub struct HttpFetchPackRequest<'a, C: HttpClient + ?Sized> {
     /// HTTP client used for smart-HTTP RPCs. Generic over [`HttpClient`] so a host
     /// can inject a network-policy-enforcing client (e.g. an SSRF guard); the
-    /// default fetch/clone path uses [`UreqHttpClient`].
+    /// default fetch/clone path uses `UreqHttpClient`.
     pub client: &'a C,
     /// Local repository `$GIT_DIR`.
     pub git_dir: &'a Path,

@@ -12,10 +12,10 @@ use sley_config::remotes::{
     remote_config_values, remote_exists, resolve_remote_fetch_url, resolve_remote_push_url,
 };
 use sley_core::{GitError, Result};
-use sley_transport::{RemoteTransport, RemoteUrl, parse_remote_url};
-use sley_worktree::discovery::{
+use sley_formats::discovery::{
     DiscoveredRepository, RepositoryDiscoveryOptions, discover_repository,
 };
+use sley_transport::{RemoteTransport, RemoteUrl, parse_remote_url};
 
 use crate::{FetchSource, PushDestination, RemoteTransportKind};
 
@@ -323,7 +323,7 @@ fn local_repository_path_from_url(repository: &str, cwd: &Path) -> Result<PathBu
 
 pub fn discover_local_git_dir(path: &Path) -> Result<PathBuf> {
     discover_repository(path, RepositoryDiscoveryOptions::local_remote())
-        .map(sley_worktree::discovery::DiscoveredRepository::into_git_dir)
+        .map(sley_formats::discovery::DiscoveredRepository::into_git_dir)
 }
 
 fn percent_decode_url_path(value: &str) -> Result<String> {

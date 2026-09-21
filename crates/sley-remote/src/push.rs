@@ -481,7 +481,7 @@ pub struct HttpReceivePackObservation<'client> {
 #[cfg(feature = "http")]
 enum HttpObservationClient<'client> {
     Borrowed(&'client dyn HttpClient),
-    Owned(crate::http::HttpOperationBatch),
+    Owned(Box<dyn HttpClient + Send + Sync>),
 }
 
 #[cfg(feature = "http")]
@@ -489,7 +489,7 @@ impl HttpObservationClient<'_> {
     fn client(&self) -> &dyn HttpClient {
         match self {
             Self::Borrowed(client) => *client,
-            Self::Owned(batch) => batch.client(),
+            Self::Owned(batch) => batch.as_ref(),
         }
     }
 }
@@ -533,7 +533,7 @@ enum PushExecution {
     Noop,
     #[cfg(feature = "http")]
     Http {
-        http_batch: Option<crate::http::HttpOperationBatch>,
+        http_batch: Option<Box<dyn HttpClient + Send + Sync>>,
         remote_url: RemoteUrl,
         features: ReceivePackFeatures,
         advertisements: Vec<RefAdvertisement>,
@@ -646,12 +646,10 @@ pub fn observe_http_receive_pack<'client>(
             HttpObservationClient::Borrowed(client),
         ),
         None => {
-            let batch = crate::http::HttpOperationBatch::with_config(
-                &request.policy.transport,
-                Some(request.config),
-            );
+            let batch =
+                crate::http::default_http_client(&request.policy.transport, Some(request.config))?;
             let discovered = crate::http::http_service_advertisements(
-                batch.client(),
+                batch.as_ref(),
                 request.remote_url,
                 request.format,
                 GitService::ReceivePack,
@@ -902,12 +900,12 @@ fn plan_push_actions_impl(
                     None,
                 ),
                 None => {
-                    let batch = crate::http::HttpOperationBatch::with_config(
+                    let batch = crate::http::default_http_client(
                         &request.plan.options.policy.transport,
                         Some(request.config),
-                    );
+                    )?;
                     let discovered = crate::http::http_service_advertisements(
-                        batch.client(),
+                        batch.as_ref(),
                         remote_url,
                         request.format,
                         GitService::ReceivePack,
@@ -1086,13 +1084,13 @@ fn execute_push_plan_impl(
             let client = if let Some(client) = http_client {
                 client
             } else if let Some(batch) = http_batch.as_ref() {
-                batch.client()
+                batch.as_ref()
             } else {
-                fallback_batch = crate::http::HttpOperationBatch::with_config(
+                fallback_batch = crate::http::default_http_client(
                     &request.options.policy.transport,
                     Some(request.config),
-                );
-                fallback_batch.client()
+                )?;
+                fallback_batch.as_ref()
             };
             execute_push_http(
                 &FileObjectDatabase::from_git_dir(request.common_git_dir, request.format),
@@ -1202,10 +1200,9 @@ fn plan_push_http(request: PushHttpRequest<'_>) -> Result<PushPlan> {
         options,
         credentials,
     } = request;
-    let http_batch =
-        crate::http::HttpOperationBatch::with_config(&options.policy.transport, Some(config));
+    let http_batch = crate::http::default_http_client(&options.policy.transport, Some(config))?;
     let discovered = crate::http::http_service_advertisements(
-        http_batch.client(),
+        http_batch.as_ref(),
         remote_url,
         format,
         GitService::ReceivePack,
@@ -2383,7 +2380,7 @@ fn branch_is_checked_out_in_any_worktree(
         Some(RefTarget::Symbolic(ref target)) if target == branch_ref
     ) {
         // Only count the main worktree when it has a working tree.
-        if sley_worktree::worktree_root_for_git_dir(remote_git_dir)?.is_some() {
+        if sley_formats::worktree_root_for_git_dir(remote_git_dir)?.is_some() {
             return Ok(true);
         }
     }
@@ -3686,18 +3683,18 @@ fn resolve_for_each_ref_target(
 mod tests {
     use super::*;
     use std::fs;
-    #[cfg(feature = "http")]
+    #[cfg(feature = "default-http-client")]
     use std::io::Write;
-    #[cfg(feature = "http")]
+    #[cfg(feature = "default-http-client")]
     use std::net::TcpListener;
-    #[cfg(feature = "http")]
+    #[cfg(feature = "default-http-client")]
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use sley_formats::RepositoryLayout;
     use sley_object::{BString, Commit, EncodedObject, ObjectType, Tree, TreeEntry};
     use sley_odb::{FileObjectDatabase, ObjectReplacements, ObjectWriter};
-    #[cfg(feature = "http")]
+    #[cfg(feature = "default-http-client")]
     use sley_protocol::{
         GitService, ProtocolVersion, RefAdvertisementSet, parse_receive_pack_push_request,
     };
@@ -3706,7 +3703,7 @@ mod tests {
         write_receive_pack_report_status, write_sideband_stream,
     };
     use sley_refs::{RefTarget, RefUpdate};
-    #[cfg(feature = "http")]
+    #[cfg(feature = "default-http-client")]
     use sley_transport::{
         ServiceAnnouncement, ServiceDiscoveryPayload, ServiceDiscoveryResponse, parse_remote_url,
         write_service_discovery_response,
@@ -3716,13 +3713,13 @@ mod tests {
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    #[cfg(feature = "http")]
+    #[cfg(feature = "default-http-client")]
     #[derive(Default)]
     struct MapObjectReader {
         objects: HashMap<ObjectId, Arc<EncodedObject>>,
     }
 
-    #[cfg(feature = "http")]
+    #[cfg(feature = "default-http-client")]
     impl ObjectReader for MapObjectReader {
         fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
             self.objects
@@ -3732,7 +3729,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "http")]
+    #[cfg(feature = "default-http-client")]
     fn insert_map_object(reader: &mut MapObjectReader, object: EncodedObject) -> ObjectId {
         let object = Arc::new(object);
         let oid = object
@@ -3742,7 +3739,7 @@ mod tests {
         oid
     }
 
-    #[cfg(feature = "http")]
+    #[cfg(feature = "default-http-client")]
     fn insert_map_commit(
         reader: &mut MapObjectReader,
         tree: ObjectId,
@@ -3850,7 +3847,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "http")]
+    #[cfg(feature = "default-http-client")]
     fn http_delete_push_bodies(old: ObjectId) -> (Vec<u8>, Vec<u8>) {
         let mut discovery = Vec::new();
         write_service_discovery_response(
@@ -3895,7 +3892,7 @@ mod tests {
         (discovery, result)
     }
 
-    #[cfg(feature = "http")]
+    #[cfg(feature = "default-http-client")]
     fn http_update_push_bodies(old: ObjectId) -> (Vec<u8>, Vec<u8>) {
         let mut discovery = Vec::new();
         write_service_discovery_response(
@@ -3939,7 +3936,7 @@ mod tests {
         (discovery, result)
     }
 
-    #[cfg(feature = "http")]
+    #[cfg(feature = "default-http-client")]
     fn run_http_delete_push(
         git_dir: &Path,
         remote: RemoteUrl,
@@ -3980,7 +3977,7 @@ mod tests {
         .expect("HTTP delete push should succeed")
     }
 
-    #[cfg(feature = "http")]
+    #[cfg(feature = "default-http-client")]
     fn read_http_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
         let mut request = Vec::new();
         let header_end = loop {
@@ -4010,7 +4007,7 @@ mod tests {
         request
     }
 
-    #[cfg(feature = "http")]
+    #[cfg(feature = "default-http-client")]
     fn serve_http_push(
         discovery: Vec<u8>,
         result: Vec<u8>,
@@ -4055,7 +4052,7 @@ mod tests {
         (remote, server)
     }
 
-    #[cfg(feature = "http")]
+    #[cfg(feature = "default-http-client")]
     #[test]
     fn http_push_uses_injected_client_for_discovery_and_receive_pack() {
         let git_dir = temp_repo("http-injected-client");
@@ -4071,7 +4068,7 @@ mod tests {
         assert!(outcome.report.is_some());
     }
 
-    #[cfg(feature = "http")]
+    #[cfg(feature = "default-http-client")]
     #[test]
     fn http_push_uses_default_client_for_discovery_and_receive_pack() {
         let git_dir = temp_repo("http-default-client");
@@ -4086,7 +4083,7 @@ mod tests {
         assert!(outcome.report.is_some());
     }
 
-    #[cfg(feature = "http")]
+    #[cfg(feature = "default-http-client")]
     #[test]
     fn repository_backed_http_actions_adapt_file_odb_to_reader_engine() {
         let git_dir = temp_repo("http-file-reader-adapter");
@@ -4132,7 +4129,7 @@ mod tests {
         assert!(outcome.report.is_some());
     }
 
-    #[cfg(feature = "http")]
+    #[cfg(feature = "default-http-client")]
     #[test]
     fn observed_http_push_streams_from_custom_reader_without_second_discovery() {
         let format = ObjectFormat::Sha1;

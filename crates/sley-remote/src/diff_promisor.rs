@@ -111,7 +111,7 @@ pub fn prefetch_promisor_objects(
         return Ok(());
     };
     let resolution_cwd =
-        sley_worktree::worktree_root_for_git_dir(&git_dir)?.unwrap_or_else(|| git_dir.clone());
+        sley_formats::worktree_root_for_git_dir(&git_dir)?.unwrap_or_else(|| git_dir.clone());
 
     // In-process upload-pack reuses this process's packet-trace identity; git's
     // promisor path forks `git fetch`, so traces show `fetch> done`. Match that.
@@ -238,9 +238,9 @@ fn prefetch_local_promisor_object(
 /// Smart-HTTP promisor hydrate (t0410 #39): exact-want, no haves. Returns
 /// `Some(any_hydrated)` when `url` is an HTTP(S) remote this build can service,
 /// or `None` when the URL is not HTTP so the caller can fall through. Only the
-/// `http` feature carries the smart-HTTP transport, so without it every URL
+/// `default-http-client` feature supplies this non-injectable path, so without it every URL
 /// falls through here.
-#[cfg(feature = "http")]
+#[cfg(feature = "default-http-client")]
 fn maybe_hydrate_promisor_via_http(
     policy: &crate::RemotePolicy,
     config: &GitConfig,
@@ -272,9 +272,9 @@ fn maybe_hydrate_promisor_via_http(
     Some(any)
 }
 
-/// Without the `http` feature there is no smart-HTTP transport, so no URL can
+/// Without `default-http-client` this path has no client, so no URL can
 /// be hydrated over HTTP; always fall through to the caller's next path.
-#[cfg(not(feature = "http"))]
+#[cfg(not(feature = "default-http-client"))]
 fn maybe_hydrate_promisor_via_http(
     _policy: &crate::RemotePolicy,
     _config: &GitConfig,
@@ -292,7 +292,7 @@ fn maybe_hydrate_promisor_via_http(
 /// Mirrors git's `promisor_remote_get_direct` over HTTP: exact-want, no haves,
 /// installed as a promisor pack so subsequent fsck/rev-list still treat the
 /// transfer as partial.
-#[cfg(feature = "http")]
+#[cfg(feature = "default-http-client")]
 #[allow(clippy::too_many_arguments)]
 fn hydrate_promisor_oid_via_http(
     policy: &crate::RemotePolicy,

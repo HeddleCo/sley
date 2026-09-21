@@ -123,6 +123,7 @@ pub fn run_post_update(
 /// Returns `Ok(true)` when the hook ran, `Ok(false)` when no hook is installed.
 /// A non-zero hook exit becomes a `GitError::Command` with the git wording
 /// (`push-to-checkout hook declined`).
+#[cfg(feature = "worktree")]
 pub fn run_push_to_checkout_hook(
     git_dir: &Path,
     new_oid: &sley_core::ObjectId,
@@ -185,6 +186,7 @@ pub fn run_push_to_checkout(
 /// Prefer the `push-to-checkout` hook when present; otherwise refresh the index,
 /// refuse dirty worktrees / staged changes, refuse untracked paths that the new
 /// tree would overwrite, then hard-reset the index+worktree to `new_oid`.
+#[cfg(feature = "worktree")]
 pub fn update_worktree_for_update_instead(
     original_cwd: Option<&std::path::Path>,
     git_dir: &Path,
@@ -205,6 +207,7 @@ pub fn update_worktree_for_update_instead(
 }
 
 /// Default updateInstead path when no push-to-checkout hook is installed.
+#[cfg(feature = "worktree")]
 fn push_to_deploy(
     original_cwd: Option<&std::path::Path>,
     git_dir: &Path,
@@ -259,6 +262,7 @@ fn push_to_deploy(
     Ok(())
 }
 
+#[cfg(feature = "worktree")]
 fn index_differs_from_head(git_dir: &Path, format: sley_core::ObjectFormat) -> Result<bool> {
     use sley_index::Index;
     use sley_object::{Commit, ObjectType};
@@ -307,6 +311,7 @@ fn index_differs_from_head(git_dir: &Path, format: sley_core::ObjectFormat) -> R
     Ok(index_entries != tree_entries)
 }
 
+#[cfg(feature = "worktree")]
 fn flatten_tree_to_map(
     db: &sley_odb::FileObjectDatabase,
     format: sley_core::ObjectFormat,
@@ -340,6 +345,7 @@ fn flatten_tree_to_map(
     Ok(())
 }
 
+#[cfg(feature = "worktree")]
 fn untracked_would_be_overwritten(
     worktree: &Path,
     git_dir: &Path,
@@ -542,4 +548,18 @@ fn receive_stream_hook_order(
             .filter(|state| state.command.old_id.is_null()),
     );
     existing
+}
+
+/// Worktree updates require the optional checkout engine.
+#[cfg(not(feature = "worktree"))]
+pub fn update_worktree_for_update_instead(
+    _original_cwd: Option<&std::path::Path>,
+    _git_dir: &Path,
+    _format: sley_core::ObjectFormat,
+    _new_oid: &sley_core::ObjectId,
+    _remote_stderr: &mut Vec<u8>,
+) -> Result<()> {
+    Err(GitError::Unsupported(
+        "receive.denyCurrentBranch=updateInstead requires the worktree feature".into(),
+    ))
 }

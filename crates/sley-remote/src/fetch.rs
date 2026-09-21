@@ -40,7 +40,7 @@ use sley_protocol::{
 };
 use sley_refs::{FileRefStore, Ref, RefTarget, RefUpdate, ReflogEntry};
 #[cfg(feature = "http")]
-use sley_transport::{HttpClient, UreqHttpClient};
+use sley_transport::HttpClient;
 use sley_transport::{RemoteTransport, RemoteUrl};
 
 use crate::{CredentialProvider, PackGenerationProgress, ProgressSink};
@@ -328,7 +328,7 @@ impl<'a> FetchServices<'a> {
 /// Emits prune notices through `progress` and returns the structured
 /// [`FetchOutcome`]; never prints or returns a process exit request.
 ///
-/// The smart-HTTP transport constructs a default [`UreqHttpClient`]. Hosts that
+/// With `default-http-client`, smart HTTP constructs a `UreqHttpClient`. Hosts that
 /// must enforce network policy on the dial (e.g. SSRF-guard a public mirror URL)
 /// call [`fetch_with_http_client`] instead to inject their own [`HttpClient`].
 pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<FetchOutcome> {
@@ -345,7 +345,8 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
 /// Like [`fetch`], but drives the smart-HTTP transport through a caller-provided
 /// [`HttpClient`] when `http_client` is `Some`.
 ///
-/// `None` is exactly [`fetch`] (a default [`UreqHttpClient`]). A `Some` client
+/// `None` uses the default client when `default-http-client` is enabled, and
+/// otherwise returns `GitError::Unsupported` for HTTP sources. A `Some` client
 /// owns the entire dial (DNS→connect→TLS) for every smart-HTTP request, letting a
 /// host enforce network policy such as SSRF validation on the resolved IP. Only
 /// the HTTP transport consults the injected client; SSH/git/local sources ignore
@@ -529,17 +530,11 @@ fn fetch_impl(
             let client: &dyn HttpClient = match http_client {
                 Some(client) => client,
                 None => {
-                    // Built from config so the buffered-response ceilings and
-                    // the body deadlines derived from them follow the same
-                    // settings the rest of the request does.
-                    default_client = UreqHttpClient::with_limits(
-                        crate::transport_limits_from_config(Some(request.config)),
-                    )
-                    .with_protocol_policy(
-                        request.options.policy.transport.clone(),
+                    default_client = crate::http::default_http_client(
+                        &request.options.policy.transport,
                         Some(request.config),
-                    );
-                    &default_client
+                    )?;
+                    default_client.as_ref()
                 }
             };
             let git_protocol = crate::http::http_git_protocol_header_value(Some(request.config))?;
@@ -2566,7 +2561,7 @@ fn validate_fetch_ref_updates(
         if old.is_some()
             && !update_head_ok
             && dst.starts_with("refs/heads/")
-            && let Some(worktree) = sley_worktree::find_shared_symref(git_dir, "HEAD", dst)?
+            && let Some(worktree) = sley_formats::find_shared_symref(git_dir, "HEAD", dst)?
         {
             return Err(GitError::InvalidFormat(format!(
                 "fatal: refusing to fetch into branch '{dst}' checked out at '{}'",
