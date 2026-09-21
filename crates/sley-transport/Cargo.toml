@@ -27,7 +27,7 @@ webpki-root-certs = { version = "1.0.9", optional = true }
 
 [dev-dependencies]
 rcgen = { version = "0.14.9", default-features = false, features = ["crypto", "pem", "ring"] }
-rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 
 [lints]
 workspace = true
