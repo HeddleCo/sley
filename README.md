@@ -141,8 +141,7 @@ These features pull in no `ureq`, TLS backend, worktree, hooks, or sequencer
 crate. Add `tls-rustls` (or another `tls-*` feature) for the built-in client,
 and `worktree` for clone checkout or receive-pack `updateInstead`.
 See the [HTTP embedding guide](docs/HTTP_EMBEDDING.md) for the feature matrix and
-adapter contract. The manifest above targets the planned 0.10 release; this
-workspace still carries 0.9.0 pending its coordinated version bump.
+adapter contract.
 
 The `sley::Repository` facade and engine crates are the embedder entry points.
 `sley-cli` still contains substantial command behavior alongside its

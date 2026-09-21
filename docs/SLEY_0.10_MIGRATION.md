@@ -1,7 +1,6 @@
 # Sley 0.10 embedding migration (breaking)
 
-This change requires Sley 0.10.0. Workspace versions remain 0.9.0 until the
-coordinated release bump. Heddle and Weft are not repinned or edited here.
+This change requires Sley 0.10.0. Heddle and Weft are not repinned or edited here.
 
 ## Speculative APIs removed (rank 3)
 
