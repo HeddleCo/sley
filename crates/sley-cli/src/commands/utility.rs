@@ -1565,7 +1565,7 @@ pub(crate) fn cmd_check_ref_format(
         // expanded name as `refs/heads/<name>` and print the short form.
         // Outside a repository the literal argument is checked instead (t1402).
         let expanded = expand_check_ref_format_branch_name(cli_session, &name);
-        if check_branch_format_name(&expanded).is_ok() {
+        if check_branch_format_name(&name, &expanded).is_ok() {
             println!("{expanded}");
             return Ok(());
         }
@@ -1629,48 +1629,25 @@ fn normalize_check_ref_format_name(name: &str) -> String {
         .join("/")
 }
 
-fn check_branch_format_name(name: &str) -> Result<()> {
-    if name.starts_with('-') {
-        return Err(GitError::InvalidPath(format!("invalid branch name {name}")));
+/// git's `check_branch_ref`: `original` is the operand as typed (its leading
+/// `-` is rejected), `expanded` is the operand after branch-name sugar, which
+/// must not be `HEAD` and must form a valid `refs/heads/<expanded>`.
+fn check_branch_format_name(original: &str, expanded: &str) -> Result<()> {
+    if original.starts_with('-') || expanded == "HEAD" {
+        return Err(GitError::InvalidPath(format!(
+            "invalid branch name {original}"
+        )));
     }
-    check_ref_format_name(name, true, false)
+    check_ref_format_name(&format!("refs/heads/{expanded}"), false, false)
 }
 
 fn check_ref_format_name(name: &str, allow_onelevel: bool, refspec_pattern: bool) -> Result<()> {
-    if name.is_empty()
-        || name == "@"
-        || name.starts_with('/')
-        || name.ends_with('/')
-        || name.ends_with('.')
-        || name.contains("..")
-        || name.contains("//")
-        || name.contains("@{")
-        || (!allow_onelevel && !name.contains('/'))
-    {
-        return Err(GitError::InvalidPath(format!("invalid ref name {name}")));
-    }
-    let mut stars = 0usize;
-    for component in name.split('/') {
-        if component.is_empty() || component.starts_with('.') || component.ends_with(".lock") {
-            return Err(GitError::InvalidPath(format!("invalid ref name {name}")));
-        }
-        for byte in component.bytes() {
-            if byte == b'*' {
-                stars += 1;
-                if !refspec_pattern || stars > 1 {
-                    return Err(GitError::InvalidPath(format!("invalid ref name {name}")));
-                }
-                continue;
-            }
-            if byte <= b' '
-                || byte == 0x7f
-                || matches!(byte, b'~' | b'^' | b':' | b'?' | b'[' | b'\\')
-            {
-                return Err(GitError::InvalidPath(format!("invalid ref name {name}")));
-            }
-        }
-    }
-    Ok(())
+    let format = sley_core::RefnameFormat {
+        allow_onelevel,
+        refspec_pattern,
+    };
+    sley_core::check_refname_format(name.as_bytes(), format)
+        .map_err(|_| GitError::InvalidPath(format!("invalid ref name {name}")))
 }
 
 #[cfg(feature = "testkit")]

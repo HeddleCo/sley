@@ -351,19 +351,16 @@ fn parse_todo_line(
     }
 
     if command == TodoCommand::UpdateRef {
-        if !bol.starts_with("refs/") {
-            if !valid_refname(bol, true) {
-                messages.push(format!("error: '{}' is not a valid refname", bol));
-            } else {
-                messages.push(
-                    "error: update-ref requires a fully qualified refname e.g. refs/heads/topic"
-                        .to_string(),
-                );
-            }
+        // git's check_label_or_ref_arg: any two-level refname is accepted
+        // (`heads/topic` included); there is no `refs/` prefix requirement.
+        if !valid_refname(bol, true) {
+            messages.push(format!("error: '{bol}' is not a valid refname"));
             return Err(());
         }
         if !valid_refname(bol, false) {
-            messages.push(format!("error: '{}' is not a valid refname", bol));
+            messages.push(format!(
+                "error: update-ref requires a fully qualified refname e.g. refs/heads/{bol}"
+            ));
             return Err(());
         }
         return Ok(RebaseTodoItem {
@@ -436,47 +433,19 @@ fn parse_todo_line(
     }
 }
 
+/// git's `check_label_or_ref_arg` for `label` (sequencer.c): `#` separates
+/// merge parents from the subject, so it is reserved; anything else must pass
+/// `check_refname_format(_, REFNAME_ALLOW_ONELEVEL)`.
 fn valid_label(label: &str) -> bool {
-    !label.is_empty()
-        && label != "#"
-        && !label.starts_with(':')
-        && !label.contains('/')
-        && !label.contains("..")
-        && !label.contains("@{")
-        && !label.ends_with('.')
-        && !label.ends_with(".lock")
-        && label
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    label != "#" && valid_refname(label, true)
 }
 
 fn valid_refname(refname: &str, allow_onelevel: bool) -> bool {
-    if refname.is_empty()
-        || refname.starts_with('/')
-        || refname.ends_with('/')
-        || refname.contains("..")
-        || refname.contains("@{")
-        || refname.ends_with('.')
-        || refname.ends_with(".lock")
-    {
-        return false;
-    }
-    let mut components = 0usize;
-    for component in refname.split('/') {
-        components += 1;
-        if component.is_empty()
-            || component.starts_with('.')
-            || component.ends_with(".lock")
-            || component.bytes().any(|b| {
-                b < 0x20
-                    || b == 0x7f
-                    || matches!(b, b' ' | b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
-            })
-        {
-            return false;
-        }
-    }
-    allow_onelevel || components >= 2
+    let format = sley_core::RefnameFormat {
+        allow_onelevel,
+        refspec_pattern: false,
+    };
+    sley_core::check_refname_format(refname.as_bytes(), format).is_ok()
 }
 
 /// `check_merge_commit_insn`: the error + advice when a pick-like command
@@ -1260,6 +1229,130 @@ mod tests {
                     .to_string(),
                 "error: invalid line 4: update-ref topic".to_string(),
             ]
+        );
+    }
+
+    /// Ask the real `git check-ref-format` about `name`.
+    fn git_check_ref_format(name: &str, allow_onelevel: bool) -> bool {
+        let mut command = std::process::Command::new("git");
+        command.arg("check-ref-format");
+        if allow_onelevel {
+            command.arg("--allow-onelevel");
+        }
+        let status = command
+            .arg(name)
+            .status()
+            .expect("run git check-ref-format");
+        match status.code() {
+            Some(0) => true,
+            Some(1) => false,
+            other => panic!("git check-ref-format {name:?} exited with {other:?}"),
+        }
+    }
+
+    /// Differential test against git (HeddleCo/sley#244 review). git's
+    /// `check_label_or_ref_arg` (sequencer.c): a label is valid unless it is
+    /// `#` or fails `check_refname_format(_, REFNAME_ALLOW_ONELEVEL)`; an
+    /// update-ref target must pass `check_refname_format(_, 0)`.
+    #[test]
+    fn label_and_update_ref_args_match_git() {
+        let args = [
+            "onto",
+            "branch-point",
+            "topic",
+            "#",
+            "##",
+            "a#b",
+            ":invalid",
+            "heads/topic",
+            "refs/heads/topic",
+            "a/b",
+            "a..b",
+            "a.b",
+            "a.lock",
+            "a.lock/b",
+            "@",
+            "@@",
+            "a@{b",
+            "x.",
+            "a-x",
+            ".x",
+            "a~1",
+            "a^",
+            "a:b",
+            "a?b",
+            "a*b",
+            "a[b",
+            "a]b",
+            "a\\b",
+            "a\u{7f}b",
+            "a\u{1}b",
+            "with space",
+            "a\tb",
+            "\u{00A0}nbsp\u{00A0}",
+            "refs/heads/\u{00A0}edge\u{00A0}",
+            "日本",
+            "é",
+            "a//b",
+            "a/",
+            "/a",
+            "HEAD",
+            "a_b",
+            "a+b",
+            "a=b",
+            "a,b",
+            "a!b",
+            "a'b",
+            "a\"b",
+            "a%b",
+            "a$b",
+            "a&b",
+            "a(b)",
+            "a{b}",
+            "a|b",
+            "a<b>",
+            "a`b",
+            "a;b",
+        ];
+        let mut mismatches = Vec::new();
+        for arg in args {
+            let git_label = arg != "#" && git_check_ref_format(arg, true);
+            let (_, messages) =
+                parse_todo_buffer(&format!("label {arg}\n"), false, '#', &mut resolver);
+            if messages.is_empty() != git_label {
+                mismatches.push(format!(
+                    "  label {arg:?}: git={git_label} sley={messages:?}"
+                ));
+            }
+
+            let expected: Vec<String> = if !git_check_ref_format(arg, true) {
+                vec![
+                    format!("error: '{arg}' is not a valid refname"),
+                    format!("error: invalid line 1: update-ref {arg}"),
+                ]
+            } else if !git_check_ref_format(arg, false) {
+                vec![
+                    format!(
+                        "error: update-ref requires a fully qualified refname e.g. refs/heads/{arg}"
+                    ),
+                    format!("error: invalid line 1: update-ref {arg}"),
+                ]
+            } else {
+                Vec::new()
+            };
+            let (_, messages) =
+                parse_todo_buffer(&format!("update-ref {arg}\n"), false, '#', &mut resolver);
+            if messages != expected {
+                mismatches.push(format!(
+                    "  update-ref {arg:?}: git={expected:?} sley={messages:?}"
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "{} todo-argument verdicts differ from git:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
         );
     }
 

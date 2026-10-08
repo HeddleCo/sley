@@ -216,18 +216,10 @@ fn get_terms(repo: &BisectRepo, terms: &mut BisectTerms) -> bool {
 }
 
 fn check_term_format(term: &str, orig_term: &str) -> Result<i32> {
-    // Upstream validates "refs/bisect/<term>" as a refname.
-    if term.is_empty()
-        || term.contains('/')
-        || term.contains(' ')
-        || term.contains("..")
-        || term.starts_with('-')
-        || term.starts_with('.')
-        || term.ends_with('.')
-        || term.ends_with(".lock")
-        || term
-            .bytes()
-            .any(|byte| byte < 0x20 || byte == 0x7f || b"~^:?*[\\".contains(&byte))
+    // Upstream validates "refs/bisect/<term>" with check_refname_format(_, 0).
+    let refname = format!("refs/bisect/{term}");
+    if sley_core::check_refname_format(refname.as_bytes(), sley_core::RefnameFormat::STRICT)
+        .is_err()
     {
         eprintln!("error: '{term}' is not a valid term");
         return Ok(-1);
@@ -2101,4 +2093,141 @@ fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
 
 fn quote_term(term: &str) -> String {
     format!("'{term}'")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_term_format;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) -> std::process::Output {
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "A U Thor")
+            .env("GIT_AUTHOR_EMAIL", "author@example.com")
+            .env("GIT_COMMITTER_NAME", "C O Mitter")
+            .env("GIT_COMMITTER_EMAIL", "committer@example.com")
+            .output()
+            .expect("run git")
+    }
+
+    /// Ask the real `git bisect start --term-new=<term>` whether `term` passes
+    /// git's `check_term_format(term, "bad")`. Returns `None` when git rejects
+    /// the pair for an unrelated reason (for example "please use two
+    /// different terms").
+    fn git_term_verdict(dir: &Path, term: &str) -> Option<bool> {
+        let output = git(dir, &["bisect", "start", &format!("--term-new={term}")]);
+        // Ends a started session; a no-op when the start was refused.
+        git(dir, &["bisect", "reset"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.success() {
+            return Some(true);
+        }
+        if stderr.contains("is not a valid term")
+            || stderr.contains("can't use the builtin command")
+            || stderr.contains("can't change the meaning")
+        {
+            return Some(false);
+        }
+        assert!(
+            stderr.contains("please use two different terms"),
+            "unexpected `git bisect start --term-new={term:?}` failure: {stderr}"
+        );
+        None
+    }
+
+    /// Differential test against git (HeddleCo/sley#244 review): git checks
+    /// `refs/bisect/<term>` with `check_refname_format(_, 0)`, then its
+    /// reserved-term rules.
+    #[test]
+    fn check_term_format_matches_git_bisect() {
+        let dir =
+            std::env::temp_dir().join(format!("sley-bisect-term-oracle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create oracle repo dir");
+        assert!(git(&dir, &["init", "-q", "-b", "main"]).status.success());
+        assert!(
+            git(&dir, &["commit", "-q", "--allow-empty", "-m", "base"])
+                .status
+                .success()
+        );
+
+        let terms = [
+            "new",
+            "fixed",
+            "broken",
+            "a/b",
+            "a/b/c",
+            "-x",
+            "--x",
+            "x@{y",
+            "@",
+            "x@y",
+            "a b",
+            "\u{00A0}nbsp\u{00A0}",
+            "\u{3000}",
+            "日本",
+            "a..b",
+            "a.b",
+            "x.lock",
+            "x.lock/y",
+            ".x",
+            "x.",
+            "a/.b",
+            "a./b",
+            "a~1",
+            "a^",
+            "a:b",
+            "a?b",
+            "a*b",
+            "a[b",
+            "a]b",
+            "a\\b",
+            "a\tb",
+            "a\u{7f}b",
+            "a//b",
+            "a/",
+            "/a",
+            "run",
+            "help",
+            "start",
+            "skip",
+            "next",
+            "reset",
+            "visualize",
+            "view",
+            "replay",
+            "log",
+            "terms",
+            "old",
+            "good",
+            "bad",
+            "HEAD",
+            "a+b",
+            "a#b",
+        ];
+        let mut mismatches = Vec::new();
+        let mut compared = 0usize;
+        for term in terms {
+            let Some(git) = git_term_verdict(&dir, term) else {
+                continue;
+            };
+            compared += 1;
+            let sley = check_term_format(term, "bad").expect("check_term_format") == 0;
+            if sley != git {
+                mismatches.push(format!("  {term:?}: git={git} sley={sley}"));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            mismatches.is_empty(),
+            "check_term_format: {} of {compared} verdicts differ from git bisect:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
+        assert!(compared >= 45, "only {compared} terms compared");
+    }
 }
