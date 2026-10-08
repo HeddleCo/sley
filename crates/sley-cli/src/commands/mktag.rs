@@ -681,54 +681,12 @@ fn is_valid_timezone(tz: &[u8]) -> bool {
     tz.len() == 5 && (tz[0] == b'+' || tz[0] == b'-') && tz[1..].iter().all(u8::is_ascii_digit)
 }
 
-/// git's `check_refname_format("refs/tags/<name>", 0)` as applied to a tag name.
-/// Because git prefixes `refs/tags/`, the name is validated as a (possibly multi-
-/// level) refname: split on `/`, every component must be non-empty and valid.
-///
-/// Returns true when `name` is a valid tag name. Rules (refs.c
-/// `check_refname_component`):
-///   * Components are `/`-separated; none may be empty (so no leading/trailing
-///     slash and no `//`).
-///   * A component may not start with `.`, end with `.`, end with `.lock`, or
-///     contain `..`.
-///   * No component may contain a control byte (`< 0x20`), `0x7f` (DEL), space,
-///     or any of `~ ^ : ? * [ \`, nor the two-byte sequence `@{`.
+/// git's `check_refname_format("refs/tags/<name>", 0)` as applied to a tag name
+/// by `fsck_tag_standalone`.
 fn check_refname_format(name: &[u8]) -> bool {
-    if name.is_empty() {
-        return false;
-    }
-    name.split(|byte| *byte == b'/')
-        .all(check_refname_component)
-}
-
-/// Validate a single refname component per git's `check_refname_component`.
-fn check_refname_component(component: &[u8]) -> bool {
-    if component.is_empty() {
-        return false;
-    }
-    if component.first() == Some(&b'.') {
-        return false;
-    }
-    if component.last() == Some(&b'.') {
-        return false;
-    }
-    if component.ends_with(b".lock") {
-        return false;
-    }
-    for (idx, &byte) in component.iter().enumerate() {
-        match byte {
-            // Control characters, space, and DEL are disallowed.
-            0x00..=0x20 | 0x7f => return false,
-            // Refspec/pathspec metacharacters disallowed in refnames.
-            b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\' => return false,
-            // No ".." within a component.
-            b'.' if component.get(idx + 1) == Some(&b'.') => return false,
-            // No "@{" sequence within a refname.
-            b'@' if component.get(idx + 1) == Some(&b'{') => return false,
-            _ => {}
-        }
-    }
-    true
+    let mut refname = b"refs/tags/".to_vec();
+    refname.extend_from_slice(name);
+    sley_core::check_refname_format(&refname, sley_core::RefnameFormat::STRICT).is_ok()
 }
 
 /// Verify the tagged object exists and its actual type matches the declared
@@ -1089,7 +1047,7 @@ mod tests {
     #[test]
     fn refname_rules_match_git() {
         for name in [
-            "v1.0", "a/b", "foo.bar", "x.lock.y", "@", "@@", "a@", "-bad", "HEAD",
+            "v1.0", "a/b", "foo.bar", "x.lock.y", "@", "@@", "a@", "-bad", "HEAD", "a./b",
         ] {
             assert!(
                 check_refname_format(name.as_bytes()),

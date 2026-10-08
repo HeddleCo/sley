@@ -451,32 +451,11 @@ fn valid_label(label: &str) -> bool {
 }
 
 fn valid_refname(refname: &str, allow_onelevel: bool) -> bool {
-    if refname.is_empty()
-        || refname.starts_with('/')
-        || refname.ends_with('/')
-        || refname.contains("..")
-        || refname.contains("@{")
-        || refname.ends_with('.')
-        || refname.ends_with(".lock")
-    {
-        return false;
-    }
-    let mut components = 0usize;
-    for component in refname.split('/') {
-        components += 1;
-        if component.is_empty()
-            || component.starts_with('.')
-            || component.ends_with(".lock")
-            || component.bytes().any(|b| {
-                b < 0x20
-                    || b == 0x7f
-                    || matches!(b, b' ' | b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
-            })
-        {
-            return false;
-        }
-    }
-    allow_onelevel || components >= 2
+    let format = sley_core::RefnameFormat {
+        allow_onelevel,
+        refspec_pattern: false,
+    };
+    sley_core::check_refname_format(refname.as_bytes(), format).is_ok()
 }
 
 /// `check_merge_commit_insn`: the error + advice when a pick-like command

@@ -100,65 +100,15 @@ pub(super) enum LsRemoteSort {
     CreatorDateDescending,
 }
 
-/// Validate a single refname component the way git's `check_refname_component`
-/// (refs.c `refname_disposition` table) does, honoring the
-/// `REFNAME_REFSPEC_PATTERN` flag. Returns `false` for a malformed component and
-/// reports (via `pattern_seen`) whether this component consumed the single
-/// asterisk a refspec pattern is allowed.
-fn refspec_component_ok(component: &str, allow_pattern: bool, pattern_seen: &mut bool) -> bool {
-    if component.is_empty() {
-        return false;
-    }
-    if component.starts_with('.') {
-        return false;
-    }
-    if component.ends_with(".lock") {
-        return false;
-    }
-    let bytes = component.as_bytes();
-    for (idx, &byte) in bytes.iter().enumerate() {
-        match byte {
-            // disposition 4: control chars, space, and the forbidden set.
-            0x00..=0x20 | 0x7f | b'~' | b'^' | b':' | b'?' | b'[' | b'\\' => return false,
-            // disposition 2: ".." is forbidden.
-            b'.' if bytes.get(idx + 1) == Some(&b'.') => return false,
-            // disposition 3: "@{" is forbidden.
-            b'@' if bytes.get(idx + 1) == Some(&b'{') => return false,
-            // disposition 5: '*' is only allowed once, and only for patterns.
-            b'*' => {
-                if !allow_pattern || *pattern_seen {
-                    return false;
-                }
-                *pattern_seen = true;
-            }
-            _ => {}
-        }
-    }
-    true
-}
-
-/// Faithful port of git's `check_refname_format` for the refspec-validation path
-/// (refs.c). `allow_onelevel` mirrors `REFNAME_ALLOW_ONELEVEL`; `allow_pattern`
-/// mirrors `REFNAME_REFSPEC_PATTERN` (a single `*` somewhere in the ref).
+/// git's `check_refname_format` for the refspec-validation path (refs.c).
+/// `allow_onelevel` mirrors `REFNAME_ALLOW_ONELEVEL`; `allow_pattern` mirrors
+/// `REFNAME_REFSPEC_PATTERN` (a single `*` somewhere in the ref).
 fn refspec_refname_ok(refname: &str, allow_onelevel: bool, allow_pattern: bool) -> bool {
-    if refname == "@" || refname.starts_with('/') || refname.ends_with('/') {
-        return false;
-    }
-    if refname.ends_with('.') {
-        return false;
-    }
-    let mut pattern_seen = false;
-    let mut component_count = 0;
-    for component in refname.split('/') {
-        if !refspec_component_ok(component, allow_pattern, &mut pattern_seen) {
-            return false;
-        }
-        component_count += 1;
-    }
-    if !allow_onelevel && component_count < 2 {
-        return false;
-    }
-    true
+    let format = sley_core::RefnameFormat {
+        allow_onelevel,
+        refspec_pattern: allow_pattern,
+    };
+    sley_core::check_refname_format(refname.as_bytes(), format).is_ok()
 }
 
 /// Validate a configured `remote.<name>.fetch`/`push` refspec the way git's

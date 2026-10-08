@@ -6493,40 +6493,16 @@ pub fn lock_path_for(path: &Path) -> Result<PathBuf> {
     Ok(path.with_file_name(lock_name))
 }
 
-/// Validate a ref name using git's `check_refname_format` rules.
+/// Validate a ref name using git's `check_refname_format` rules
+/// (`allow_onelevel` mirrors `REFNAME_ALLOW_ONELEVEL`). See
+/// [`sley_core::check_refname_format`] for the rule set.
 pub fn check_refname_format(name: &str, allow_onelevel: bool) -> Result<()> {
-    if name.is_empty()
-        || name == "@"
-        || name.starts_with('/')
-        || name.ends_with('/')
-        || name.ends_with('.')
-        || name.contains("..")
-        || name.contains("//")
-        || name.contains("@{")
-        || (!allow_onelevel && !name.contains('/'))
-    {
-        return Err(GitError::InvalidPath(format!("invalid ref name {name}")));
-    }
-    for component in name.split('/') {
-        if component.is_empty() || component.starts_with('.') || component.ends_with(".lock") {
-            return Err(GitError::InvalidPath(format!("invalid ref name {name}")));
-        }
-        for (idx, byte) in component.bytes().enumerate() {
-            if byte <= b' '
-                || byte == 0x7f
-                || matches!(byte, b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
-            {
-                return Err(GitError::InvalidPath(format!("invalid ref name {name}")));
-            }
-            if byte == b'.' && component.as_bytes().get(idx + 1) == Some(&b'.') {
-                return Err(GitError::InvalidPath(format!("invalid ref name {name}")));
-            }
-            if byte == b'@' && component.as_bytes().get(idx + 1) == Some(&b'{') {
-                return Err(GitError::InvalidPath(format!("invalid ref name {name}")));
-            }
-        }
-    }
-    Ok(())
+    let format = sley_core::RefnameFormat {
+        allow_onelevel,
+        refspec_pattern: false,
+    };
+    sley_core::check_refname_format(name.as_bytes(), format)
+        .map_err(|_| GitError::InvalidPath(format!("invalid ref name {name}")))
 }
 
 /// Validate a symbolic ref name (HEAD, one-level pseudo-refs, or `refs/...`).

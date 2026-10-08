@@ -1620,46 +1620,12 @@ fn is_known_object_type(s: &[u8]) -> bool {
     matches!(s, b"blob" | b"tree" | b"commit" | b"tag")
 }
 
-/// A tag name is valid iff `refs/tags/<name>` is a valid refname. We mirror the
-/// subset of `check_refname_format` git applies: reject names with spaces, with
-/// components that are `.`/`..`/empty, ending in `.lock`, containing control
-/// chars or any of ` ~^:?*[\` or `..` or `@{`, or a trailing `/` or `.`.
+/// A tag name is valid iff `refs/tags/<name>` is a valid refname under git's
+/// `check_refname_format(_, 0)`.
 fn valid_tag_name(name: &[u8]) -> bool {
-    if name.is_empty() {
-        return false;
-    }
-    // No control chars, no DEL, none of the forbidden punctuation, no space.
-    for &b in name {
-        if b < 0x20 || b == 0x7f {
-            return false;
-        }
-        if matches!(b, b' ' | b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\') {
-            return false;
-        }
-    }
-    // No "..", no "@{", no leading/trailing '/', no "//", no trailing '.',
-    // no ".lock" suffix on any component, no component beginning with '.'.
-    if name.windows(2).any(|w| w == b".." || w == b"@{") {
-        return false;
-    }
-    if name.first() == Some(&b'/') || name.last() == Some(&b'/') {
-        return false;
-    }
-    if name.last() == Some(&b'.') {
-        return false;
-    }
-    for component in name.split(|&b| b == b'/') {
-        if component.is_empty() {
-            return false;
-        }
-        if component.first() == Some(&b'.') {
-            return false;
-        }
-        if component.ends_with(b".lock") {
-            return false;
-        }
-    }
-    true
+    let mut refname = b"refs/tags/".to_vec();
+    refname.extend_from_slice(name);
+    sley_core::check_refname_format(&refname, sley_core::RefnameFormat::STRICT).is_ok()
 }
 
 /// Standard git tree-entry modes.

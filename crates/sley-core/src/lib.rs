@@ -32,8 +32,10 @@ pub mod fsync;
 pub mod paths;
 pub mod precompose;
 pub mod primitives;
+pub mod refname;
 pub mod text;
 pub use precompose::{PrecomposeUnicode, has_non_ascii};
+pub use refname::{RefnameFormat, RefnameFormatError, check_refname_format};
 
 pub mod namespace;
 pub use namespace::{Namespace, ref_is_hidden, trim_hidden_ref_pattern};
@@ -946,8 +948,10 @@ impl FromStr for ObjectId {
 pub struct FullName(String);
 
 impl FullName {
-    /// Construct a ref name, rejecting empty names, ASCII control characters,
-    /// leading/trailing whitespace, and consecutive slashes.
+    /// Construct a ref name, accepting exactly the names
+    /// `git check-ref-format --allow-onelevel` accepts (see
+    /// [`check_refname_format`]). One-level names such as `HEAD` are allowed;
+    /// non-ASCII bytes, including non-ASCII whitespace, are ordinary bytes.
     pub fn new(name: impl AsRef<str>) -> Result<Self> {
         let name = name.as_ref();
         validate_full_name(name)?;
@@ -1019,27 +1023,8 @@ impl PartialEq<FullName> for &str {
 }
 
 fn validate_full_name(name: &str) -> Result<()> {
-    if name.is_empty() {
-        return Err(GitError::InvalidFormat("ref name must not be empty".into()));
-    }
-    if name.chars().next().is_some_and(|ch| ch.is_whitespace())
-        || name.chars().last().is_some_and(|ch| ch.is_whitespace())
-    {
-        return Err(GitError::InvalidFormat(
-            "ref name must not have leading or trailing whitespace".into(),
-        ));
-    }
-    if name.contains("//") {
-        return Err(GitError::InvalidFormat(
-            "ref name must not contain consecutive slashes".into(),
-        ));
-    }
-    if name.bytes().any(|byte| byte.is_ascii_control()) {
-        return Err(GitError::InvalidFormat(
-            "ref name must not contain control characters".into(),
-        ));
-    }
-    Ok(())
+    check_refname_format(name.as_bytes(), RefnameFormat::ALLOW_ONELEVEL)
+        .map_err(|err| GitError::InvalidFormat(format!("{err}: {name:?}")))
 }
 
 /// A byte string for git paths and similar on-disk identifiers.
@@ -2732,6 +2717,18 @@ mod tests {
         assert!(FullName::new("refs/heads/main ").is_err());
         assert!(FullName::new("refs//heads/main").is_err());
         assert!(FullName::new("refs/heads/\nmain").is_err());
+        assert!(FullName::new("refs/heads/a..b").is_err());
+        assert!(FullName::new("refs/heads/a.lock").is_err());
+        assert!(FullName::new("refs/heads/a~1").is_err());
+        assert!(FullName::new("@").is_err());
+    }
+
+    #[test]
+    fn full_name_accepts_what_git_accepts() {
+        // HeddleCo/sley#244: non-ASCII whitespace is not special to Git.
+        assert!(FullName::new("refs/heads/\u{00A0}edge\u{00A0}").is_ok());
+        assert!(FullName::new("HEAD").is_ok());
+        assert!(FullName::new("refs/heads/a./b").is_ok());
     }
 
     #[test]
