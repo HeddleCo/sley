@@ -614,13 +614,18 @@ mod tests {
         let root = tempfile::tempdir().expect("temporary repository");
         let admin_dir = root.path().join("worktrees/linked");
         fs::create_dir_all(&admin_dir).expect("admin directory");
-        fs::write(admin_dir.join("gitdir"), "/missing/linked/.git\n").expect("gitdir");
+        let missing = root.path().join("missing");
+        fs::write(
+            admin_dir.join("gitdir"),
+            format!("{}\n", missing.join("linked/.git").display()),
+        )
+        .expect("gitdir");
         fs::write(admin_dir.join("locked"), "because\n").expect("lock");
 
         let snapshot = WorktreeAdminSnapshot::scan(root.path()).expect("scan admins");
         assert_eq!(snapshot.linked().len(), 1);
         let linked = snapshot
-            .find_path(Path::new("/missing/other/../linked"))
+            .find_path(&missing.join("other/../linked"))
             .expect("lexical match");
         assert_eq!(linked.locked_reason.as_deref(), Some("because"));
     }

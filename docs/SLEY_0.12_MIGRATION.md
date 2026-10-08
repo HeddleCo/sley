@@ -29,3 +29,23 @@ malformed ref that Git would refuse to create (for example
 
 `Repository::find_reference` now returns `Err` for a malformed name instead of
 `Ok(None)`. `Ok(None)` still means a well-formed ref that does not exist.
+
+## 0.12.1 worktree path safety
+
+Checkout, reset, read-tree and merge writers default both `core.protectNTFS`
+and `core.protectHFS` to `true` on every platform. HFS protection now defaults
+on outside macOS too; read-tree no longer defaults either protection off.
+Repository configuration can disable these alias checks. Windows still rejects
+backslashes, drive prefixes and rooted tree names; its NTFS protection also
+rejects reserved device names, invalid characters and trailing dots/spaces.
+
+The `_with_path_policy` entry points carry the caller's policy explicitly into
+parallel checkout and delayed filter writes. Unpack callers can use
+`ReadTreeWorktree::with_path_policy` without changing existing struct literals.
+Tracked-file removals and empty-directory pruning use directory handles and
+never follow symlink parents; reset skips case collisions like checkout.
+
+Public signatures remain compatible. The path-only
+`write_blob_body_or_symlink` helper now refuses symlinks in parents or at the
+leaf and still overwrites existing regular files. No API removal or version
+bump is required for this patch release.

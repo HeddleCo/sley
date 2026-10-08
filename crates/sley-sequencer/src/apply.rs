@@ -178,52 +178,7 @@ pub fn merge_remove_worktree_file(
     worktree_root: &Path,
     path: &[u8],
 ) -> Result<()> {
-    let rel = std::str::from_utf8(path)
-        .map_err(|_| GitError::InvalidFormat("non-utf8 worktree path".into()))?;
-    let full = worktree_root.join(rel);
-    // lstat (symlink_metadata): `Path::exists` follows symlinks and misses a
-    // dangling one, leaving it behind on removal.
-    match std::fs::symlink_metadata(&full) {
-        Ok(metadata) if metadata.is_dir() => {
-            if merge_path_is_original_cwd(original_cwd, &full) {
-                return Ok(());
-            }
-            // A directory occupies a tracked path being removed: this is a
-            // gitlink (submodule checkout). git's entry.c `unlink_entry` ⇒
-            // `remove_or_warn(mode, ..)` dispatches on `S_ISGITLINK(mode)` to
-            // `rmdir_or_warn` (vs `unlink_or_warn` for blobs/symlinks), so the
-            // submodule's *directory* is removed, never `unlink`ed. git first
-            // deinits via `submodule_move_head` (a higher layer sley does not
-            // perform), then `rmdir`s; `rmdir` of a still-populated submodule
-            // fails with ENOTEMPTY and git only *warns*, leaving the directory
-            // in place rather than erroring (`warn_if_unremovable`). Mirror that:
-            // try to remove the (now-empty-or-not) directory, but never fail the
-            // operation on a non-empty submodule directory.
-            match std::fs::remove_dir(&full) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => {
-                    // ENOTEMPTY (populated submodule) and friends: git warns and
-                    // continues. Match the warn-and-continue, do not propagate.
-                    sley_core::diagnostic!(
-                        Stderr,
-                        true,
-                        "warning: unable to rmdir '{rel}': Directory not empty"
-                    );
-                }
-            }
-        }
-        Ok(_) => std::fs::remove_file(&full)?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        // ENOTDIR: a path component is a (non-directory) file, so the target
-        // cannot exist — it was already removed (e.g. a directory→file typechange
-        // cleared the parent before this delete ran). git's `unlink_or_warn`
-        // treats this as already-gone; mirror that.
-        Err(err) if err.raw_os_error() == Some(20) => {}
-        Err(err) => return Err(err.into()),
-    }
-    merge_prune_empty_dirs(original_cwd, worktree_root, full.parent());
-    Ok(())
+    sley_worktree::remove_worktree_path(original_cwd, worktree_root, path)
 }
 
 pub fn merge_refuse_if_current_working_directory_becomes_file(
@@ -263,14 +218,6 @@ fn merge_original_cwd_relative_to(
     Some(path_to_git_bytes_lossy(rel))
 }
 
-fn merge_path_is_original_cwd(original_cwd: Option<&std::path::Path>, path: &Path) -> bool {
-    let Some(cwd) = merge_original_cwd_absolute(original_cwd) else {
-        return false;
-    };
-    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    path == cwd
-}
-
 fn merge_refuse_remove_current_working_directory(path: &Path) -> Result<()> {
     sley_core::diagnostic!(
         Stderr,
@@ -279,22 +226,6 @@ fn merge_refuse_remove_current_working_directory(path: &Path) -> Result<()> {
         path.display()
     );
     Err(GitError::Rejected(sley_core::RejectionKind::Refused))
-}
-
-fn merge_prune_empty_dirs(
-    original_cwd: Option<&std::path::Path>,
-    root: &Path,
-    mut dir: Option<&Path>,
-) {
-    while let Some(path) = dir {
-        if path == root || merge_path_is_original_cwd(original_cwd, path) {
-            break;
-        }
-        if std::fs::remove_dir(path).is_err() {
-            break;
-        }
-        dir = path.parent();
-    }
 }
 
 fn path_to_git_bytes_lossy(path: &Path) -> Vec<u8> {

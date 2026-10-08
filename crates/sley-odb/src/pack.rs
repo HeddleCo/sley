@@ -2111,7 +2111,17 @@ impl FileObjectDatabase {
     }
 }
 pub(crate) fn freshen_file_mtime(path: &Path) -> Result<bool> {
-    let file = match fs::OpenOptions::new().read(true).open(path) {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // SetFileTime needs FILE_WRITE_ATTRIBUTES; a read-only handle lacks
+        // it, but no permission to overwrite the object's body is needed.
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        options.access_mode(FILE_WRITE_ATTRIBUTES);
+    }
+    let file = match options.open(path) {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(err) => return Err(GitError::from(err)),

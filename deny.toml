@@ -42,6 +42,12 @@ allow = [
 ]
 confidence-threshold = 0.8
 
+# cap-std's Windows filesystem backend uses Apache-2.0 with the LLVM linking exception.
+[[licenses.exceptions]]
+name = "winx"
+version = "0.36.4"
+allow = ["Apache-2.0 WITH LLVM-exception"]
+
 [bans]
 # Warn (don't fail) on duplicate dependency versions: pre-1.0 workspace, the
 # tree is still consolidating. Flip to "deny" once it stabilises.

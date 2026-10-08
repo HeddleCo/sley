@@ -93,12 +93,14 @@ pub use types_admin::*;
 // its internal helpers intentionally keep module-private names that would
 // otherwise collide with the crate-wide prelude.
 pub use unpack_worktree::{
-    ReadTreeWorktree, SubmoduleCheckoutHook, SubmoduleHooks, SubmoduleRemoveHook, UnpackPorcelain,
-    checkout_two_way_engine, gitlink_should_recurse, load_superproject_submodules,
+    PathPolicyWorktreeWriter, ReadTreeWorktree, SubmoduleCheckoutHook, SubmoduleHooks,
+    SubmoduleRemoveHook, UnpackPorcelain, checkout_two_way_engine,
+    checkout_two_way_engine_with_path_policy, gitlink_should_recurse, load_superproject_submodules,
     prune_empty_dirs, refuse_if_unpack_entries_turn_cwd_into_file,
     refuse_if_unpack_result_removes_current_directory, remove_path_in_the_way,
     remove_worktree_path, safe_worktree_path, verify_uptodate_path, write_tree_entry_to_worktree,
     write_tree_entry_to_worktree_with_hooks,
+    write_tree_entry_to_worktree_with_hooks_and_path_policy,
 };
 
 /// Resolve normalization once for a filesystem operation's repository.

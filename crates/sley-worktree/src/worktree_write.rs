@@ -26,9 +26,9 @@
 //! or above the root is followed (it is the caller's choice of directory),
 //! and the identity check only knows the `.git` at the worktree root, not a
 //! `GIT_DIR` that lives elsewhere inside the worktree under another name.
-//! Removing a *tracked* path that leaves the index (not a write of remote
-//! content) still uses the path-based helpers. On non-Unix targets the
-//! writer falls back to path-based operations after the same parent checks;
+//! Tracked-path removals use descriptor-relative no-follow walks as well.
+//! On non-Unix targets the writer falls back to path-based operations after
+//! the same parent checks;
 //! the name rules are the protection there.
 
 use super::*;
@@ -76,7 +76,7 @@ impl FileIdentity {
 const MAX_COMPONENT_ATTEMPTS: usize = 8;
 
 impl WorktreeLeaf {
-    /// Validate `git_path` against the checks git applies unconditionally,
+    /// Validate `git_path` against the effective repository path policy,
     /// then create its parent directories under `worktree_root` without
     /// following symlinks.
     pub(crate) fn open(
@@ -85,7 +85,23 @@ impl WorktreeLeaf {
         git_path: &[u8],
         mode: u32,
     ) -> Result<Self> {
-        verify_path_unconditional(git_path, mode)?;
+        Self::open_with_policy(
+            original_cwd,
+            worktree_root,
+            git_path,
+            mode,
+            &crate::path_safety::writer_path_policy(worktree_root),
+        )
+    }
+
+    pub(crate) fn open_with_policy(
+        original_cwd: Option<&Path>,
+        worktree_root: &Path,
+        git_path: &[u8],
+        mode: u32,
+        policy: &WorktreePathPolicy,
+    ) -> Result<Self> {
+        policy.verify_path(git_path, mode)?;
         let path = crate::index_io::worktree_path(worktree_root, git_path)?;
         Self::open_validated(original_cwd, worktree_root, git_path, path)
     }
@@ -246,7 +262,7 @@ impl WorktreeLeaf {
 
     /// git's `write_entry` type-by-mode switch on a cleared leaf: a symlink
     /// for `0o120000`, else a regular file whose mode is set like
-    /// [`crate::checkout::set_worktree_file_mode`].
+    /// checkout's executable-mode handling.
     pub(crate) fn create_blob_body_or_symlink(
         &self,
         mode: u32,
@@ -337,7 +353,28 @@ pub(crate) fn replace_worktree_blob(
     body: &[u8],
     link_target: &[u8],
 ) -> Result<PathBuf> {
-    let leaf = WorktreeLeaf::open(original_cwd, worktree_root, git_path, mode)?;
+    replace_worktree_blob_with_policy(
+        original_cwd,
+        worktree_root,
+        git_path,
+        mode,
+        body,
+        link_target,
+        &crate::path_safety::writer_path_policy(worktree_root),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn replace_worktree_blob_with_policy(
+    original_cwd: Option<&Path>,
+    worktree_root: &Path,
+    git_path: &[u8],
+    mode: u32,
+    body: &[u8],
+    link_target: &[u8],
+    policy: &WorktreePathPolicy,
+) -> Result<PathBuf> {
+    let leaf = WorktreeLeaf::open_with_policy(original_cwd, worktree_root, git_path, mode, policy)?;
     leaf.remove_existing(
         original_cwd,
         crate::index_io::refuse_remove_current_working_directory,
@@ -395,7 +432,7 @@ pub fn write_worktree_entry(
 }
 
 /// chmod an open regular file to match its entry mode, the handle form of
-/// [`crate::checkout::set_worktree_file_mode`].
+/// checkout's executable-mode handling.
 pub(crate) fn set_handle_file_mode(file: &fs::File, entry_mode: u32) -> Result<()> {
     #[cfg(unix)]
     {
@@ -633,6 +670,53 @@ mod tests {
     }
 
     #[test]
+    fn removal_and_pruning_stay_relative_to_held_directories() {
+        let root = tempfile::tempdir().expect("worktree");
+        let outside = tempfile::tempdir().expect("outside directory");
+        fs::create_dir(root.path().join("a")).expect("parent");
+        fs::write(root.path().join("a/file"), b"tracked").expect("tracked file");
+        fs::write(outside.path().join("file"), b"outside").expect("outside file");
+        let leaf = ExistingWorktreeLeaf::open(root.path(), b"a/file")
+            .expect("open")
+            .expect("present parent");
+        fs::rename(root.path().join("a"), root.path().join("held")).expect("move parent");
+        std::os::unix::fs::symlink(outside.path(), root.path().join("a"))
+            .expect("replacement link");
+        assert!(leaf.remove(None).expect("remove via descriptor"));
+        leaf.prune(None).expect("prune via descriptor");
+        assert!(!root.path().join("held/file").exists());
+        assert_eq!(
+            fs::read(outside.path().join("file")).expect("outside file"),
+            b"outside"
+        );
+    }
+
+    #[test]
+    fn pruning_missing_directory_still_removes_empty_real_ancestors() {
+        let root = tempfile::tempdir().expect("worktree");
+        fs::create_dir(root.path().join("a")).expect("empty ancestor");
+        prune_worktree_dirs(None, root.path(), Some(&root.path().join("a/missing")))
+            .expect("missing directory is absent");
+        assert!(!root.path().join("a").exists());
+        assert!(root.path().is_dir());
+    }
+
+    #[test]
+    fn removal_prunes_empty_real_parents_and_preserves_cwd() {
+        let root = tempfile::tempdir().expect("worktree");
+        fs::create_dir_all(root.path().join("a/b")).expect("parents");
+        fs::write(root.path().join("a/b/file"), b"tracked").expect("tracked file");
+        remove_worktree_entry(Some(&root.path().join("a")), root.path(), b"a/b/file")
+            .expect("remove");
+        assert!(!root.path().join("a/b").exists());
+        assert!(root.path().join("a").is_dir());
+        fs::write(root.path().join("a/file"), b"tracked").expect("tracked file");
+        remove_worktree_entry(None, root.path(), b"a/file").expect("remove and prune");
+        assert!(!root.path().join("a").exists());
+        assert!(root.path().is_dir());
+    }
+
+    #[test]
     fn symlinked_parent_is_replaced_not_followed() {
         let base = tempfile::tempdir().expect("tempdir");
         let root = base.path().join("root");
@@ -730,5 +814,275 @@ mod tests {
         leaf.remove_existing(None, refuse).expect("remove subtree");
         assert!(!root.join("d").exists());
         assert_eq!(fs::read(outside.join("keep")).expect("kept"), b"keep");
+    }
+}
+
+/// An existing path reached one component at a time from a held root handle.
+/// Unlike the write walk, a non-directory parent is absent, never replaced.
+struct ExistingWorktreeLeaf {
+    dirs: Vec<cap_std::fs::Dir>,
+    names: Vec<std::ffi::OsString>,
+    paths: Vec<PathBuf>,
+    path: PathBuf,
+    dot_git: Option<same_file::Handle>,
+}
+
+impl ExistingWorktreeLeaf {
+    fn open(root: &Path, path: &[u8]) -> Result<Option<Self>> {
+        use cap_fs_ext::DirExt as _;
+        // Sparse-index directory boundaries carry one trailing slash. They
+        // name the existing directory itself, not a new tree-entry component.
+        let path = path.strip_suffix(b"/").unwrap_or(path);
+        verify_path_unconditional(path, 0o100644)?;
+        let absolute = crate::index_io::worktree_path(root, path)?;
+        let dir = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
+        let dot_git = dir
+            .open_dir_nofollow(".git")
+            .ok()
+            .and_then(|dir| same_file::Handle::from_file(dir.into_std_file()).ok());
+        let names = path
+            .split(|byte| *byte == b'/')
+            .map(git_name_os_string)
+            .collect::<Vec<_>>();
+        let mut leaf = Self {
+            dirs: vec![dir],
+            names,
+            paths: vec![root.to_path_buf()],
+            path: absolute,
+            dot_git,
+        };
+        for name in leaf.names.iter().take(leaf.names.len().saturating_sub(1)) {
+            let parent = leaf.parent()?;
+            let dir = match parent.open_dir_nofollow(name) {
+                Ok(dir) => dir,
+                Err(error) => {
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) || parent.symlink_metadata(name).is_ok_and(|metadata| {
+                        !metadata.is_dir() || metadata.file_type().is_symlink()
+                    }) {
+                        return Ok(None);
+                    }
+                    return Err(error.into());
+                }
+            };
+            leaf.refuse_dot_git(&dir)?;
+            let mut current = leaf
+                .paths
+                .last()
+                .ok_or_else(|| GitError::InvalidPath("missing root".into()))?
+                .clone();
+            current.push(name);
+            leaf.paths.push(current);
+            leaf.dirs.push(dir);
+        }
+        Ok(Some(leaf))
+    }
+
+    fn parent(&self) -> Result<&cap_std::fs::Dir> {
+        self.dirs
+            .last()
+            .ok_or_else(|| GitError::InvalidPath("missing worktree parent".into()))
+    }
+
+    fn name(&self) -> Result<&std::ffi::OsStr> {
+        self.names
+            .last()
+            .map(std::ffi::OsString::as_os_str)
+            .ok_or_else(|| GitError::InvalidPath("missing worktree leaf".into()))
+    }
+
+    fn refuse_dot_git(&self, dir: &cap_std::fs::Dir) -> Result<()> {
+        if let Some(dot_git) = &self.dot_git {
+            let identity = same_file::Handle::from_file(dir.try_clone()?.into_std_file())?;
+            if &identity == dot_git {
+                return Err(crate::path_safety::invalid_path_error(
+                    self.path.as_os_str().as_encoded_bytes(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn remove(&self, original_cwd: Option<&Path>) -> Result<bool> {
+        use cap_fs_ext::DirExt as _;
+        let parent = self.parent()?;
+        let name = self.name()?;
+        let metadata = match parent.symlink_metadata(name) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let result = if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            self.refuse_dot_git(&parent.open_dir_nofollow(name)?)?;
+            if crate::index_io::path_is_original_cwd(original_cwd, &self.path) {
+                return Ok(false);
+            }
+            // Gitlinks and directories with untracked content are never recursive.
+            parent.remove_dir(name)
+        } else {
+            parent.remove_file_or_symlink(name)
+        };
+        match result {
+            Ok(()) => Ok(true),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::DirectoryNotEmpty
+                        | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn prune(mut self, original_cwd: Option<&Path>) -> Result<()> {
+        for position in (1..self.dirs.len()).rev() {
+            let path = &self.paths[position];
+            if crate::index_io::path_is_original_cwd(original_cwd, path) {
+                break;
+            }
+            // Windows capability handles pin directories against deletion.
+            // Release this child before rmdir while retaining its parent;
+            // the removal still resolves only one name relative to that parent.
+            drop(self.dirs.pop());
+            let parent = self.parent()?;
+            let name = &self.names[position - 1];
+            match parent.remove_dir(name) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn remove_worktree_entry(
+    original_cwd: Option<&Path>,
+    root: &Path,
+    path: &[u8],
+) -> Result<()> {
+    if let Some(leaf) = ExistingWorktreeLeaf::open(root, path)?
+        && leaf.remove(original_cwd)?
+    {
+        leaf.prune(original_cwd)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn prune_worktree_dirs(
+    original_cwd: Option<&Path>,
+    root: &Path,
+    dir: Option<&Path>,
+) -> Result<()> {
+    let Some(dir) = dir.filter(|dir| *dir != root) else {
+        return Ok(());
+    };
+    let relative = dir
+        .strip_prefix(root)
+        .map_err(|_| GitError::InvalidPath(dir.display().to_string()))?;
+    if let Some(leaf) = ExistingWorktreeLeaf::open(root, &git_path_bytes(relative))? {
+        let can_prune = match leaf.parent()?.symlink_metadata(leaf.name()?) {
+            Ok(metadata) => {
+                metadata.is_dir()
+                    && !metadata.file_type().is_symlink()
+                    && leaf.remove(original_cwd)?
+            }
+            // A move may already have removed this directory. Its held real
+            // ancestors can still be empty and should be pruned as before.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(error) => return Err(error.into()),
+        };
+        if can_prune {
+            leaf.prune(original_cwd)?;
+        }
+    }
+    Ok(())
+}
+
+/// Compatibility path-only writer: all parents and the leaf are no-follow.
+/// Keep the public signature while refusing symlinks rather than truncating
+/// their targets. Existing regular files retain the historical overwrite behavior.
+pub(crate) fn write_blob_at_path(
+    file_path: &Path,
+    mode: u32,
+    body: &[u8],
+    link_target: &[u8],
+) -> Result<()> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+    use std::io::Write as _;
+    let absolute = if file_path.is_absolute() {
+        file_path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(file_path)
+    };
+    let mut root = PathBuf::new();
+    for component in absolute.components() {
+        if matches!(
+            component,
+            std::path::Component::RootDir | std::path::Component::Prefix(_)
+        ) {
+            root.push(component.as_os_str());
+        } else {
+            break;
+        }
+    }
+    let relative = absolute
+        .strip_prefix(&root)
+        .map_err(|_| GitError::InvalidPath(absolute.display().to_string()))?;
+    let leaf = ExistingWorktreeLeaf::open(&root, &git_path_bytes(relative))?
+        .ok_or_else(|| GitError::InvalidPath(file_path.display().to_string()))?;
+    #[cfg(unix)]
+    if mode & 0o170000 == 0o120000 {
+        cap_fs_ext::DirExt::symlink(leaf.parent()?, os_str(link_target), leaf.name()?)?;
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    let _ = link_target;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.write(true).create(true).follow(FollowSymlinks::No);
+    let mut file = leaf.parent()?.open_with(leaf.name()?, &options)?.into_std();
+    if !file.metadata()?.is_file() {
+        return Err(GitError::InvalidPath(file_path.display().to_string()));
+    }
+    file.set_len(0)?;
+    file.write_all(body)?;
+    set_handle_file_mode(&file, mode)
+}
+
+fn git_path_bytes(path: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        path.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        path.to_string_lossy().replace('\\', "/").into_bytes()
+    }
+}
+
+fn git_name_os_string(name: &[u8]) -> std::ffi::OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt as _;
+        std::ffi::OsString::from_vec(name.to_vec())
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8_lossy(name).into_owned().into()
     }
 }

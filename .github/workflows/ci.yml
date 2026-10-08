@@ -65,6 +65,21 @@ jobs:
       - name: Check sley-transport on Windows
         run: cargo check -p sley-transport --locked --target x86_64-pc-windows-msvc
 
+  windows-worktree-test:
+    name: Windows worktree tests
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-tests-${{ runner.os }}-worktree
+      - name: Test sley-worktree on Windows
+        run: cargo test --locked -p sley-worktree
+
   # Build once, then clippy + test + format checks reuse the same target/ directory.
   # Avoids 4 separate cold builds; total compute time is ~70% lower at modest
   # parallelism cost.

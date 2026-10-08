@@ -8,6 +8,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+cap-std = "4.0.3"
+cap-fs-ext = "4.0.3"
 encoding_rs = "0.8.41"
 same-file = "1.0.6"
 sley-config.workspace = true

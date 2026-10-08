@@ -144,12 +144,14 @@ impl Repo {
                 if skip_git && path == dir.join(".git") {
                     continue;
                 }
-                out.push(
-                    path.strip_prefix(dir)
-                        .expect("under dir")
-                        .to_string_lossy()
-                        .into_owned(),
-                );
+                let relative = path
+                    .strip_prefix(dir)
+                    .expect("under dir")
+                    .to_string_lossy()
+                    .into_owned();
+                #[cfg(windows)]
+                let relative = relative.replace('\\', "/");
+                out.push(relative);
                 let file_type = entry.file_type().expect("file type");
                 if file_type.is_dir() {
                     stack.push(path);
@@ -431,7 +433,7 @@ fn run_checkout_with_policy(
     commit: &ObjectId,
     policy: &sley_worktree::WorktreePathPolicy,
 ) -> sley_core::Result<()> {
-    let config = GitConfig::default();
+    let config = GitConfig::read(repo.git_dir.join("config")).expect("repo config");
     match entry {
         Entry::CheckoutBranch => {
             repo.set_branch("hostile", commit);
@@ -521,7 +523,7 @@ fn caller_reserved_root_name_is_refused_only_at_the_root() {
     }
 }
 
-/// The scoped policy must not leak past the call that installed it.
+/// The explicit policy must not affect subsequent calls.
 #[test]
 fn path_policy_is_scoped_to_its_call() {
     let policy = sley_worktree::WorktreePathPolicy::default().reserve_root_name(".heddle");
@@ -557,17 +559,27 @@ fn protection_switches_follow_repository_config() {
 }
 
 fn oracle_git() -> Option<std::process::Command> {
-    let probe = std::process::Command::new("git")
-        .arg("--version")
-        .output()
-        .ok()?;
-    if !probe.status.success() {
+    static GIT_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let available = *GIT_AVAILABLE.get_or_init(|| {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|probe| probe.status.success())
+    });
+    if !available {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "git is required for path-safety differential tests under CI"
+        );
         return None;
     }
     let mut command = std::process::Command::new("git");
     command
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        )
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .args(["-c", "core.protectNTFS=true", "-c", "core.protectHFS=true"]);
@@ -620,6 +632,13 @@ fn verdicts_match_real_git() {
     ] {
         corpus.push((path.as_bytes().to_vec(), mode));
     }
+    let generated = randomized_names(2_500);
+    assert_eq!(generated.len(), 2_500);
+    corpus.extend(generated);
+    eprintln!(
+        "path-safety oracle: {} names (2,500 generated), NTFS and HFS enabled",
+        corpus.len()
+    );
     let scratch = tempfile::tempdir().expect("scratch repository");
     let init = oracle_git()
         .expect("git")
@@ -632,8 +651,13 @@ fn verdicts_match_real_git() {
     let policy = sley_worktree::WorktreePathPolicy::default();
     let mut disagreements = Vec::new();
     for (path, mode) in &corpus {
+        // Each name gets an empty index; unrelated D/F conflicts must not
+        // influence the oracle's path-validation verdict.
+        let index_path = scratch.path().join("oracle-index");
+        let _ = fs::remove_file(&index_path);
         let output = oracle_git()
             .expect("git")
+            .env("GIT_INDEX_FILE", &index_path)
             .arg("-C")
             .arg(scratch.path())
             // The three-argument `--cacheinfo` form takes the path verbatim.
@@ -686,4 +710,354 @@ fn verdicts_match_real_git() {
         );
         assert!(!repo.git_dir.join("hooks/post-checkout").exists());
     }
+}
+
+#[test]
+fn standalone_writer_enforces_configured_alias_rules() {
+    for path in [
+        b".git./hooks/x".as_slice(),
+        b"GIT~1/hooks/x",
+        ".g\u{200c}it/hooks/x".as_bytes(),
+    ] {
+        let repo = Repo::new();
+        let result =
+            sley_worktree::write_worktree_entry(None, &repo.root, path, 0o100644, b"content");
+        assert!(
+            matches!(result, Err(sley_core::GitError::InvalidPath(_))),
+            "{path:?}: {result:?}"
+        );
+        assert!(repo.worktree_listing().is_empty());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn reset_removal_treats_symlinked_parent_as_absent() {
+    let repo = Repo::new();
+    let first = repo.commit(&[(b"A/authorized_keys", 0o100644, b"tracked")]);
+    run_checkout(&repo, Entry::Reset, &first).expect("first reset");
+    let outside = repo.outside.join("outside");
+    fs::create_dir(&outside).expect("outside directory");
+    fs::write(outside.join("authorized_keys"), b"outside").expect("outside file");
+    fs::remove_dir_all(repo.root.join("A")).expect("remove tracked directory");
+    std::os::unix::fs::symlink(&outside, repo.root.join("A")).expect("parent symlink");
+    let second = repo.commit(&[]);
+    run_checkout(&repo, Entry::Reset, &second).expect("second reset");
+    assert_eq!(
+        fs::read(outside.join("authorized_keys")).expect("outside file survives"),
+        b"outside"
+    );
+    assert!(
+        fs::symlink_metadata(repo.root.join("A"))
+            .expect("parent unchanged")
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sparse_reset_removal_treats_symlinked_parent_as_absent() {
+    let repo = Repo::new();
+    let commit = repo.commit(&[(b"A/authorized_keys", 0o100644, b"tracked")]);
+    run_checkout(&repo, Entry::Reset, &commit).expect("first reset");
+    let outside = repo.outside.join("outside");
+    fs::create_dir(&outside).expect("outside directory");
+    fs::write(outside.join("authorized_keys"), b"outside").expect("outside file");
+    fs::remove_dir_all(repo.root.join("A")).expect("remove tracked directory");
+    std::os::unix::fs::symlink(&outside, repo.root.join("A")).expect("parent symlink");
+    fs::write(
+        repo.git_dir.join("config"),
+        b"[core]\n bare = false\n sparseCheckout = true\n sparseCheckoutCone = false\n",
+    )
+    .expect("sparse config");
+    fs::write(repo.git_dir.join("info/sparse-checkout"), b"/included/\n").expect("sparse patterns");
+    run_checkout(&repo, Entry::Reset, &commit).expect("sparse reset");
+    assert_eq!(
+        fs::read(outside.join("authorized_keys")).expect("outside file survives"),
+        b"outside"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn reset_skips_case_colliding_symlink_and_preserves_both_index_entries() {
+    let repo = Repo::new();
+    fs::write(
+        repo.git_dir.join("config"),
+        b"[core]\n bare = false\n ignoreCase = true\n",
+    )
+    .expect("case-insensitive config");
+    let commit = repo.commit(&[
+        (b"A/authorized_keys", 0o100644, b"tracked"),
+        (b"a", 0o120000, b"../outside"),
+    ]);
+    run_checkout(&repo, Entry::Reset, &commit).expect("reset");
+    assert!(
+        !repo.root.join("a").is_symlink(),
+        "colliding symlink must not be materialized"
+    );
+    assert_eq!(
+        fs::read(repo.root.join("A/authorized_keys")).expect("first path retained"),
+        b"tracked"
+    );
+    let index = sley_index::Index::parse(
+        &fs::read(repo.git_dir.join("index")).expect("index"),
+        FORMAT,
+    )
+    .expect("parse index");
+    assert_eq!(index.entries.len(), 2);
+    assert_eq!(
+        index.entries[1].size, 0,
+        "colliding entry has no worktree stat"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn reset_collision_and_removal_on_case_insensitive_filesystem() {
+    let repo = Repo::new();
+    // Try setting casefold on an EMPTY directory before creating the repository.
+    // Native case-insensitive volumes (e.g. macOS) need no chattr.
+    let folded = repo.outside.join("casefold");
+    fs::create_dir(&folded).expect("empty casefold directory");
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("chattr")
+        .arg("+F")
+        .arg(&folded)
+        .output();
+    fs::write(folded.join("probe"), b"probe").expect("probe");
+    let insensitive = folded.join("PROBE").exists();
+    fs::remove_file(folded.join("probe")).expect("remove probe");
+    if !insensitive {
+        eprintln!(
+            "skipping casefold reset regression: no case-insensitive filesystem at {}",
+            folded.display()
+        );
+        return;
+    }
+    // Create fresh directories so they inherit casefold from the parent.
+    for dir in ["objects", "refs/heads", "refs/tags", "hooks", "info"] {
+        fs::create_dir_all(folded.join("worktree/.git").join(dir)).expect("casefold git directory");
+    }
+    for file in ["HEAD", "config"] {
+        fs::copy(
+            repo.git_dir.join(file),
+            folded.join("worktree/.git").join(file),
+        )
+        .expect("fixture config");
+    }
+    let repo = Repo {
+        root: folded.join("worktree"),
+        git_dir: folded.join("worktree/.git"),
+        db: FileObjectDatabase::from_git_dir(folded.join("worktree/.git"), FORMAT),
+        ..repo
+    };
+    let outside = repo.outside.join("outside");
+    fs::create_dir(&outside).expect("outside directory");
+    fs::write(outside.join("authorized_keys"), b"outside").expect("outside file");
+    let target = outside.as_os_str().as_encoded_bytes();
+    let first = repo.commit(&[
+        (b"A/authorized_keys", 0o100644, b"tracked"),
+        (b"a", 0o120000, target),
+    ]);
+    run_checkout(&repo, Entry::Reset, &first).expect("first reset");
+    assert!(
+        fs::symlink_metadata(repo.root.join("A"))
+            .expect("directory")
+            .is_dir(),
+        "reset must skip colliding symlink"
+    );
+    let second = repo.commit(&[]);
+    run_checkout(&repo, Entry::Reset, &second).expect("second reset");
+    assert_eq!(
+        fs::read(outside.join("authorized_keys")).expect("outside file survives both resets"),
+        b"outside"
+    );
+    // Also exercise an index/worktree left by the old reset implementation:
+    // the index retains A/authorized_keys while its parent aliases a symlink.
+    run_checkout(&repo, Entry::Reset, &first).expect("restore first commit");
+    fs::remove_dir_all(repo.root.join("A")).expect("remove directory");
+    std::os::unix::fs::symlink(&outside, repo.root.join("a")).expect("legacy colliding parent");
+    run_checkout(&repo, Entry::Reset, &second).expect("remove legacy colliding parent");
+    assert_eq!(
+        fs::read(outside.join("authorized_keys")).expect("outside file survives"),
+        b"outside"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_blob_writer_refuses_symlinks_at_leaf_and_in_parents() {
+    for parent_link in [false, true] {
+        let repo = Repo::new();
+        let outside = repo.outside.join("outside");
+        fs::create_dir(&outside).expect("outside directory");
+        fs::write(outside.join("file"), b"outside").expect("outside file");
+        let path = if parent_link {
+            std::os::unix::fs::symlink(&outside, repo.root.join("link")).expect("parent link");
+            repo.root.join("link/file")
+        } else {
+            std::os::unix::fs::symlink(outside.join("file"), repo.root.join("file"))
+                .expect("leaf link");
+            repo.root.join("file")
+        };
+        assert!(
+            sley_worktree::write_blob_body_or_symlink(&path, 0o100644, b"new", b"new").is_err()
+        );
+        assert_eq!(
+            fs::read(outside.join("file")).expect("outside file survives"),
+            b"outside"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_checkout_refuses_root_backslash_and_win32_names() {
+    let policy = sley_worktree::WorktreePathPolicy::default();
+    for path in [
+        r"\Users\Public\x",
+        r"a\b",
+        "C:relative",
+        "AUX.txt",
+        "dir/LPT0",
+        "dir/COM9",
+        "CONIN$",
+        "CONOUT$",
+        "a:stream",
+        "a.",
+        "a ",
+        "a?b",
+        "a\u{1f}b",
+    ] {
+        assert!(!policy.is_valid_path(path.as_bytes(), 0o100644), "{path:?}");
+        let repo = Repo::new();
+        let commit = repo.commit(&[(path.as_bytes(), 0o100644, b"content")]);
+        assert!(
+            run_checkout(&repo, Entry::Reset, &commit).is_err(),
+            "{path:?}"
+        );
+        assert!(repo.worktree_listing().is_empty());
+    }
+}
+
+/// Seeded generation makes failures reproducible, with many names unrelated
+/// to the fixed regressions, and biased mutations near the platform aliases.
+fn randomized_names(count: usize) -> Vec<(Vec<u8>, u32)> {
+    let mut state = 0x2492_4755_u64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let seeds = [
+        ".git",
+        ".gitmodules",
+        "GIT~1",
+        "gitmod~4",
+        "gi7eba~1",
+        ".g\u{200c}it",
+        ".git\u{feff}modules",
+        "AUX",
+        "CONIN$",
+        "LPT0",
+        "COM9",
+        ".github",
+        "ordinary",
+        "..",
+        ".",
+        "",
+        "a\\b",
+        "\\.git",
+        "C:foo",
+    ];
+    let suffixes = [
+        "", ".", " ", ":stream", "x", ".. ", "\\hooks", "\u{206a}", "\u{00ad}",
+    ];
+    let alphabet = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._ ~:\\?*<>|";
+    let mut names = std::collections::BTreeSet::new();
+    while names.len() < count {
+        let mut path = String::new();
+        for component in 0..(1 + next() % 4) {
+            if component != 0 {
+                path.push('/');
+            }
+            if next() % 3 == 0 {
+                for _ in 0..(1 + next() % 20) {
+                    path.push(char::from(alphabet[next() as usize % alphabet.len()]));
+                }
+            } else {
+                path.push_str(seeds[next() as usize % seeds.len()]);
+                path.push_str(suffixes[next() as usize % suffixes.len()]);
+            }
+        }
+        let mode = if next() & 1 == 0 { 0o100644 } else { 0o120000 };
+        names.insert((path.into_bytes(), mode));
+    }
+    names.into_iter().collect()
+}
+
+#[test]
+fn caller_policy_reaches_parallel_and_sparse_writers() {
+    for entry in ENTRY_POINTS {
+        for sparse in [false, true] {
+            let repo = Repo::new();
+            let mut config =
+                b"[core]\n bare = false\n[checkout]\n workers = 2\n thresholdForParallelism = 0\n"
+                    .to_vec();
+            if sparse {
+                config.extend_from_slice(
+                    b"[core]\n sparseCheckout = true\n sparseCheckoutCone = false\n",
+                );
+                fs::write(repo.git_dir.join("info/sparse-checkout"), b"/*\n")
+                    .expect("sparse patterns");
+            }
+            fs::write(repo.git_dir.join("config"), config).expect("config");
+            let commit = repo.commit(&[
+                (b"GIT~1/file", 0o100644, b"ntfs"),
+                (".g\u{200c}it/file".as_bytes(), 0o100644, b"hfs"),
+            ]);
+            let policy = sley_worktree::WorktreePathPolicy::default()
+                .protect_ntfs(false)
+                .protect_hfs(false);
+            run_checkout_with_policy(&repo, entry, &commit, &policy)
+                .expect("explicit policy overrides config even in workers");
+            assert_eq!(
+                fs::read(repo.root.join("GIT~1/file")).expect("ntfs alias"),
+                b"ntfs"
+            );
+        }
+    }
+}
+
+#[test]
+fn missing_git_under_ci_fails_the_differential_test() {
+    let scratch = tempfile::tempdir().expect("empty PATH directory");
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", "verdicts_match_real_git", "--nocapture"])
+        .env("CI", "1")
+        .env("PATH", scratch.path())
+        .current_dir(scratch.path())
+        .output()
+        .expect("run differential without git");
+    assert!(
+        !output.status.success(),
+        "differential must fail under CI without git"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("git is required"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn legacy_blob_writer_keeps_regular_file_overwrite_behavior() {
+    let root = tempfile::tempdir().expect("worktree");
+    let path = root.path().join("file");
+    fs::write(&path, b"old and longer").expect("regular file");
+    sley_worktree::write_blob_body_or_symlink(&path, 0o100644, b"new", b"new").expect("overwrite");
+    assert_eq!(fs::read(path).expect("regular file"), b"new");
 }
