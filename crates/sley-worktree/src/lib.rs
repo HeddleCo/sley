@@ -45,11 +45,14 @@ mod ignore;
 mod index;
 mod index_io;
 mod move_remove;
+pub mod path_safety;
 mod read_tree;
 mod status;
 mod status_plan;
 mod types_admin;
 mod unpack_worktree;
+mod worktree_write;
+pub use worktree_write::write_worktree_entry;
 
 // Environment-respecting repository discovery, shared with the facade setup
 // path and the hook engine (see the `discovery` module docs).
@@ -81,6 +84,7 @@ pub use ignore::*;
 pub use index::*;
 pub use index_io::{StatCleanFilterValidator, fill_index_entry_stat_cache};
 pub use move_remove::*;
+pub use path_safety::{WorktreePathPolicy, verify_tree_paths};
 pub use read_tree::*;
 pub use status::*;
 pub use status_plan::*;

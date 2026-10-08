@@ -7,8 +7,12 @@ use crate::attributes::*;
 use crate::filter::*;
 use crate::index::*;
 use crate::index_io::*;
+use crate::path_safety::{
+    checkout_path_policy, checkout_path_policy_for, verify_entry_paths, verify_tracked_entries,
+};
 use crate::status::*;
 use crate::types_admin::*;
+use crate::worktree_write::{WorktreeLeaf, replace_worktree_blob, replace_worktree_file};
 use sley_pathspec::{PathspecElement, PathspecMatchMagic};
 
 pub fn deleted_index_entries(
@@ -274,6 +278,36 @@ pub fn checkout_branch_filtered(
     })
 }
 
+/// [`checkout_branch_filtered`] with an explicit [`WorktreePathPolicy`].
+///
+/// The policy replaces the one derived from `core.protectNTFS` /
+/// `core.protectHFS`, so a caller can reserve extra names (heddle reserves a
+/// root `.heddle`) on top of git's `.git` rules. Every target path is
+/// checked before the worktree is touched; one refused path refuses the
+/// whole checkout.
+#[allow(clippy::too_many_arguments)]
+pub fn checkout_branch_filtered_with_path_policy(
+    original_cwd: Option<&std::path::Path>,
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    branch: &str,
+    committer: Vec<u8>,
+    config: &GitConfig,
+    policy: &WorktreePathPolicy,
+) -> Result<CheckoutResult> {
+    let _policy = crate::path_safety::scope_worktree_path_policy(policy);
+    checkout_branch_filtered(
+        original_cwd,
+        worktree_root,
+        git_dir,
+        format,
+        branch,
+        committer,
+        config,
+    )
+}
+
 /// Reconcile an already-current branch with newly enabled or changed sparse
 /// checkout rules. A normal same-HEAD checkout remains a no-op; sparse checkout
 /// is the exception because `git checkout <current-branch>` is also the legacy
@@ -341,6 +375,33 @@ pub fn checkout_detached_filtered(
         oid: *target,
         files,
     })
+}
+
+/// [`checkout_detached_filtered`] with an explicit [`WorktreePathPolicy`];
+/// see [`checkout_branch_filtered_with_path_policy`].
+#[allow(clippy::too_many_arguments)]
+pub fn checkout_detached_filtered_with_path_policy(
+    original_cwd: Option<&std::path::Path>,
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    target: &ObjectId,
+    committer: Vec<u8>,
+    message: Vec<u8>,
+    config: &GitConfig,
+    policy: &WorktreePathPolicy,
+) -> Result<CheckoutResult> {
+    let _policy = crate::path_safety::scope_worktree_path_policy(policy);
+    checkout_detached_filtered(
+        original_cwd,
+        worktree_root,
+        git_dir,
+        format,
+        target,
+        committer,
+        message,
+        config,
+    )
 }
 
 pub(crate) fn checkout_commit_to_index_and_worktree(
@@ -413,6 +474,10 @@ pub(crate) fn checkout_commit_to_index_and_worktree_filtered(
     let commit = read_commit(&db, format, target)?;
     let mut target_entries = BTreeMap::new();
     collect_tree_entries(&db, format, &commit.tree, &mut target_entries)?;
+    verify_tracked_entries(
+        &checkout_path_policy_for(smudge_config, git_dir),
+        &target_entries,
+    )?;
     refuse_if_current_working_directory_becomes_file(original_cwd, worktree_root, &target_entries)?;
 
     let attributes = smudge_config
@@ -772,8 +837,7 @@ fn prepare_index_checkout_entry(
     delayed: &mut DelayedCheckoutQueue,
 ) -> Result<Option<PreparedCheckoutResult>> {
     if sley_index::is_gitlink(entry.mode) {
-        let dir_path = worktree_path(worktree_root, entry.path.as_bytes())?;
-        materialize_gitlink_dir(original_cwd, worktree_root, &dir_path)?;
+        materialize_gitlink_dir(original_cwd, worktree_root, entry.path.as_bytes())?;
         return Ok(None);
     }
     let file_path = worktree_path(worktree_root, entry.path.as_bytes())?;
@@ -861,17 +925,14 @@ fn materialize_prepared_checkout_entry(
         index_template,
     } = prepared;
     if sley_index::is_gitlink(entry.mode) {
-        let dir_path = worktree_path(worktree_root, &path)?;
-        materialize_gitlink_dir(original_cwd, worktree_root, &dir_path)?;
+        materialize_gitlink_dir(original_cwd, worktree_root, &path)?;
         return Ok(index_template.unwrap_or_else(|| unmaterialized_index_entry(&path, &entry)));
     }
     let body = body.ok_or_else(|| {
         GitError::InvalidFormat("checkout blob materialization had no body".into())
     })?;
-    let file_path = worktree_path(worktree_root, &path)?;
-    prepare_blob_parent_dirs(worktree_root, &file_path)?;
-    remove_existing_worktree_path(original_cwd, &file_path)?;
-    write_blob_body_or_symlink(&file_path, entry.mode, &body, &body)?;
+    let file_path =
+        replace_worktree_blob(original_cwd, worktree_root, &path, entry.mode, &body, &body)?;
     let metadata = fs::symlink_metadata(&file_path)?;
     let mut index_entry = match index_template {
         Some(template) => index_entry_with_refreshed_stat(&template, &metadata),
@@ -986,6 +1047,12 @@ pub fn materialize_checkout_entries_with_database(
 ) -> Result<CheckoutMaterializationOutcome> {
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
+    verify_entry_paths(
+        &checkout_path_policy(config),
+        entries
+            .iter()
+            .map(|entry| (entry.path.as_slice(), entry.mode)),
+    )?;
     let mut prepared = Vec::with_capacity(entries.len());
     for entry in entries {
         if sley_index::is_gitlink(entry.mode) {
@@ -1250,11 +1317,7 @@ fn write_delayed_checkout_output(
     if checkout_path_has_symlink_parent(worktree_root, path)? {
         return Ok(None);
     }
-    let file_path = worktree_path(worktree_root, path)?;
-    prepare_blob_parent_dirs(worktree_root, &file_path)?;
-    remove_existing_worktree_path(original_cwd, &file_path)?;
-    fs::write(&file_path, body)?;
-    set_worktree_file_mode(&file_path, entry.mode)?;
+    let file_path = replace_worktree_file(original_cwd, worktree_root, path, entry.mode, body)?;
     // Prefer symlink_metadata so a replaced symlink is not followed, and force
     // the cached size from the body we just wrote. On some filesystems a
     // same-second delayed smudge can leave the index size as 0 after the
@@ -1375,12 +1438,8 @@ pub(crate) fn materialize_tree_entry_with_optional_smudge(
             ));
         }
     };
-    let file_path = worktree_path(worktree_root, path)?;
-    prepare_blob_parent_dirs(worktree_root, &file_path)?;
-    remove_existing_worktree_path(original_cwd, &file_path)?;
-    fs::write(&file_path, &body)?;
-    set_worktree_file_mode(&file_path, entry.mode)?;
-    let metadata = fs::metadata(&file_path)?;
+    let file_path = replace_worktree_file(original_cwd, worktree_root, path, entry.mode, &body)?;
+    let metadata = fs::symlink_metadata(&file_path)?;
     let mut index_entry = index_entry_from_metadata(path.to_vec(), entry.oid, &metadata);
     index_entry.mode = entry.mode;
     Ok(index_entry)
@@ -1415,6 +1474,10 @@ pub fn checkout_commit_to_index_and_worktree_sparse(
     let commit = read_commit(&db, format, target)?;
     let mut target_entries = BTreeMap::new();
     collect_tree_entries(&db, format, &commit.tree, &mut target_entries)?;
+    verify_tracked_entries(
+        &checkout_path_policy_for(smudge_config, git_dir),
+        &target_entries,
+    )?;
 
     // Honor skip-worktree: a path whose worktree file is intentionally absent
     // must not be treated as a dirty (deleted) change blocking the checkout.
@@ -2272,11 +2335,13 @@ pub(crate) fn checkout_merge_unmerged_path(
             marker_size: 7,
         },
     );
-    let file_path = worktree_path(worktree_root, ours.path.as_bytes())?;
-    prepare_blob_parent_dirs(worktree_root, &file_path)?;
-    remove_existing_worktree_path(original_cwd, &file_path)?;
-    fs::write(&file_path, result.content)?;
-    set_worktree_file_mode(&file_path, ours.mode)?;
+    replace_worktree_file(
+        original_cwd,
+        worktree_root,
+        ours.path.as_bytes(),
+        ours.mode,
+        &result.content,
+    )?;
     Ok(())
 }
 
@@ -2695,6 +2760,14 @@ pub(crate) fn restore_index_and_worktree_paths_from_entries(
     let mut replacement_entries = Vec::new();
     let mut replaced_paths = BTreeSet::new();
     let mut replacement_leaf_paths = BTreeSet::new();
+    verify_entry_paths(
+        &checkout_path_policy(&config),
+        matched_paths.iter().filter_map(|path| {
+            source_entries
+                .get(path)
+                .map(|entry| (path.as_slice(), entry.mode))
+        }),
+    )?;
     for path in matched_paths {
         if let Some(entry) = source_entries.get(&path) {
             // git's `update_some` leaves the existing index entry when oid+mode
@@ -2803,6 +2876,8 @@ pub fn reset_index_and_worktree_to_commit(
     let commit = read_commit(&db, format, commit_oid)?;
     let mut target_entries = BTreeMap::new();
     collect_tree_entries(&db, format, &commit.tree, &mut target_entries)?;
+    let config = effective_worktree_config(git_dir, None).unwrap_or_default();
+    verify_tracked_entries(&checkout_path_policy(&config), &target_entries)?;
     let sparse = active_sparse_checkout(git_dir)?;
     let sparse_matcher = sparse
         .as_ref()
@@ -2821,7 +2896,6 @@ pub fn reset_index_and_worktree_to_commit(
             BTreeSet::new()
         };
     refuse_if_current_working_directory_becomes_file(original_cwd, worktree_root, &target_entries)?;
-    let config = effective_worktree_config(git_dir, None).unwrap_or_default();
     let attributes = build_tree_attribute_matcher(worktree_root, &db, format, &commit.tree)?;
 
     // git's `reset --hard` runs a one-way merge through unpack-trees: EVERY path
@@ -2933,6 +3007,20 @@ pub fn reset_index_and_worktree_to_commit_with_process_filter_metadata(
     reset_index_and_worktree_to_commit(original_cwd, worktree_root, git_dir, format, commit_oid)
 }
 
+/// [`reset_index_and_worktree_to_commit`] with an explicit
+/// [`WorktreePathPolicy`]; see [`checkout_branch_filtered_with_path_policy`].
+pub fn reset_index_and_worktree_to_commit_with_path_policy(
+    original_cwd: Option<&std::path::Path>,
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    commit_oid: &ObjectId,
+    policy: &WorktreePathPolicy,
+) -> Result<RestoreResult> {
+    let _policy = crate::path_safety::scope_worktree_path_policy(policy);
+    reset_index_and_worktree_to_commit(original_cwd, worktree_root, git_dir, format, commit_oid)
+}
+
 /// All paths the current index references, deduped across stages (a conflicted
 /// path appears at stages 1–3; we want it listed once). Unlike
 /// `read_index_entries`, which filters to stage 0, this keeps conflicted paths
@@ -2968,8 +3056,7 @@ pub(crate) fn materialize_tree_entry(
     entry: &TrackedEntry,
 ) -> Result<IndexEntry> {
     if sley_index::is_gitlink(entry.mode) {
-        let dir_path = worktree_path(worktree_root, path)?;
-        materialize_gitlink_dir(original_cwd, worktree_root, &dir_path)?;
+        materialize_gitlink_dir(original_cwd, worktree_root, path)?;
         return Ok(IndexEntry {
             ctime_seconds: 0,
             ctime_nanoseconds: 0,
@@ -2997,24 +3084,18 @@ pub(crate) fn materialize_tree_entry(
 pub(crate) fn materialize_gitlink_dir(
     original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
-    dir_path: &Path,
+    path: &[u8],
 ) -> Result<()> {
-    prepare_blob_parent_dirs(worktree_root, dir_path)?;
     // git's `validate_submodule_path` / entry.c: never replace a symlink with a
     // gitlink directory. Doing so would destroy the link and let a later
     // --recurse-submodules pass migrate the linked repo's .git into
     // $GIT_DIR/modules (t7423). Leave the symlink in place so the recursive
     // submodule path can refuse with the proper error.
-    if let Ok(metadata) = fs::symlink_metadata(dir_path) {
-        if metadata.file_type().is_symlink() {
-            return Ok(());
-        }
-        if !metadata.is_dir() {
-            remove_existing_worktree_path(original_cwd, dir_path)?;
-        }
-    }
-    fs::create_dir_all(dir_path)?;
-    Ok(())
+    WorktreeLeaf::open(original_cwd, worktree_root, path, 0o160000)?.ensure_dir(
+        original_cwd,
+        refuse_remove_current_working_directory,
+        true,
+    )
 }
 
 pub(crate) fn materialize_path_restore_entry_filtered(
@@ -3039,11 +3120,7 @@ pub(crate) fn materialize_path_restore_entry_filtered(
         &object.body,
         format,
     )?;
-    let file_path = worktree_path(worktree_root, path)?;
-    prepare_blob_parent_dirs(worktree_root, &file_path)?;
-    remove_existing_worktree_path(original_cwd, &file_path)?;
-    fs::write(&file_path, &body)?;
-    set_worktree_file_mode(&file_path, entry.mode)?;
+    let file_path = replace_worktree_file(original_cwd, worktree_root, path, entry.mode, &body)?;
     let metadata = fs::symlink_metadata(&file_path)?;
     let mut index_entry = index_entry_from_metadata(path.to_vec(), entry.oid, &metadata);
     index_entry.mode = entry.mode;
@@ -3068,15 +3145,18 @@ pub(crate) fn write_worktree_blob_entry(
     entry: &TrackedEntry,
 ) -> Result<PathBuf> {
     let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
-    let file_path = worktree_path(worktree_root, path)?;
-    // Clear any non-directory blocking an ancestor component (prior tree had
-    // `dir` as a FILE, target wants `dir/<child>`), creating the parent dirs.
-    prepare_blob_parent_dirs(worktree_root, &file_path)?;
-    // Clear whatever sits at the leaf — including a directory where the target
-    // wants a plain file (reverse D/F) — before writing.
-    remove_existing_worktree_path(original_cwd, &file_path)?;
-    write_blob_body_or_symlink(&file_path, entry.mode, &object.body, &object.body)?;
-    Ok(file_path)
+    // Clears any non-directory blocking an ancestor component (prior tree had
+    // `dir` as a FILE, target wants `dir/<child>`) and whatever sits at the
+    // leaf — including a directory where the target wants a plain file
+    // (reverse D/F) — before writing, never following a symlink.
+    replace_worktree_blob(
+        original_cwd,
+        worktree_root,
+        path,
+        entry.mode,
+        &object.body,
+        &object.body,
+    )
 }
 
 /// Write the materialized worktree object at `file_path` as the right *type* for
@@ -3119,80 +3199,6 @@ pub fn write_blob_body_or_symlink(
     } else {
         fs::write(file_path, body)?;
         set_worktree_file_mode(file_path, mode)?;
-    }
-    Ok(())
-}
-
-/// Create the ancestor directories of a worktree blob path, removing any
-/// regular file or symlink that occupies an ancestor *component* first.
-///
-/// Mirrors git's `entry.c` `create_directories`: it walks each path component
-/// between `worktree_root` and the leaf and, for each, if a non-directory (a
-/// regular file or symlink left by a prior tree where `dir` was a FILE) blocks
-/// it, unlinks the blocker before `mkdir`. A plain `fs::create_dir_all` fails
-/// with `ENOTDIR`/`EEXIST` on such a D/F transition; this is the directory-side
-/// of git's force-checkout D/F clearing.
-///
-/// `worktree_root` itself is never touched. Only components strictly between the
-/// root and the leaf are cleared, matching `create_directories`' `base_dir_len`
-/// boundary.
-pub(crate) fn prepare_blob_parent_dirs(worktree_root: &Path, file_path: &Path) -> Result<()> {
-    let parent = match file_path.parent() {
-        Some(parent) => parent,
-        None => return Ok(()),
-    };
-    // Fast path: parent already is a directory (the overwhelmingly common
-    // case).  Do not use `Path::is_dir()` here: it follows a symlink.  A
-    // checkout of `D/file` with an untracked `D -> elsewhere` must replace the
-    // link with a real directory, never write through it into `elsewhere`.
-    match fs::symlink_metadata(parent) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => return Ok(()),
-        Ok(_) => {}
-        // `lstat("file/child")` reports ENOTDIR when an earlier component is
-        // the D/F blocker we are about to replace. Treat it like an absent
-        // descendant and let the root-to-leaf walk remove that blocker.
-        Err(err)
-            if matches!(
-                err.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            ) => {}
-        Err(err) => return Err(err.into()),
-    }
-    // Collect the ancestor chain from worktree_root (exclusive) down to `parent`
-    // (inclusive). We can't `create_dir_all` blindly because a non-directory may
-    // sit on one of these components; walk them and clear blockers as git does.
-    let mut components: Vec<&Path> = Vec::new();
-    let mut cursor = Some(parent);
-    while let Some(dir) = cursor {
-        if dir == worktree_root {
-            break;
-        }
-        components.push(dir);
-        cursor = dir.parent();
-        if cursor.is_none() {
-            break;
-        }
-    }
-    // Walk root → leaf so each parent exists before its child.
-    for dir in components.iter().rev() {
-        match fs::symlink_metadata(dir) {
-            Ok(metadata) if metadata.is_dir() => {}
-            Ok(_) => {
-                // A regular file or symlink occupies this component (the prior
-                // tree had `dir` as a FILE). Unlink it, then create the dir.
-                fs::remove_file(dir)?;
-                fs::create_dir(dir)?;
-            }
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                ) =>
-            {
-                fs::create_dir(dir)?;
-            }
-            Err(err) => return Err(err.into()),
-        }
     }
     Ok(())
 }
@@ -3276,6 +3282,7 @@ pub fn checkout_tree_to_index_and_worktree(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let mut target_entries = BTreeMap::new();
     collect_tree_entries(&db, format, tree_oid, &mut target_entries)?;
+    verify_tracked_entries(&checkout_path_policy_for(None, git_dir), &target_entries)?;
 
     for path in read_index_entries(git_dir, format)?.keys() {
         if !target_entries.contains_key(path) {
@@ -3597,7 +3604,7 @@ pub fn apply_sparse_checkout_with_mode(
             clear_skip_worktree(entry);
             let file_path = worktree_path(worktree_root, entry.path.as_bytes())?;
             if !file_path.exists() {
-                materialize_index_entry_file(original_cwd, &db, worktree_root, &file_path, entry)?;
+                materialize_index_entry_file(original_cwd, &db, worktree_root, entry)?;
                 let metadata = fs::symlink_metadata(&file_path)?;
                 *entry = index_entry_with_refreshed_stat(entry, &metadata);
             }
@@ -4333,7 +4340,6 @@ pub(crate) fn materialize_index_entry_file(
     original_cwd: Option<&std::path::Path>,
     db: &FileObjectDatabase,
     worktree_root: &Path,
-    file_path: &Path,
     entry: &IndexEntry,
 ) -> Result<()> {
     // A gitlink (mode 160000) has no blob in this object store and materializes
@@ -4342,13 +4348,18 @@ pub(crate) fn materialize_index_entry_file(
     // sparse re-materialization of a submodule path would fail with "not found:
     // blob object <commit-oid>".
     if sley_index::is_gitlink(entry.mode) {
-        materialize_gitlink_dir(original_cwd, worktree_root, file_path)?;
+        materialize_gitlink_dir(original_cwd, worktree_root, entry.path.as_bytes())?;
         return Ok(());
     }
     let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
-    prepare_blob_parent_dirs(worktree_root, file_path)?;
-    remove_existing_worktree_path(original_cwd, file_path)?;
-    write_blob_body_or_symlink(file_path, entry.mode, &object.body, &object.body)?;
+    replace_worktree_blob(
+        original_cwd,
+        worktree_root,
+        entry.path.as_bytes(),
+        entry.mode,
+        &object.body,
+        &object.body,
+    )?;
     Ok(())
 }
 
@@ -4466,6 +4477,14 @@ pub(crate) fn restore_worktree_paths_from_entries(
             .chain(source_entries.keys())
             .map(Vec::as_slice),
         false,
+    )?;
+    verify_entry_paths(
+        &checkout_path_policy(&config),
+        matched_paths.iter().filter_map(|path| {
+            source_entries
+                .get(path)
+                .map(|entry| (path.as_slice(), entry.mode))
+        }),
     )?;
     for path in matched_paths {
         if let Some(entry) = source_entries.get(&path) {
@@ -4676,8 +4695,8 @@ mod checkout_parent_safety_tests {
         let outside = tempfile::tempdir().expect("outside directory");
         symlink(outside.path(), root.path().join("D")).expect("leading symlink");
 
-        prepare_blob_parent_dirs(root.path(), &root.path().join("D/file"))
-            .expect("prepare real parent directory");
+        replace_worktree_blob(None, root.path(), b"D/file", 0o100644, b"x", b"x")
+            .expect("write through a real parent directory");
 
         let metadata = fs::symlink_metadata(root.path().join("D")).expect("D metadata");
         assert!(metadata.is_dir());

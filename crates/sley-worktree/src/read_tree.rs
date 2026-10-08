@@ -162,7 +162,7 @@ pub fn plan_read_tree_transition(
     options: ReadTreeTransitionOptions<'_>,
     diagnostics: &mut dyn ReadTreeDiagnostics,
 ) -> ReadTreeTransitionResult<ReadTreeTransitionOutcome> {
-    let rules = ReadTreePathRules::from_config(config);
+    let policy = crate::path_safety::checkout_path_policy(config);
     let mut merged = match &options.mode {
         ReadTreeTransitionMode::Overlay => LeafMap::new(),
         ReadTreeTransitionMode::Prefix(_) => read_current_index_stage_zero(git_dir, format)?,
@@ -177,7 +177,7 @@ pub fn plan_read_tree_transition(
         for (path, value) in sley_diff_merge::flatten_tree(db, format, tree_oid)? {
             let mut full = prefix.to_vec();
             full.extend_from_slice(&path);
-            verify_read_tree_path(&full, value.0, rules, diagnostics)?;
+            verify_read_tree_path(&full, value.0, &policy, diagnostics)?;
             match options.mode {
                 ReadTreeTransitionMode::Overlay => overlay_tree_leaf(&mut merged, full, value),
                 ReadTreeTransitionMode::Prefix(_) => {
@@ -241,10 +241,10 @@ pub fn flatten_validated_read_tree_source(
     tree_oid: &ObjectId,
     diagnostics: &mut dyn ReadTreeDiagnostics,
 ) -> ReadTreeTransitionResult<sley_unpack_trees::FlatTree> {
-    let rules = ReadTreePathRules::from_config(config);
+    let policy = crate::path_safety::checkout_path_policy(config);
     let tree = sley_diff_merge::flatten_tree(db, format, tree_oid)?;
     for (path, (mode, _)) in &tree {
-        verify_read_tree_path(path, *mode, rules, diagnostics)?;
+        verify_read_tree_path(path, *mode, &policy, diagnostics)?;
     }
     Ok(tree)
 }
@@ -268,149 +268,17 @@ fn overlay_tree_leaf(merged: &mut LeafMap, path: Vec<u8>, value: (u32, ObjectId)
     merged.insert(path, value);
 }
 
-#[derive(Clone, Copy, Debug)]
-struct ReadTreePathRules {
-    protect_hfs: bool,
-    protect_ntfs: bool,
-}
-
-impl ReadTreePathRules {
-    fn from_config(config: &GitConfig) -> Self {
-        Self {
-            protect_hfs: config.get_bool("core", None, "protectHFS").unwrap_or(false),
-            protect_ntfs: config
-                .get_bool("core", None, "protectNTFS")
-                .unwrap_or(false),
-        }
-    }
-}
-
 fn verify_read_tree_path(
     path: &[u8],
     mode: u32,
-    rules: ReadTreePathRules,
+    policy: &WorktreePathPolicy,
     diagnostics: &mut dyn ReadTreeDiagnostics,
 ) -> ReadTreeTransitionResult<()> {
-    if path.is_empty() || path.contains(&0) {
-        return invalid_read_tree_path(path, diagnostics);
+    if policy.is_valid_path(path, mode) {
+        return Ok(());
     }
-    for component in path.split(|&byte| byte == b'/') {
-        if component.is_empty()
-            || component == b"."
-            || component == b".."
-            || component.eq_ignore_ascii_case(b".git")
-            || (rules.protect_hfs && is_hfs_dotgit(component))
-            || (rules.protect_ntfs && is_ntfs_dotgit(component))
-        {
-            return invalid_read_tree_path(path, diagnostics);
-        }
-        if mode == 0o120000
-            && (component.eq_ignore_ascii_case(b".gitmodules")
-                || (rules.protect_hfs && is_hfs_dotgitmodules(component))
-                || (rules.protect_ntfs && is_ntfs_dotgitmodules(component)))
-        {
-            return invalid_read_tree_path(path, diagnostics);
-        }
-    }
-    Ok(())
-}
-
-fn invalid_read_tree_path(
-    path: &[u8],
-    diagnostics: &mut dyn ReadTreeDiagnostics,
-) -> ReadTreeTransitionResult<()> {
     diagnostics.invalid_path(path);
     Err(ReadTreeTransitionError::InvalidPath(path.to_vec()))
-}
-
-fn is_hfs_dotgit(name: &[u8]) -> bool {
-    strip_hfs_ignorable(name).eq_ignore_ascii_case(b".git")
-}
-
-fn is_hfs_dotgitmodules(name: &[u8]) -> bool {
-    strip_hfs_ignorable(name).eq_ignore_ascii_case(b".gitmodules")
-}
-
-fn is_ntfs_dotgit(name: &[u8]) -> bool {
-    for segment in name.split(|&byte| byte == b'\\') {
-        let stream_name = segment
-            .iter()
-            .position(|&byte| byte == b':')
-            .map_or(segment, |colon| &segment[..colon]);
-        let mut end = stream_name.len();
-        while end > 0 && matches!(stream_name[end - 1], b'.' | b' ') {
-            end -= 1;
-        }
-        let trimmed = &stream_name[..end];
-        if trimmed.eq_ignore_ascii_case(b".git") || trimmed.eq_ignore_ascii_case(b"git~1") {
-            return true;
-        }
-    }
-    false
-}
-
-fn is_ntfs_dotgitmodules(name: &[u8]) -> bool {
-    is_ntfs_dot_name(name, b".gitmodules", b"gitmodules", b"gi7eba")
-}
-
-fn is_ntfs_dot_name(name: &[u8], long: &[u8], short_base: &[u8], fallback: &[u8]) -> bool {
-    for segment in name.split(|&byte| byte == b'\\') {
-        let stream_name = segment
-            .iter()
-            .position(|&byte| byte == b':')
-            .map_or(segment, |colon| &segment[..colon]);
-        let mut end = stream_name.len();
-        while end > 0 && matches!(stream_name[end - 1], b'.' | b' ') {
-            end -= 1;
-        }
-        let trimmed = &stream_name[..end];
-        if trimmed.eq_ignore_ascii_case(long) {
-            return true;
-        }
-        if short_base.len() >= 6
-            && trimmed.len() == 8
-            && trimmed[..6].eq_ignore_ascii_case(&short_base[..6])
-            && trimmed[6] == b'~'
-            && matches!(trimmed[7], b'1'..=b'4')
-        {
-            return true;
-        }
-        if trimmed.len() == 8 && trimmed[..fallback.len()].eq_ignore_ascii_case(fallback) {
-            let mut saw_tilde = false;
-            let mut ok = true;
-            for byte in trimmed.iter().take(8).skip(fallback.len()) {
-                if saw_tilde {
-                    ok &= byte.is_ascii_digit();
-                } else if *byte == b'~' {
-                    saw_tilde = true;
-                } else {
-                    ok = false;
-                }
-            }
-            if ok && saw_tilde {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn strip_hfs_ignorable(name: &[u8]) -> Vec<u8> {
-    let Ok(text) = std::str::from_utf8(name) else {
-        return name.to_vec();
-    };
-    text.chars()
-        .filter(|ch| !is_hfs_ignorable(*ch))
-        .collect::<String>()
-        .into_bytes()
-}
-
-fn is_hfs_ignorable(ch: char) -> bool {
-    matches!(
-        ch as u32,
-        0x200c | 0x200d | 0x200e | 0x200f | 0x202a..=0x202e | 0x206a..=0x206f
-        | 0xfeff | 0x00ad | 0x034f | 0x115f | 0x1160 | 0x17b4 | 0x17b5 | 0x2060..=0x2064
-    )
 }
 
 /// Read the current stage-zero index into path/mode/object form.

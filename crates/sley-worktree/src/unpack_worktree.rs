@@ -9,6 +9,7 @@
 
 use super::*;
 use crate::index_io::{original_cwd_absolute, path_is_original_cwd};
+use crate::worktree_write::WorktreeLeaf;
 use std::io;
 
 /// Which command's porcelain error strings the engine's safety checks should
@@ -524,6 +525,12 @@ pub fn checkout_two_way_engine(
         None => None,
     };
     let new_leaves = sley_diff_merge::flatten_tree(db, format, new_tree)?;
+    crate::path_safety::verify_entry_paths(
+        &crate::path_safety::checkout_path_policy(repo_config),
+        new_leaves
+            .iter()
+            .map(|(path, (mode, _))| (path.as_slice(), *mode)),
+    )?;
     let mut sparse_paths = index.keys().cloned().collect::<BTreeSet<_>>();
     if let Some(old_leaves) = old_leaves.as_ref() {
         sparse_paths.extend(old_leaves.keys().cloned());
@@ -832,23 +839,22 @@ fn write_blob_to_worktree(
     mode: u32,
     oid: &ObjectId,
 ) -> Result<Option<sley_unpack_trees::StatInfo>> {
-    let Some(file_path) = safe_worktree_path(worktree_root, path) else {
-        return Err(GitError::InvalidPath(format!(
-            "invalid worktree path {}",
-            String::from_utf8_lossy(path)
-        )));
-    };
+    // git verifies every path as unpack-trees adds it to the result index;
+    // callers that hand entries straight to this writer get the same check.
+    crate::path_safety::checkout_path_policy(config).verify_path(path, mode)?;
 
     // A gitlink is a directory git leaves to the submodule move-head machinery;
     // it never reads an object here. Ensure the directory exists (an
     // already-populated submodule is left untouched) and record a zeroed stat,
     // exactly as git's `write_entry` S_IFGITLINK arm and `materialize_tree_entry`.
+    // Parents are created and the leaf replaced without following symlinks
+    // (`WorktreeLeaf`), which also refuses `.git` and path traversal.
     if sley_index::is_gitlink(mode) {
-        create_leading_directories(original_cwd, worktree_root, &file_path)?;
-        if fs::symlink_metadata(&file_path).is_ok_and(|md| !md.is_dir()) {
-            remove_path_in_the_way(original_cwd, &file_path)?;
-        }
-        fs::create_dir_all(&file_path)?;
+        WorktreeLeaf::open(original_cwd, worktree_root, path, mode)?.ensure_dir(
+            original_cwd,
+            refuse_remove_current_working_directory_absolute,
+            false,
+        )?;
         return Ok(None);
     }
 
@@ -863,29 +869,20 @@ fn write_blob_to_worktree(
     // Create leading directories FIRST, unlinking a non-dir in the way of a
     // needed component (git's `create_directories`, the file→dir transition:
     // a tracked file `p` being replaced by `p/child` must first become a dir).
-    // This must precede the final-path probe below, which would otherwise see
-    // ENOTDIR trying to stat `p/child` under a file `p`.
-    create_leading_directories(original_cwd, worktree_root, &file_path)?;
     // Then remove whatever currently occupies the final path: a directory
     // subtree (the D/F dir→file transition, git's `remove_subtree`) or any
     // file/symlink. `force` is always set here.
-    remove_path_in_the_way(original_cwd, &file_path)?;
+    let leaf = WorktreeLeaf::open(original_cwd, worktree_root, path, mode)?;
+    leaf.remove_existing(
+        original_cwd,
+        refuse_remove_current_working_directory_absolute,
+    )?;
 
     if (mode & 0o170000) == 0o120000 {
         // Symlink: the blob bytes are the link target, opaque to clean/smudge.
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStringExt;
-            let target =
-                std::path::PathBuf::from(std::ffi::OsString::from_vec(object.body.clone()));
-            std::os::unix::fs::symlink(&target, &file_path)?;
-        }
-        #[cfg(not(unix))]
-        {
-            // No symlink support: fall back to writing the link text as a regular
-            // file, matching git's behaviour on filesystems without symlinks.
-            fs::write(&file_path, &object.body)?;
-        }
+        // Without symlink support the link text is written as a regular file,
+        // matching git's behaviour on filesystems without symlinks.
+        leaf.create_symlink(&object.body)?;
     } else {
         let body = match tree_attributes {
             Some(attributes) => attributes.apply_smudge_filter(config, path, &object.body)?,
@@ -893,24 +890,25 @@ fn write_blob_to_worktree(
                 apply_smudge_filter(worktree_root, git_dir, format, config, path, &object.body)?
             }
         };
-        fs::write(&file_path, &body)?;
+        let file = leaf.create_file(&body, mode)?;
         // Executable bit: 0o100755 → +x, 0o100644 → plain. git only honours the
         // user-execute bit when deciding the index mode, so set/clear it here.
         #[cfg(unix)]
         if (mode & 0o170000) == 0o100000 {
             use std::os::unix::fs::PermissionsExt;
-            let perms = fs::symlink_metadata(&file_path)?.permissions();
-            let mut bits = perms.mode();
+            let mut bits = file.metadata()?.permissions().mode();
             if mode & 0o111 != 0 {
                 bits |= 0o111;
             } else {
                 bits &= !0o111;
             }
-            fs::set_permissions(&file_path, fs::Permissions::from_mode(bits))?;
+            file.set_permissions(fs::Permissions::from_mode(bits))?;
         }
+        #[cfg(not(unix))]
+        drop(file);
     }
 
-    Ok(Some(stat_info_from_lstat(&file_path)?))
+    Ok(Some(stat_info_from_lstat(leaf.path())?))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1099,59 +1097,12 @@ pub fn remove_path_in_the_way(
         }
         // Nothing there (`NotFound`) or a non-directory leading component
         // (`NotADirectory`/ENOTDIR — only possible if a parent was not turned
-        // into a directory, which `create_leading_directories` already does)
+        // into a directory, which `WorktreeLeaf::open` already does)
         // means there is nothing to clear.
         Err(err)
             if err.kind() == io::ErrorKind::NotFound
                 || err.kind() == io::ErrorKind::NotADirectory => {}
         Err(err) => return Err(err.into()),
-    }
-    Ok(())
-}
-
-/// git's `create_directories`: create every leading directory of `file_path`
-/// up from (and excluding) `worktree_root`, unlinking a non-directory in the way
-/// of a needed component (the file→dir transition). `fs::create_dir_all` handles
-/// the common all-missing case; the per-component fallback handles a regular
-/// file or symlink sitting where a directory must be.
-fn create_leading_directories(
-    original_cwd: Option<&std::path::Path>,
-    worktree_root: &Path,
-    file_path: &Path,
-) -> Result<()> {
-    let Some(parent) = file_path.parent() else {
-        return Ok(());
-    };
-    // NOTE: `fs::create_dir_all` treats an existing *file* at a needed component
-    // as success (the mkdir gets EEXIST, which create_dir_all swallows without
-    // checking the type), so it canNOT be trusted for the D/F file→dir
-    // transition. Walk each leading component and, where a non-directory blocks
-    // a needed directory, unlink it and create the directory (git's
-    // `mkdir → EEXIST && force → unlink → mkdir`).
-    let mut cur = worktree_root.to_path_buf();
-    let rel = parent.strip_prefix(worktree_root).unwrap_or(parent);
-    for component in rel.components() {
-        let std::path::Component::Normal(name) = component else {
-            continue;
-        };
-        cur.push(name);
-        match fs::symlink_metadata(&cur) {
-            Ok(md) if md.is_dir() => {}
-            Ok(_) => {
-                if path_is_original_cwd(original_cwd, &cur) {
-                    return refuse_remove_current_working_directory_absolute(&cur);
-                }
-                fs::remove_file(&cur)?;
-                fs::create_dir(&cur)?;
-            }
-            Err(err)
-                if err.kind() == io::ErrorKind::NotFound
-                    || err.kind() == io::ErrorKind::NotADirectory =>
-            {
-                fs::create_dir(&cur)?;
-            }
-            Err(err) => return Err(err.into()),
-        }
     }
     Ok(())
 }

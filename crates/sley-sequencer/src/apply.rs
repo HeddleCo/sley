@@ -162,109 +162,14 @@ pub fn merge_write_worktree_file(
     content: &[u8],
     mode: u32,
 ) -> Result<()> {
-    let rel = std::str::from_utf8(path)
-        .map_err(|_| GitError::InvalidFormat("non-utf8 worktree path".into()))?;
-    let full = worktree_root.join(rel);
-    if let Some(parent) = full.parent() {
-        // A regular file may occupy one of the ancestor path components (the D/F
-        // case: HEAD had `dir` as a file, the merge now needs `dir/<child>`). git
-        // removes the blocking file before materializing the directory subtree, so
-        // clear any non-directory ancestor before `create_dir_all`, which would
-        // otherwise fail with EEXIST/ENOTDIR.
-        remove_blocking_file_ancestors(worktree_root, rel)?;
-        std::fs::create_dir_all(parent)?;
-    }
-    if is_gitlink(mode) {
-        // Gitlink (submodule) entry: the `oid` is a *commit*, not a blob, so it
-        // must NOT be written as file content. git's entry.c `write_entry`
-        // S_IFGITLINK arm only `mkdir`s the submodule directory
-        // (`submodule_move_head` — the embedded checkout — is a higher layer
-        // sley does not perform), preserving an already-populated submodule
-        // checkout.
-        if full.is_dir() {
-            return Ok(());
-        }
-        merge_unlink_path_in_the_way(original_cwd, &full)?;
-        std::fs::create_dir_all(&full)?;
-        return Ok(());
-    }
-    // Unlink whatever is in the way first (git's entry.c `write_entry`), so a type
-    // change (regular file ⇄ symlink) is overwritten rather than written *through*
-    // an existing symlink or left stale — the symlink-stash-apply / merge cases.
-    merge_unlink_path_in_the_way(original_cwd, &full)?;
-    if (mode & 0o170000) == 0o120000 {
-        // Symlink entry (mode 120000): the blob bytes are the link target.
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStringExt;
-            let target = std::path::PathBuf::from(std::ffi::OsString::from_vec(content.to_vec()));
-            std::os::unix::fs::symlink(&target, &full)?;
-        }
-        #[cfg(not(unix))]
-        std::fs::write(&full, content)?;
-    } else {
-        std::fs::write(&full, content)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms =
-                std::fs::Permissions::from_mode(if mode == 0o100755 { 0o755 } else { 0o644 });
-            std::fs::set_permissions(&full, perms)?;
-        }
-    }
-    Ok(())
-}
-
-/// Remove whatever currently occupies `full` (lstat-based, so a dangling symlink
-/// is removed as the link, not followed) before a merge materializes a new object
-/// there. A directory in the way is removed recursively (D/F transition).
-fn merge_unlink_path_in_the_way(original_cwd: Option<&std::path::Path>, full: &Path) -> Result<()> {
-    match std::fs::symlink_metadata(full) {
-        Ok(metadata) => {
-            if metadata.is_dir() {
-                if merge_path_is_original_cwd(original_cwd, full) {
-                    return merge_refuse_remove_current_working_directory(full);
-                }
-                match std::fs::remove_dir_all(full) {
-                    Ok(()) => {}
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(err) => return Err(err.into()),
-                }
-            } else {
-                std::fs::remove_file(full)?;
-            }
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err.into()),
-    }
-    Ok(())
-}
-
-/// Remove any regular file occupying an ancestor directory component of `rel`
-/// (relative worktree path). This clears the D/F case where a file (e.g. `dir`)
-/// blocks the creation of a directory subtree (`dir/child`). Only plain files
-/// are removed — an existing directory ancestor is left intact, and a symlink
-/// ancestor is unlinked (git would not write through it).
-fn remove_blocking_file_ancestors(worktree_root: &Path, rel: &str) -> Result<()> {
-    let mut prefix = String::new();
-    let mut components = rel.split('/').peekable();
-    while let Some(component) = components.next() {
-        // Stop before the leaf — only ancestors (directory components) matter.
-        if components.peek().is_none() {
-            break;
-        }
-        if !prefix.is_empty() {
-            prefix.push('/');
-        }
-        prefix.push_str(component);
-        let candidate = worktree_root.join(&prefix);
-        match std::fs::symlink_metadata(&candidate) {
-            Ok(meta) if !meta.is_dir() => std::fs::remove_file(&candidate)?,
-            Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
-        }
-    }
+    // git's entry.c `write_entry`: create leading directories (replacing a
+    // file or symlink in the way, the D/F case), unlink whatever occupies the
+    // leaf so a type change is overwritten rather than written *through* a
+    // symlink, then create the entry by mode. A gitlink only gets its
+    // directory; the embedded checkout is a higher layer. The shared writer
+    // never follows a symlink and refuses `.git` and `..` components, so a
+    // merged tree cannot write outside the worktree or into the repository.
+    sley_worktree::write_worktree_entry(original_cwd, worktree_root, path, mode, content)?;
     Ok(())
 }
 

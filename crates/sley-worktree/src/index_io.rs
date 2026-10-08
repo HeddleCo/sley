@@ -9,6 +9,7 @@ use crate::filter::*;
 use crate::ignore::*;
 use crate::index::*;
 use crate::types_admin::*;
+use crate::worktree_write::replace_worktree_blob;
 
 pub(crate) fn restore_index_entry(
     original_cwd: Option<&std::path::Path>,
@@ -50,8 +51,7 @@ pub(crate) fn restore_index_entry_maybe_delayed(
     // exists and never touches an object; the submodule's content is `submodule
     // update` territory. Single gitlink rule via `sley_index::is_gitlink`.
     if sley_index::is_gitlink(entry.mode) {
-        let dir_path = worktree_path(worktree_root, entry.path.as_bytes())?;
-        materialize_gitlink_dir(original_cwd, worktree_root, &dir_path)?;
+        materialize_gitlink_dir(original_cwd, worktree_root, entry.path.as_bytes())?;
         return Ok(None);
     }
     let file_path = worktree_path(worktree_root, entry.path.as_bytes())?;
@@ -103,9 +103,14 @@ pub(crate) fn restore_index_entry_maybe_delayed(
         }
         None => Cow::Borrowed(&object.body),
     };
-    prepare_blob_parent_dirs(worktree_root, &file_path)?;
-    remove_existing_worktree_path(original_cwd, &file_path)?;
-    write_blob_body_or_symlink(&file_path, entry.mode, &body, &object.body)?;
+    let file_path = replace_worktree_blob(
+        original_cwd,
+        worktree_root,
+        entry.path.as_bytes(),
+        entry.mode,
+        &body,
+        &object.body,
+    )?;
     let metadata = fs::symlink_metadata(&file_path)?;
     Ok(Some(index_entry_with_refreshed_stat(entry, &metadata)))
 }
