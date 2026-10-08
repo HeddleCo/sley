@@ -2236,3 +2236,13 @@ pub(crate) fn path_has_trailing_separator(path: &Path) -> bool {
         .to_string_lossy()
         .ends_with(std::path::MAIN_SEPARATOR)
 }
+
+
+#[cfg(all(test, windows))]
+mod windows_path_tests {
+    use super::*;
+    #[test]
+    fn worktree_path_rejects_bare_root_components() {
+        assert!(worktree_path(Path::new(r"C:\worktree"), br"\escape").is_err());
+    }
+}

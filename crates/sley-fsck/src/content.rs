@@ -1780,6 +1780,16 @@ fn verify_ordered(
 mod tests {
     use super::*;
 
+
+    #[test]
+    fn alias_detection_uses_exact_git_hfs_and_ntfs_rules() {
+        assert!(is_dotgit_name(b".git:stream"));
+        assert!(is_dotgit_name(b"GIT~1..."));
+        assert!(is_dotgitmodules_name(b".gitmodules\xff")); // malformed UTF-8 ends the HFS view
+        assert!(!is_dotgit_name(".g\u{00ad}it".as_bytes()));
+        assert!(!is_dotgitmodules_name(".git\u{034f}modules".as_bytes()));
+    }
+
     fn ids(findings: &[ContentFinding]) -> Vec<&'static str> {
         findings.iter().map(|f| f.msg_id.camel()).collect()
     }

@@ -4704,6 +4704,25 @@ mod checkout_parent_safety_tests {
         assert!(!outside.path().join("file").exists());
     }
 
+
+    #[test]
+    fn parallel_workers_enforce_the_callers_policy_at_the_write() {
+        let root = tempfile::tempdir().expect("worktree");
+        let config = GitConfig::parse(b"[checkout]\n workers = 2\n thresholdForParallelism = 0\n").expect("workers config");
+        let policy = WorktreePathPolicy::default().reserve_root_name(".heddle");
+        let _guard = crate::path_safety::scope_worktree_path_policy(&policy);
+        // Hand prepared entries straight to the worker queue, bypassing preflight.
+        let prepared = vec![PreparedCheckoutEntry {
+            path: b".heddle/config".to_vec(),
+            entry: TrackedEntry { mode: 0o100644, oid: ObjectId::null(ObjectFormat::Sha1) },
+            body: Some(b"content".to_vec()),
+            index_template: None,
+        }];
+        let result = materialize_prepared_checkout_entries(None, root.path(), &config, prepared);
+        assert!(matches!(result, Err(GitError::InvalidPath(_))), "{result:?}");
+        assert!(!root.path().join(".heddle").exists());
+    }
+
     #[test]
     fn parallel_materializer_uses_queue_and_serializes_shared_prefix() {
         let root = tempfile::tempdir().expect("temporary worktree");

@@ -687,3 +687,135 @@ fn verdicts_match_real_git() {
         assert!(!repo.git_dir.join("hooks/post-checkout").exists());
     }
 }
+
+
+#[test]
+fn standalone_writer_enforces_configured_alias_rules() {
+    for path in [b".git./hooks/x".as_slice(), b"GIT~1/hooks/x", ".g\u{200c}it/hooks/x".as_bytes()] {
+        let repo = Repo::new();
+        let result = sley_worktree::write_worktree_entry(None, &repo.root, path, 0o100644, b"content");
+        assert!(matches!(result, Err(sley_core::GitError::InvalidPath(_))), "{path:?}: {result:?}");
+        assert!(repo.worktree_listing().is_empty());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn reset_removal_treats_symlinked_parent_as_absent() {
+    let repo = Repo::new();
+    let first = repo.commit(&[(b"A/authorized_keys", 0o100644, b"tracked")]);
+    run_checkout(&repo, Entry::Reset, &first).expect("first reset");
+    let outside = repo.outside.join("outside");
+    fs::create_dir(&outside).expect("outside directory");
+    fs::write(outside.join("authorized_keys"), b"outside").expect("outside file");
+    fs::remove_dir_all(repo.root.join("A")).expect("remove tracked directory");
+    std::os::unix::fs::symlink(&outside, repo.root.join("A")).expect("parent symlink");
+    let second = repo.commit(&[]);
+    run_checkout(&repo, Entry::Reset, &second).expect("second reset");
+    assert_eq!(fs::read(outside.join("authorized_keys")).expect("outside file survives"), b"outside");
+    assert!(fs::symlink_metadata(repo.root.join("A")).expect("parent unchanged").file_type().is_symlink());
+}
+
+#[cfg(unix)]
+#[test]
+fn sparse_reset_removal_treats_symlinked_parent_as_absent() {
+    let repo = Repo::new();
+    let commit = repo.commit(&[(b"A/authorized_keys", 0o100644, b"tracked")]);
+    run_checkout(&repo, Entry::Reset, &commit).expect("first reset");
+    let outside = repo.outside.join("outside");
+    fs::create_dir(&outside).expect("outside directory");
+    fs::write(outside.join("authorized_keys"), b"outside").expect("outside file");
+    fs::remove_dir_all(repo.root.join("A")).expect("remove tracked directory");
+    std::os::unix::fs::symlink(&outside, repo.root.join("A")).expect("parent symlink");
+    fs::write(repo.git_dir.join("config"), b"[core]\n bare = false\n sparseCheckout = true\n sparseCheckoutCone = false\n").expect("sparse config");
+    fs::write(repo.git_dir.join("info/sparse-checkout"), b"/included/\n").expect("sparse patterns");
+    run_checkout(&repo, Entry::Reset, &commit).expect("sparse reset");
+    assert_eq!(fs::read(outside.join("authorized_keys")).expect("outside file survives"), b"outside");
+}
+
+#[cfg(unix)]
+#[test]
+fn reset_skips_case_colliding_symlink_and_preserves_both_index_entries() {
+    let repo = Repo::new();
+    fs::write(repo.git_dir.join("config"), b"[core]\n bare = false\n ignoreCase = true\n").expect("case-insensitive config");
+    let commit = repo.commit(&[(b"A/authorized_keys", 0o100644, b"tracked"), (b"a", 0o120000, b"../outside")]);
+    run_checkout(&repo, Entry::Reset, &commit).expect("reset");
+    assert!(!repo.root.join("a").is_symlink(), "colliding symlink must not be materialized");
+    assert_eq!(fs::read(repo.root.join("A/authorized_keys")).expect("first path retained"), b"tracked");
+    let index = sley_index::Index::parse(&fs::read(repo.git_dir.join("index")).expect("index"), FORMAT).expect("parse index");
+    assert_eq!(index.entries.len(), 2);
+    assert_eq!(index.entries[1].size, 0, "colliding entry has no worktree stat");
+}
+
+#[cfg(unix)]
+#[test]
+fn reset_collision_and_removal_on_case_insensitive_filesystem() {
+    let repo = Repo::new();
+    // Try setting casefold on an EMPTY directory before creating the repository.
+    // Native case-insensitive volumes (e.g. macOS) need no chattr.
+    let folded = repo.outside.join("casefold");
+    fs::create_dir(&folded).expect("empty casefold directory");
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("chattr").arg("+F").arg(&folded).output();
+    fs::write(folded.join("probe"), b"probe").expect("probe");
+    let insensitive = folded.join("PROBE").exists();
+    fs::remove_file(folded.join("probe")).expect("remove probe");
+    if !insensitive {
+        eprintln!("skipping casefold reset regression: no case-insensitive filesystem at {}", folded.display());
+        return;
+    }
+    fs::rename(&repo.root, folded.join("worktree")).expect("move fixture onto casefold filesystem");
+    let repo = Repo {
+        root: folded.join("worktree"),
+        git_dir: folded.join("worktree/.git"),
+        db: FileObjectDatabase::from_git_dir(folded.join("worktree/.git"), FORMAT),
+        ..repo
+    };
+    let outside = repo.outside.join("outside");
+    fs::create_dir(&outside).expect("outside directory");
+    fs::write(outside.join("authorized_keys"), b"outside").expect("outside file");
+    let target = outside.as_os_str().as_encoded_bytes();
+    let first = repo.commit(&[(b"A/authorized_keys", 0o100644, b"tracked"), (b"a", 0o120000, target)]);
+    run_checkout(&repo, Entry::Reset, &first).expect("first reset");
+    assert!(fs::symlink_metadata(repo.root.join("A")).expect("directory").is_dir(), "reset must skip colliding symlink");
+    // Also exercise an index/worktree left by the old reset implementation:
+    // the index retains A/authorized_keys while its parent aliases a symlink.
+    fs::remove_dir_all(repo.root.join("A")).expect("remove directory");
+    std::os::unix::fs::symlink(&outside, repo.root.join("a")).expect("legacy colliding parent");
+    let second = repo.commit(&[]);
+    run_checkout(&repo, Entry::Reset, &second).expect("second reset");
+    assert_eq!(fs::read(outside.join("authorized_keys")).expect("outside file survives"), b"outside");
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_blob_writer_refuses_symlinks_at_leaf_and_in_parents() {
+    for parent_link in [false, true] {
+        let repo = Repo::new();
+        let outside = repo.outside.join("outside");
+        fs::create_dir(&outside).expect("outside directory");
+        fs::write(outside.join("file"), b"outside").expect("outside file");
+        let path = if parent_link {
+            std::os::unix::fs::symlink(&outside, repo.root.join("link")).expect("parent link");
+            repo.root.join("link/file")
+        } else {
+            std::os::unix::fs::symlink(outside.join("file"), repo.root.join("file")).expect("leaf link");
+            repo.root.join("file")
+        };
+        assert!(sley_worktree::write_blob_body_or_symlink(&path, 0o100644, b"new", b"new").is_err());
+        assert_eq!(fs::read(outside.join("file")).expect("outside file survives"), b"outside");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_checkout_refuses_root_backslash_and_win32_names() {
+    let policy = sley_worktree::WorktreePathPolicy::default();
+    for path in [r"\Users\Public\x", r"a\b", "C:relative", "AUX.txt", "dir/LPT0", "dir/COM9", "CONIN$", "CONOUT$", "a:stream", "a.", "a ", "a?b", "a\u{1f}b"] {
+        assert!(!policy.is_valid_path(path.as_bytes(), 0o100644), "{path:?}");
+        let repo = Repo::new();
+        let commit = repo.commit(&[(path.as_bytes(), 0o100644, b"content")]);
+        assert!(run_checkout(&repo, Entry::Reset, &commit).is_err(), "{path:?}");
+        assert!(repo.worktree_listing().is_empty());
+    }
+}
