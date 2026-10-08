@@ -182,8 +182,8 @@ pub use pack_plan::{
     ReachablePackSummary,
 };
 pub use refs::{
-    DeleteRef, HeadUpdateOptions, RefBatchChange, RefChange, RefChangeResult, RefConflict,
-    RefDeleteExpected, RefUpdateOptions, ReflogMessage,
+    DeleteRef, DeleteRefName, HeadUpdateOptions, RefBatchChange, RefChange, RefChangeResult,
+    RefConflict, RefDeleteExpected, RefUpdateOptions, ReflogMessage,
 };
 pub use refspec::{NegativeRefSpec, RefSpec};
 pub use rev_graph::{ReachableCommit, ReachableCommitOptions, RevGraph};
@@ -1084,6 +1084,15 @@ impl Repository {
 
     /// Look up a reference by full name (e.g. `refs/heads/main`, `refs/tags/v1`,
     /// or `HEAD`), returning `None` if it does not exist.
+    ///
+    /// # Errors
+    ///
+    /// A name that is not a valid [`FullName`] (that is, one
+    /// `git check-ref-format --allow-onelevel` rejects, such as
+    /// `refs/heads/a..b` or a broken on-disk ref like `refs/heads/x:y`) returns
+    /// `Err`, not `Ok(None)`, even when a loose file of that name exists. To
+    /// inspect or remove such a ref, read it through [`Repository::references`]
+    /// and delete it with a [`DeleteRefName`].
     pub fn find_reference(&self, name: &str) -> Result<Option<Reference>> {
         let name = FullName::new(name)?;
         let refs = self.references();

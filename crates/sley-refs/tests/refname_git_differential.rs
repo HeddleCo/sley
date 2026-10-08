@@ -214,6 +214,35 @@ fn corpus() -> Vec<String> {
     names.push(format!("refs/heads/{}\u{00A0}", "n".repeat(4000)));
     names.push(format!("refs/heads/{}.lock", "a".repeat(500)));
 
+    // Rebase-todo labels (`#` is special-cased by the sequencer), update-ref
+    // todo targets, bisect terms as `refs/bisect/<term>`, and names that only
+    // `refname_is_safe` distinguishes.
+    for name in [
+        "#",
+        "onto",
+        "branch-point",
+        "heads/topic",
+        "refs/bisect/new",
+        "refs/bisect/a/b",
+        "refs/bisect/-x",
+        "refs/bisect/x@{y",
+        "refs/bisect/@",
+        "refs/",
+        "refs/.",
+        "refs/..",
+        "refs/heads/./x",
+        "refs/heads/a/../b",
+        "refs/heads/a/..",
+        "refs/heads/../../x",
+        "ORIG_HEAD",
+        "HEAD_",
+        "_",
+        "Head",
+        "my-file",
+    ] {
+        names.push(name.into());
+    }
+
     names
 }
 
@@ -294,6 +323,84 @@ fn sley_refs_check_refname_format_matches_git() {
         "sley_refs::check_refname_format",
         &MODES[..2],
         |name, mode| sley_refs::check_refname_format(name, mode.allow_onelevel).is_ok(),
+    );
+}
+
+/// Ask the real git whether `name` passes the delete gate. `git update-ref -d`
+/// checks `refname_is_safe` (not `check_refname_format`) for deletions. The
+/// repository is unborn, so no ref exists and every safe name deletes as a
+/// no-op. Returns `None` for git's pseudorefs, which are refused before the
+/// name check.
+fn git_delete_verdict(git_dir: &std::path::Path, name: &str) -> Option<bool> {
+    let output = Command::new("git")
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(["update-ref", "-d", "--", name])
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run `git update-ref -d`: {err}"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Pseudorefs are refused before the name check. A lock failure (for
+    // example a component longer than the filesystem's NAME_MAX) happens
+    // after the name check passed, so the name itself was accepted.
+    if stderr.contains("refusing to update pseudoref") {
+        return None;
+    }
+    if stderr.contains("cannot lock ref") {
+        return Some(true);
+    }
+    if stderr.contains("refusing to update ref with bad name") {
+        return Some(false);
+    }
+    assert!(
+        output.status.success(),
+        "`git update-ref -d -- {}` failed unexpectedly: {stderr}",
+        abbreviate(name)
+    );
+    Some(true)
+}
+
+#[test]
+fn sley_refs_refname_is_safe_matches_git_delete_gate() {
+    let git_dir = std::env::temp_dir().join(format!(
+        "sley-refname-is-safe-oracle-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&git_dir);
+    let init = Command::new("git")
+        .args(["init", "-q", "--bare"])
+        .arg(&git_dir)
+        .status()
+        .expect("git init");
+    assert!(init.success());
+
+    let names = corpus();
+    let mut compared = 0usize;
+    let mut mismatches = Vec::new();
+    for name in &names {
+        let Some(git) = git_delete_verdict(&git_dir, name) else {
+            continue;
+        };
+        compared += 1;
+        let sley = sley_refs::refname_is_safe(name);
+        if sley != git {
+            mismatches.push(format!(
+                "  {}: git={} sley={}",
+                abbreviate(name),
+                if git { "safe" } else { "unsafe" },
+                if sley { "safe" } else { "unsafe" },
+            ));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&git_dir);
+    assert!(
+        mismatches.is_empty(),
+        "refname_is_safe: {} of {compared} verdicts differ from git update-ref -d:\n{}",
+        mismatches.len(),
+        mismatches.join("\n"),
+    );
+    eprintln!(
+        "refname_is_safe: {compared} verdicts over {} names match git",
+        names.len()
     );
 }
 

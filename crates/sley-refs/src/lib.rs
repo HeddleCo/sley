@@ -6599,11 +6599,17 @@ pub fn validate_ref_name_for_update(name: &str) -> Result<()> {
 }
 
 /// git's `refname_is_safe` (refs.c): the gate applied when *deleting* a ref
-/// (`transaction_refname_valid` with a null new-oid). It is stricter than the
-/// create-time `check_refname_format(_, REFNAME_ALLOW_ONELEVEL)`:
-///   - a name under `refs/` is safe when the remainder is non-empty, has no
-///     leading/trailing `/`, and does not escape `refs/` (`..`, absolute,
-///     backslash component);
+/// (`transaction_refname_valid` with a null new-oid). It differs from the
+/// create-time `check_refname_format(_, REFNAME_ALLOW_ONELEVEL)` in both
+/// directions:
+///   - a name under `refs/` is safe when the remainder survives git's
+///     `normalize_path_copy` unchanged: it is non-empty and every `/`-separated
+///     component is non-empty and neither `.` nor `..`. Characters that
+///     `check_refname_format` forbids (`refs/heads/x:y`,
+///     `refs/heads/broken...ref`) are allowed, so a broken on-disk ref can
+///     still be deleted. On Windows, where git also treats `\` as a separator
+///     (and so normalisation changes the name), a `\` or a drive prefix makes
+///     the name unsafe;
 ///   - any other (one-level) name is safe only when every byte is an uppercase
 ///     ASCII letter or `_` — the pseudo-ref shape (`HEAD`, `ORIG_HEAD`).
 ///
@@ -6613,22 +6619,21 @@ pub fn validate_ref_name_for_update(name: &str) -> Result<()> {
 /// keeps `update-ref -d` from unlinking arbitrary files inside `.git`.
 pub fn refname_is_safe(refname: &str) -> bool {
     if let Some(rest) = refname.strip_prefix("refs/") {
-        if rest.is_empty() || rest.starts_with('/') || rest.ends_with('/') || rest.contains('\\') {
+        if cfg!(windows) && (rest.contains('\\') || has_dos_drive_prefix(rest)) {
             return false;
         }
-        let path = Path::new(rest);
-        !path.is_absolute()
-            && !path.components().any(|component| {
-                matches!(
-                    component,
-                    std::path::Component::ParentDir
-                        | std::path::Component::Prefix(_)
-                        | std::path::Component::RootDir
-                )
-            })
+        !rest.is_empty()
+            && rest
+                .split('/')
+                .all(|component| !component.is_empty() && component != "." && component != "..")
     } else {
         !refname.is_empty() && refname.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
     }
+}
+
+/// git's `has_dos_drive_prefix` (Windows only): `<letter>:`.
+fn has_dos_drive_prefix(path: &str) -> bool {
+    matches!(path.as_bytes(), [letter, b':', ..] if letter.is_ascii_alphabetic())
 }
 
 /// git's is_root_ref_syntax (refs.c): a ref name made only of uppercase ASCII,

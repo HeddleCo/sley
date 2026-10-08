@@ -8,16 +8,103 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sley_refs::{
     DeleteRef as StoreDeleteRef, RefDeleteError,
     RefDeletePrecondition as StoreRefDeletePrecondition, RefTarget, RefUpdate, ReflogEntry,
-    branch_ref_name,
+    branch_ref_name, refname_is_safe,
 };
 
 use crate::{FullName, GitError, ObjectId, Repository, Result};
 
+/// A ref name accepted for deletion.
+///
+/// Git gates deletion on `refname_is_safe` rather than on
+/// `check_refname_format`, so a ref whose on-disk name Git would refuse to
+/// create (`refs/heads/broken...ref`, `refs/heads/x:y`) can still be removed,
+/// as `git update-ref -d` allows. A name under `refs/` must not contain an
+/// empty, `.` or `..` component, and a one-level name must be pseudo-ref
+/// shaped (uppercase ASCII and `_`, such as `HEAD`); see
+/// [`sley_refs::refname_is_safe`]. Use [`FullName`] for names being created
+/// or updated.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DeleteRefName(String);
+
+impl DeleteRefName {
+    /// Validate `name` with git's delete-time `refname_is_safe` rule.
+    pub fn new(name: impl AsRef<str>) -> Result<Self> {
+        let name = name.as_ref();
+        if !refname_is_safe(name) {
+            return Err(GitError::InvalidFormat(format!(
+                "ref name is not safe to delete: {name:?}"
+            )));
+        }
+        Ok(Self(name.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for DeleteRefName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("DeleteRefName").field(&self.0).finish()
+    }
+}
+
+impl fmt::Display for DeleteRefName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for DeleteRefName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<DeleteRefName> for String {
+    fn from(value: DeleteRefName) -> Self {
+        value.0
+    }
+}
+
+impl TryFrom<&str> for DeleteRefName {
+    type Error = GitError;
+
+    fn try_from(value: &str) -> Result<Self> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for DeleteRefName {
+    type Error = GitError;
+
+    fn try_from(value: String) -> Result<Self> {
+        Self::new(value)
+    }
+}
+
+/// Not infallible: a valid one-level [`FullName`] such as `my-file` is not
+/// safe to delete.
+impl TryFrom<FullName> for DeleteRefName {
+    type Error = GitError;
+
+    fn try_from(value: FullName) -> Result<Self> {
+        Self::try_from(String::from(value))
+    }
+}
+
+impl PartialEq<&str> for DeleteRefName {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
 /// One ref delete to apply atomically via [`Repository::delete_ref`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeleteRef {
-    /// Full ref name (e.g. `refs/heads/main`).
-    pub name: FullName,
+    /// Full ref name (e.g. `refs/heads/main`), validated with the delete-time
+    /// rule (see [`DeleteRefName`]).
+    pub name: DeleteRefName,
     /// When set, the ref must currently point at this exact object id.
     pub expected_old: Option<ObjectId>,
     /// Optional richer delete precondition. When present, this takes precedence
@@ -730,7 +817,7 @@ mod tests {
         // A stale expected_old must still be rejected (precondition enforced).
         let stale = sley_core::ObjectId::null(repo.object_format());
         repo.delete_ref(DeleteRef {
-            name: FullName::new("refs/heads/main").expect("valid ref name"),
+            name: DeleteRefName::new("refs/heads/main").expect("valid ref name"),
             expected_old: Some(stale),
             expected: None,
             reflog: Some(ReflogMessage::new(b"delete main".to_vec())),
@@ -745,7 +832,7 @@ mod tests {
         );
 
         repo.delete_ref(DeleteRef {
-            name: FullName::new("refs/heads/main").expect("valid ref name"),
+            name: DeleteRefName::new("refs/heads/main").expect("valid ref name"),
             expected_old: Some(oid),
             expected: None,
             reflog: Some(ReflogMessage::new(b"delete main".to_vec())),
@@ -782,7 +869,7 @@ mod tests {
                 RefChange::new("refs/heads/feature", RefTarget::Direct(b)).expect("valid ref name"),
             ),
             RefBatchChange::Delete(DeleteRef {
-                name: FullName::new("refs/heads/main").expect("valid ref name"),
+                name: DeleteRefName::new("refs/heads/main").expect("valid ref name"),
                 expected_old: Some(a),
                 expected: None,
                 reflog: None,
@@ -824,7 +911,7 @@ mod tests {
                         .expect("valid ref name"),
                 ),
                 RefBatchChange::Delete(DeleteRef {
-                    name: FullName::new("refs/heads/main").expect("valid ref name"),
+                    name: DeleteRefName::new("refs/heads/main").expect("valid ref name"),
                     expected_old: Some(b),
                     expected: None,
                     reflog: None,
@@ -940,7 +1027,7 @@ mod tests {
         .expect("seed refs");
 
         repo.apply_ref_batch(&[RefBatchChange::Delete(DeleteRef {
-            name: FullName::new("refs/alias/main").expect("valid ref name"),
+            name: DeleteRefName::new("refs/alias/main").expect("valid ref name"),
             expected_old: None,
             expected: Some(RefDeleteExpected::Immediate(RefTarget::Symbolic(
                 "refs/heads/main".into(),
@@ -987,7 +1074,7 @@ mod tests {
         let committer = b"Heddle <actor@example.invalid> 7 +0000".to_vec();
 
         repo.apply_ref_batch(&[RefBatchChange::Delete(DeleteRef {
-            name: FullName::new("refs/heads/main").expect("valid ref name"),
+            name: DeleteRefName::new("refs/heads/main").expect("valid ref name"),
             expected_old: Some(oid),
             expected: None,
             reflog: Some(ReflogMessage::new(b"delete main".to_vec())),
@@ -1026,7 +1113,7 @@ mod tests {
         let committer = b"Heddle <actor@example.invalid> 7 +0000".to_vec();
 
         repo.delete_ref(DeleteRef {
-            name: FullName::new("refs/heads/main").expect("valid ref name"),
+            name: DeleteRefName::new("refs/heads/main").expect("valid ref name"),
             expected_old: Some(oid),
             expected: None,
             reflog: Some(ReflogMessage::new(b"delete main".to_vec())),
@@ -1058,7 +1145,7 @@ mod tests {
         .expect("seed refs");
 
         repo.delete_ref(DeleteRef {
-            name: FullName::new("refs/alias/main").expect("valid ref name"),
+            name: DeleteRefName::new("refs/alias/main").expect("valid ref name"),
             expected_old: None,
             expected: Some(RefDeleteExpected::Immediate(RefTarget::Symbolic(
                 "refs/heads/main".into(),
