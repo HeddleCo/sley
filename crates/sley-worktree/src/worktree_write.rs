@@ -692,6 +692,16 @@ mod tests {
     }
 
     #[test]
+    fn pruning_missing_directory_still_removes_empty_real_ancestors() {
+        let root = tempfile::tempdir().expect("worktree");
+        fs::create_dir(root.path().join("a")).expect("empty ancestor");
+        prune_worktree_dirs(None, root.path(), Some(&root.path().join("a/missing")))
+            .expect("missing directory is absent");
+        assert!(!root.path().join("a").exists());
+        assert!(root.path().is_dir());
+    }
+
+    #[test]
     fn removal_prunes_empty_real_parents_and_preserves_cwd() {
         let root = tempfile::tempdir().expect("worktree");
         fs::create_dir_all(root.path().join("a/b")).expect("parents");
@@ -930,17 +940,18 @@ impl ExistingWorktreeLeaf {
         }
     }
 
-    fn prune(&self, original_cwd: Option<&Path>) -> Result<()> {
-        for ((parent, name), path) in self
-            .dirs
-            .iter()
-            .zip(&self.names)
-            .zip(self.paths.iter().skip(1))
-            .rev()
-        {
+    fn prune(mut self, original_cwd: Option<&Path>) -> Result<()> {
+        for position in (1..self.dirs.len()).rev() {
+            let path = &self.paths[position];
             if crate::index_io::path_is_original_cwd(original_cwd, path) {
                 break;
             }
+            // Windows capability handles pin directories against deletion.
+            // Release this child before rmdir while retaining its parent;
+            // the removal still resolves only one name relative to that parent.
+            drop(self.dirs.pop());
+            let parent = self.parent()?;
+            let name = &self.names[position - 1];
             match parent.remove_dir(name) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -984,8 +995,18 @@ pub(crate) fn prune_worktree_dirs(
         .strip_prefix(root)
         .map_err(|_| GitError::InvalidPath(dir.display().to_string()))?;
     if let Some(leaf) = ExistingWorktreeLeaf::open(root, &git_path_bytes(relative))? {
-        let metadata = leaf.parent()?.symlink_metadata(leaf.name()?)?;
-        if metadata.is_dir() && !metadata.file_type().is_symlink() && leaf.remove(original_cwd)? {
+        let can_prune = match leaf.parent()?.symlink_metadata(leaf.name()?) {
+            Ok(metadata) => {
+                metadata.is_dir()
+                    && !metadata.file_type().is_symlink()
+                    && leaf.remove(original_cwd)?
+            }
+            // A move may already have removed this directory. Its held real
+            // ancestors can still be empty and should be pruned as before.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(error) => return Err(error.into()),
+        };
+        if can_prune {
             leaf.prune(original_cwd)?;
         }
     }
