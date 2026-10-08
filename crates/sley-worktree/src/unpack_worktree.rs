@@ -391,60 +391,16 @@ impl sley_unpack_trees::WorktreeWriter for ReadTreeWorktree<'_> {
         mode: u32,
         oid: &ObjectId,
     ) -> Result<Option<sley_unpack_trees::StatInfo>> {
-        write_tree_entry_to_worktree_with_hooks(
-            self.original_cwd.as_deref(),
-            &self.worktree_root,
-            &self.git_dir,
-            self.format,
-            self.db,
-            &self.repo_config,
-            None,
-            path,
-            mode,
-            oid,
-            self.recurse_submodules,
-            self.hooks,
-        )
+        let policy = WorktreePathPolicy::from_config(&self.repo_config);
+        self.with_path_policy(&policy).write_blob(path, mode, oid)
     }
 
     fn write_blobs(
         &mut self,
         entries: &[(Vec<u8>, u32, ObjectId)],
     ) -> Result<Vec<Option<sley_unpack_trees::StatInfo>>> {
-        let ordinary = entries
-            .iter()
-            .filter(|(_, mode, _)| !sley_index::is_gitlink(*mode))
-            .map(|(path, mode, oid)| CheckoutMaterializationEntry {
-                path: path.clone(),
-                mode: *mode,
-                oid: *oid,
-            })
-            .collect::<Vec<_>>();
-        let mut ordinary_stats = materialize_checkout_entries_with_database(
-            self.original_cwd.as_deref(),
-            &self.worktree_root,
-            &self.git_dir,
-            self.format,
-            self.db,
-            &self.repo_config,
-            self.tree_attributes.as_ref(),
-            &ordinary,
-        )?
-        .stats;
-        entries
-            .iter()
-            .map(|(path, mode, oid)| {
-                if sley_index::is_gitlink(*mode) {
-                    return self.write_blob(path, *mode, oid);
-                }
-                ordinary_stats.remove(path).ok_or_else(|| {
-                    GitError::Transaction(format!(
-                        "checkout worker did not report path '{}'",
-                        String::from_utf8_lossy(path)
-                    ))
-                })
-            })
-            .collect()
+        let policy = WorktreePathPolicy::from_config(&self.repo_config);
+        self.with_path_policy(&policy).write_blobs(entries)
     }
 
     fn remove_path(&mut self, path: &[u8]) -> Result<()> {
@@ -466,6 +422,97 @@ impl ReadTreeWorktree<'_> {
             .as_ref()
             .and_then(|set| set.from_path(path))
             .is_some()
+    }
+}
+
+/// Writer adapter preserving a caller policy across checkout worker threads.
+pub struct PathPolicyWorktreeWriter<'a, 'repo> {
+    worktree: &'a mut ReadTreeWorktree<'repo>,
+    policy: &'a WorktreePathPolicy,
+}
+
+impl<'repo> ReadTreeWorktree<'repo> {
+    /// Use this writer when applying an unpack plan with a caller policy.
+    pub fn with_path_policy<'a>(
+        &'a mut self,
+        policy: &'a WorktreePathPolicy,
+    ) -> PathPolicyWorktreeWriter<'a, 'repo> {
+        PathPolicyWorktreeWriter {
+            worktree: self,
+            policy,
+        }
+    }
+}
+
+impl sley_unpack_trees::WorktreeWriter for PathPolicyWorktreeWriter<'_, '_> {
+    fn write_blob(
+        &mut self,
+        path: &[u8],
+        mode: u32,
+        oid: &ObjectId,
+    ) -> Result<Option<sley_unpack_trees::StatInfo>> {
+        let wt = &self.worktree;
+        write_tree_entry_to_worktree_with_hooks_and_path_policy(
+            wt.original_cwd.as_deref(),
+            &wt.worktree_root,
+            &wt.git_dir,
+            wt.format,
+            wt.db,
+            &wt.repo_config,
+            wt.tree_attributes.as_ref(),
+            path,
+            mode,
+            oid,
+            wt.recurse_submodules,
+            wt.hooks,
+            self.policy,
+        )
+    }
+
+    fn write_blobs(
+        &mut self,
+        entries: &[(Vec<u8>, u32, ObjectId)],
+    ) -> Result<Vec<Option<sley_unpack_trees::StatInfo>>> {
+        let wt = &self.worktree;
+        let ordinary = entries
+            .iter()
+            .filter(|(_, mode, _)| !sley_index::is_gitlink(*mode))
+            .map(|(path, mode, oid)| CheckoutMaterializationEntry {
+                path: path.clone(),
+                mode: *mode,
+                oid: *oid,
+            })
+            .collect::<Vec<_>>();
+        let mut stats = materialize_checkout_entries_with_database_with_path_policy(
+            wt.original_cwd.as_deref(),
+            &wt.worktree_root,
+            &wt.git_dir,
+            wt.format,
+            wt.db,
+            &wt.repo_config,
+            wt.tree_attributes.as_ref(),
+            &ordinary,
+            self.policy,
+        )?
+        .stats;
+        entries
+            .iter()
+            .map(|(path, mode, oid)| {
+                if sley_index::is_gitlink(*mode) {
+                    return self.write_blob(path, *mode, oid);
+                }
+                stats.remove(path).ok_or_else(|| {
+                    GitError::Transaction(format!(
+                        "checkout worker did not report path '{}'",
+                        String::from_utf8_lossy(path)
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    fn remove_path(&mut self, path: &[u8]) -> Result<()> {
+        sley_unpack_trees::WorktreeWriter::remove_path(self.worktree, path)
     }
 }
 
@@ -515,6 +562,38 @@ pub fn checkout_two_way_engine(
     recurse_submodules: bool,
     overwrite_untracked: bool,
 ) -> Result<()> {
+    checkout_two_way_engine_with_path_policy(
+        original_cwd,
+        git_dir,
+        worktree_root,
+        format,
+        db,
+        repo_config,
+        old_tree,
+        new_tree,
+        porcelain,
+        recurse_submodules,
+        overwrite_untracked,
+        &WorktreePathPolicy::from_config(repo_config),
+    )
+}
+
+/// Two-way checkout with a caller policy shared with the unpack writer.
+#[allow(clippy::too_many_arguments)]
+pub fn checkout_two_way_engine_with_path_policy(
+    original_cwd: Option<&std::path::Path>,
+    git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    repo_config: &GitConfig,
+    old_tree: Option<&ObjectId>,
+    new_tree: &ObjectId,
+    porcelain: UnpackPorcelain,
+    recurse_submodules: bool,
+    overwrite_untracked: bool,
+    policy: &WorktreePathPolicy,
+) -> Result<()> {
     let previous_index = read_repository_index(git_dir, format)?;
     let mut index = read_current_unpack_index(git_dir, format)?;
 
@@ -526,7 +605,7 @@ pub fn checkout_two_way_engine(
     };
     let new_leaves = sley_diff_merge::flatten_tree(db, format, new_tree)?;
     crate::path_safety::verify_entry_paths(
-        &crate::path_safety::checkout_path_policy(repo_config),
+        policy,
         new_leaves
             .iter()
             .map(|(path, (mode, _))| (path.as_slice(), *mode)),
@@ -568,7 +647,7 @@ pub fn checkout_two_way_engine(
     let plan =
         sley_unpack_trees::plan_checkout_transition(&index, old_leaves, new_leaves, options, &wt)?;
     refuse_if_unpack_result_removes_current_directory(original_cwd, worktree_root, plan.result())?;
-    let result = plan.apply(&mut wt)?;
+    let result = plan.apply(&mut wt.with_path_policy(policy))?;
     if !result.sparse_checkout_present_paths.is_empty() {
         sley_core::diagnostic!(
             Stderr,
@@ -838,10 +917,11 @@ fn write_blob_to_worktree(
     path: &[u8],
     mode: u32,
     oid: &ObjectId,
+    policy: &WorktreePathPolicy,
 ) -> Result<Option<sley_unpack_trees::StatInfo>> {
     // git verifies every path as unpack-trees adds it to the result index;
     // callers that hand entries straight to this writer get the same check.
-    crate::path_safety::checkout_path_policy(config).verify_path(path, mode)?;
+    policy.verify_path(path, mode)?;
 
     // A gitlink is a directory git leaves to the submodule move-head machinery;
     // it never reads an object here. Ensure the directory exists (an
@@ -850,11 +930,12 @@ fn write_blob_to_worktree(
     // Parents are created and the leaf replaced without following symlinks
     // (`WorktreeLeaf`), which also refuses `.git` and path traversal.
     if sley_index::is_gitlink(mode) {
-        WorktreeLeaf::open(original_cwd, worktree_root, path, mode)?.ensure_dir(
-            original_cwd,
-            refuse_remove_current_working_directory_absolute,
-            false,
-        )?;
+        WorktreeLeaf::open_with_policy(original_cwd, worktree_root, path, mode, policy)?
+            .ensure_dir(
+                original_cwd,
+                refuse_remove_current_working_directory_absolute,
+                false,
+            )?;
         return Ok(None);
     }
 
@@ -872,7 +953,7 @@ fn write_blob_to_worktree(
     // Then remove whatever currently occupies the final path: a directory
     // subtree (the D/F dir→file transition, git's `remove_subtree`) or any
     // file/symlink. `force` is always set here.
-    let leaf = WorktreeLeaf::open(original_cwd, worktree_root, path, mode)?;
+    let leaf = WorktreeLeaf::open_with_policy(original_cwd, worktree_root, path, mode, policy)?;
     leaf.remove_existing(
         original_cwd,
         refuse_remove_current_working_directory_absolute,
@@ -956,6 +1037,41 @@ pub fn write_tree_entry_to_worktree_with_hooks(
     recurse_submodules: bool,
     hooks: SubmoduleHooks<'_>,
 ) -> Result<Option<sley_unpack_trees::StatInfo>> {
+    write_tree_entry_to_worktree_with_hooks_and_path_policy(
+        original_cwd,
+        worktree_root,
+        git_dir,
+        format,
+        db,
+        config,
+        tree_attributes,
+        path,
+        mode,
+        oid,
+        recurse_submodules,
+        hooks,
+        &WorktreePathPolicy::from_config(config),
+    )
+}
+
+/// Entry writer with an explicit policy, including recursive gitlink hooks.
+#[allow(clippy::too_many_arguments)]
+pub fn write_tree_entry_to_worktree_with_hooks_and_path_policy(
+    original_cwd: Option<&std::path::Path>,
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    config: &GitConfig,
+    tree_attributes: Option<&TreeAttributes>,
+    path: &[u8],
+    mode: u32,
+    oid: &ObjectId,
+    recurse_submodules: bool,
+    hooks: SubmoduleHooks<'_>,
+    policy: &WorktreePathPolicy,
+) -> Result<Option<sley_unpack_trees::StatInfo>> {
+    policy.verify_path(path, mode)?;
     if recurse_submodules
         && sley_index::is_gitlink(mode)
         && gitlink_should_recurse(worktree_root, config, path)
@@ -976,6 +1092,7 @@ pub fn write_tree_entry_to_worktree_with_hooks(
         path,
         mode,
         oid,
+        policy,
     )
 }
 
@@ -1108,68 +1225,22 @@ pub fn remove_path_in_the_way(
 }
 
 /// git's `unlink_entry`: remove a working-tree path and prune now-empty leading
-/// directories, ignoring an already-absent target. A directory occupying the
-/// path (a leftover from a prior file→dir transition, or a populated gitlink
-/// being removed) is removed recursively — git's `remove_or_warn` honours the
-/// directory mode.
+/// directories, ignoring an already-absent target or a non-directory parent.
+/// An empty directory is removed; a populated gitlink or untracked directory
+/// is preserved. Every operation is relative to held directory handles.
 pub fn remove_worktree_path(
     original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
     path: &[u8],
 ) -> Result<()> {
-    let Some(file_path) = safe_worktree_path(worktree_root, path) else {
-        return Ok(());
-    };
-    match fs::symlink_metadata(&file_path) {
-        // git's `unlink_entry`: a path whose worktree copy is a *directory* is a
-        // gitlink (a populated submodule) or a directory whose tracked children
-        // have already been removed first (check_updates unlinks every
-        // CE_WT_REMOVE entry before this one). git removes it with a *non-recursive*
-        // `rmdir` and, when the directory still holds untracked content (a dirty
-        // submodule), emits `warning: unable to rmdir '<path>': Directory not
-        // empty` and leaves it in place — it never recursively deletes a
-        // submodule's working tree.
-        Ok(md) if md.is_dir() => match fs::remove_dir(&file_path) {
-            Ok(()) => {}
-            Err(err)
-                if err.kind() == io::ErrorKind::DirectoryNotEmpty
-                    || err.raw_os_error() == Some(39) =>
-            {
-                sley_core::diagnostic!(
-                    Stderr,
-                    true,
-                    "warning: unable to rmdir '{}': Directory not empty",
-                    String::from_utf8_lossy(path)
-                );
-                return Ok(());
-            }
-            Err(err) => return Err(err.into()),
-        },
-        Ok(_) => fs::remove_file(&file_path)?,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err.into()),
-    }
-    prune_empty_dirs(original_cwd, worktree_root, file_path.parent());
-    Ok(())
+    crate::index_io::remove_worktree_file(original_cwd, worktree_root, path)
 }
 
 /// Remove now-empty parent directories up to (but not including) the worktree
 /// root. Errors are swallowed: a non-empty or vanished directory simply stops
 /// the walk.
-pub fn prune_empty_dirs(
-    original_cwd: Option<&std::path::Path>,
-    root: &Path,
-    mut dir: Option<&Path>,
-) {
-    while let Some(path) = dir {
-        if path == root || path_is_original_cwd(original_cwd, path) {
-            break;
-        }
-        if fs::remove_dir(path).is_err() {
-            break;
-        }
-        dir = path.parent();
-    }
+pub fn prune_empty_dirs(original_cwd: Option<&std::path::Path>, root: &Path, dir: Option<&Path>) {
+    let _ = crate::worktree_write::prune_worktree_dirs(original_cwd, root, dir);
 }
 
 fn original_cwd_relative_to(

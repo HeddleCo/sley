@@ -1974,7 +1974,9 @@ pub(crate) fn worktree_path(root: &Path, path: &[u8]) -> Result<PathBuf> {
         || relative.components().any(|component| {
             matches!(
                 component,
-                std::path::Component::ParentDir | std::path::Component::Prefix(_)
+                std::path::Component::RootDir
+                    | std::path::Component::ParentDir
+                    | std::path::Component::Prefix(_)
             )
         })
     {
@@ -1990,61 +1992,15 @@ pub(crate) fn remove_worktree_file(
     root: &Path,
     path: &[u8],
 ) -> Result<()> {
-    let file = worktree_path(root, path)?;
-    // Use lstat semantics. `Path::is_dir` follows symlinks, so a symlink to a
-    // directory was previously sent to `remove_dir` and failed with ENOTDIR;
-    // a dangling symlink was missed entirely by `exists`. Checkout removes the
-    // directory entry itself, never the symlink target.
-    let metadata = match fs::symlink_metadata(&file) {
-        Ok(metadata) => metadata,
-        // A D/F transition can ask to remove `dir/child` after `dir` has
-        // already become a file. There is no child entry to remove; lstat
-        // reports ENOTDIR rather than ENOENT, and both mean the requested leaf
-        // is absent.
-        Err(err)
-            if matches!(
-                err.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            ) =>
-        {
-            return Ok(());
-        }
-        Err(err) => return Err(err.into()),
-    };
-    if metadata.is_dir() {
-        // A tracked path that is a directory on disk is a gitlink: upstream
-        // checkout/reset never recurses into a submodule's working tree. It
-        // rmdirs the path when empty (remove_scheduled_dirs) and leaves a
-        // populated submodule in place.
-        match fs::remove_dir(&file) {
-            Ok(()) => prune_empty_parents(original_cwd, root, file.parent())?,
-            Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
-            Err(err) => return Err(err.into()),
-        }
-        return Ok(());
-    }
-    fs::remove_file(&file)?;
-    prune_empty_parents(original_cwd, root, file.parent())?;
-    Ok(())
+    crate::worktree_write::remove_worktree_entry(original_cwd, root, path)
 }
 
 pub(crate) fn prune_empty_parents(
     original_cwd: Option<&std::path::Path>,
     root: &Path,
-    mut dir: Option<&Path>,
+    dir: Option<&Path>,
 ) -> Result<()> {
-    while let Some(path) = dir {
-        if path == root || path_is_original_cwd(original_cwd, path) {
-            break;
-        }
-        match fs::remove_dir(path) {
-            Ok(()) => dir = path.parent(),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => dir = path.parent(),
-            Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
-            Err(err) => return Err(err.into()),
-        }
-    }
-    Ok(())
+    crate::worktree_write::prune_worktree_dirs(original_cwd, root, dir)
 }
 
 pub(crate) fn original_cwd_absolute(original_cwd: Option<&Path>) -> Option<PathBuf> {
@@ -2163,7 +2119,9 @@ pub(crate) fn git_path_bytes(
     if path.components().any(|component| {
         matches!(
             component,
-            std::path::Component::ParentDir | std::path::Component::Prefix(_)
+            std::path::Component::RootDir
+                | std::path::Component::ParentDir
+                | std::path::Component::Prefix(_)
         )
     }) {
         return Err(GitError::InvalidPath(format!(
@@ -2236,7 +2194,6 @@ pub(crate) fn path_has_trailing_separator(path: &Path) -> bool {
         .to_string_lossy()
         .ends_with(std::path::MAIN_SEPARATOR)
 }
-
 
 #[cfg(all(test, windows))]
 mod windows_path_tests {

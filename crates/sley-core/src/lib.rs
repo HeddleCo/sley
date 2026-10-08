@@ -29,6 +29,7 @@ pub const MAX_SYMREF_DEPTH: usize = 5;
 pub mod atomic;
 pub mod date;
 pub mod fsync;
+pub mod path_safety;
 pub mod paths;
 pub mod precompose;
 pub mod primitives;

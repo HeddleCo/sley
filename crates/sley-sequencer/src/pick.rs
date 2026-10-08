@@ -2076,7 +2076,7 @@ pub fn reset_merge_in(
     // Apply removals before materializations. A directory→gitlink transition
     // has flattened deletes under `path/` plus a gitlink at `path`; writing the
     // gitlink directory first and then pruning its children via
-    // `merge_remove_worktree_file` → `merge_prune_empty_dirs` would rmdir the
+    // `merge_remove_worktree_file` and worktree parent pruning would rmdir the
     // newly-required empty submodule placeholder ("replace directory with
     // submodule"). Deletions first leave the parent gone/empty, then the
     // gitlink write recreates the empty directory.

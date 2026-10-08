@@ -32,6 +32,14 @@ use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_odb::FileObjectDatabase;
 
+// Preserve the public worktree predicate paths while fsck and remote consumers
+// share the same pure implementation without depending on worktree I/O.
+use sley_core::path_safety::is_reserved_alias;
+pub use sley_core::path_safety::{
+    is_hfs_dot_generic, is_hfs_dotgit, is_hfs_dotgitmodules, is_ntfs_dot_generic, is_ntfs_dotgit,
+    is_ntfs_dotgitmodules,
+};
+
 const S_IFMT: u32 = 0o170000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFLNK: u32 = 0o120000;
@@ -202,52 +210,16 @@ pub(crate) fn verify_entry_paths<'a>(
     Ok(())
 }
 
-std::thread_local! {
-    static SCOPED_POLICY: std::cell::RefCell<Option<WorktreePathPolicy>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Restores the previous scoped policy on drop.
-pub(crate) struct ScopedPolicyGuard {
-    previous: Option<WorktreePathPolicy>,
-}
-
-impl Drop for ScopedPolicyGuard {
-    fn drop(&mut self) {
-        let previous = self.previous.take();
-        SCOPED_POLICY.with(|slot| *slot.borrow_mut() = previous);
-    }
-}
-
-/// Install `policy` for checkout pre-flight on the current thread until the
-/// guard drops. Mirrors `set_process_filter_metadata`: the policy-taking entry
-/// points scope it around the shared checkout machinery instead of threading
-/// it through every internal signature. Pre-flight always runs on the calling
-/// thread, before parallel checkout workers start.
-pub(crate) fn scope_worktree_path_policy(policy: &WorktreePathPolicy) -> ScopedPolicyGuard {
-    let previous = SCOPED_POLICY.with(|slot| slot.borrow_mut().replace(policy.clone()));
-    ScopedPolicyGuard { previous }
-}
-
-/// The policy for a checkout into a repository with `config`: the caller's
-/// scoped policy when one is installed, otherwise `config`'s.
+/// Repository-derived policy for callers without an explicit policy.
 pub(crate) fn checkout_path_policy(config: &GitConfig) -> WorktreePathPolicy {
-    SCOPED_POLICY
-        .with(|slot| slot.borrow().clone())
-        .unwrap_or_else(|| WorktreePathPolicy::from_config(config))
+    WorktreePathPolicy::from_config(config)
 }
 
-/// [`checkout_path_policy`] for callers that only know the git directory.
 pub(crate) fn checkout_path_policy_for_git_dir(git_dir: &std::path::Path) -> WorktreePathPolicy {
-    if let Some(policy) = SCOPED_POLICY.with(|slot| slot.borrow().clone()) {
-        return policy;
-    }
     let config = sley_config::read_effective_worktree_config(git_dir, None).unwrap_or_default();
     WorktreePathPolicy::from_config(&config)
 }
 
-/// The checkout policy from `config` when the caller supplied one, else from
-/// the repository's effective config.
 pub(crate) fn checkout_path_policy_for(
     config: Option<&GitConfig>,
     git_dir: &std::path::Path,
@@ -256,6 +228,22 @@ pub(crate) fn checkout_path_policy_for(
         Some(config) => checkout_path_policy(config),
         None => checkout_path_policy_for_git_dir(git_dir),
     }
+}
+
+/// Resolve the worktree's gitdir, including linked worktrees' `.git` files.
+pub(crate) fn writer_path_policy(root: &std::path::Path) -> WorktreePathPolicy {
+    let dotgit = root.join(".git");
+    let git_dir = std::fs::read(&dotgit)
+        .ok()
+        .and_then(|bytes| {
+            let value = std::str::from_utf8(&bytes)
+                .ok()?
+                .trim()
+                .strip_prefix("gitdir: ")?;
+            Some(root.join(value))
+        })
+        .unwrap_or(dotgit);
+    checkout_path_policy_for_git_dir(&git_dir)
 }
 
 /// Verify every target of a tree checkout before any of it is written, as
@@ -301,8 +289,7 @@ fn tail(bytes: &[u8], index: usize) -> &[u8] {
     bytes.get(index..).unwrap_or(&[])
 }
 
-/// git `read-cache.c` `verify_path_internal` on a POSIX build: no DOS drive
-/// prefix and no win32 path validation, `/` the only directory separator.
+/// git `read-cache.c` `verify_path_internal`, with native Windows validation.
 fn verify_path_internal(
     path: &[u8],
     mode: u32,
@@ -310,6 +297,13 @@ fn verify_path_internal(
     protect_hfs: bool,
 ) -> PathCheck {
     if path.contains(&0) {
+        return PathCheck::Invalid;
+    }
+    #[cfg(windows)]
+    if path.contains(&b'\\')
+        || (path.get(1) == Some(&b':'))
+        || (protect_ntfs && !is_valid_win32_path(path))
+    {
         return PathCheck::Invalid;
     }
     let is_link = mode & S_IFMT == S_IFLNK;
@@ -355,6 +349,72 @@ fn verify_path_internal(
     }
 }
 
+/// Git for Windows `compat/mingw.c::is_valid_win32_path` (creation form).
+/// Backslashes and drive prefixes are refused separately, even with NTFS off.
+#[cfg(any(windows, test))]
+fn is_valid_win32_path(path: &[u8]) -> bool {
+    for component in path.split(|byte| *byte == b'/') {
+        if component
+            .iter()
+            .any(|byte| *byte < 0x20 || b":<>\"|?*".contains(byte))
+        {
+            return false;
+        }
+        if component
+            .last()
+            .is_some_and(|byte| matches!(byte, b' ' | b'.'))
+            && component != b"."
+            && component != b".."
+        {
+            return false;
+        }
+        let reserved_len = if [b"AUX".as_slice(), b"CON", b"NUL", b"PRN"]
+            .iter()
+            .any(|name| {
+                component
+                    .get(..name.len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(name))
+            }) {
+            if component
+                .get(..6)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"CONIN$"))
+            {
+                6
+            } else if component
+                .get(..7)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"CONOUT$"))
+            {
+                7
+            } else {
+                3
+            }
+        } else if component
+            .get(..3)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"COM"))
+            && component
+                .get(3)
+                .is_some_and(|byte| (b'1'..=b'9').contains(byte))
+            || component
+                .get(..3)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"LPT"))
+                && component.get(3).is_some_and(u8::is_ascii_digit)
+        {
+            4
+        } else {
+            continue;
+        };
+        let rest = tail(component, reserved_len);
+        let rest = rest
+            .iter()
+            .position(|byte| *byte != b' ')
+            .map_or(&[][..], |i| &rest[i..]);
+        if rest.is_empty() || matches!(rest[0], b'.' | b':') {
+            return false;
+        }
+    }
+    true
+}
+
 /// git `read-cache.c` `verify_dotfile`: `rest` follows a leading `.`.
 fn verify_dotfile(rest: &[u8], mode: u32) -> bool {
     let c0 = at(rest, 0);
@@ -390,273 +450,59 @@ fn verify_dotfile(rest: &[u8], mode: u32) -> bool {
     }
 }
 
-fn is_xplatform_dir_sep(c: u8) -> bool {
-    c == b'/' || c == b'\\'
-}
-
-/// git `path.c` `is_ntfs_dotgit`: `name` is the remainder of a path starting
-/// at a component. True for `.git` or `git~1` (any case), followed by only
-/// dots and spaces up to the end, a `/` or `\`, or a `:` stream suffix.
-pub fn is_ntfs_dotgit(name: &[u8]) -> bool {
-    let mut i;
-    let c = at(name, 0);
-    if c == b'.' {
-        if !at(name, 1).eq_ignore_ascii_case(&b'g')
-            || !at(name, 2).eq_ignore_ascii_case(&b'i')
-            || !at(name, 3).eq_ignore_ascii_case(&b't')
-        {
-            return false;
-        }
-        i = 4;
-    } else if c == b'g' || c == b'G' {
-        if !at(name, 1).eq_ignore_ascii_case(&b'i')
-            || !at(name, 2).eq_ignore_ascii_case(&b't')
-            || at(name, 3) != b'~'
-            || at(name, 4) != b'1'
-        {
-            return false;
-        }
-        i = 5;
-    } else {
-        return false;
-    }
-    loop {
-        let c = at(name, i);
-        i += 1;
-        if c == 0 || is_xplatform_dir_sep(c) || c == b':' {
-            return true;
-        }
-        if c != b'.' && c != b' ' {
-            return false;
-        }
-    }
-}
-
-/// git `path.c` `is_ntfs_dotgitmodules`.
-pub fn is_ntfs_dotgitmodules(name: &[u8]) -> bool {
-    is_ntfs_dot_generic(name, b"gitmodules", b"gi7eba")
-}
-
-/// git `path.c` `is_ntfs_dot_generic`: `.<dotgit_name>`, its regular 8.3
-/// short name (first six characters, `~1`..`~4`), or the hashed fall-back
-/// short name `<shortname_prefix>~N`, then only dots and spaces up to the
-/// end or a `:` stream suffix.
-fn is_ntfs_dot_generic(name: &[u8], dotgit_name: &[u8], shortname_prefix: &[u8]) -> bool {
-    let len = dotgit_name.len();
-    if at(name, 0) == b'.' && strncasecmp_eq(tail(name, 1), dotgit_name, len) {
-        return only_spaces_and_periods(name, len + 1);
-    }
-    if strncasecmp_eq(name, dotgit_name, 6)
-        && at(name, 6) == b'~'
-        && (b'1'..=b'4').contains(&at(name, 7))
-    {
-        return only_spaces_and_periods(name, 8);
-    }
-    let mut saw_tilde = false;
-    let mut i = 0usize;
-    while i < 8 {
-        let c = at(name, i);
-        if c == 0 {
-            return false;
-        } else if saw_tilde {
-            if !c.is_ascii_digit() {
-                return false;
-            }
-        } else if c == b'~' {
-            i += 1;
-            if !(b'1'..=b'9').contains(&at(name, i)) {
-                return false;
-            }
-            saw_tilde = true;
-        } else if i >= 6 || c & 0x80 != 0 {
-            return false;
-        } else if c.to_ascii_lowercase() != at(shortname_prefix, i) {
-            return false;
-        }
-        i += 1;
-    }
-    only_spaces_and_periods(name, i)
-}
-
-fn only_spaces_and_periods(name: &[u8], mut i: usize) -> bool {
-    loop {
-        let c = at(name, i);
-        i += 1;
-        if c == 0 || c == b':' {
-            return true;
-        }
-        if c != b' ' && c != b'.' {
-            return false;
-        }
-    }
-}
-
-/// C `strncasecmp(a, b, n) == 0` over NUL-terminated views.
-fn strncasecmp_eq(a: &[u8], b: &[u8], n: usize) -> bool {
-    for index in 0..n {
-        let (x, y) = (at(a, index), at(b, index));
-        if !x.eq_ignore_ascii_case(&y) {
-            return false;
-        }
-        if x == 0 {
-            return true;
-        }
-    }
-    true
-}
-
-/// git `utf8.c` `is_hfs_dotgit`: after dropping the code points HFS+
-/// ignores, `.git` (ASCII case-insensitive) followed by the end or `/`.
-pub fn is_hfs_dotgit(path: &[u8]) -> bool {
-    is_hfs_dot_generic(path, b"git")
-}
-
-/// git `utf8.c` `is_hfs_dotgitmodules`.
-pub fn is_hfs_dotgitmodules(path: &[u8]) -> bool {
-    is_hfs_dot_generic(path, b"gitmodules")
-}
-
-fn is_hfs_dot_generic(path: &[u8], needle: &[u8]) -> bool {
-    let mut cursor = Some(0usize);
-    if next_hfs_char(path, &mut cursor) != u32::from(b'.') {
-        return false;
-    }
-    for expected in needle {
-        let c = next_hfs_char(path, &mut cursor);
-        if c > 127 {
-            return false;
-        }
-        // `c <= 127` was just checked, so the narrowing is lossless.
-        if (c as u8).to_ascii_lowercase() != *expected {
-            return false;
-        }
-    }
-    let c = next_hfs_char(path, &mut cursor);
-    c == 0 || c == u32::from(b'/')
-}
-
-/// git `utf8.c` `next_hfs_char`. `cursor` is `None` once malformed UTF-8 has
-/// been seen, which reads as the end of the string (as in git).
-fn next_hfs_char(path: &[u8], cursor: &mut Option<usize>) -> u32 {
-    loop {
-        let Some(position) = *cursor else {
-            return 0;
-        };
-        let Some((ch, width)) = pick_one_utf8_char(tail(path, position)) else {
-            *cursor = None;
-            return 0;
-        };
-        *cursor = Some(position + width);
-        if is_hfs_ignorable(ch) {
-            continue;
-        }
-        return ch;
-    }
-}
-
-/// The code points HFS+ drops when comparing names (git `next_hfs_char`).
-pub(crate) fn is_hfs_ignorable(ch: u32) -> bool {
-    matches!(
-        ch,
-        0x200c..=0x200f | 0x202a..=0x202e | 0x206a..=0x206f | 0xfeff
-    )
-}
-
-/// git `utf8.c` `pick_one_utf8_char` on a NUL-terminated string: the code
-/// point and its width, or `None` for malformed UTF-8.
-fn pick_one_utf8_char(s: &[u8]) -> Option<(u32, usize)> {
-    let b = |index: usize| u32::from(at(s, index));
-    let s0 = b(0);
-    if s0 < 0x80 {
-        return Some((s0, 1));
-    }
-    let cont = |index: usize| b(index) & 0xc0 == 0x80;
-    if s0 & 0xe0 == 0xc0 {
-        if !cont(1) || s0 & 0xfe == 0xc0 {
-            return None;
-        }
-        return Some((((s0 & 0x1f) << 6) | (b(1) & 0x3f), 2));
-    }
-    if s0 & 0xf0 == 0xe0 {
-        if !cont(1)
-            || !cont(2)
-            || (s0 == 0xe0 && b(1) & 0xe0 == 0x80)
-            || (s0 == 0xed && b(1) & 0xe0 == 0xa0)
-            || (s0 == 0xef && b(1) == 0xbf && b(2) & 0xfe == 0xbe)
-        {
-            return None;
-        }
-        return Some((
-            ((s0 & 0x0f) << 12) | ((b(1) & 0x3f) << 6) | (b(2) & 0x3f),
-            3,
-        ));
-    }
-    if s0 & 0xf8 == 0xf0 {
-        if !cont(1)
-            || !cont(2)
-            || !cont(3)
-            || (s0 == 0xf0 && b(1) & 0xf0 == 0x80)
-            || (s0 == 0xf4 && b(1) > 0x8f)
-            || s0 > 0xf4
-        {
-            return None;
-        }
-        return Some((
-            ((s0 & 0x07) << 18) | ((b(1) & 0x3f) << 12) | ((b(2) & 0x3f) << 6) | (b(3) & 0x3f),
-            4,
-        ));
-    }
-    None
-}
-
-/// Whether the path component `component` aliases the reserved `name` under
-/// any of the rules git applies to `.git`: ASCII case; trailing dots and
-/// spaces, a `:` stream or a `\` separator (NTFS); the 8.3 short name of a
-/// dot-name (`HEDDLE~1` for `.heddle`); or HFS+ ignorable code points.
-fn is_reserved_alias(component: &[u8], name: &[u8]) -> bool {
-    let ntfs_tail = |rest: &[u8]| {
-        let mut index = 0;
-        loop {
-            match at(rest, index) {
-                0 | b'/' | b'\\' | b':' => return true,
-                b'.' | b' ' => index += 1,
-                _ => return false,
-            }
-        }
-    };
-    if strncasecmp_eq(component, name, name.len()) && ntfs_tail(tail(component, name.len())) {
-        return true;
-    }
-    if let Some(stem) = name.strip_prefix(b".")
-        && !stem.is_empty()
-    {
-        let short = &stem[..stem.len().min(6)];
-        if strncasecmp_eq(component, short, short.len())
-            && at(component, short.len()) == b'~'
-            && (b'1'..=b'4').contains(&at(component, short.len() + 1))
-            && ntfs_tail(tail(component, short.len() + 2))
-        {
-            return true;
-        }
-    }
-    // HFS+: compare with ignorable code points dropped.
-    let mut cursor = Some(0usize);
-    for expected in name {
-        let c = next_hfs_char(component, &mut cursor);
-        if c > 127 || !(c as u8).eq_ignore_ascii_case(expected) {
-            return false;
-        }
-    }
-    let c = next_hfs_char(component, &mut cursor);
-    c == 0 || c == u32::from(b'/')
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn valid(path: &str, mode: u32) -> bool {
         WorktreePathPolicy::default().is_valid_path(path.as_bytes(), mode)
+    }
+
+    #[test]
+    fn win32_creation_rules_match_git_for_windows() {
+        for path in [
+            "AUX",
+            "aux.txt",
+            "CON",
+            "CONIN$",
+            "CONOUT$.txt",
+            "NUL",
+            "PRN ",
+            "COM1",
+            "COM9.x",
+            "LPT0",
+            "LPT9",
+            "dir/aux",
+            "a.",
+            "a ",
+            "a:b",
+            "a?b",
+            "a*b",
+            "a<b",
+            "a>b",
+            "a|b",
+            "a\"b",
+            "a\u{1f}b",
+        ] {
+            assert!(!is_valid_win32_path(path.as_bytes()), "{path:?}");
+        }
+        for path in [
+            "COM0",
+            "COM10",
+            "LPT10",
+            "auxiliary",
+            "conifer",
+            "CONIN",
+            "CONOUT",
+            "AUX x",
+            ".",
+            "..",
+            "dir/file",
+            "..dots",
+            "a. b",
+        ] {
+            assert!(is_valid_win32_path(path.as_bytes()), "{path:?}");
+        }
     }
 
     #[test]
@@ -697,7 +543,11 @@ mod tests {
         for path in [
             "git~2", "git~10", ".gitx", ".git.x", "x\\git", "\\.git", "gi~1",
         ] {
-            assert!(valid(path, 0o100644), "{path:?}");
+            assert_eq!(
+                valid(path, 0o100644),
+                !cfg!(windows) || !path.contains('\\'),
+                "{path:?}"
+            );
         }
     }
 
@@ -718,7 +568,11 @@ mod tests {
             assert!(!valid(path, 0o120000), "{path:?}");
             if !path.ends_with(".gitmodules") || path.contains('\u{200c}') {
                 // Non-literal aliases are plain names when not a symlink.
-                assert!(valid(path, 0o100644), "{path:?} as a file");
+                assert_eq!(
+                    valid(path, 0o100644),
+                    !cfg!(windows) || is_valid_win32_path(path.as_bytes()),
+                    "{path:?} as a file"
+                );
             }
         }
         assert!(valid(".gitmodules", 0o100644));

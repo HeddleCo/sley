@@ -540,14 +540,19 @@ pub fn check_gitattributes_blob(body: &[u8], config: &SeverityConfig) -> Vec<Con
 }
 
 /// Whether a tree-entry name is `.gitattributes` (HFS/NTFS spellings included,
-/// mirroring git's `is_hfs_dotgitattributes`/`is_ntfs_dotgitattributes`). For
-/// the parity suite the plain ASCII form is what the tests exercise.
+/// using git's exact HFS and NTFS predicates shared with checkout).
 pub fn is_dotgitattributes_name(name: &[u8]) -> bool {
     is_hfs_dot_name(name, "gitattributes") || is_ntfs_dot_name(name, "gitattributes", "gi7d29")
 }
 
 pub fn is_dotgitmodules_name(name: &[u8]) -> bool {
-    is_hfs_dot_name(name, "gitmodules") || is_ntfs_dot_name(name, "gitmodules", "gi7eba")
+    is_hfs_dot_name(name, "gitmodules")
+        || is_ntfs_dot_name(name, "gitmodules", "gi7eba")
+        // fsck_tree also checks NTFS aliases after each backslash. The
+        // entire suffix matters: `.gitmodules\\file` is not an alias.
+        || name.iter().enumerate().any(|(index, byte)| {
+            *byte == b'\\' && sley_core::path_safety::is_ntfs_dotgitmodules(&name[index + 1..])
+        })
 }
 
 pub fn is_dotgitignore_name(name: &[u8]) -> bool {
@@ -559,81 +564,11 @@ pub fn is_dotmailmap_name(name: &[u8]) -> bool {
 }
 
 fn is_hfs_dot_name(name: &[u8], needle: &str) -> bool {
-    let Ok(text) = std::str::from_utf8(name) else {
-        return false;
-    };
-    let folded: String = text.chars().filter(|ch| !is_hfs_ignorable(*ch)).collect();
-    folded.eq_ignore_ascii_case(&format!(".{needle}"))
+    sley_core::path_safety::is_hfs_dot_generic(name, needle.as_bytes())
 }
 
 fn is_ntfs_dot_name(name: &[u8], needle: &str, short_prefix: &str) -> bool {
-    for segment in name.split(|&byte| byte == b'\\') {
-        let stream_name = segment
-            .iter()
-            .position(|&byte| byte == b':')
-            .map_or(segment, |colon| &segment[..colon]);
-        if ntfs_long_name_matches(stream_name, needle)
-            || ntfs_short_name_matches(stream_name, needle, short_prefix)
-        {
-            return true;
-        }
-    }
-    false
-}
-
-fn ntfs_long_name_matches(name: &[u8], needle: &str) -> bool {
-    let needle = needle.as_bytes();
-    if name.len() < needle.len() + 1 || name[0] != b'.' {
-        return false;
-    }
-    if !name[1..1 + needle.len()].eq_ignore_ascii_case(needle) {
-        return false;
-    }
-    ntfs_suffix_is_ignorable(&name[1 + needle.len()..])
-}
-
-fn ntfs_short_name_matches(name: &[u8], needle: &str, short_prefix: &str) -> bool {
-    let prefix = needle.as_bytes();
-    if prefix.len() >= 6
-        && name.len() >= 8
-        && name[..6].eq_ignore_ascii_case(&prefix[..6])
-        && name[6] == b'~'
-        && matches!(name[7], b'1'..=b'4')
-    {
-        return ntfs_suffix_is_ignorable(&name[8..]);
-    }
-
-    let short = short_prefix.as_bytes();
-    if name.len() < 8 {
-        return false;
-    }
-    let mut saw_tilde = false;
-    for i in 0..8 {
-        let c = name[i];
-        if c == 0 || c & 0x80 != 0 {
-            return false;
-        }
-        if saw_tilde {
-            if !c.is_ascii_digit() {
-                return false;
-            }
-        } else if c == b'~' {
-            if i + 1 >= 8 || !matches!(name[i + 1], b'1'..=b'9') {
-                return false;
-            }
-            saw_tilde = true;
-        } else if i >= 6 || ![c].eq_ignore_ascii_case(&[short[i]]) {
-            return false;
-        }
-    }
-    saw_tilde && ntfs_suffix_is_ignorable(&name[8..])
-}
-
-fn ntfs_suffix_is_ignorable(mut suffix: &[u8]) -> bool {
-    if let Some(colon) = suffix.iter().position(|&byte| byte == b':') {
-        suffix = &suffix[..colon];
-    }
-    suffix.iter().all(|&byte| byte == b'.' || byte == b' ')
+    sley_core::path_safety::is_ntfs_dot_generic(name, needle.as_bytes(), short_prefix.as_bytes())
 }
 
 /// Validate a loaded object body, returning every content finding whose
@@ -1456,8 +1391,8 @@ fn check_tree(format: ObjectFormat, body: &[u8], large_pathname_len: usize) -> V
         // `is_ntfs_dotgit` inspects the name up to the first `\`, then its
         // caller re-checks each subsequent segment.
         if name.contains(&b'\\') {
-            for seg in name.split(|&b| b == b'\\') {
-                if is_dotgit_name(seg) {
+            for seg in name.split(|&b| b == b'\\').skip(1) {
+                if sley_core::path_safety::is_ntfs_dotgit(seg) {
                     has_dotgit = true;
                 }
             }
@@ -1651,54 +1586,9 @@ fn parse_octal_mode(bytes: &[u8]) -> Option<u32> {
     Some(mode as u16 as u32)
 }
 
-/// HFS/NTFS `.git` detection (the common cases t1450 exercises): `.git`,
-/// `.GIT`, `.Git`, `git~1`, `.git.`, trailing dots/spaces, and the zero-width
-/// joiner variant `.gI{u200c}T`. We approximate git's `is_hfs_dotgit` /
-/// `is_ntfs_dotgit` by normalising the candidate.
+/// The same exact HFS/NTFS predicates checkout uses.
 fn is_dotgit_name(name: &[u8]) -> bool {
-    // NTFS 8.3 short name for ".git".
-    if name.eq_ignore_ascii_case(b"git~1") {
-        return true;
-    }
-    // Strip a single trailing run of dots/spaces (NTFS strips these).
-    let trimmed = {
-        let mut end = name.len();
-        while end > 0 && (name[end - 1] == b'.' || name[end - 1] == b' ') {
-            end -= 1;
-        }
-        &name[..end]
-    };
-    if trimmed.eq_ignore_ascii_case(b".git") {
-        return true;
-    }
-    // HFS ignores certain zero-width code points; drop them and re-compare.
-    let folded = strip_hfs_ignorable(name);
-    if folded.eq_ignore_ascii_case(b".git") {
-        return true;
-    }
-    false
-}
-
-/// Remove the Unicode code points HFS+ ignores in its dotgit check (the ones
-/// t1450 uses: U+200C zero-width non-joiner, plus the broader git set).
-fn strip_hfs_ignorable(name: &[u8]) -> Vec<u8> {
-    // The bytes are UTF-8; decode, drop ignorable code points, re-encode ASCII.
-    let s = match std::str::from_utf8(name) {
-        Ok(s) => s,
-        Err(_) => return name.to_vec(),
-    };
-    s.chars()
-        .filter(|c| !is_hfs_ignorable(*c))
-        .collect::<String>()
-        .into_bytes()
-}
-
-fn is_hfs_ignorable(c: char) -> bool {
-    matches!(
-        c as u32,
-        0x200c | 0x200d | 0x200e | 0x200f | 0x202a..=0x202e | 0x206a..=0x206f
-        | 0xfeff | 0x00ad | 0x034f | 0x115f | 0x1160 | 0x17b4 | 0x17b5 | 0x2060..=0x2064
-    )
+    sley_core::path_safety::is_hfs_dotgit(name) || sley_core::path_safety::is_ntfs_dotgit(name)
 }
 
 #[derive(PartialEq, Eq)]
@@ -1780,11 +1670,12 @@ fn verify_ordered(
 mod tests {
     use super::*;
 
-
     #[test]
     fn alias_detection_uses_exact_git_hfs_and_ntfs_rules() {
         assert!(is_dotgit_name(b".git:stream"));
         assert!(is_dotgit_name(b"GIT~1..."));
+        assert!(is_dotgitmodules_name(b"dir\\.gitmodules"));
+        assert!(!is_dotgitmodules_name(b".gitmodules\\file"));
         assert!(is_dotgitmodules_name(b".gitmodules\xff")); // malformed UTF-8 ends the HFS view
         assert!(!is_dotgit_name(".g\u{00ad}it".as_bytes()));
         assert!(!is_dotgitmodules_name(".git\u{034f}modules".as_bytes()));

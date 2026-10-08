@@ -230,6 +230,36 @@ pub fn checkout_branch_filtered(
     committer: Vec<u8>,
     config: &GitConfig,
 ) -> Result<CheckoutResult> {
+    checkout_branch_filtered_with_path_policy(
+        original_cwd,
+        worktree_root,
+        git_dir,
+        format,
+        branch,
+        committer,
+        config,
+        &checkout_path_policy(config),
+    )
+}
+
+/// [`checkout_branch_filtered`] with an explicit [`WorktreePathPolicy`].
+///
+/// The policy replaces the one derived from `core.protectNTFS` /
+/// `core.protectHFS`, so a caller can reserve extra names (heddle reserves a
+/// root `.heddle`) on top of git's `.git` rules. Every target path is
+/// checked before the worktree is touched; one refused path refuses the
+/// whole checkout.
+#[allow(clippy::too_many_arguments)]
+pub fn checkout_branch_filtered_with_path_policy(
+    original_cwd: Option<&std::path::Path>,
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    branch: &str,
+    committer: Vec<u8>,
+    config: &GitConfig,
+    policy: &WorktreePathPolicy,
+) -> Result<CheckoutResult> {
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let branch_ref = branch_ref_name(branch)?;
@@ -247,16 +277,23 @@ pub fn checkout_branch_filtered(
     };
     let current_head = resolve_head_commit_oid(git_dir, format)?;
     let files = if current_head == Some(target) {
-        reapply_active_sparse_checkout(original_cwd, worktree_root, git_dir, format)?;
+        reapply_active_sparse_checkout_with_policy(
+            original_cwd,
+            worktree_root,
+            git_dir,
+            format,
+            policy,
+        )?;
         0
     } else {
-        checkout_commit_to_index_and_worktree_filtered(
+        checkout_commit_to_index_and_worktree_filtered_with_policy(
             original_cwd,
             worktree_root,
             git_dir,
             format,
             &target,
             Some(config),
+            policy,
             Some(vec![
                 ("ref".to_string(), branch_ref.clone()),
                 ("treeish".to_string(), target.to_hex()),
@@ -278,36 +315,6 @@ pub fn checkout_branch_filtered(
     })
 }
 
-/// [`checkout_branch_filtered`] with an explicit [`WorktreePathPolicy`].
-///
-/// The policy replaces the one derived from `core.protectNTFS` /
-/// `core.protectHFS`, so a caller can reserve extra names (heddle reserves a
-/// root `.heddle`) on top of git's `.git` rules. Every target path is
-/// checked before the worktree is touched; one refused path refuses the
-/// whole checkout.
-#[allow(clippy::too_many_arguments)]
-pub fn checkout_branch_filtered_with_path_policy(
-    original_cwd: Option<&std::path::Path>,
-    worktree_root: impl AsRef<Path>,
-    git_dir: impl AsRef<Path>,
-    format: ObjectFormat,
-    branch: &str,
-    committer: Vec<u8>,
-    config: &GitConfig,
-    policy: &WorktreePathPolicy,
-) -> Result<CheckoutResult> {
-    let _policy = crate::path_safety::scope_worktree_path_policy(policy);
-    checkout_branch_filtered(
-        original_cwd,
-        worktree_root,
-        git_dir,
-        format,
-        branch,
-        committer,
-        config,
-    )
-}
-
 /// Reconcile an already-current branch with newly enabled or changed sparse
 /// checkout rules. A normal same-HEAD checkout remains a no-op; sparse checkout
 /// is the exception because `git checkout <current-branch>` is also the legacy
@@ -325,10 +332,34 @@ pub fn reapply_active_sparse_checkout(
     git_dir: &Path,
     format: ObjectFormat,
 ) -> Result<()> {
+    reapply_active_sparse_checkout_with_policy(
+        original_cwd,
+        worktree_root,
+        git_dir,
+        format,
+        &checkout_path_policy_for(None, git_dir),
+    )
+}
+
+fn reapply_active_sparse_checkout_with_policy(
+    original_cwd: Option<&std::path::Path>,
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    policy: &WorktreePathPolicy,
+) -> Result<()> {
     let Some((sparse, mode)) = active_sparse_checkout(git_dir)? else {
         return Ok(());
     };
-    apply_sparse_checkout_with_mode(original_cwd, worktree_root, git_dir, format, &sparse, mode)?;
+    apply_sparse_checkout_with_mode_and_policy(
+        original_cwd,
+        worktree_root,
+        git_dir,
+        format,
+        &sparse,
+        mode,
+        policy,
+    )?;
     Ok(())
 }
 
@@ -344,15 +375,43 @@ pub fn checkout_detached_filtered(
     message: Vec<u8>,
     config: &GitConfig,
 ) -> Result<CheckoutResult> {
+    checkout_detached_filtered_with_path_policy(
+        original_cwd,
+        worktree_root,
+        git_dir,
+        format,
+        target,
+        committer,
+        message,
+        config,
+        &checkout_path_policy(config),
+    )
+}
+
+/// [`checkout_detached_filtered`] with an explicit [`WorktreePathPolicy`];
+/// see [`checkout_branch_filtered_with_path_policy`].
+#[allow(clippy::too_many_arguments)]
+pub fn checkout_detached_filtered_with_path_policy(
+    original_cwd: Option<&std::path::Path>,
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    target: &ObjectId,
+    committer: Vec<u8>,
+    message: Vec<u8>,
+    config: &GitConfig,
+    policy: &WorktreePathPolicy,
+) -> Result<CheckoutResult> {
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
-    let files = checkout_commit_to_index_and_worktree_filtered(
+    let files = checkout_commit_to_index_and_worktree_filtered_with_policy(
         original_cwd,
         worktree_root,
         git_dir,
         format,
         target,
         Some(config),
+        policy,
         Some(vec![("treeish".to_string(), target.to_hex())]),
     )?;
     let refs = FileRefStore::new(git_dir, format);
@@ -375,33 +434,6 @@ pub fn checkout_detached_filtered(
         oid: *target,
         files,
     })
-}
-
-/// [`checkout_detached_filtered`] with an explicit [`WorktreePathPolicy`];
-/// see [`checkout_branch_filtered_with_path_policy`].
-#[allow(clippy::too_many_arguments)]
-pub fn checkout_detached_filtered_with_path_policy(
-    original_cwd: Option<&std::path::Path>,
-    worktree_root: impl AsRef<Path>,
-    git_dir: impl AsRef<Path>,
-    format: ObjectFormat,
-    target: &ObjectId,
-    committer: Vec<u8>,
-    message: Vec<u8>,
-    config: &GitConfig,
-    policy: &WorktreePathPolicy,
-) -> Result<CheckoutResult> {
-    let _policy = crate::path_safety::scope_worktree_path_policy(policy);
-    checkout_detached_filtered(
-        original_cwd,
-        worktree_root,
-        git_dir,
-        format,
-        target,
-        committer,
-        message,
-        config,
-    )
 }
 
 pub(crate) fn checkout_commit_to_index_and_worktree(
@@ -435,8 +467,32 @@ pub(crate) fn checkout_commit_to_index_and_worktree_filtered(
     smudge_config: Option<&GitConfig>,
     process_metadata: Option<Vec<(String, String)>>,
 ) -> Result<usize> {
+    let policy = checkout_path_policy_for(smudge_config, git_dir);
+    checkout_commit_to_index_and_worktree_filtered_with_policy(
+        original_cwd,
+        worktree_root,
+        git_dir,
+        format,
+        target,
+        smudge_config,
+        &policy,
+        process_metadata,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn checkout_commit_to_index_and_worktree_filtered_with_policy(
+    original_cwd: Option<&std::path::Path>,
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    target: &ObjectId,
+    smudge_config: Option<&GitConfig>,
+    policy: &WorktreePathPolicy,
+    process_metadata: Option<Vec<(String, String)>>,
+) -> Result<usize> {
     if let Some((sparse, mode)) = active_sparse_checkout(git_dir)? {
-        return checkout_commit_to_index_and_worktree_sparse(
+        return checkout_commit_to_index_and_worktree_sparse_with_policy(
             original_cwd,
             worktree_root,
             git_dir,
@@ -444,6 +500,7 @@ pub(crate) fn checkout_commit_to_index_and_worktree_filtered(
             target,
             Some((&sparse, mode)),
             smudge_config,
+            policy,
             process_metadata,
         );
     }
@@ -474,10 +531,7 @@ pub(crate) fn checkout_commit_to_index_and_worktree_filtered(
     let commit = read_commit(&db, format, target)?;
     let mut target_entries = BTreeMap::new();
     collect_tree_entries(&db, format, &commit.tree, &mut target_entries)?;
-    verify_tracked_entries(
-        &checkout_path_policy_for(smudge_config, git_dir),
-        &target_entries,
-    )?;
+    verify_tracked_entries(policy, &target_entries)?;
     refuse_if_current_working_directory_becomes_file(original_cwd, worktree_root, &target_entries)?;
 
     let attributes = smudge_config
@@ -491,47 +545,14 @@ pub(crate) fn checkout_commit_to_index_and_worktree_filtered(
         }
     }
 
-    let ignore_case = checkout_should_detect_case_collisions(worktree_root, git_dir);
-    let needs_filesystem_collision_probe =
-        ignore_case && target_entries.keys().any(|path| !path.is_ascii());
-    let collision_probe = needs_filesystem_collision_probe
-        .then(|| CheckoutCollisionProbe::new(worktree_root))
-        .transpose()?;
-    let mut collision_probe = collision_probe;
-    let mut materialized_paths = Vec::<CheckoutCollisionPath>::new();
-    let mut collided_paths: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let mut collisions = CheckoutCollisions::new(worktree_root, git_dir, &target_entries)?;
     let mut index_entries = Vec::new();
     let mut prepared_entries = Vec::new();
     let mut delayed_checkout = DelayedCheckoutQueue::default();
     for (path, entry) in &target_entries {
-        if ignore_case {
-            let folded = checkout_ascii_collision_key(path);
-            let filesystem_key = if path.is_ascii() {
-                None
-            } else {
-                collision_probe
-                    .as_mut()
-                    .map(|probe| probe.key(path))
-                    .transpose()?
-            };
-            if let Some(existing) = materialized_paths.iter().find(|existing| {
-                checkout_paths_collide(&existing.ascii, &folded)
-                    || existing.filesystem.as_ref().is_some_and(|existing_key| {
-                        filesystem_key
-                            .as_ref()
-                            .is_some_and(|key| checkout_filesystem_paths_collide(existing_key, key))
-                    })
-            }) {
-                collided_paths.insert(existing.original.clone());
-                collided_paths.insert(path.clone());
-                index_entries.push(unmaterialized_index_entry(path, entry));
-                continue;
-            }
-            materialized_paths.push(CheckoutCollisionPath {
-                ascii: folded,
-                filesystem: filesystem_key,
-                original: path.clone(),
-            });
+        if collisions.collides(path)? {
+            index_entries.push(unmaterialized_index_entry(path, entry));
+            continue;
         }
         match prepare_checkout_entry(
             &db,
@@ -546,22 +567,23 @@ pub(crate) fn checkout_commit_to_index_and_worktree_filtered(
             PreparedCheckoutResult::Delayed(entry) => index_entries.push(entry),
         }
     }
-    drop(collision_probe);
+    collisions.finish();
     let default_config = GitConfig::default();
     index_entries.extend(materialize_prepared_checkout_entries(
         original_cwd,
         worktree_root,
         smudge_config.unwrap_or(&default_config),
+        policy,
         prepared_entries,
     )?);
     let mut delayed_updates =
-        finish_delayed_checkout(original_cwd, worktree_root, delayed_checkout)?;
+        finish_delayed_checkout_with_policy(original_cwd, worktree_root, delayed_checkout, policy)?;
     for entry in &mut index_entries {
         if let Some(updated) = delayed_updates.remove(entry.path.as_bytes()) {
             *entry = updated;
         }
     }
-    warn_checkout_collisions(&collided_paths);
+
     index_entries.sort_by(|left, right| left.path.cmp(&right.path));
     let extensions = preserved_index_extensions(git_dir, format)?;
     let mut index = Index {
@@ -581,29 +603,8 @@ fn remove_checkout_tracked_path(
     path: &[u8],
     entry: &TrackedEntry,
 ) -> Result<()> {
-    if !sley_index::is_gitlink(entry.mode) {
-        return remove_worktree_file(original_cwd, worktree_root, path);
-    }
-    let file = worktree_path(worktree_root, path)?;
-    if !file.exists() {
-        return Ok(());
-    }
-    if !file.is_dir() {
-        return remove_worktree_file(original_cwd, worktree_root, path);
-    }
-    match fs::remove_dir(&file) {
-        Ok(()) => prune_empty_parents(original_cwd, worktree_root, file.parent())?,
-        Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
-            sley_core::diagnostic!(
-                Stderr,
-                true,
-                "warning: unable to rmdir '{}': Directory not empty",
-                String::from_utf8_lossy(path)
-            );
-        }
-        Err(err) => return Err(err.into()),
-    }
-    Ok(())
+    let _ = entry;
+    remove_worktree_file(original_cwd, worktree_root, path)
 }
 
 fn checkout_should_detect_case_collisions(worktree_root: &Path, git_dir: &Path) -> bool {
@@ -626,6 +627,66 @@ fn filesystem_is_case_insensitive(root: &Path) -> bool {
         let _ = fs::remove_file(&upper);
     }
     result.unwrap_or(false)
+}
+
+struct CheckoutCollisions {
+    ignore_case: bool,
+    probe: Option<CheckoutCollisionProbe>,
+    materialized: Vec<CheckoutCollisionPath>,
+    collided: BTreeSet<Vec<u8>>,
+}
+
+impl CheckoutCollisions {
+    fn new(root: &Path, git_dir: &Path, entries: &BTreeMap<Vec<u8>, TrackedEntry>) -> Result<Self> {
+        let ignore_case = checkout_should_detect_case_collisions(root, git_dir);
+        let probe = (ignore_case && entries.keys().any(|path| !path.is_ascii()))
+            .then(|| CheckoutCollisionProbe::new(root))
+            .transpose()?;
+        Ok(Self {
+            ignore_case,
+            probe,
+            materialized: Vec::new(),
+            collided: BTreeSet::new(),
+        })
+    }
+
+    fn collides(&mut self, path: &[u8]) -> Result<bool> {
+        if !self.ignore_case {
+            return Ok(false);
+        }
+        let folded = checkout_ascii_collision_key(path);
+        let filesystem_key = if path.is_ascii() {
+            None
+        } else {
+            self.probe
+                .as_mut()
+                .map(|probe| probe.key(path))
+                .transpose()?
+        };
+        if let Some(existing) = self.materialized.iter().find(|existing| {
+            checkout_paths_collide(&existing.ascii, &folded)
+                || existing.filesystem.as_ref().is_some_and(|existing_key| {
+                    filesystem_key
+                        .as_ref()
+                        .is_some_and(|key| checkout_filesystem_paths_collide(existing_key, key))
+                })
+        }) {
+            self.collided.insert(existing.original.clone());
+            self.collided.insert(path.to_vec());
+            return Ok(true);
+        }
+        self.materialized.push(CheckoutCollisionPath {
+            ascii: folded,
+            filesystem: filesystem_key,
+            original: path.to_vec(),
+        });
+        Ok(false)
+    }
+
+    fn finish(self) {
+        drop(self.probe);
+        warn_checkout_collisions(&self.collided);
+    }
 }
 
 struct CheckoutCollisionPath {
@@ -916,6 +977,7 @@ fn prepare_index_checkout_entry(
 fn materialize_prepared_checkout_entry(
     original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
+    policy: &WorktreePathPolicy,
     prepared: PreparedCheckoutEntry,
 ) -> Result<IndexEntry> {
     let PreparedCheckoutEntry {
@@ -924,15 +986,24 @@ fn materialize_prepared_checkout_entry(
         body,
         index_template,
     } = prepared;
+    policy.verify_path(&path, entry.mode)?;
     if sley_index::is_gitlink(entry.mode) {
-        materialize_gitlink_dir(original_cwd, worktree_root, &path)?;
+        WorktreeLeaf::open_with_policy(original_cwd, worktree_root, &path, entry.mode, policy)?
+            .ensure_dir(original_cwd, refuse_remove_current_working_directory, true)?;
         return Ok(index_template.unwrap_or_else(|| unmaterialized_index_entry(&path, &entry)));
     }
     let body = body.ok_or_else(|| {
         GitError::InvalidFormat("checkout blob materialization had no body".into())
     })?;
-    let file_path =
-        replace_worktree_blob(original_cwd, worktree_root, &path, entry.mode, &body, &body)?;
+    let file_path = crate::worktree_write::replace_worktree_blob_with_policy(
+        original_cwd,
+        worktree_root,
+        &path,
+        entry.mode,
+        &body,
+        &body,
+        policy,
+    )?;
     let metadata = fs::symlink_metadata(&file_path)?;
     let mut index_entry = match index_template {
         Some(template) => index_entry_with_refreshed_stat(&template, &metadata),
@@ -953,13 +1024,16 @@ fn materialize_prepared_checkout_entries(
     original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
     config: &GitConfig,
+    policy: &WorktreePathPolicy,
     prepared: Vec<PreparedCheckoutEntry>,
 ) -> Result<Vec<IndexEntry>> {
     let plan = ParallelCheckoutPlan::from_config(config, prepared.len());
     if plan.worker_count == 0 {
         return prepared
             .into_iter()
-            .map(|entry| materialize_prepared_checkout_entry(original_cwd, worktree_root, entry))
+            .map(|entry| {
+                materialize_prepared_checkout_entry(original_cwd, worktree_root, policy, entry)
+            })
             .collect();
     }
 
@@ -1003,9 +1077,19 @@ fn materialize_prepared_checkout_entries(
                         let _guard = path_lock
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        materialize_prepared_checkout_entry(original_cwd, worktree_root, entry)
+                        materialize_prepared_checkout_entry(
+                            original_cwd,
+                            worktree_root,
+                            policy,
+                            entry,
+                        )
                     } else {
-                        materialize_prepared_checkout_entry(original_cwd, worktree_root, entry)
+                        materialize_prepared_checkout_entry(
+                            original_cwd,
+                            worktree_root,
+                            policy,
+                            entry,
+                        )
                     };
                     results
                         .lock()
@@ -1045,10 +1129,36 @@ pub fn materialize_checkout_entries_with_database(
     attributes: Option<&TreeAttributes>,
     entries: &[CheckoutMaterializationEntry],
 ) -> Result<CheckoutMaterializationOutcome> {
+    materialize_checkout_entries_with_database_with_path_policy(
+        original_cwd,
+        worktree_root,
+        git_dir,
+        format,
+        db,
+        config,
+        attributes,
+        entries,
+        &checkout_path_policy(config),
+    )
+}
+
+/// Batch materialization with a caller policy, passed to every worker.
+#[allow(clippy::too_many_arguments)]
+pub fn materialize_checkout_entries_with_database_with_path_policy(
+    original_cwd: Option<&std::path::Path>,
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    config: &GitConfig,
+    attributes: Option<&TreeAttributes>,
+    entries: &[CheckoutMaterializationEntry],
+    policy: &WorktreePathPolicy,
+) -> Result<CheckoutMaterializationOutcome> {
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     verify_entry_paths(
-        &checkout_path_policy(config),
+        policy,
         entries
             .iter()
             .map(|entry| (entry.path.as_slice(), entry.mode)),
@@ -1088,8 +1198,13 @@ pub fn materialize_checkout_entries_with_database(
             index_template: None,
         });
     }
-    let materialized =
-        materialize_prepared_checkout_entries(original_cwd, worktree_root, config, prepared)?;
+    let materialized = materialize_prepared_checkout_entries(
+        original_cwd,
+        worktree_root,
+        config,
+        policy,
+        prepared,
+    )?;
     let stats = materialized
         .into_iter()
         .map(|entry| {
@@ -1127,12 +1242,14 @@ impl DelayedCheckoutQueue {
     }
 }
 
-pub(crate) fn finish_delayed_checkout(
+pub(crate) fn finish_delayed_checkout_with_policy(
     original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
     delayed: DelayedCheckoutQueue,
+    policy: &WorktreePathPolicy,
 ) -> Result<BTreeMap<Vec<u8>, IndexEntry>> {
-    let outcome = finish_delayed_checkout_outcome(original_cwd, worktree_root, delayed)?;
+    let outcome =
+        finish_delayed_checkout_outcome_with_policy(original_cwd, worktree_root, delayed, policy)?;
     if outcome.had_error {
         return Err(GitError::Rejected(sley_core::RejectionKind::Incomplete));
     }
@@ -1148,7 +1265,21 @@ struct DelayedCheckoutFinishOutcome {
 fn finish_delayed_checkout_outcome(
     original_cwd: Option<&std::path::Path>,
     worktree_root: &Path,
+    delayed: DelayedCheckoutQueue,
+) -> Result<DelayedCheckoutFinishOutcome> {
+    finish_delayed_checkout_outcome_with_policy(
+        original_cwd,
+        worktree_root,
+        delayed,
+        &crate::path_safety::writer_path_policy(worktree_root),
+    )
+}
+
+fn finish_delayed_checkout_outcome_with_policy(
+    original_cwd: Option<&std::path::Path>,
+    worktree_root: &Path,
     mut delayed: DelayedCheckoutQueue,
+    policy: &WorktreePathPolicy,
 ) -> Result<DelayedCheckoutFinishOutcome> {
     if delayed.is_empty() {
         return Ok(DelayedCheckoutFinishOutcome {
@@ -1230,6 +1361,7 @@ fn finish_delayed_checkout_outcome(
                             &path,
                             &delayed_entry.entry,
                             &output,
+                            policy,
                         ) {
                             Ok(Some(index_entry)) => {
                                 updates.insert(path, index_entry);
@@ -1313,11 +1445,20 @@ fn write_delayed_checkout_output(
     path: &[u8],
     entry: &TrackedEntry,
     body: &[u8],
+    policy: &WorktreePathPolicy,
 ) -> Result<Option<IndexEntry>> {
     if checkout_path_has_symlink_parent(worktree_root, path)? {
         return Ok(None);
     }
-    let file_path = replace_worktree_file(original_cwd, worktree_root, path, entry.mode, body)?;
+    let file_path = crate::worktree_write::replace_worktree_blob_with_policy(
+        original_cwd,
+        worktree_root,
+        path,
+        entry.mode,
+        body,
+        body,
+        policy,
+    )?;
     // Prefer symlink_metadata so a replaced symlink is not followed, and force
     // the cached size from the body we just wrote. On some filesystems a
     // same-second delayed smudge can leave the index size as 0 after the
@@ -1388,63 +1529,6 @@ pub(crate) fn build_tree_attribute_matcher(
     Ok(matcher)
 }
 
-pub(crate) fn materialize_tree_entry_with_optional_smudge(
-    original_cwd: Option<&std::path::Path>,
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    worktree_root: &Path,
-    path: &[u8],
-    entry: &TrackedEntry,
-    smudge_config: Option<&GitConfig>,
-    attributes: Option<&AttributeMatcher>,
-    delayed: Option<&mut DelayedCheckoutQueue>,
-) -> Result<IndexEntry> {
-    // A symlink (mode 120000) is written as a *symlink* whose target is the raw,
-    // unfiltered blob bytes — git treats symlink content as an opaque path, so no
-    // smudge/EOL filter ever applies. Route it through the type-aware
-    // `materialize_tree_entry` (→ `write_worktree_blob_entry`) so it is never
-    // materialized as a regular file holding the target string. A gitlink (mkdir,
-    // no blob read) and the no-smudge case go through the same shared path.
-    if smudge_config.is_none()
-        || sley_index::is_gitlink(entry.mode)
-        || (entry.mode & 0o170000) == 0o120000
-    {
-        return materialize_tree_entry(original_cwd, db, worktree_root, path, entry);
-    }
-    let Some(config) = smudge_config else {
-        return materialize_tree_entry(original_cwd, db, worktree_root, path, entry);
-    };
-    let Some(matcher) = attributes else {
-        return materialize_tree_entry(original_cwd, db, worktree_root, path, entry);
-    };
-    let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
-    let checks = matcher.attributes_for_path(path, filter_attribute_names(), false);
-    let body = match apply_smudge_filter_with_attributes_maybe_delayed(
-        config,
-        &checks,
-        path,
-        &object.body,
-        format,
-        delayed.is_some(),
-    )? {
-        SmudgeFilterResult::Content(body) => body,
-        SmudgeFilterResult::Delayed { process } => {
-            if let Some(queue) = delayed {
-                queue.enqueue(process, path, entry);
-                return Ok(unmaterialized_index_entry(path, entry));
-            }
-            return Err(GitError::InvalidFormat(
-                "smudge filter requested delay without a checkout queue".into(),
-            ));
-        }
-    };
-    let file_path = replace_worktree_file(original_cwd, worktree_root, path, entry.mode, &body)?;
-    let metadata = fs::symlink_metadata(&file_path)?;
-    let mut index_entry = index_entry_from_metadata(path.to_vec(), entry.oid, &metadata);
-    index_entry.mode = entry.mode;
-    Ok(index_entry)
-}
-
 /// Sparse- and skip-worktree-aware variant of
 /// `checkout_commit_to_index_and_worktree`.
 ///
@@ -1467,6 +1551,32 @@ pub fn checkout_commit_to_index_and_worktree_sparse(
     smudge_config: Option<&GitConfig>,
     process_metadata: Option<Vec<(String, String)>>,
 ) -> Result<usize> {
+    let policy = checkout_path_policy_for(smudge_config, git_dir);
+    checkout_commit_to_index_and_worktree_sparse_with_policy(
+        original_cwd,
+        worktree_root,
+        git_dir,
+        format,
+        target,
+        sparse,
+        smudge_config,
+        &policy,
+        process_metadata,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn checkout_commit_to_index_and_worktree_sparse_with_policy(
+    original_cwd: Option<&std::path::Path>,
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    target: &ObjectId,
+    sparse: Option<(&SparseCheckout, SparseCheckoutMode)>,
+    smudge_config: Option<&GitConfig>,
+    policy: &WorktreePathPolicy,
+    process_metadata: Option<Vec<(String, String)>>,
+) -> Result<usize> {
     let _process_filter_metadata = set_process_filter_metadata(process_metadata);
     let _process_filter_cwd = set_process_filter_cwd(Some(worktree_root.to_path_buf()));
     let previously_skipped = skip_worktree_paths(git_dir, format)?;
@@ -1474,10 +1584,7 @@ pub fn checkout_commit_to_index_and_worktree_sparse(
     let commit = read_commit(&db, format, target)?;
     let mut target_entries = BTreeMap::new();
     collect_tree_entries(&db, format, &commit.tree, &mut target_entries)?;
-    verify_tracked_entries(
-        &checkout_path_policy_for(smudge_config, git_dir),
-        &target_entries,
-    )?;
+    verify_tracked_entries(policy, &target_entries)?;
 
     // Honor skip-worktree: a path whose worktree file is intentionally absent
     // must not be treated as a dirty (deleted) change blocking the checkout.
@@ -1537,6 +1644,7 @@ pub fn checkout_commit_to_index_and_worktree_sparse(
     }
 
     let mut index_entries = Vec::new();
+    let mut prepared_entries = Vec::new();
     let mut delayed_checkout = DelayedCheckoutQueue::default();
     for (path, entry) in &target_entries {
         let in_cone = matcher.as_ref().map_or_else(
@@ -1544,17 +1652,21 @@ pub fn checkout_commit_to_index_and_worktree_sparse(
             |matcher| matcher.includes_file(path),
         );
         let index_entry = if in_cone {
-            materialize_tree_entry_with_optional_smudge(
-                original_cwd,
+            match prepare_checkout_entry(
                 &db,
                 format,
-                worktree_root,
                 path,
                 entry,
                 smudge_config,
                 attributes.as_ref(),
-                Some(&mut delayed_checkout),
-            )?
+                &mut delayed_checkout,
+            )? {
+                PreparedCheckoutResult::Ready(prepared) => {
+                    prepared_entries.push(prepared);
+                    continue;
+                }
+                PreparedCheckoutResult::Delayed(entry) => entry,
+            }
         } else {
             // Out of cone: ensure no stale worktree file remains and synthesize
             // an index entry straight from the tree (no worktree metadata),
@@ -1566,8 +1678,16 @@ pub fn checkout_commit_to_index_and_worktree_sparse(
         };
         index_entries.push(index_entry);
     }
+    let default_config = GitConfig::default();
+    index_entries.extend(materialize_prepared_checkout_entries(
+        original_cwd,
+        worktree_root,
+        smudge_config.unwrap_or(&default_config),
+        policy,
+        prepared_entries,
+    )?);
     let mut delayed_updates =
-        finish_delayed_checkout(original_cwd, worktree_root, delayed_checkout)?;
+        finish_delayed_checkout_with_policy(original_cwd, worktree_root, delayed_checkout, policy)?;
     for entry in &mut index_entries {
         if let Some(updated) = delayed_updates.remove(entry.path.as_bytes()) {
             *entry = updated;
@@ -1979,6 +2099,7 @@ pub fn checkout_index_paths_with_database_outcome_sparse(
         original_cwd,
         worktree_root,
         options.smudge_config.unwrap_or(&default_config),
+        &checkout_path_policy_for(options.smudge_config, git_dir),
         prepared_entries,
     )?;
     for entry in materialized {
@@ -2869,6 +2990,45 @@ pub fn reset_index_and_worktree_to_commit(
     format: ObjectFormat,
     commit_oid: &ObjectId,
 ) -> Result<RestoreResult> {
+    let git_dir = git_dir.as_ref();
+    let policy = checkout_path_policy_for(None, git_dir);
+    reset_index_and_worktree_to_commit_with_path_policy(
+        original_cwd,
+        worktree_root,
+        git_dir,
+        format,
+        commit_oid,
+        &policy,
+    )
+}
+
+/// Transition API variant of [`reset_index_and_worktree_to_commit`] that also
+/// installs process filter metadata for the duration of the transition, so
+/// `filter.<name>.process` negotiations run with the caller's environment
+/// contract (git's `subprocess` filter context). Prefer the plain form when no
+/// process filters are configured.
+pub fn reset_index_and_worktree_to_commit_with_process_filter_metadata(
+    original_cwd: Option<&std::path::Path>,
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    commit_oid: &ObjectId,
+    process_metadata: Option<ProcessFilterMetadata>,
+) -> Result<RestoreResult> {
+    let _process_filter_metadata = set_process_filter_metadata(process_metadata);
+    reset_index_and_worktree_to_commit(original_cwd, worktree_root, git_dir, format, commit_oid)
+}
+
+/// [`reset_index_and_worktree_to_commit`] with an explicit
+/// [`WorktreePathPolicy`]; see [`checkout_branch_filtered_with_path_policy`].
+pub fn reset_index_and_worktree_to_commit_with_path_policy(
+    original_cwd: Option<&std::path::Path>,
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    commit_oid: &ObjectId,
+    policy: &WorktreePathPolicy,
+) -> Result<RestoreResult> {
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let _process_filter_cwd = set_process_filter_cwd(Some(worktree_root.to_path_buf()));
@@ -2877,7 +3037,7 @@ pub fn reset_index_and_worktree_to_commit(
     let mut target_entries = BTreeMap::new();
     collect_tree_entries(&db, format, &commit.tree, &mut target_entries)?;
     let config = effective_worktree_config(git_dir, None).unwrap_or_default();
-    verify_tracked_entries(&checkout_path_policy(&config), &target_entries)?;
+    verify_tracked_entries(policy, &target_entries)?;
     let sparse = active_sparse_checkout(git_dir)?;
     let sparse_matcher = sparse
         .as_ref()
@@ -2910,6 +3070,7 @@ pub fn reset_index_and_worktree_to_commit(
         }
     }
 
+    let mut collisions = CheckoutCollisions::new(worktree_root, git_dir, &target_entries)?;
     let mut index_entries = Vec::new();
     let mut prepared_entries = Vec::new();
     let mut delayed_checkout = DelayedCheckoutQueue::default();
@@ -2929,6 +3090,10 @@ pub fn reset_index_and_worktree_to_commit(
             skipped.set_skip_worktree(true);
             index_entries.push(skipped);
         } else {
+            if collisions.collides(path)? {
+                index_entries.push(unmaterialized_index_entry(path, entry));
+                continue;
+            }
             match prepare_checkout_entry(
                 &db,
                 format,
@@ -2943,14 +3108,16 @@ pub fn reset_index_and_worktree_to_commit(
             }
         }
     }
+    collisions.finish();
     index_entries.extend(materialize_prepared_checkout_entries(
         original_cwd,
         worktree_root,
         &config,
+        policy,
         prepared_entries,
     )?);
     let mut delayed_updates =
-        finish_delayed_checkout(original_cwd, worktree_root, delayed_checkout)?;
+        finish_delayed_checkout_with_policy(original_cwd, worktree_root, delayed_checkout, policy)?;
     for entry in &mut index_entries {
         if let Some(updated) = delayed_updates.remove(entry.path.as_bytes()) {
             *entry = updated;
@@ -2988,37 +3155,6 @@ pub fn reset_index_and_worktree_to_commit(
     Ok(RestoreResult {
         restored: target_entries.len(),
     })
-}
-
-/// Transition API variant of [`reset_index_and_worktree_to_commit`] that also
-/// installs process filter metadata for the duration of the transition, so
-/// `filter.<name>.process` negotiations run with the caller's environment
-/// contract (git's `subprocess` filter context). Prefer the plain form when no
-/// process filters are configured.
-pub fn reset_index_and_worktree_to_commit_with_process_filter_metadata(
-    original_cwd: Option<&std::path::Path>,
-    worktree_root: impl AsRef<Path>,
-    git_dir: impl AsRef<Path>,
-    format: ObjectFormat,
-    commit_oid: &ObjectId,
-    process_metadata: Option<ProcessFilterMetadata>,
-) -> Result<RestoreResult> {
-    let _process_filter_metadata = set_process_filter_metadata(process_metadata);
-    reset_index_and_worktree_to_commit(original_cwd, worktree_root, git_dir, format, commit_oid)
-}
-
-/// [`reset_index_and_worktree_to_commit`] with an explicit
-/// [`WorktreePathPolicy`]; see [`checkout_branch_filtered_with_path_policy`].
-pub fn reset_index_and_worktree_to_commit_with_path_policy(
-    original_cwd: Option<&std::path::Path>,
-    worktree_root: impl AsRef<Path>,
-    git_dir: impl AsRef<Path>,
-    format: ObjectFormat,
-    commit_oid: &ObjectId,
-    policy: &WorktreePathPolicy,
-) -> Result<RestoreResult> {
-    let _policy = crate::path_safety::scope_worktree_path_policy(policy);
-    reset_index_and_worktree_to_commit(original_cwd, worktree_root, git_dir, format, commit_oid)
 }
 
 /// All paths the current index references, deduped across stages (a conflicted
@@ -3164,14 +3300,14 @@ pub(crate) fn write_worktree_blob_entry(
 /// single primitive so no checkout/reset/restore materializer can silently write
 /// a symlink blob as a regular file (the symlink-checkout bug class).
 ///
-/// The caller is responsible for the pre-write steps (leading directories +
-/// removing any blocker at the leaf). Type by `mode`:
+/// Parents must already exist as real directories. Symlinks in parents or at
+/// the leaf are refused; regular files can be overwritten. Type by `mode`:
 /// * `0o120000` (symlink) → a real symlink whose target is `link_target`, the
 ///   **raw** blob bytes. git treats symlink content as an opaque path, so the
 ///   smudge/EOL filter never applies — pass the unfiltered blob here even when
 ///   `body` is the smudged content for the regular-file arm.
 /// * everything else → a regular file holding `body`, with the user-execute bit
-///   set iff `mode` has it (`set_worktree_file_mode`).
+///   set iff `mode` has it.
 ///
 /// Exposed crate-publicly so out-of-crate worktree materializers (e.g.
 /// `sley-cli`'s `stash -u` untracked-tree restore) route through the same
@@ -3183,24 +3319,7 @@ pub fn write_blob_body_or_symlink(
     body: &[u8],
     link_target: &[u8],
 ) -> Result<()> {
-    if (mode & 0o170000) == 0o120000 {
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStringExt;
-            let target =
-                std::path::PathBuf::from(std::ffi::OsString::from_vec(link_target.to_vec()));
-            std::os::unix::fs::symlink(&target, file_path)?;
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = link_target;
-            fs::write(file_path, body)?;
-        }
-    } else {
-        fs::write(file_path, body)?;
-        set_worktree_file_mode(file_path, mode)?;
-    }
-    Ok(())
+    crate::worktree_write::write_blob_at_path(file_path, mode, body, link_target)
 }
 
 /// Remove whatever currently occupies a worktree path before writing a new
@@ -3230,42 +3349,6 @@ pub(crate) fn remove_existing_worktree_path(
     } else {
         fs::remove_file(file_path)?;
     }
-    Ok(())
-}
-
-/// chmod a freshly-materialized worktree blob to match its tree/index entry mode.
-///
-/// `fs::write` truncates an existing file *in place*, preserving its prior
-/// permission bits. For a mode-only diff (identical oid, 100644 vs 100755) that
-/// leaves the wrong exec bit on disk — which is exactly the `reset --hard` /
-/// checkout bug this guards against. git's checkout path unlinks+recreates the
-/// file precisely to "get the new one with the right permissions" (entry.c
-/// `write_entry`); we instead chmod the just-written file.
-///
-/// Mirrors the observable result of git's `create_file` (entry.c):
-/// `(mode & 0100) ? 0777 : 0666` masked by the standard umask (0022), i.e. 0755
-/// for an executable entry and 0644 otherwise. Only regular-file entries (100644
-/// / 100755) are chmod'd; gitlinks and symlinks have no meaningful exec bit.
-///
-/// We set the perms directly (rather than relying on a fresh `open(2)` to apply
-/// the umask) because `fs::write` truncates an existing file in place, leaving its
-/// old permission bits — the very thing that breaks a mode-only checkout/reset.
-/// Matching git's default-umask output keeps the worktree byte-for-byte aligned
-/// with the oracle, which is what the parity suite asserts.
-#[cfg(unix)]
-pub(crate) fn set_worktree_file_mode(file_path: &Path, entry_mode: u32) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let perms = match entry_mode {
-        0o100755 => 0o755,
-        0o100644 => 0o644,
-        _ => return Ok(()),
-    };
-    fs::set_permissions(file_path, fs::Permissions::from_mode(perms))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-pub(crate) fn set_worktree_file_mode(_file_path: &Path, _entry_mode: u32) -> Result<()> {
     Ok(())
 }
 
@@ -3561,6 +3644,28 @@ pub fn apply_sparse_checkout_with_mode(
     sparse: &SparseCheckout,
     mode: SparseCheckoutMode,
 ) -> Result<ApplySparseResult> {
+    let git_dir = git_dir.as_ref();
+    apply_sparse_checkout_with_mode_and_policy(
+        original_cwd,
+        worktree_root,
+        git_dir,
+        format,
+        sparse,
+        mode,
+        &checkout_path_policy_for(None, git_dir),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_sparse_checkout_with_mode_and_policy(
+    original_cwd: Option<&std::path::Path>,
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    sparse: &SparseCheckout,
+    mode: SparseCheckoutMode,
+    policy: &WorktreePathPolicy,
+) -> Result<ApplySparseResult> {
     let precompose = crate::precompose_for_git_dir(git_dir.as_ref());
 
     let worktree_root = worktree_root.as_ref();
@@ -3590,6 +3695,14 @@ pub fn apply_sparse_checkout_with_mode(
             expand_sparse_index(&mut index, &db, format)?;
         }
     }
+    verify_entry_paths(
+        policy,
+        index
+            .entries
+            .iter()
+            .filter(|entry| index_entry_stage(entry) == 0)
+            .map(|entry| (entry.path.as_bytes(), entry.mode)),
+    )?;
     let mut materialized = Vec::new();
     let mut skipped = Vec::new();
     let mut not_up_to_date = Vec::new();
@@ -3604,7 +3717,13 @@ pub fn apply_sparse_checkout_with_mode(
             clear_skip_worktree(entry);
             let file_path = worktree_path(worktree_root, entry.path.as_bytes())?;
             if !file_path.exists() {
-                materialize_index_entry_file(original_cwd, &db, worktree_root, entry)?;
+                materialize_index_entry_file_with_policy(
+                    original_cwd,
+                    &db,
+                    worktree_root,
+                    entry,
+                    policy,
+                )?;
                 let metadata = fs::symlink_metadata(&file_path)?;
                 *entry = index_entry_with_refreshed_stat(entry, &metadata);
             }
@@ -4342,23 +4461,47 @@ pub(crate) fn materialize_index_entry_file(
     worktree_root: &Path,
     entry: &IndexEntry,
 ) -> Result<()> {
+    materialize_index_entry_file_with_policy(
+        original_cwd,
+        db,
+        worktree_root,
+        entry,
+        &crate::path_safety::writer_path_policy(worktree_root),
+    )
+}
+
+pub(crate) fn materialize_index_entry_file_with_policy(
+    original_cwd: Option<&std::path::Path>,
+    db: &FileObjectDatabase,
+    worktree_root: &Path,
+    entry: &IndexEntry,
+    policy: &WorktreePathPolicy,
+) -> Result<()> {
     // A gitlink (mode 160000) has no blob in this object store and materializes
     // as a directory (git's `write_entry` S_IFGITLINK arm: mkdir, never read an
     // object). Single gitlink rule via `sley_index::is_gitlink`; without it a
     // sparse re-materialization of a submodule path would fail with "not found:
     // blob object <commit-oid>".
     if sley_index::is_gitlink(entry.mode) {
-        materialize_gitlink_dir(original_cwd, worktree_root, entry.path.as_bytes())?;
+        WorktreeLeaf::open_with_policy(
+            original_cwd,
+            worktree_root,
+            entry.path.as_bytes(),
+            entry.mode,
+            policy,
+        )?
+        .ensure_dir(original_cwd, refuse_remove_current_working_directory, true)?;
         return Ok(());
     }
     let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
-    replace_worktree_blob(
+    crate::worktree_write::replace_worktree_blob_with_policy(
         original_cwd,
         worktree_root,
         entry.path.as_bytes(),
         entry.mode,
         &object.body,
         &object.body,
+        policy,
     )?;
     Ok(())
 }
@@ -4704,22 +4847,70 @@ mod checkout_parent_safety_tests {
         assert!(!outside.path().join("file").exists());
     }
 
+    #[test]
+    fn unmerged_checkout_writer_refuses_configured_git_aliases() {
+        for path in [b".git./hooks/x".as_slice(), b"GIT~1/hooks/x"] {
+            let root = tempfile::tempdir().expect("worktree");
+            let git_dir = root.path().join(".git");
+            fs::create_dir_all(git_dir.join("objects")).expect("git objects");
+            let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+            let oid = db
+                .write_object(EncodedObject::new(ObjectType::Blob, b"body\n".to_vec()))
+                .expect("blob");
+            let mut ours = unmaterialized_index_entry(
+                path,
+                &TrackedEntry {
+                    mode: 0o100644,
+                    oid,
+                },
+            );
+            ours.flags = (ours.flags & !0x3000) | (Stage::Ours.as_u16() << 12);
+            let mut theirs = ours.clone();
+            theirs.flags = (theirs.flags & !0x3000) | (Stage::Theirs.as_u16() << 12);
+            let index = Index {
+                version: 2,
+                entries: vec![ours, theirs],
+                extensions: Vec::new(),
+                checksum: None,
+            };
+            let result = checkout_merge_unmerged_path(
+                None,
+                root.path(),
+                &db,
+                &index,
+                &[0, 1],
+                CheckoutConflictStyle::Merge,
+            );
+            assert!(
+                matches!(result, Err(GitError::InvalidPath(_))),
+                "{result:?}"
+            );
+            assert_eq!(fs::read_dir(root.path()).expect("listing").count(), 1);
+        }
+    }
 
     #[test]
     fn parallel_workers_enforce_the_callers_policy_at_the_write() {
         let root = tempfile::tempdir().expect("worktree");
-        let config = GitConfig::parse(b"[checkout]\n workers = 2\n thresholdForParallelism = 0\n").expect("workers config");
+        let config = GitConfig::parse(b"[checkout]\n workers = 2\n thresholdForParallelism = 0\n")
+            .expect("workers config");
         let policy = WorktreePathPolicy::default().reserve_root_name(".heddle");
-        let _guard = crate::path_safety::scope_worktree_path_policy(&policy);
         // Hand prepared entries straight to the worker queue, bypassing preflight.
         let prepared = vec![PreparedCheckoutEntry {
             path: b".heddle/config".to_vec(),
-            entry: TrackedEntry { mode: 0o100644, oid: ObjectId::null(ObjectFormat::Sha1) },
+            entry: TrackedEntry {
+                mode: 0o100644,
+                oid: ObjectId::null(ObjectFormat::Sha1),
+            },
             body: Some(b"content".to_vec()),
             index_template: None,
         }];
-        let result = materialize_prepared_checkout_entries(None, root.path(), &config, prepared);
-        assert!(matches!(result, Err(GitError::InvalidPath(_))), "{result:?}");
+        let result =
+            materialize_prepared_checkout_entries(None, root.path(), &config, &policy, prepared);
+        assert!(
+            matches!(result, Err(GitError::InvalidPath(_))),
+            "{result:?}"
+        );
         assert!(!root.path().join(".heddle").exists());
     }
 
@@ -4745,8 +4936,14 @@ mod checkout_parent_safety_tests {
             })
             .collect();
 
-        let entries = materialize_prepared_checkout_entries(None, root.path(), &config, prepared)
-            .expect("parallel materialization");
+        let entries = materialize_prepared_checkout_entries(
+            None,
+            root.path(),
+            &config,
+            &WorktreePathPolicy::from_config(&config),
+            prepared,
+        )
+        .expect("parallel materialization");
 
         assert_eq!(entries.len(), 2);
         assert_eq!(fs::read(root.path().join("D/A")).expect("D/A"), b"D/A");
