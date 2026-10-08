@@ -1984,6 +1984,7 @@ name = "sley-worktree"
 version = "0.12.0"
 dependencies = [
  "encoding_rs",
+ "rustix",
  "same-file",
  "sley-config",
  "sley-core",

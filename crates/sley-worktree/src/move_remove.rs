@@ -2047,7 +2047,6 @@ fn sparse_single_file_move(
                 original_cwd,
                 &db,
                 worktree_root,
-                destination_absolute,
                 &destination_entry,
             )?;
         }
@@ -2307,7 +2306,6 @@ fn sparse_directory_move(
                     original_cwd,
                     &db,
                     worktree_root,
-                    &destination_absolute,
                     &destination_entry,
                 )?;
             }
