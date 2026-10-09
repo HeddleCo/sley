@@ -963,11 +963,27 @@ impl PackIndex {
         })
     }
 
+    /// Match Git's `bsearch_hash`: search the first-byte fanout range and
+    /// return the first midpoint that compares equal, including duplicate IDs.
+    /// <https://github.com/git/git/blob/v2.55.0/hash-lookup.c>
     pub fn find(&self, oid: &ObjectId) -> Option<&PackIndexEntry> {
-        self.entries
-            .binary_search_by(|entry| entry.oid.as_bytes().cmp(oid.as_bytes()))
-            .ok()
-            .map(|idx| &self.entries[idx])
+        let first = usize::from(oid.as_bytes()[0]);
+        let mut lo = if first == 0 {
+            0
+        } else {
+            self.fanout[first - 1] as usize
+        };
+        let mut hi = self.fanout[first] as usize;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let entry = self.entries.get(mid)?;
+            match entry.oid.as_bytes().cmp(oid.as_bytes()) {
+                std::cmp::Ordering::Equal => return Some(entry),
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Less => lo = mid + 1,
+            }
+        }
+        None
     }
 
     pub fn write_v2_sha1(entries: &[PackIndexEntry], pack_checksum: &ObjectId) -> Result<Vec<u8>> {

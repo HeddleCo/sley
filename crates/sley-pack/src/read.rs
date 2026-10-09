@@ -141,25 +141,8 @@ impl PackFile {
             let entry_offset = offset as u64;
             let header = parse_entry_header(entry_region, &mut offset)?;
             let stream_size = header.size;
-            let base = match header.kind {
-                PackObjectKind::OfsDelta => Some(DeltaBase::Offset(parse_ofs_delta_base_offset(
-                    entry_region,
-                    &mut offset,
-                    entry_offset,
-                )?)),
-                PackObjectKind::RefDelta => {
-                    let hash_len = format.raw_len();
-                    if offset + hash_len > trailer_offset {
-                        return Err(GitError::InvalidFormat(
-                            "truncated ref-delta base object id".into(),
-                        ));
-                    }
-                    let oid = ObjectId::from_raw(format, &entry_region[offset..offset + hash_len])?;
-                    offset += hash_len;
-                    Some(DeltaBase::Ref(oid))
-                }
-                _ => None,
-            };
+            let base =
+                parse_entry_base(entry_region, &mut offset, entry_offset, format, header.kind)?;
             // Skip the compressed body to reach the next entry header.
             let mut body = Vec::new();
             let consumed = inflate_into(
@@ -878,14 +861,11 @@ where
         .filter(|&value| value < trailer_offset)
         .ok_or_else(|| GitError::InvalidFormat("pack object offset out of range".into()))?;
     let header = parse_entry_header(entry_region, &mut cursor)?;
-    let resolved = match header.kind {
-        PackObjectKind::Commit => PackObjectHeader::undeltified(ObjectType::Commit, header.size),
-        PackObjectKind::Tree => PackObjectHeader::undeltified(ObjectType::Tree, header.size),
-        PackObjectKind::Blob => PackObjectHeader::undeltified(ObjectType::Blob, header.size),
-        PackObjectKind::Tag => PackObjectHeader::undeltified(ObjectType::Tag, header.size),
-        PackObjectKind::OfsDelta => {
+    let base = parse_entry_base(entry_region, &mut cursor, offset, format, header.kind)?;
+    let resolved = match base {
+        None => PackObjectHeader::undeltified(object_type_for_entry(header.kind)?, header.size),
+        Some(DeltaBase::Offset(base_offset)) => {
             let next_delta_depth = checked_header_delta_depth(offset, delta_depth)?;
-            let base_offset = parse_ofs_delta_base_offset(entry_region, &mut cursor, offset)?;
             let size = delta_result_size_from_stream(&entry_region[cursor..])?;
             // The end-of-chain type only depends on the base, so reuse it across
             // reads instead of re-walking the chain per object (sley#26).
@@ -914,16 +894,8 @@ where
                 delta_depth: resolved_delta_depth,
             }
         }
-        PackObjectKind::RefDelta => {
+        Some(DeltaBase::Ref(oid)) => {
             let next_delta_depth = checked_header_delta_depth(offset, delta_depth)?;
-            let hash_len = format.raw_len();
-            if cursor + hash_len > trailer_offset {
-                return Err(GitError::InvalidFormat(
-                    "truncated ref-delta base object id".into(),
-                ));
-            }
-            let oid = ObjectId::from_raw(format, &entry_region[cursor..cursor + hash_len])?;
-            cursor += hash_len;
             let size = delta_result_size_from_stream(&entry_region[cursor..])?;
             let base_header = resolve_ref_base_type(&oid, next_delta_depth)?
                 .ok_or_else(|| GitError::not_found(format!("ref-delta base object {oid}")))?;
