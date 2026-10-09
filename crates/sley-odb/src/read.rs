@@ -17,12 +17,11 @@ use crate::registry::PackLookup;
 use crate::{FileObjectDatabase, ObjectReader, implied_empty_tree_object};
 use sley_core::{GitError, MissingObjectContext, ObjectId, Result};
 use sley_object::EncodedObject;
-use sley_pack::{
-    DecodedPackEntry, DeltaBase, DeltaChainBase, DeltaChainResolver, DeltaChainStep,
-    PackDeltaCache, PackIndex, read_pack_entry_at, resolve_delta_chain,
-};
+use sley_pack::chain::{DeltaChainBase, DeltaChainResolver, DeltaChainStep, resolve_delta_chain};
+use sley_pack::{DecodedPackEntry, DeltaBase, PackDeltaCache, PackIndex, read_pack_entry_at};
 use smallvec::SmallVec;
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 /// Read `oid` from `db` (no replacement mapping).
@@ -41,8 +40,10 @@ pub(crate) fn read_object(db: &FileObjectDatabase, oid: &ObjectId) -> Result<Arc
         oid: *oid,
         stage,
     };
+    // `start` has just probed the decoded-object cache for the first copy.
+    let mut cache_checked = true;
     loop {
-        let error = match reader.resolve_copy(next) {
+        let error = match reader.resolve_copy(next, cache_checked) {
             Ok(object) => return Ok(object),
             Err(error) => error,
         };
@@ -50,6 +51,7 @@ pub(crate) fn read_object(db: &FileObjectDatabase, oid: &ObjectId) -> Result<Arc
             Next::Resolved(object) => return Ok(object),
             Next::Attempt(location) => next = location,
         }
+        cache_checked = false;
     }
 }
 
@@ -62,12 +64,10 @@ enum Location {
     Object(usize, ObjectId),
     /// Decode the packed copy of `oid` at an offset in a source, verifying
     /// and caching the result as an ordinary packed object read.
-    /// `cache_checked` skips a decoded-object cache probe the caller just made.
     Copy {
         source: usize,
         offset: u64,
         oid: ObjectId,
-        cache_checked: bool,
     },
     /// Decode one pack entry and its delta base.
     Entry(usize, u64),
@@ -88,9 +88,11 @@ enum Stage {
         loose_error: Option<GitError>,
     },
     /// A copy was corrupt: try every redundant copy, ignoring their errors,
-    /// then report `error`.
+    /// then report `error`. Other packs are found by a lazy directory scan,
+    /// then the alternates are opened.
     Redundant {
-        remaining: VecDeque<Location>,
+        packs: Option<PackScan>,
+        alternates: Option<VecDeque<Location>>,
         error: GitError,
     },
 }
@@ -113,6 +115,14 @@ enum Entry {
         entry: DecodedPackEntry,
         recovered: bool,
     },
+}
+
+/// A lazy scan of a store's pack directory for redundant copies. Like a
+/// plain directory walk, it stops at the first usable copy, so a later
+/// unreadable entry cannot fail a read that an earlier copy satisfies.
+struct PackScan {
+    entries: std::fs::ReadDir,
+    exclude: Option<PathBuf>,
 }
 
 /// One pack file in one store, opened lazily.
@@ -217,7 +227,6 @@ impl<'a> Reader<'a> {
                 source,
                 offset,
                 oid,
-                cache_checked: false,
             },
             location => location,
         }
@@ -227,32 +236,24 @@ impl<'a> Reader<'a> {
         self.store(store).decoded.lock().ok()?.get(oid)
     }
 
-    /// Copies of `oid` in every pack of `store` except `exclude`. Scans the
-    /// on-disk `.idx` files directly, bypassing the registry whose first hit
-    /// is the excluded pack.
-    fn other_pack_copies(
+    /// The next copy of `oid` in `scan`, reading `.idx` files directly so
+    /// the registry, whose first hit is the excluded pack, is bypassed.
+    /// Unreadable or unparsable indexes are skipped; a directory read error
+    /// is reported.
+    fn next_pack_copy(
         &mut self,
         store: usize,
         oid: ObjectId,
-        exclude: usize,
-    ) -> Result<VecDeque<Location>> {
-        let db = self.store(store);
-        let format = db.format;
-        let Ok(entries) = std::fs::read_dir(db.objects_dir.join("pack")) else {
-            return Ok(VecDeque::new());
-        };
-        let mut lookups = Vec::new();
-        for entry in entries {
+        scan: &mut PackScan,
+    ) -> Result<Option<Location>> {
+        let format = self.store(store).format;
+        for entry in scan.entries.by_ref() {
             let idx_path = entry?.path();
             if idx_path.extension().and_then(|ext| ext.to_str()) != Some("idx") {
                 continue;
             }
             let pack_path = idx_path.with_extension("pack");
-            if self
-                .sources
-                .get(exclude)
-                .is_some_and(|source| source.lookup.pack_path() == pack_path)
-            {
+            if scan.exclude.as_ref() == Some(&pack_path) {
                 continue;
             }
             let Ok(idx_bytes) = std::fs::read(&idx_path) else {
@@ -262,13 +263,30 @@ impl<'a> Reader<'a> {
                 continue;
             };
             if let Some(entry) = index.find(&oid) {
-                lookups.push(PackLookup::from_path(pack_path, entry.offset));
+                let lookup = PackLookup::from_path(pack_path, entry.offset);
+                return Ok(Some(self.copy(store, oid, lookup)));
             }
         }
-        Ok(lookups
-            .into_iter()
-            .map(|lookup| self.copy(store, oid, lookup))
-            .collect())
+        Ok(None)
+    }
+
+    /// Redundant copies of `oid` outside source `exclude`: other packs of
+    /// `store`, then its alternates.
+    fn redundant_stage(&self, store: usize, exclude: usize, error: GitError) -> Stage {
+        let packs = std::fs::read_dir(self.store(store).objects_dir.join("pack"))
+            .ok()
+            .map(|entries| PackScan {
+                entries,
+                exclude: self
+                    .sources
+                    .get(exclude)
+                    .map(|source| source.lookup.pack_path().to_path_buf()),
+            });
+        Stage::Redundant {
+            packs,
+            alternates: None,
+            error,
+        }
     }
 
     /// Start a lookup: the registry-selected pack copy first, so a corrupt
@@ -283,20 +301,9 @@ impl<'a> Reader<'a> {
             if let Some(object) = self.cached(store, &oid) {
                 return Ok(Start::Resolved(object));
             }
-            let Location::Copy {
-                source,
-                offset,
-                oid,
-                ..
-            } = self.copy(store, oid, lookup)
-            else {
+            let location = self.copy(store, oid, lookup);
+            let Location::Copy { source, .. } = location else {
                 return Err(invariant("pack copy location"));
-            };
-            let location = Location::Copy {
-                source,
-                offset,
-                oid,
-                cache_checked: true,
             };
             return Ok(Start::Attempt(location, Stage::Primary { source }));
         }
@@ -382,25 +389,28 @@ impl<'a> Reader<'a> {
                     GitError::object_not_found_in(oid, MissingObjectContext::Read)
                 }))
             }
-            Stage::Redundant { remaining, error } => match remaining.pop_front() {
-                Some(location) => Ok(Next::Attempt(location)),
-                None => Err(std::mem::replace(
-                    error,
-                    GitError::object_not_found_in(oid, MissingObjectContext::Read),
-                )),
-            },
+            Stage::Redundant {
+                packs,
+                alternates,
+                error,
+            } => {
+                if let Some(scan) = packs {
+                    match self.next_pack_copy(store, oid, scan)? {
+                        Some(location) => return Ok(Next::Attempt(location)),
+                        None => *packs = None,
+                    }
+                }
+                let alternates =
+                    alternates.get_or_insert_with(|| self.alternate_locations(store, oid));
+                match alternates.pop_front() {
+                    Some(location) => Ok(Next::Attempt(location)),
+                    None => Err(std::mem::replace(
+                        error,
+                        GitError::object_not_found_in(oid, MissingObjectContext::Read),
+                    )),
+                }
+            }
         }
-    }
-
-    fn redundant_copies(
-        &mut self,
-        store: usize,
-        oid: ObjectId,
-        exclude: usize,
-    ) -> Result<VecDeque<Location>> {
-        let mut copies = self.other_pack_copies(store, oid, exclude)?;
-        copies.extend(self.alternate_locations(store, oid));
-        Ok(copies)
     }
 
     fn enter_packed(
@@ -446,6 +456,7 @@ impl<'a> Reader<'a> {
                 Location::Entry(source, base)
             }
             Some(&DeltaBase::Ref(oid)) => Location::Object(store, oid),
+            Some(_) => return Err(invariant("unsupported delta base kind")),
         };
         Ok(DeltaChainStep::Pending(
             Entry::Packed {
@@ -479,8 +490,7 @@ impl<'a> Reader<'a> {
                 if let Ok(object) = self.store(store).loose.read_object(&oid) {
                     return Ok(Next::Resolved(object));
                 }
-                let remaining = self.redundant_copies(store, oid, source)?;
-                lookup.stage = Stage::Redundant { remaining, error };
+                lookup.stage = self.redundant_stage(store, source, error);
                 self.advance(store, oid, &mut lookup.stage)
             }
             Stage::Reselected => Err(error),
@@ -492,12 +502,15 @@ impl<'a> Reader<'a> {
     /// Resolve one copy for the top-level lookup. A packed copy's entry chain
     /// runs on the work stack and its verification and caching happen here,
     /// so a plain packed read needs no lookup or copy frames.
-    fn resolve_copy(&mut self, location: Location) -> Result<Arc<EncodedObject>> {
+    fn resolve_copy(
+        &mut self,
+        location: Location,
+        cache_checked: bool,
+    ) -> Result<Arc<EncodedObject>> {
         let Location::Copy {
             source,
             offset,
             oid,
-            cache_checked,
         } = location
         else {
             return resolve_delta_chain(self, location);
@@ -511,8 +524,8 @@ impl<'a> Reader<'a> {
     }
 
     /// An OFS base failed to decode in its own pack: find the base object's
-    /// id from the index and read any other copy of it. `None` reports the
-    /// original error.
+    /// id from the index and read any other copy of it, or report the
+    /// original error when there is none.
     fn recover_ofs_base(
         &mut self,
         source: usize,
@@ -530,14 +543,10 @@ impl<'a> Reader<'a> {
         if let Ok(object) = self.store(store).loose.read_object(&oid) {
             return Ok(DeltaChainBase::Resolved(object));
         }
-        let remaining = self.redundant_copies(store, oid, source)?;
-        if remaining.is_empty() {
-            return Err(error);
-        }
         let lookup = Lookup {
             store,
             oid,
-            stage: Stage::Redundant { remaining, error },
+            stage: self.redundant_stage(store, source, error),
         };
         self.queued.push(Some(lookup));
         Ok(DeltaChainBase::Location(Location::Queued(
@@ -599,12 +608,11 @@ impl DeltaChainResolver for Reader<'_> {
                 source,
                 offset,
                 oid,
-                cache_checked,
             } => {
                 let store = self.sources[source].store;
                 // Same order as a packed object read: the decoded-object
                 // cache, then this copy's entry.
-                if !cache_checked && let Some(object) = self.cached(store, &oid) {
+                if let Some(object) = self.cached(store, &oid) {
                     return Ok(DeltaChainStep::Resolved(object));
                 }
                 Ok(DeltaChainStep::Pending(
@@ -665,11 +673,14 @@ impl DeltaChainResolver for Reader<'_> {
         }
     }
 
-    /// Only an object lookup can be reached again: pack entries lead to
-    /// strictly earlier OFS entries or to a lookup, and every other location
-    /// is entered once.
+    /// Object lookups and packed copies can be reached again: a REF base
+    /// re-enters a lookup, and recovering a corrupt OFS base re-enters a copy
+    /// of it in another pack, whose own recovery can lead back. Both come
+    /// from finite sets, so any endless descent repeats one of them while it
+    /// is still pending. Pack entries lead only to strictly earlier OFS
+    /// entries, and queued lookups are entered once.
     fn tracks_cycles(&self, location: &Location) -> bool {
-        matches!(location, Location::Object(..))
+        matches!(location, Location::Object(..) | Location::Copy { .. })
     }
 
     fn cycle_error(&self) -> GitError {

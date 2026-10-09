@@ -1148,13 +1148,13 @@ mod tests {
         encoded
     }
 
+    /// `(oid, size, delta)`: see [`write_crossed_pack`].
+    type CrossedEntry = (ObjectId, usize, Option<(usize, Vec<u8>)>);
+
     /// Write a pack of `entries`: `(oid, size, None)` is a corrupt (non-zlib)
     /// blob; `(oid, base_size, Some((base_index, body)))` is an OFS delta on
     /// an earlier entry that replaces the base with `body`.
-    fn write_crossed_pack(
-        pack_dir: &Path,
-        entries: &[(ObjectId, usize, Option<(usize, Vec<u8>)>)],
-    ) {
+    fn write_crossed_pack(pack_dir: &Path, entries: &[CrossedEntry]) {
         let mut pack = b"PACK".to_vec();
         pack.extend_from_slice(&2u32.to_be_bytes());
         pack.extend_from_slice(&(entries.len() as u32).to_be_bytes());
@@ -1231,7 +1231,65 @@ mod tests {
             let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
             let result = ObjectReader::read_object(&db, &x);
             let _ = fs::remove_dir_all(&root);
-            assert!(result.is_err(), "no good copy of B or D exists: {result:?}");
+            let error = match result {
+                Ok(_) => panic!("no good copy of B or D exists"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                !error.contains("state machine"),
+                "recovery must end in a storage error: {error}"
+            );
+        });
+    }
+
+    #[test]
+    fn self_referencing_ofs_entry_falls_back_to_loose_copy() {
+        // The packed copy is an OFS delta whose back-offset is 0, naming
+        // itself as its base. The read reports that as a corrupt copy and
+        // falls back to the good loose copy.
+        let name = "tests::self_referencing_ofs_entry_falls_back_to_loose_copy";
+        run_in_small_stack_child(name, std::time::Duration::from_secs(60), || {
+            let root = temp_root("sley-self-referencing-ofs");
+            let git_dir = root.join(".git");
+            let pack_dir = git_dir.join("objects").join("pack");
+            fs::create_dir_all(&pack_dir).expect("test operation should succeed");
+            let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+            let object = EncodedObject::new(ObjectType::Blob, b"good loose copy\n".to_vec());
+            let oid = db
+                .write_object(object.clone())
+                .expect("test operation should succeed");
+
+            let mut pack = b"PACK".to_vec();
+            pack.extend_from_slice(&2u32.to_be_bytes());
+            pack.extend_from_slice(&1u32.to_be_bytes());
+            let offset = pack.len() as u64;
+            let instructions = b"\x10\x10\x10good loose copy\n";
+            crossed_entry_header(6, instructions.len(), &mut pack);
+            pack.extend(crossed_ofs_distance(0));
+            let mut zlib = ZlibEncoder::new(Vec::new(), Compression::default());
+            zlib.write_all(instructions)
+                .expect("test operation should succeed");
+            pack.extend(zlib.finish().expect("test operation should succeed"));
+            let crc32 = crc32fast::hash(&pack[offset as usize..]);
+            let checksum = sley_core::digest_bytes(ObjectFormat::Sha1, &pack)
+                .expect("test operation should succeed");
+            pack.extend_from_slice(checksum.as_bytes());
+            let index = PackIndex::write_v2(
+                ObjectFormat::Sha1,
+                &[PackIndexEntry { oid, crc32, offset }],
+                &checksum,
+            )
+            .expect("test operation should succeed");
+            let pack_name = checksum.to_hex();
+            fs::write(pack_dir.join(format!("pack-{pack_name}.pack")), pack)
+                .expect("test operation should succeed");
+            fs::write(pack_dir.join(format!("pack-{pack_name}.idx")), index)
+                .expect("test operation should succeed");
+            db.refresh_read_cache();
+
+            let read = ObjectReader::read_object(&db, &oid);
+            let _ = fs::remove_dir_all(&root);
+            assert_eq!(*read.expect("loose fallback"), object);
         });
     }
 

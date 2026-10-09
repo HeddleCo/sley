@@ -12,7 +12,10 @@ use std::hash::Hash;
 /// object that is already decoded.
 #[derive(Debug)]
 pub enum DeltaChainBase<L, O> {
+    /// A storage location the driver enters next.
     Location(L),
+    /// A base that is already decoded, for example from a cache or another
+    /// object store.
     Resolved(O),
 }
 

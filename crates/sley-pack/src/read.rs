@@ -629,7 +629,7 @@ where
 /// One inflated pack entry whose delta, if any, is not yet applied.
 ///
 /// [`read_pack_entry_at`] produces these so an object store can drive
-/// [`resolve_delta_chain`] itself, supplying base locations from any pack.
+/// [`crate::chain::resolve_delta_chain`] itself, supplying base locations from any pack.
 #[derive(Debug)]
 pub struct DecodedPackEntry {
     base: Option<DeltaBase>,
@@ -644,13 +644,26 @@ impl DecodedPackEntry {
     }
 
     /// Apply this entry's delta to its resolved `base`, or build the object
-    /// directly when the entry is not a delta.
+    /// directly when the entry is not a delta. Passing a base for an
+    /// undeltified entry, or none for a delta, is an `InvalidFormat` error.
     pub fn resolve(self, base: Option<&EncodedObject>) -> Result<Arc<EncodedObject>> {
-        let object = match base {
-            Some(base) => {
+        let object = match (base, self.base.is_some()) {
+            (Some(base), true) => {
                 EncodedObject::new(base.object_type, apply_pack_delta(&base.body, &self.body)?)
             }
-            None => EncodedObject::new(object_type_for_entry(self.header.kind)?, self.body),
+            (None, false) => {
+                EncodedObject::new(object_type_for_entry(self.header.kind)?, self.body)
+            }
+            (None, true) => {
+                return Err(GitError::InvalidFormat(
+                    "delta pack entry decoded without a base".into(),
+                ));
+            }
+            (Some(_), false) => {
+                return Err(GitError::InvalidFormat(
+                    "undeltified pack entry given a delta base".into(),
+                ));
+            }
         };
         Ok(Arc::new(object))
     }
