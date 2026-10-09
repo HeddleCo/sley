@@ -3104,17 +3104,18 @@ mod tests {
             let entry_offset = offset as u64;
             let header =
                 parse_entry_header(pack, &mut offset).expect("test operation should succeed");
-            let base = match header.kind {
-                PackObjectKind::OfsDelta => {
-                    let base_offset = parse_ofs_delta_base_offset(pack, &mut offset, entry_offset)
-                        .expect("test operation should succeed");
-                    EntryBase::Offset(base_offset)
-                }
-                PackObjectKind::RefDelta => {
-                    offset += format.raw_len();
-                    EntryBase::Ref
-                }
-                _ => EntryBase::None,
+            let base = match parse_entry_base(
+                &pack[..trailer_offset],
+                &mut offset,
+                entry_offset,
+                format,
+                header.kind,
+            )
+            .expect("test base should parse")
+            {
+                Some(DeltaBase::Offset(base_offset)) => EntryBase::Offset(base_offset),
+                Some(DeltaBase::Ref(_)) => EntryBase::Ref,
+                None => EntryBase::None,
             };
             let mut decoder = ZlibDecoder::new(&pack[offset..trailer_offset]);
             let mut body = Vec::new();

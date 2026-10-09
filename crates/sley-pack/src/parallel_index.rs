@@ -371,48 +371,17 @@ fn candidate_header(
     trailer_offset: usize,
     offset: usize,
 ) -> Option<EntryDescriptor> {
-    let first = *pack.get(offset)?;
-    let kind = match (first >> 4) & 0x07 {
-        1 => PackObjectKind::Commit,
-        2 => PackObjectKind::Tree,
-        3 => PackObjectKind::Blob,
-        4 => PackObjectKind::Tag,
-        6 => PackObjectKind::OfsDelta,
-        7 => PackObjectKind::RefDelta,
-        _ => return None,
-    };
-    let mut cursor = offset + 1;
-    let mut byte = first;
-    let mut size = u64::from(first & 0x0f);
-    let mut shift = 4u32;
-    while byte & 0x80 != 0 {
-        byte = *pack.get(cursor)?;
-        cursor = cursor.checked_add(1)?;
-        let part = u64::from(byte & 0x7f).checked_shl(shift)?;
-        size = size.checked_add(part)?;
-        shift = shift.checked_add(7)?;
-        if shift > 67 {
-            return None;
-        }
-    }
-    let base = match kind {
-        PackObjectKind::OfsDelta => {
-            let mut base_cursor = cursor;
-            let base = parse_ofs_delta_base_offset(pack, &mut base_cursor, offset as u64).ok()?;
-            cursor = base_cursor;
-            Some(DeltaBase::Offset(base))
-        }
-        PackObjectKind::RefDelta => {
-            let end = cursor.checked_add(format.raw_len())?;
-            if end > trailer_offset {
-                return None;
-            }
-            let oid = ObjectId::from_raw(format, pack.get(cursor..end)?).ok()?;
-            cursor = end;
-            Some(DeltaBase::Ref(oid))
-        }
-        _ => None,
-    };
+    let entry_region = pack.get(..trailer_offset)?;
+    let mut cursor = offset;
+    let header = parse_entry_header(entry_region, &mut cursor).ok()?;
+    let base = parse_entry_base(
+        entry_region,
+        &mut cursor,
+        offset as u64,
+        format,
+        header.kind,
+    )
+    .ok()?;
     if cursor >= trailer_offset || !is_zlib_header(pack.get(cursor..cursor.checked_add(2)?)?) {
         return None;
     }
@@ -420,7 +389,7 @@ fn candidate_header(
         offset,
         data_offset: cursor,
         end_offset: 0,
-        header: EntryHeader { kind, size },
+        header,
         base,
     })
 }

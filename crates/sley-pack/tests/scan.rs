@@ -633,7 +633,13 @@ fn scan_empty_and_non_blob_packs() {
 }
 
 fn encoded_fixture(entries: Vec<(EncodedObject, Vec<u8>)>) -> Fixture {
-    let format = ObjectFormat::Sha1;
+    encoded_fixture_with_format(ObjectFormat::Sha1, entries)
+}
+
+fn encoded_fixture_with_format(
+    format: ObjectFormat,
+    entries: Vec<(EncodedObject, Vec<u8>)>,
+) -> Fixture {
     let mut pack = b"PACK".to_vec();
     pack.extend_from_slice(&2u32.to_be_bytes());
     pack.extend_from_slice(&(entries.len() as u32).to_be_bytes());
@@ -665,7 +671,7 @@ fn encoded_fixture(entries: Vec<(EncodedObject, Vec<u8>)>) -> Fixture {
 }
 
 #[test]
-fn scan_duplicate_objects_keep_first_copy_and_check_git() {
+fn scan_duplicate_objects_match_git_lookup() {
     let object = EncodedObject::new(ObjectType::Blob, vec![b'x'; 4096]);
     let bytes = entry(3, &object.body, &[]);
     let fixture = encoded_fixture(vec![(object.clone(), bytes.clone()), (object, bytes)]);
@@ -712,21 +718,22 @@ fn scan_duplicate_objects_keep_first_copy_and_check_git() {
     let scan = PackScan::from_slice(&fixture.pack, &oracle, limits()).expect("duplicate scan");
     let plan = scan.plan([oid, oid]).expect("plan");
     assert_eq!(plan.entries().len(), 1);
-    assert_eq!(plan.entries().next().expect("entry").offset, 12);
+    assert_eq!(oracle.find(&oid).expect("lookup").offset, 65);
+    assert_eq!(plan.entries().next().expect("entry").offset, 65);
     let mut cursor = plan.cursor(lookup(HashMap::new()), CancelFlag::never());
-    assert_eq!(cursor.next().expect("object").expect("decode").offset, 12);
+    assert_eq!(cursor.next().expect("object").expect("decode").offset, 65);
     assert!(cursor.next().is_none());
     assert_eq!(cursor.stats().entries_inflated, 1);
-    // OFS references address the second physical copy; both base forms must
-    // still add only the canonical first copy to the dependency closure.
+    // OFS references address their physical copy; REF references use lookup.
+    // In this fixture both select the second copy.
     let base = fixture.objects[&oid].clone();
     let base_bytes = entry(3, &base.body, &[]);
     let mut body = base.body.clone();
     body.push(b'!');
     let child = EncodedObject::new(ObjectType::Blob, body);
-    for ofs in [false, true] {
+    for (ofs, first) in [(false, false), (true, false), (true, true)] {
         let base_reference = if ofs {
-            vec![base_bytes.len() as u8]
+            vec![(base_bytes.len() * if first { 2 } else { 1 }) as u8]
         } else {
             oid.as_bytes().to_vec()
         };
@@ -748,12 +755,103 @@ fn scan_duplicate_objects_keep_first_copy_and_check_git() {
             .plan([child.object_id(ObjectFormat::Sha1).expect("oid")])
             .expect("plan");
         assert_eq!(plan.entries().len(), 2);
-        assert_eq!(plan.entries().next().expect("base").offset, 12);
+        assert_eq!(
+            plan.entries().next().expect("base").offset,
+            if first { 12 } else { 65 }
+        );
         let mut cursor = plan.cursor(lookup(HashMap::new()), CancelFlag::never());
         for output in cursor.by_ref() {
             output.expect("decode");
         }
         assert_eq!(cursor.stats().entries_inflated, 2);
+    }
+}
+
+#[test]
+fn scan_duplicate_lookup_matches_git_across_fanout_and_copy_counts() {
+    // Like Git's t5308, put two duplicate runs and a missing ID into the
+    // same fanout bucket, then compare lookup against the pinned Git oracle.
+    // Other buckets ensure a whole-index binary search would select differently.
+    for format in [ObjectFormat::Sha1, ObjectFormat::Sha256] {
+        let empty = EncodedObject::new(ObjectType::Blob, Vec::new());
+        let bucket = empty.object_id(format).expect("oid").as_bytes()[0];
+        let neighbor = (0u32..)
+            .map(|n| EncodedObject::new(ObjectType::Blob, n.to_be_bytes().to_vec()))
+            .find(|object| object.object_id(format).expect("oid").as_bytes()[0] == bucket)
+            .expect("same-bucket neighbor");
+        for copies in [1, 2, 3, 4, 5, 17, 100] {
+            let mut entries = Vec::new();
+            for _ in 0..copies {
+                for object in [&empty, &neighbor] {
+                    entries.push((object.clone(), entry(3, &object.body, &[])));
+                }
+            }
+            for n in 0u32..8 {
+                let object = EncodedObject::new(ObjectType::Blob, n.to_le_bytes().to_vec());
+                if object.object_id(format).expect("oid").as_bytes()[0] != bucket {
+                    entries.push((object.clone(), entry(3, &object.body, &[])));
+                }
+            }
+            let fixture = encoded_fixture_with_format(format, entries);
+            let repo = TempRepo::new(format);
+            let pack_path = repo.0.join("duplicates.pack");
+            std::fs::write(&pack_path, &fixture.pack).expect("pack");
+            git(
+                &repo.0,
+                &["index-pack", pack_path.to_str().expect("path")],
+                &[],
+            );
+            let oracle = PackIndex::parse(
+                &std::fs::read(pack_path.with_extension("idx")).expect("git index"),
+                format,
+            )
+            .expect("index");
+            git(&repo.0, &["index-pack", "--stdin"], &fixture.pack);
+            let scan = PackScan::from_slice(&fixture.pack, &oracle, limits()).expect("scan");
+            for object in [&empty, &neighbor] {
+                let oid = object.object_id(format).expect("oid");
+                let trace = repo.0.join(format!("{oid}.trace"));
+                let output = Command::new("git")
+                    .args(["cat-file", "blob", &oid.to_string()])
+                    .current_dir(&repo.0)
+                    .env("GIT_TRACE_PACK_ACCESS", &trace)
+                    .output()
+                    .expect("cat-file");
+                assert!(output.status.success());
+                assert_eq!(output.stdout, object.body);
+                let accesses = std::fs::read_to_string(trace).expect("trace");
+                let offset: u64 = accesses
+                    .lines()
+                    .next()
+                    .expect("access")
+                    .split_whitespace()
+                    .last()
+                    .expect("offset")
+                    .parse()
+                    .expect("numeric offset");
+                assert_eq!(oracle.find(&oid).expect("lookup").offset, offset);
+                let mut cursor = scan
+                    .plan([oid, oid])
+                    .expect("plan")
+                    .cursor(lookup(HashMap::new()), CancelFlag::never());
+                let decoded = cursor.next().expect("object").expect("decode");
+                assert_eq!(decoded.offset, offset, "{format:?}, {copies} copies");
+                assert_eq!(*decoded.object, *object);
+                assert!(cursor.next().is_none());
+                assert_eq!(cursor.stats().entries_inflated, 1);
+            }
+            let mut missing = empty.object_id(format).expect("oid").as_bytes().to_vec();
+            missing[1..].fill(0);
+            let missing = ObjectId::from_raw(format, &missing).expect("missing oid");
+            assert!(oracle.find(&missing).is_none());
+            assert!(scan.plan([missing]).is_err());
+            let output = git(
+                &repo.0,
+                &["cat-file", "--batch-check"],
+                format!("{missing}\n").as_bytes(),
+            );
+            assert_eq!(output, format!("{missing} missing\n").as_bytes());
+        }
     }
 }
 

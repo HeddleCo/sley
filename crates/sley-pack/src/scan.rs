@@ -152,7 +152,21 @@ impl<S: PackReadSource> PackScan<S> {
                 )
                 .into());
             }
-            by_oid.entry(entry.oid).or_insert(position);
+        }
+        // Use the index lookup's first equality hit, as Git does, rather than
+        // choosing a physical first/last copy. Unique IDs need no search.
+        for copies in index.entries.chunk_by(|a, b| a.oid == b.oid) {
+            let entry = if copies.len() == 1 {
+                &copies[0]
+            } else {
+                index.find(&copies[0].oid).ok_or_else(|| {
+                    GitError::InvalidFormat("missing duplicate index lookup".into())
+                })?
+            };
+            let position = *by_offset
+                .get(&entry.offset)
+                .ok_or_else(|| GitError::InvalidFormat("missing indexed object offset".into()))?;
+            by_oid.insert(entry.oid, position);
         }
         let mut entries = Vec::with_capacity(count);
         for (position, entry) in ordered.iter().enumerate() {
@@ -166,46 +180,36 @@ impl<S: PackReadSource> PackScan<S> {
             let bytes = &prefix[..available];
             let mut cursor = 0;
             let header = parse_entry_header(bytes, &mut cursor)?;
-            let (kind, base, base_position) = match header.kind {
-                PackObjectKind::OfsDelta => {
-                    let offset = parse_ofs_delta_base_offset(bytes, &mut cursor, entry.offset)?;
+            let parsed_base =
+                parse_entry_base(bytes, &mut cursor, entry.offset, format, header.kind)?;
+            let (kind, base, base_position) = match parsed_base {
+                Some(DeltaBase::Offset(offset)) => {
                     let base = *by_offset
                         .get(&offset)
                         .filter(|base| **base < position)
                         .ok_or_else(|| {
                             GitError::InvalidFormat("ofs-delta base is not an earlier entry".into())
                         })?;
-                    let base = *by_oid.get(&ordered[base].oid).ok_or_else(|| {
-                        GitError::InvalidObject("missing indexed base identity".into())
-                    })?;
                     (
                         PackScanKind::OfsDelta,
                         Some(PackScanBase::InPack(ordered[base].oid)),
                         Some(base),
                     )
                 }
-                PackObjectKind::RefDelta => {
-                    let raw_end = cursor + format.raw_len();
-                    let raw = bytes.get(cursor..raw_end).ok_or_else(|| {
-                        GitError::InvalidFormat("truncated ref-delta base object id".into())
-                    })?;
-                    let oid = ObjectId::from_raw(format, raw)?;
-                    cursor = raw_end;
-                    match by_oid.get(&oid).copied() {
-                        Some(base) => (
-                            PackScanKind::RefDelta,
-                            Some(PackScanBase::InPack(oid)),
-                            Some(base),
-                        ),
-                        None => (
-                            PackScanKind::RefDelta,
-                            Some(PackScanBase::External(oid)),
-                            None,
-                        ),
-                    }
-                }
-                kind => (
-                    PackScanKind::Object(object_type_for_entry(kind)?),
+                Some(DeltaBase::Ref(oid)) => match by_oid.get(&oid).copied() {
+                    Some(base) => (
+                        PackScanKind::RefDelta,
+                        Some(PackScanBase::InPack(oid)),
+                        Some(base),
+                    ),
+                    None => (
+                        PackScanKind::RefDelta,
+                        Some(PackScanBase::External(oid)),
+                        None,
+                    ),
+                },
+                None => (
+                    PackScanKind::Object(object_type_for_entry(header.kind)?),
                     None,
                     None,
                 ),
@@ -244,7 +248,8 @@ impl<S: PackReadSource> PackScan<S> {
 
     /// Add transitive in-pack bases, count direct dependents, and detect cycles.
     /// Duplicate requested IDs are counted once. For duplicate pack objects,
-    /// only the first copy in pack order is planned. An absent target is an error.
+    /// target and REF lookups select the same index entry as Git's binary search.
+    /// OFS bases retain their physical offset. An absent target is an error.
     pub fn plan(
         &self,
         needed: impl IntoIterator<Item = ObjectId>,
