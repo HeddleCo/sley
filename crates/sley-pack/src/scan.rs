@@ -446,21 +446,21 @@ impl<S: PackReadSource> PackScanCursor<'_, S> {
                 if let Some(object) = &self.states[base].object {
                     self.live_bytes -= object.body.len();
                 }
-                if self.states[base].yielded {
-                    if let Some(object) = self.states[base].object.take() {
-                        self.active_bytes -= object.body.len();
-                    }
+                if self.states[base].yielded
+                    && let Some(object) = self.states[base].object.take()
+                {
+                    self.active_bytes -= object.body.len();
                 }
             }
-        } else if let Some(PackScanBase::External(oid)) = entry.public.base {
-            if let Some((object, remaining)) = self.external.get_mut(&oid) {
-                *remaining -= 1;
-                if *remaining == 0 {
-                    let size = object.body.len();
-                    self.external.remove(&oid);
-                    self.live_bytes -= size;
-                    self.active_bytes -= size;
-                }
+        } else if let Some(PackScanBase::External(oid)) = entry.public.base
+            && let Some((object, remaining)) = self.external.get_mut(&oid)
+        {
+            *remaining -= 1;
+            if *remaining == 0 {
+                let size = object.body.len();
+                self.external.remove(&oid);
+                self.live_bytes -= size;
+                self.active_bytes -= size;
             }
         }
     }

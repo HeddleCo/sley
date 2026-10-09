@@ -159,7 +159,7 @@ fn assert_differential(fixture: &Fixture, format: ObjectFormat) {
         .expect("plan");
     let mut cursor = plan.cursor(fixture.external.clone()).expect("cursor");
     let mut last_offset = 0;
-    while let Some(actual) = cursor.next() {
+    for actual in cursor.by_ref() {
         let actual = actual.expect("scan object");
         assert!(actual.offset > last_offset);
         last_offset = actual.offset;
@@ -534,15 +534,13 @@ fn scan_truncated_corrupt_headers_streams_and_cycles_never_panic() {
             for byte in 0u8..=255 {
                 let mut pack = fixture.pack.clone();
                 pack[at] = byte;
-                if let Ok(scan) = PackScan::from_slice(&pack, &fixture.index, limits()) {
-                    if let Ok(plan) = scan.plan(fixture.index.entries.iter().map(|entry| entry.oid))
-                    {
-                        if let Ok(cursor) = plan.cursor(HashMap::new()) {
-                            for object in cursor {
-                                if object.is_err() {
-                                    break;
-                                }
-                            }
+                if let Ok(scan) = PackScan::from_slice(&pack, &fixture.index, limits())
+                    && let Ok(plan) = scan.plan(fixture.index.entries.iter().map(|entry| entry.oid))
+                    && let Ok(cursor) = plan.cursor(HashMap::new())
+                {
+                    for object in cursor {
+                        if object.is_err() {
+                            break;
                         }
                     }
                 }
