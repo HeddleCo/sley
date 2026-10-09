@@ -571,7 +571,7 @@ impl<S: PackReadSource> Iterator for PackScanCursor<'_, S> {
             }
         }
         let state = &mut self.states[position];
-        let object = if true {
+        let object = if self.remaining[position] == 0 {
             let object = state.object.take()?;
             self.active_bytes -= object.body.len();
             object
