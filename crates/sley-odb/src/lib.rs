@@ -16,6 +16,7 @@ mod loose;
 mod midx;
 mod pack;
 mod reachability;
+mod read;
 mod registry;
 mod repack;
 
@@ -746,6 +747,117 @@ mod tests {
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
+    /// Write `objects` as an undeltified pack in `pack_dir`; returns its path.
+    fn write_plain_pack(pack_dir: &Path, objects: &[EncodedObject]) -> PathBuf {
+        let written =
+            PackFile::write_undeltified_sha1(objects).expect("test operation should succeed");
+        let name = written.checksum.to_hex();
+        let pack_path = pack_dir.join(format!("pack-{name}.pack"));
+        fs::write(&pack_path, written.pack).expect("test operation should succeed");
+        fs::write(pack_dir.join(format!("pack-{name}.idx")), written.index)
+            .expect("test operation should succeed");
+        pack_path
+    }
+
+    #[test]
+    fn corrupt_pack_copy_falls_back_to_redundant_pack_copy() {
+        let root = temp_root("sley-corrupt-pack-redundant-copy");
+        let git_dir = root.join(".git");
+        let pack_dir = git_dir.join("objects").join("pack");
+        fs::create_dir_all(&pack_dir).expect("test operation should succeed");
+        let object = EncodedObject::new(ObjectType::Blob, b"stored twice\n".to_vec());
+        let oid = object
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let filler = EncodedObject::new(ObjectType::Blob, b"second pack filler\n".to_vec());
+        write_plain_pack(&pack_dir, std::slice::from_ref(&object));
+        write_plain_pack(&pack_dir, &[object.clone(), filler]);
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+
+        // Corrupt whichever copy the registry selects; no loose copy exists.
+        let selected = db
+            .find_pack_containing(&oid)
+            .expect("test operation should succeed")
+            .expect("the object is packed");
+        let mut pack_bytes = fs::read(selected.pack_path()).expect("test operation should succeed");
+        let entry = usize::try_from(selected.offset).expect("test operation should succeed");
+        pack_bytes[entry + 4] ^= 0xff;
+        fs::write(selected.pack_path(), &pack_bytes).expect("test operation should succeed");
+        db.refresh_read_cache();
+
+        assert_eq!(read_object_for_assert(&db, &oid), object);
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn ofs_delta_base_recovers_from_redundant_pack_copy() {
+        let root = temp_root("sley-ofs-delta-base-redundant-pack");
+        let git_dir = root.join(".git");
+        let pack_dir = git_dir.join("objects").join("pack");
+        fs::create_dir_all(&pack_dir).expect("test operation should succeed");
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+
+        let mut base_body = Vec::new();
+        for idx in 0..256u16 {
+            base_body.extend_from_slice(format!("shared line {idx:03}\n").as_bytes());
+        }
+        let base = EncodedObject::new(ObjectType::Blob, base_body.clone());
+        let mut first_body = base_body;
+        first_body.extend_from_slice(b"first delta payload\n");
+        let first = EncodedObject::new(ObjectType::Blob, first_body.clone());
+        let mut second_body = first_body;
+        second_body.extend_from_slice(b"second delta payload\n");
+        let second = EncodedObject::new(ObjectType::Blob, second_body);
+        let first_oid = first
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let second_oid = second
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+
+        let options = PackWriteOptions::new()
+            .with_prefer_ofs_delta(true)
+            .with_reorder(false);
+        let written = PackFile::write_packed_with_options(
+            &[base, first.clone(), second.clone()],
+            ObjectFormat::Sha1,
+            &options,
+        )
+        .expect("test operation should succeed");
+        let stats = PackFile::verify_pack_stats(&written.pack, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let first_stat = stats
+            .objects
+            .iter()
+            .find(|stat| stat.oid == first_oid)
+            .expect("first object should be packed");
+        let second_stat = stats
+            .objects
+            .iter()
+            .find(|stat| stat.oid == second_oid)
+            .expect("second object should be packed");
+        assert_eq!(second_stat.base_oid, Some(first_oid));
+        let installed = db
+            .install_pack(&written)
+            .expect("test operation should succeed");
+
+        // Break `first` in the delta pack; the only other copy is a plain one
+        // in a second pack, and there is no loose copy.
+        let mut corrupt_pack = written.pack;
+        let base_reference = ofs_delta_base_reference_position(&corrupt_pack, first_stat.offset);
+        corrupt_pack[base_reference] = if corrupt_pack[base_reference] == 1 {
+            2
+        } else {
+            1
+        };
+        fs::write(&installed.pack_path, &corrupt_pack).expect("test operation should succeed");
+        write_plain_pack(&pack_dir, std::slice::from_ref(&first));
+        db.refresh_read_cache();
+
+        assert_eq!(read_object_for_assert(&db, &second_oid), second);
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
     fn ofs_delta_base_reference_position(pack: &[u8], offset: u64) -> usize {
         let mut cursor = usize::try_from(offset).expect("test operation should succeed");
         let first = pack[cursor];
@@ -938,6 +1050,32 @@ mod tests {
                 .expect("the loose fallback should satisfy the header read"),
             Some((ObjectType::Blob, object.body.len() as u64))
         );
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn read_object_ref_delta_cycle_falls_back_to_loose_copy() {
+        let root = temp_root("sley-read-ref-delta-cycle");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        let format = ObjectFormat::Sha1;
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let object = EncodedObject::new(ObjectType::Blob, b"good loose fallback\n".to_vec());
+        let oid = db
+            .write_object(object.clone())
+            .expect("test operation should succeed");
+        let other_oid = sley_core::object_id_for_bytes(format, "blob", b"cycle peer")
+            .expect("test operation should succeed");
+
+        // The packed copies form `oid -> other_oid -> oid`. The read must
+        // detect the cycle and fall back to the loose copy of `oid`.
+        write_indexed_ref_delta(&db.pack_dir, format, oid, other_oid);
+        write_indexed_ref_delta(&db.pack_dir, format, other_oid, oid);
+        db.refresh_read_cache();
+        assert_eq!(read_object_for_assert(&db, &oid), object);
+        // The peer's base resolves to that loose copy, which its placeholder
+        // delta does not fit: an error, not unbounded recursion.
+        assert!(ObjectReader::read_object(&db, &other_oid).is_err());
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 

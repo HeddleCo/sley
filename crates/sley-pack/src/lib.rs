@@ -26,6 +26,7 @@ use std::sync::Arc;
 // `sley_pack::X` path (public API and intra-crate) resolves unchanged.
 // This is a pure code move: no function body was altered.
 mod bounded_read;
+mod chain;
 mod delta;
 mod fix_thin;
 mod index;
@@ -36,6 +37,7 @@ mod read;
 mod write;
 
 pub use bounded_read::*;
+pub use chain::*;
 pub(crate) use delta::*;
 pub use fix_thin::*;
 pub use index::*;
@@ -195,9 +197,12 @@ enum PackObjectKind {
     RefDelta,
 }
 
+/// The immediate base named by a packed delta entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum DeltaBase {
+pub enum DeltaBase {
+    /// An OFS delta: the base entry's absolute offset in the same pack.
     Offset(u64),
+    /// A REF delta: the base object's id, which may live anywhere.
     Ref(ObjectId),
 }
 

@@ -6,7 +6,7 @@
 
 use super::*;
 use flate2::{FlushDecompress, Status};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 
 const ENTRY_PREFIX_BYTES: usize = 64;
@@ -891,151 +891,17 @@ impl<S: PackReadSource> BoundedPackDecoder<S> {
             });
         }
 
-        let mut visited = HashSet::new();
-        let mut deltas = Vec::new();
-        let mut current_location = location;
-        let mut base_object: Option<(
-            Arc<EncodedObject>,
-            ObjectId,
-            Option<PackObjectLocation>,
-            usize,
-        )> = None;
-        let mut base_entry = None;
-
-        loop {
-            cancel.check()?;
-            self.source_state(current_location)?;
-            if !visited.insert(current_location) {
-                return Err(GitError::InvalidFormat("pack delta cycle detected".into()).into());
-            }
-            if current_location != location
-                && let Some((object, oid, cached_depth)) = self.cache.peek(current_location)
-            {
-                let full_depth = deltas.len().saturating_add(cached_depth);
-                self.enforce_depth(full_depth)?;
-                base_object = Some((object, oid, Some(current_location), cached_depth));
-                break;
-            }
-            let entry = self.read_entry_plan(current_location, cancel, &mut stats)?;
-            cancel.check()?;
-            match entry.base.clone() {
-                None => {
-                    base_entry = Some(entry);
-                    break;
-                }
-                Some(base) => {
-                    let depth = deltas.len().saturating_add(1);
-                    self.enforce_depth(depth)?;
-                    deltas.push(entry);
-                    match base {
-                        DeltaBase::Offset(base_offset) => {
-                            current_location =
-                                PackObjectLocation::new(current_location.source, base_offset);
-                        }
-                        DeltaBase::Ref(base_oid) => {
-                            cancel.check()?;
-                            match ref_bases.get(&base_oid) {
-                                Some(RefDeltaBase::Location(base_location)) => {
-                                    current_location = *base_location;
-                                }
-                                Some(RefDeltaBase::Resolved(resolved)) => {
-                                    if resolved.oid != base_oid {
-                                        return Err(GitError::InvalidObject(format!(
-                                            "resolved REF base identity mismatch: expected {base_oid}, got {}",
-                                            resolved.oid
-                                        ))
-                                        .into());
-                                    }
-                                    let full_depth = deltas.len().saturating_add(resolved.depth);
-                                    self.enforce_depth(full_depth)?;
-                                    let pinned = resolved.origin.filter(|origin| {
-                                        self.cache.contains_same(*origin, &resolved.object)
-                                    });
-                                    let active = if pinned.is_some() {
-                                        0
-                                    } else {
-                                        resolved.object.body.len()
-                                    };
-                                    self.ensure_materialized(
-                                        0, active, pinned, cancel, &mut stats,
-                                    )?;
-                                    base_object = Some((
-                                        Arc::clone(&resolved.object),
-                                        resolved.oid,
-                                        pinned,
-                                        resolved.depth,
-                                    ));
-                                    break;
-                                }
-                                None => {
-                                    return Err(GitError::not_found(format!(
-                                        "ref-delta base object {base_oid}"
-                                    ))
-                                    .into());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let cached_base_depth = base_object.as_ref().map_or(0, |(_, _, _, depth)| *depth);
-        stats.delta_depth = deltas.len().saturating_add(cached_base_depth);
-        self.enforce_depth(stats.delta_depth)?;
-        let (mut object, mut object_oid, mut pinned_cache) = match (base_object, base_entry) {
-            (Some((object, oid, pinned, _)), None) => (object, Some(oid), pinned),
-            (None, Some(entry)) => {
-                let object_type = object_type_for_entry(entry.header.kind)?;
-                let body = self.inflate_entry(&entry, 0, None, cancel, &mut stats)?;
-                let object = Arc::new(EncodedObject::new(object_type, body));
-                (object, None, None)
-            }
-            _ => {
-                return Err(
-                    GitError::InvalidFormat("pack delta base planning failed".into()).into(),
-                );
-            }
-        };
-
-        for delta_entry in deltas.iter().rev() {
-            cancel.check()?;
-            if let Some(DeltaBase::Ref(expected_oid)) = delta_entry.base.as_ref() {
-                let actual_oid = match object_oid {
-                    Some(oid) if oid.format() == expected_oid.format() => oid,
-                    _ => cancellable_object_id(&object, expected_oid.format(), cancel)?,
-                };
-                if actual_oid != *expected_oid {
-                    return Err(GitError::InvalidObject(format!(
-                        "resolved REF base identity mismatch: expected {expected_oid}, got {actual_oid}"
-                    ))
-                    .into());
-                }
-            }
-            let base_bytes = if pinned_cache.is_some() {
-                0
-            } else {
-                object.body.len()
-            };
-            let delta =
-                self.inflate_entry(delta_entry, base_bytes, pinned_cache, cancel, &mut stats)?;
-            let plan = plan_pack_delta(&object.body, &delta)?;
-            let result_size_u64 = plan.result_size;
-            let result_size = usize::try_from(result_size_u64).map_err(|_| {
-                PackReadError::Limit(PackLimitError {
-                    kind: PackLimitKind::MaterializedBytes,
-                    limit: self.limits.max_materialized_bytes,
-                    attempted: usize::MAX,
-                })
-            })?;
-            let active_bytes = self.checked_materialized_add(base_bytes, delta.len())?;
-            let mut resolved =
-                self.allocate_body(result_size, active_bytes, pinned_cache, cancel, &mut stats)?;
-            apply_pack_delta_exact(&object.body, &delta, plan, &mut resolved, cancel)?;
-            object = Arc::new(EncodedObject::new(object.object_type, resolved));
-            object_oid = None;
-            pinned_cache = None;
-        }
+        let resolved = resolve_delta_chain(
+            &mut BoundedChain {
+                decoder: self,
+                refs: ref_bases,
+                cancel,
+                stats: &mut stats,
+            },
+            location,
+        )?;
+        let object = resolved.object;
+        stats.delta_depth = resolved.depth;
 
         cancel.check()?;
         let oid = cancellable_object_id(&object, target_format, cancel)?;
@@ -1113,25 +979,7 @@ impl<S: PackReadSource> BoundedPackDecoder<S> {
         let bytes = &prefix[..available];
         let mut cursor = 0usize;
         let header = parse_entry_header(bytes, &mut cursor)?;
-        let base = match header.kind {
-            PackObjectKind::OfsDelta => Some(DeltaBase::Offset(parse_ofs_delta_base_offset(
-                bytes,
-                &mut cursor,
-                offset,
-            )?)),
-            PackObjectKind::RefDelta => {
-                let raw_len = source.format.raw_len();
-                let end = cursor.checked_add(raw_len).ok_or_else(|| {
-                    GitError::InvalidFormat("ref-delta base offset overflow".into())
-                })?;
-                let raw = bytes.get(cursor..end).ok_or_else(|| {
-                    GitError::InvalidFormat("truncated ref-delta base object id".into())
-                })?;
-                cursor = end;
-                Some(DeltaBase::Ref(ObjectId::from_raw(source.format, raw)?))
-            }
-            _ => None,
-        };
+        let base = parse_entry_base(bytes, &mut cursor, offset, source.format, header.kind)?;
         let data_offset = offset
             .checked_add(cursor as u64)
             .ok_or_else(|| GitError::InvalidFormat("pack object offset overflow".into()))?;
@@ -1398,6 +1246,162 @@ impl<S: PackReadSource> BoundedPackDecoder<S> {
     }
 }
 
+struct BoundedBase {
+    object: Arc<EncodedObject>,
+    oid: Option<ObjectId>,
+    pinned: Option<PackObjectLocation>,
+    depth: usize,
+}
+
+struct BoundedChain<'a, 'c, S> {
+    decoder: &'a mut BoundedPackDecoder<S>,
+    refs: &'a RefDeltaBases,
+    cancel: CancelFlag<'c>,
+    stats: &'a mut PackReadStats,
+}
+
+impl<S: PackReadSource> DeltaChainResolver for BoundedChain<'_, '_, S> {
+    type Location = PackObjectLocation;
+    type Entry = EntryPlan;
+    type Object = BoundedBase;
+    type Error = PackReadError;
+
+    fn enter(
+        &mut self,
+        location: PackObjectLocation,
+        pending: usize,
+    ) -> std::result::Result<DeltaChainStep<Self::Location, Self::Entry, Self::Object>, PackReadError>
+    {
+        self.cancel.check()?;
+        self.decoder.source_state(location)?;
+        if let Some((object, oid, depth)) = self.decoder.cache.peek(location) {
+            self.decoder.enforce_depth(pending.saturating_add(depth))?;
+            return Ok(DeltaChainStep::Resolved(BoundedBase {
+                object,
+                oid: Some(oid),
+                pinned: Some(location),
+                depth,
+            }));
+        }
+        let entry = self
+            .decoder
+            .read_entry_plan(location, self.cancel, self.stats)?;
+        self.cancel.check()?;
+        let Some(base) = entry.base.clone() else {
+            return Ok(DeltaChainStep::Base(entry));
+        };
+        self.decoder.enforce_depth(pending.saturating_add(1))?;
+        let base = match base {
+            DeltaBase::Offset(offset) => {
+                DeltaChainBase::Location(PackObjectLocation::new(location.source, offset))
+            }
+            DeltaBase::Ref(oid) => match self.refs.get(&oid) {
+                Some(RefDeltaBase::Location(location)) => DeltaChainBase::Location(*location),
+                Some(RefDeltaBase::Resolved(resolved)) => {
+                    if resolved.oid != oid {
+                        return Err(GitError::InvalidObject(format!(
+                            "resolved REF base identity mismatch: expected {oid}, got {}",
+                            resolved.oid
+                        ))
+                        .into());
+                    }
+                    self.decoder
+                        .enforce_depth(pending.saturating_add(1).saturating_add(resolved.depth))?;
+                    let pinned = resolved.origin.filter(|origin| {
+                        self.decoder.cache.contains_same(*origin, &resolved.object)
+                    });
+                    let active = if pinned.is_some() {
+                        0
+                    } else {
+                        resolved.object.body.len()
+                    };
+                    self.decoder
+                        .ensure_materialized(0, active, pinned, self.cancel, self.stats)?;
+                    DeltaChainBase::Resolved(BoundedBase {
+                        object: Arc::clone(&resolved.object),
+                        oid: Some(resolved.oid),
+                        pinned,
+                        depth: resolved.depth,
+                    })
+                }
+                None => {
+                    return Err(GitError::not_found(format!("ref-delta base object {oid}")).into());
+                }
+            },
+        };
+        Ok(DeltaChainStep::Pending(entry, base))
+    }
+
+    fn finish(
+        &mut self,
+        entry: EntryPlan,
+        base: Option<BoundedBase>,
+    ) -> std::result::Result<BoundedBase, PackReadError> {
+        self.cancel.check()?;
+        let Some(base) = base else {
+            let object_type = object_type_for_entry(entry.header.kind)?;
+            let body = self
+                .decoder
+                .inflate_entry(&entry, 0, None, self.cancel, self.stats)?;
+            return Ok(BoundedBase {
+                object: Arc::new(EncodedObject::new(object_type, body)),
+                oid: None,
+                pinned: None,
+                depth: 0,
+            });
+        };
+        if let Some(DeltaBase::Ref(expected_oid)) = entry.base.as_ref() {
+            let actual_oid = match base.oid {
+                Some(oid) if oid.format() == expected_oid.format() => oid,
+                _ => cancellable_object_id(&base.object, expected_oid.format(), self.cancel)?,
+            };
+            if actual_oid != *expected_oid {
+                return Err(GitError::InvalidObject(format!(
+                    "resolved REF base identity mismatch: expected {expected_oid}, got {actual_oid}"
+                ))
+                .into());
+            }
+        }
+        let base_bytes = if base.pinned.is_some() {
+            0
+        } else {
+            base.object.body.len()
+        };
+        let delta =
+            self.decoder
+                .inflate_entry(&entry, base_bytes, base.pinned, self.cancel, self.stats)?;
+        let plan = plan_pack_delta(&base.object.body, &delta)?;
+        let result_size = usize::try_from(plan.result_size).map_err(|_| {
+            PackReadError::Limit(PackLimitError {
+                kind: PackLimitKind::MaterializedBytes,
+                limit: self.decoder.limits.max_materialized_bytes,
+                attempted: usize::MAX,
+            })
+        })?;
+        let active_bytes = self
+            .decoder
+            .checked_materialized_add(base_bytes, delta.len())?;
+        let mut resolved = self.decoder.allocate_body(
+            result_size,
+            active_bytes,
+            base.pinned,
+            self.cancel,
+            self.stats,
+        )?;
+        apply_pack_delta_exact(&base.object.body, &delta, plan, &mut resolved, self.cancel)?;
+        Ok(BoundedBase {
+            object: Arc::new(EncodedObject::new(base.object.object_type, resolved)),
+            oid: None,
+            pinned: None,
+            depth: base.depth.saturating_add(1),
+        })
+    }
+
+    fn cycle_error(&self) -> PackReadError {
+        GitError::InvalidFormat("pack delta cycle detected".into()).into()
+    }
+}
+
 fn inflate_exact_into(
     compressed: &[u8],
     body: &mut Vec<u8>,
@@ -1469,7 +1473,7 @@ fn cancellable_object_id(
     digest.finalize()
 }
 
-fn object_type_for_entry(kind: PackObjectKind) -> Result<ObjectType> {
+pub(crate) fn object_type_for_entry(kind: PackObjectKind) -> Result<ObjectType> {
     match kind {
         PackObjectKind::Commit => Ok(ObjectType::Commit),
         PackObjectKind::Tree => Ok(ObjectType::Tree),
