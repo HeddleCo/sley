@@ -5,12 +5,11 @@
 //! Scan time includes header inspection and dependency planning. Both modes
 //! verify every resolved object ID and drop each output after counting it.
 
-use sley_core::ObjectFormat;
+use sley_core::{CancelFlag, GitError, ObjectFormat};
 use sley_pack::{
     BoundedPackDecoder, PackIndex, PackObjectLocation, PackReadLimits, PackScan, RefDeltaBases,
-    SlicePackSource, read_object_at_arc,
+    ScanLimits, SlicePackSource, read_object_at_arc,
 };
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -53,13 +52,15 @@ fn run() -> Result<(), String> {
     let mut object_bytes = 0u64;
     let started = Instant::now();
     if mode == "scan" {
-        let scan = PackScan::from_slice(mapped.as_bytes(), &index, limits)
+        let scan = PackScan::from_slice(mapped.as_bytes(), &index, ScanLimits::default())
             .map_err(|error| error.to_string())?;
         let mut cursor = scan
             .plan(index.entries.iter().map(|entry| entry.oid))
             .map_err(|error| error.to_string())?
-            .cursor(HashMap::new())
-            .map_err(|error| error.to_string())?;
+            .cursor(
+                |oid| Err(GitError::object_not_found(*oid).into()),
+                CancelFlag::never(),
+            );
         for outcome in cursor.by_ref() {
             let outcome = outcome.map_err(|error| error.to_string())?;
             objects += 1;

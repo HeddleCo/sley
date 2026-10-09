@@ -2,11 +2,12 @@
 //!
 //! [`PackScan`] inspects indexed entry headers without inflation. Its
 //! [`PackScan::plan`] adds transitive bases; [`PackScanPlan::external_bases`]
-//! reports resolved objects to supply to [`PackScanPlan::cursor`]. The cursor
+//! reports IDs for the lazy external-base callback in [`PackScanPlan::cursor`].
+//! Scanning requires an existing index, for example from `git index-pack`. The cursor
 //! inflates and yields all planned entries in pack order, sharing live bases
 //! through `Arc` and evicting each after its last dependent. [`PackScanStats`]
 //! reports work and peak live-base bytes. Slice and positional sources use the
-//! same grammar. [`PackReadLimits`] bounds depth, total materialization and
+//! same grammar. [`ScanLimits`] bounds depth, total materialization and
 //! retained bases; [`PackLimitKind::LiveBaseBytes`] identifies a scan base cap.
 //!
 // sley#7: untrusted-input parsing crate — fallible ops propagate errors;

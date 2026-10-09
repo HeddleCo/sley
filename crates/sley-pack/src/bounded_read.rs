@@ -124,8 +124,7 @@ impl PackReadSource for std::fs::File {
 ///
 /// Whole-pack readers use [`Self::max_delta_depth`]. Targeted reads through a
 /// [`BoundedPackDecoder`] additionally enforce the materialization and cache
-/// limits. [`PackScan`] uses the materialization limit for all active bodies and
-/// instructions, and the cache limit as a hard cap on retained live bases.
+/// limits. Sequential scans use their own [`ScanLimits`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackReadLimits {
     /// Maximum number of delta entries between a target and its base.
@@ -141,8 +140,7 @@ pub struct PackReadLimits {
     pub max_materialized_bytes: usize,
     /// Maximum logical decoded body bytes retained between calls. The effective
     /// cache ceiling is also capped by `max_materialized_bytes`. For a
-    /// [`PackScanCursor`], this is a hard cap on resolved live-base bytes;
-    /// exceeding it returns [`PackLimitKind::LiveBaseBytes`].
+    /// sequential scan, see [`ScanLimits::max_live_base_bytes`].
     pub max_cached_bytes: usize,
 }
 
@@ -158,6 +156,7 @@ impl Default for PackReadLimits {
 
 /// Which explicit decoder limit rejected a read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PackLimitKind {
     DeltaDepth,
     MaterializedBytes,
