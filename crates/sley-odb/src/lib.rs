@@ -1079,6 +1079,162 @@ mod tests {
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
+    const SMALL_STACK_CHILD_ENV: &str = "SLEY_ODB_SMALL_STACK_CHILD";
+
+    /// Run `body` on a 256 KiB thread in a child copy of this test binary.
+    /// The parent fails the test if the child aborts (a stack overflow kills
+    /// the whole process), fails, or is still running after `timeout`.
+    fn run_in_small_stack_child(
+        name: &str,
+        timeout: std::time::Duration,
+        body: impl FnOnce() + Send + 'static,
+    ) {
+        if std::env::var(SMALL_STACK_CHILD_ENV).as_deref() == Ok(name) {
+            std::thread::Builder::new()
+                .stack_size(256 * 1024)
+                .spawn(body)
+                .expect("spawn small-stack reader")
+                .join()
+                .expect("small-stack reader succeeds");
+            return;
+        }
+        let mut child =
+            std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", name, "--nocapture", "--test-threads=1"])
+                .env(SMALL_STACK_CHILD_ENV, name)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn child test");
+        let deadline = std::time::Instant::now() + timeout;
+        while child.try_wait().expect("poll child test").is_none() {
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{name}: read did not terminate within {timeout:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let output = child.wait_with_output().expect("collect child test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{name}: small-stack child failed: {}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn crossed_entry_header(kind: u8, mut size: usize, out: &mut Vec<u8>) {
+        let mut byte = (kind << 4) | (size & 0x0f) as u8;
+        size >>= 4;
+        while size != 0 {
+            out.push(byte | 0x80);
+            byte = (size & 0x7f) as u8;
+            size >>= 7;
+        }
+        out.push(byte);
+    }
+
+    fn crossed_ofs_distance(mut relative: u64) -> Vec<u8> {
+        let mut encoded = vec![(relative & 0x7f) as u8];
+        relative >>= 7;
+        while relative != 0 {
+            relative -= 1;
+            encoded.push(0x80 | (relative & 0x7f) as u8);
+            relative >>= 7;
+        }
+        encoded.reverse();
+        encoded
+    }
+
+    /// Write a pack of `entries`: `(oid, size, None)` is a corrupt (non-zlib)
+    /// blob; `(oid, base_size, Some((base_index, body)))` is an OFS delta on
+    /// an earlier entry that replaces the base with `body`.
+    fn write_crossed_pack(
+        pack_dir: &Path,
+        entries: &[(ObjectId, usize, Option<(usize, Vec<u8>)>)],
+    ) {
+        let mut pack = b"PACK".to_vec();
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+        let mut offsets = Vec::new();
+        let mut index_entries = Vec::new();
+        for (oid, size, delta) in entries {
+            let offset = pack.len() as u64;
+            offsets.push(offset);
+            let start = pack.len();
+            match delta {
+                None => {
+                    crossed_entry_header(3, *size, &mut pack);
+                    pack.extend_from_slice(&[0xff; 12]);
+                }
+                Some((base, body)) => {
+                    let mut instructions = vec![*size as u8, body.len() as u8, body.len() as u8];
+                    instructions.extend_from_slice(body);
+                    crossed_entry_header(6, instructions.len(), &mut pack);
+                    pack.extend(crossed_ofs_distance(offset - offsets[*base]));
+                    let mut zlib = ZlibEncoder::new(Vec::new(), Compression::default());
+                    zlib.write_all(&instructions)
+                        .expect("test operation should succeed");
+                    pack.extend(zlib.finish().expect("test operation should succeed"));
+                }
+            }
+            index_entries.push(PackIndexEntry {
+                oid: *oid,
+                crc32: crc32fast::hash(&pack[start..]),
+                offset,
+            });
+        }
+        let checksum = sley_core::digest_bytes(ObjectFormat::Sha1, &pack)
+            .expect("test operation should succeed");
+        pack.extend_from_slice(checksum.as_bytes());
+        let index = PackIndex::write_v2(ObjectFormat::Sha1, &index_entries, &checksum)
+            .expect("test operation should succeed");
+        let name = checksum.to_hex();
+        fs::write(pack_dir.join(format!("pack-{name}.pack")), pack)
+            .expect("test operation should succeed");
+        fs::write(pack_dir.join(format!("pack-{name}.idx")), index)
+            .expect("test operation should succeed");
+    }
+
+    #[test]
+    fn read_crossed_corrupt_ofs_bases_terminates() {
+        // Pack A holds B (corrupt), D (OFS on B) and X (OFS on D); pack C holds
+        // D (corrupt) and B (OFS on D). Recovering each corrupt base from the
+        // other pack leads back to the first, so redundant-copy recovery must
+        // notice it is already resolving that copy and give up with an error.
+        let name = "tests::read_crossed_corrupt_ofs_bases_terminates";
+        run_in_small_stack_child(name, std::time::Duration::from_secs(60), || {
+            let root = temp_root("sley-crossed-corrupt-ofs");
+            let git_dir = root.join(".git");
+            let pack_dir = git_dir.join("objects").join("pack");
+            fs::create_dir_all(&pack_dir).expect("test operation should succeed");
+            let blob = |body: &[u8]| {
+                EncodedObject::new(ObjectType::Blob, body.to_vec())
+                    .object_id(ObjectFormat::Sha1)
+                    .expect("test operation should succeed")
+            };
+            let (b, d, x) = (blob(b"B-body\n"), blob(b"D-body\n"), blob(b"X-body\n"));
+            write_crossed_pack(
+                &pack_dir,
+                &[
+                    (b, 7, None),
+                    (d, 7, Some((0, b"D-body\n".to_vec()))),
+                    (x, 7, Some((1, b"X-body\n".to_vec()))),
+                ],
+            );
+            write_crossed_pack(
+                &pack_dir,
+                &[(d, 7, None), (b, 7, Some((0, b"B-body\n".to_vec())))],
+            );
+            let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+            let result = ObjectReader::read_object(&db, &x);
+            let _ = fs::remove_dir_all(&root);
+            assert!(result.is_err(), "no good copy of B or D exists: {result:?}");
+        });
+    }
+
     #[test]
     fn read_object_header_preserves_missing_ref_delta_base_error() {
         let root = temp_root("sley-header-missing-ref-delta-base");
