@@ -1,3 +1,14 @@
+//! Packfile readers, writers and indices.
+//!
+//! [`PackScan`] inspects indexed entry headers without inflation. Its
+//! [`PackScan::plan`] adds transitive bases; [`PackScanPlan::external_bases`]
+//! reports resolved objects to supply to [`PackScanPlan::cursor`]. The cursor
+//! inflates and yields all planned entries in pack order, sharing live bases
+//! through `Arc` and evicting each after its last dependent. [`PackScanStats`]
+//! reports work and peak live-base bytes. Slice and positional sources use the
+//! same grammar. [`PackReadLimits`] bounds depth, total materialization and
+//! retained bases; [`PackLimitKind::LiveBaseBytes`] identifies a scan base cap.
+//!
 // sley#7: untrusted-input parsing crate — fallible ops propagate errors;
 // the only retained `expect`s would be documented compile-time invariants.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
@@ -33,6 +44,7 @@ pub mod inflate;
 mod limits;
 mod parallel_index;
 mod read;
+mod scan;
 mod write;
 
 pub use bounded_read::*;
@@ -43,6 +55,7 @@ pub use limits::{MAX_READ_DELTA_CHAIN_DEPTH, PACK_OBJECT_COUNT_PREALLOC_CAP};
 pub(crate) use limits::{checked_pack_object_count, pack_entry_prealloc};
 pub use parallel_index::*;
 pub use read::*;
+pub use scan::*;
 pub use write::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
