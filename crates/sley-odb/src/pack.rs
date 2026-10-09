@@ -482,7 +482,7 @@ pub(crate) type LruOffsetCache = LruCache<u64>;
 /// so the pack decoder can reuse decoded delta bases. Holds the shared cache
 /// behind its mutex; a poisoned lock simply behaves as a cache miss/no-op, so a
 /// decode still completes correctly (just without reuse).
-struct PackDeltaCacheAdapter<'a>(&'a Arc<Mutex<LruOffsetCache>>);
+pub(crate) struct PackDeltaCacheAdapter<'a>(pub(crate) &'a Arc<Mutex<LruOffsetCache>>);
 
 impl sley_pack::PackDeltaCache for PackDeltaCacheAdapter<'_> {
     fn get(&self, offset: u64) -> Option<Arc<EncodedObject>> {
@@ -1139,80 +1139,6 @@ impl FileObjectDatabase {
         Ok(None)
     }
 
-    pub(crate) fn read_packed_object(&self, oid: &ObjectId) -> Result<Option<Arc<EncodedObject>>> {
-        // Memory-capped decoded-object cache first (delta-base reuse for ref-delta
-        // bases that resolve back through the store + repeated whole-object reads).
-        if let Ok(mut cache) = self.decoded.lock()
-            && let Some(object) = cache.get(oid)
-        {
-            return Ok(Some(object));
-        }
-        let Some(pack_lookup) = self.find_pack_containing(oid)? else {
-            return Ok(None);
-        };
-        self.read_packed_object_at_lookup(oid, &pack_lookup)
-            .map(Some)
-    }
-
-    pub(crate) fn read_packed_object_at_lookup(
-        &self,
-        oid: &ObjectId,
-        pack_lookup: &PackLookup,
-    ) -> Result<Arc<EncodedObject>> {
-        if let Ok(mut cache) = self.decoded.lock()
-            && let Some(object) = cache.get(oid)
-        {
-            return Ok(object);
-        }
-        let bytes = pack_lookup.pack_bytes(self)?;
-        // Per-pack delta-base cache (keyed by in-pack offset). Resolving an
-        // ofs-delta chain reuses already-decoded bases instead of re-inflating the
-        // whole chain on every read. Scoped to this pack's path so an offset key is
-        // never applied to the wrong pack's bytes.
-        let delta_cache = pack_lookup.delta_cache(self);
-        let delta_adapter = delta_cache.as_ref().map(PackDeltaCacheAdapter);
-        // Decode only this object at its offset (plus its delta-base chain). A
-        // ref-delta base resolves through the full store (loose / other packs) and
-        // reuses the decoded-object cache. No cache lock is held across the decode,
-        // so the recursive resolver re-entry (which may re-enter read_object) is
-        // safe.
-        let resolve_ref_base = |base: &ObjectId| self.read_object_raw(base).map(Some);
-        let resolve_ofs_base =
-            |base_offset| self.read_ofs_delta_base_from_other_sources(pack_lookup, base_offset);
-        let object = match &delta_adapter {
-            Some(adapter) => sley_pack::read_object_at_with_cache_and_ofs_base_arc(
-                &bytes,
-                pack_lookup.offset,
-                self.format,
-                resolve_ref_base,
-                resolve_ofs_base,
-                adapter,
-            )?,
-            None => sley_pack::read_object_at_with_ofs_base_arc(
-                &bytes,
-                pack_lookup.offset,
-                self.format,
-                resolve_ref_base,
-                resolve_ofs_base,
-            )?,
-        };
-        // Trust the index → offset mapping rather than re-hashing every decoded
-        // object on read (see `verify_reads_enabled`); this re-hash dominated
-        // bulk-read cost. Opt back in with `SLEY_VERIFY_READS` for a paranoid check.
-        if verify_reads_enabled() {
-            let actual = object.object_id(self.format)?;
-            if actual != *oid {
-                return Err(GitError::InvalidObject(format!(
-                    "pack object id mismatch: index says {oid}, decoded {actual}"
-                )));
-            }
-        }
-        if let Ok(mut cache) = self.decoded.lock() {
-            cache.put(*oid, Arc::clone(&object));
-        }
-        Ok(object)
-    }
-
     /// The per-pack delta-base cache for `pack_path`, creating it on first use.
     /// Returns `None` only if the shared map's lock is poisoned, in which case the
     /// caller falls back to an uncached decode (correctness preserved).
@@ -1460,47 +1386,6 @@ impl FileObjectDatabase {
         Ok(None)
     }
 
-    /// Read `oid` from any pack *other than* the one named by `exclude`, used as
-    /// a corruption fallback: a redundant packed copy survives one pack's
-    /// damage. Scans the on-disk `.idx` files directly (bypassing the registry
-    /// cache, whose first hit is the excluded pack) and decodes from the first
-    /// other pack that both indexes the object and parses cleanly.
-    pub(crate) fn read_packed_object_from_other_packs(
-        &self,
-        oid: &ObjectId,
-        exclude: &PackLookup,
-    ) -> Result<Option<Arc<EncodedObject>>> {
-        let pack_dir = self.objects_dir.join("pack");
-        let Ok(entries) = fs::read_dir(&pack_dir) else {
-            return Ok(None);
-        };
-        let excluded_pack = exclude.pack_path().to_path_buf();
-        for entry in entries {
-            let idx_path = entry?.path();
-            if idx_path.extension().and_then(|ext| ext.to_str()) != Some("idx") {
-                continue;
-            }
-            let pack_path = idx_path.with_extension("pack");
-            if pack_path == excluded_pack {
-                continue;
-            }
-            let Ok(idx_bytes) = fs::read(&idx_path) else {
-                continue;
-            };
-            let Ok(index) = PackIndex::parse(&idx_bytes, self.format) else {
-                continue;
-            };
-            let Some(entry) = index.find(oid) else {
-                continue;
-            };
-            let candidate = PackLookup::from_path(pack_path, entry.offset);
-            if let Ok(object) = self.read_packed_object_at_lookup(oid, &candidate) {
-                return Ok(Some(object));
-            }
-        }
-        Ok(None)
-    }
-
     pub(crate) fn pack_oid_at_offset(
         &self,
         pack_lookup: &PackLookup,
@@ -1520,35 +1405,6 @@ impl FileObjectDatabase {
             }
             Err(_) => self.midx_oid_for_pack_offset(pack_lookup, offset),
         }
-    }
-
-    pub(crate) fn read_ofs_delta_base_from_other_sources(
-        &self,
-        pack_lookup: &PackLookup,
-        base_offset: u64,
-    ) -> Result<Option<Arc<EncodedObject>>> {
-        let Some(base_oid) = self.pack_oid_at_offset(pack_lookup, base_offset)? else {
-            return Ok(None);
-        };
-        if let Ok(mut cache) = self.decoded.lock()
-            && let Some(object) = cache.get(&base_oid)
-        {
-            return Ok(Some(object));
-        }
-        if let Ok(object) = self.loose.read_object(&base_oid) {
-            return Ok(Some(object));
-        }
-        if let Some(object) = self.read_packed_object_from_other_packs(&base_oid, pack_lookup)? {
-            return Ok(Some(object));
-        }
-        for alternate in &self.alternates {
-            if let Ok(object) =
-                Self::without_alternates(alternate, self.format).read_object(&base_oid)
-            {
-                return Ok(Some(object));
-            }
-        }
-        Ok(None)
     }
 
     pub(crate) fn find_pack_containing(&self, oid: &ObjectId) -> Result<Option<PackLookup>> {
@@ -1936,84 +1792,15 @@ impl sley_formats::TreeObjectSource for FileObjectDatabase {
 }
 
 impl FileObjectDatabase {
+    /// Read `oid` from every source in git's order without replacement
+    /// mapping. Pack copies come first, so a corrupt loose file never shadows
+    /// a good packed copy; a corrupt packed copy falls back to loose storage,
+    /// other packs, and alternates before its error is reported; a hard miss
+    /// re-probes loose storage once. Delta chains, including REF bases that
+    /// come back through this lookup, are resolved on a heap work stack (see
+    /// `read.rs`), so chain depth never grows the call stack.
     fn read_object_raw(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
-        if let Some(object) = implied_empty_tree_object(self.format, oid) {
-            return Ok(object);
-        }
-        // A corrupt loose copy must not shadow a good packed copy: git's
-        // `oid_object_info_extended` consults every source, so a repacked object
-        // whose loose file was later corrupted still reads fine from the pack. If
-        // a packed copy exists, prefer it WITHOUT touching the corrupt loose file
-        // (which would otherwise emit a spurious `inflate:` diagnostic on each
-        // probe). Only when no pack copy exists do we read (and, if corrupt,
-        // surface the error from) the loose file.
-        if let Some(pack_lookup) = self.find_pack_containing(oid)? {
-            match self.read_packed_object_at_lookup(oid, &pack_lookup) {
-                Ok(object) => return Ok(object),
-                Err(GitError::NotFound(_)) => {}
-                // A corrupt packed copy must not be fatal when another good copy
-                // exists: git's `oid_object_info_extended` keeps consulting the
-                // remaining sources (loose, other packs, alternates) when a pack
-                // read fails. Fall through to the loose/other-pack probes and
-                // only surface the packed error if every source comes up empty.
-                Err(packed_err) => {
-                    if let Ok(object) = self.loose.read_object(oid) {
-                        return Ok(object);
-                    }
-                    // Try any *other* pack that also holds the object (a
-                    // redundant copy survives one pack's corruption).
-                    if let Some(object) =
-                        self.read_packed_object_from_other_packs(oid, &pack_lookup)?
-                    {
-                        return Ok(object);
-                    }
-                    for alternate in &self.alternates {
-                        if let Ok(object) =
-                            Self::without_alternates(alternate, self.format).read_object_raw(oid)
-                        {
-                            return Ok(object);
-                        }
-                    }
-                    return Err(packed_err);
-                }
-            }
-        }
-        let loose_err = match self.loose.read_object(oid) {
-            Ok(object) => return Ok(object),
-            Err(GitError::NotFound(_)) => None,
-            Err(err) => Some(err),
-        };
-        if let Some(object) = self.read_packed_object(oid)? {
-            return Ok(object);
-        }
-        for alternate in &self.alternates {
-            match Self::without_alternates(alternate, self.format).read_object_raw(oid) {
-                Ok(object) => return Ok(object),
-                Err(GitError::NotFound(_)) => {}
-                Err(err) => return Err(err),
-            }
-        }
-        // Hard miss against every store. If an earlier enumeration built a loose
-        // cache, an object written loose afterward by a sibling handle could have
-        // been skipped above. Mirror git's `oid_object_info_extended`
-        // reprepare-on-miss: drop stale cache state and retry an exact loose path
-        // probe once before declaring the object missing.
-        self.loose.invalidate_cache();
-        match self.loose.read_object(oid) {
-            Ok(object) => return Ok(object),
-            Err(GitError::NotFound(_)) => {}
-            Err(err) => return Err(err),
-        }
-        // No good copy in any store. If the local loose copy was corrupt (not
-        // merely absent), surface that error — it is more specific than a plain
-        // "not found".
-        if let Some(err) = loose_err {
-            return Err(err);
-        }
-        Err(GitError::object_not_found_in(
-            *oid,
-            MissingObjectContext::Read,
-        ))
+        crate::read::read_object(self, oid)
     }
 }
 impl FileObjectDatabase {

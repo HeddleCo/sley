@@ -325,8 +325,8 @@ impl PackDeltaCache for NoopDeltaCache {
 // Reused zlib inflate state. Resetting and reusing one `Decompress` avoids
 // allocating a fresh (~10 KiB) `InflateState` for every object and delta decoded —
 // an allocation that dominated bulk reads. Borrowed only for the duration of a
-// single inflate; the recursive pack reader fully inflates each entry's data before
-// recursing to its base, so the borrow never nests.
+// single inflate; each entry is fully inflated before following its base,
+// so the borrow never nests.
 thread_local! {
     static INFLATE: RefCell<flate2::Decompress> = RefCell::new(flate2::Decompress::new(true));
 }
@@ -420,7 +420,7 @@ pub(crate) fn inflate_prefix(compressed: &[u8], out: &mut [u8]) -> Result<usize>
 /// Decode the single object stored at byte `offset` within `pack_bytes`, reading
 /// only that object and its delta-base chain instead of parsing the whole pack.
 ///
-/// Ofs-delta bases are followed by offset (recursively, within this pack);
+/// Ofs-delta bases are followed by offset on a heap work stack;
 /// ref-delta bases are obtained from `resolve_ref_base`, which the caller backs
 /// with the surrounding object store (so a base in another pack or loose still
 /// resolves). The pack trailer checksum is the final `format.raw_len()` bytes.
@@ -534,11 +534,148 @@ where
     G: FnMut(u64) -> Result<Option<Arc<EncodedObject>>>,
     C: PackDeltaCache + ?Sized,
 {
-    // A warm cache entry for this exact offset is already the fully resolved
-    // object, so the whole base chain below can be skipped.
-    if let Some(object) = cache.get(offset) {
-        return Ok(object);
+    struct Reader<'a, F, G, C: ?Sized> {
+        bytes: &'a [u8],
+        format: ObjectFormat,
+        refs: &'a mut F,
+        ofs: &'a mut G,
+        cache: &'a C,
     }
+    impl<F, G, C> DeltaChainResolver for Reader<'_, F, G, C>
+    where
+        F: FnMut(&ObjectId) -> Result<Option<Arc<EncodedObject>>>,
+        G: FnMut(u64) -> Result<Option<Arc<EncodedObject>>>,
+        C: PackDeltaCache + ?Sized,
+    {
+        type Location = u64;
+        type Entry = (u64, DecodedPackEntry);
+        type Object = Arc<EncodedObject>;
+        type Error = GitError;
+
+        fn enter(
+            &mut self,
+            offset: u64,
+            _pending: usize,
+        ) -> Result<DeltaChainStep<u64, Self::Entry, Self::Object>> {
+            if let Some(object) = self.cache.get(offset) {
+                return Ok(DeltaChainStep::Resolved(object));
+            }
+            let entry = read_pack_entry_at(self.bytes, offset, self.format)?;
+            let base = match entry.base {
+                None => return Ok(DeltaChainStep::Base((offset, entry))),
+                // A cached base needs no frame: apply the delta now.
+                Some(DeltaBase::Offset(base)) => match self.cache.get(base) {
+                    Some(base) => {
+                        let object = entry.resolve(Some(&base))?;
+                        self.cache.insert(offset, Arc::clone(&object));
+                        return Ok(DeltaChainStep::Resolved(object));
+                    }
+                    None => DeltaChainBase::Location(base),
+                },
+                Some(DeltaBase::Ref(oid)) => {
+                    DeltaChainBase::Resolved((self.refs)(&oid)?.ok_or_else(|| {
+                        GitError::not_found(format!("ref-delta base object {oid}"))
+                    })?)
+                }
+            };
+            Ok(DeltaChainStep::Pending((offset, entry), base))
+        }
+
+        fn finish(
+            &mut self,
+            (offset, entry): Self::Entry,
+            base: Option<Self::Object>,
+        ) -> Result<Self::Object> {
+            let object = entry.resolve(base.as_deref())?;
+            self.cache.insert(offset, Arc::clone(&object));
+            Ok(object)
+        }
+
+        fn recover(
+            &mut self,
+            (_, entry): &mut Self::Entry,
+            error: GitError,
+        ) -> Result<DeltaChainBase<u64, Self::Object>> {
+            if let Some(DeltaBase::Offset(offset)) = entry.base
+                && let Some(object) = (self.ofs)(offset)?
+            {
+                return Ok(DeltaChainBase::Resolved(object));
+            }
+            Err(error)
+        }
+
+        // Locations are OFS bases, which strictly decrease; REF bases come
+        // back already resolved.
+        fn tracks_cycles(&self, _offset: &u64) -> bool {
+            false
+        }
+
+        fn cycle_error(&self) -> GitError {
+            GitError::InvalidFormat("pack delta cycle detected".into())
+        }
+    }
+    resolve_delta_chain(
+        &mut Reader {
+            bytes: pack_bytes,
+            format,
+            refs: resolve_ref_base,
+            ofs: resolve_ofs_base,
+            cache,
+        },
+        offset,
+    )
+}
+
+/// One inflated pack entry whose delta, if any, is not yet applied.
+///
+/// [`read_pack_entry_at`] produces these so an object store can drive
+/// [`crate::chain::resolve_delta_chain`] itself, supplying base locations from any pack.
+#[derive(Debug)]
+pub struct DecodedPackEntry {
+    base: Option<DeltaBase>,
+    header: EntryHeader,
+    body: Vec<u8>,
+}
+
+impl DecodedPackEntry {
+    /// The entry's immediate delta base, or `None` for an undeltified object.
+    pub fn base(&self) -> Option<&DeltaBase> {
+        self.base.as_ref()
+    }
+
+    /// Apply this entry's delta to its resolved `base`, or build the object
+    /// directly when the entry is not a delta. Passing a base for an
+    /// undeltified entry, or none for a delta, is an `InvalidFormat` error.
+    pub fn resolve(self, base: Option<&EncodedObject>) -> Result<Arc<EncodedObject>> {
+        let object = match (base, self.base.is_some()) {
+            (Some(base), true) => {
+                EncodedObject::new(base.object_type, apply_pack_delta(&base.body, &self.body)?)
+            }
+            (None, false) => {
+                EncodedObject::new(object_type_for_entry(self.header.kind)?, self.body)
+            }
+            (None, true) => {
+                return Err(GitError::InvalidFormat(
+                    "delta pack entry decoded without a base".into(),
+                ));
+            }
+            (Some(_), false) => {
+                return Err(GitError::InvalidFormat(
+                    "undeltified pack entry given a delta base".into(),
+                ));
+            }
+        };
+        Ok(Arc::new(object))
+    }
+}
+
+/// Parse and inflate the single entry at `offset` without following its
+/// delta base. Uses the same grammar and inflater as the targeted readers.
+pub fn read_pack_entry_at(
+    pack_bytes: &[u8],
+    offset: u64,
+    format: ObjectFormat,
+) -> Result<DecodedPackEntry> {
     let trailer_offset = pack_bytes
         .len()
         .checked_sub(format.raw_len())
@@ -549,25 +686,7 @@ where
         .filter(|&value| value < trailer_offset)
         .ok_or_else(|| GitError::InvalidFormat("pack object offset out of range".into()))?;
     let header = parse_entry_header(entry_region, &mut cursor)?;
-    let base = match header.kind {
-        PackObjectKind::OfsDelta => Some(DeltaBase::Offset(parse_ofs_delta_base_offset(
-            entry_region,
-            &mut cursor,
-            offset,
-        )?)),
-        PackObjectKind::RefDelta => {
-            let hash_len = format.raw_len();
-            if cursor + hash_len > trailer_offset {
-                return Err(GitError::InvalidFormat(
-                    "truncated ref-delta base object id".into(),
-                ));
-            }
-            let oid = ObjectId::from_raw(format, &entry_region[cursor..cursor + hash_len])?;
-            cursor += hash_len;
-            Some(DeltaBase::Ref(oid))
-        }
-        _ => None,
-    };
+    let base = parse_entry_base(entry_region, &mut cursor, offset, format, header.kind)?;
     let mut body = Vec::new();
     inflate_into(
         &entry_region[cursor..],
@@ -581,51 +700,40 @@ where
             body.len()
         )));
     }
-    let object = match base {
-        None => {
-            let object_type = match header.kind {
-                PackObjectKind::Commit => ObjectType::Commit,
-                PackObjectKind::Tree => ObjectType::Tree,
-                PackObjectKind::Blob => ObjectType::Blob,
-                PackObjectKind::Tag => ObjectType::Tag,
-                PackObjectKind::OfsDelta | PackObjectKind::RefDelta => {
-                    return Err(GitError::InvalidFormat(
-                        "delta pack entry decoded without a base".into(),
-                    ));
-                }
-            };
-            Arc::new(EncodedObject::new(object_type, body))
+    Ok(DecodedPackEntry { base, header, body })
+}
+
+/// Parse the delta-base reference that follows an entry header: an OFS
+/// back-offset or a REF object id. `None` for undeltified kinds.
+pub(crate) fn parse_entry_base(
+    bytes: &[u8],
+    cursor: &mut usize,
+    offset: u64,
+    format: ObjectFormat,
+    kind: PackObjectKind,
+) -> Result<Option<DeltaBase>> {
+    match kind {
+        PackObjectKind::OfsDelta => {
+            let base = parse_ofs_delta_base_offset(bytes, cursor, offset)?;
+            // A zero back-offset names the entry itself. Every other OFS base
+            // lies strictly earlier in the pack, so OFS links cannot cycle.
+            if base == offset {
+                return Err(GitError::InvalidFormat("pack delta cycle detected".into()));
+            }
+            Ok(Some(DeltaBase::Offset(base)))
         }
-        Some(DeltaBase::Offset(base_offset)) => {
-            let base = match read_object_at_inner(
-                pack_bytes,
-                base_offset,
-                format,
-                resolve_ref_base,
-                resolve_ofs_base,
-                cache,
-            ) {
-                Ok(base) => base,
-                Err(pack_err) => match resolve_ofs_base(base_offset)? {
-                    Some(base) => base,
-                    None => return Err(pack_err),
-                },
-            };
-            let resolved = apply_pack_delta(&base.body, &body)?;
-            Arc::new(EncodedObject::new(base.object_type, resolved))
+        PackObjectKind::RefDelta => {
+            let end = cursor
+                .checked_add(format.raw_len())
+                .ok_or_else(|| GitError::InvalidFormat("ref-delta base offset overflow".into()))?;
+            let raw = bytes.get(*cursor..end).ok_or_else(|| {
+                GitError::InvalidFormat("truncated ref-delta base object id".into())
+            })?;
+            *cursor = end;
+            Ok(Some(DeltaBase::Ref(ObjectId::from_raw(format, raw)?)))
         }
-        Some(DeltaBase::Ref(base_oid)) => {
-            let base = resolve_ref_base(&base_oid)?
-                .ok_or_else(|| GitError::not_found(format!("ref-delta base object {base_oid}")))?;
-            let resolved = apply_pack_delta(&base.body, &body)?;
-            Arc::new(EncodedObject::new(base.object_type, resolved))
-        }
-    };
-    // Record the fully resolved object so any later read that walks through this
-    // offset (as a delta base or directly) reuses it. Bases are inserted as the
-    // recursion unwinds, so a chain is decoded at most once across reads.
-    cache.insert(offset, Arc::clone(&object));
-    Ok(object)
+        _ => Ok(None),
+    }
 }
 
 /// The object type and final (inflated) size of the entry at `offset`, *without*
