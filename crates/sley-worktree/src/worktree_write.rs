@@ -914,7 +914,8 @@ impl ExistingWorktreeLeaf {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error.into()),
         };
-        let result = if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        let is_directory = metadata.is_dir() && !metadata.file_type().is_symlink();
+        let result = if is_directory {
             self.refuse_dot_git(&parent.open_dir_nofollow(name)?)?;
             if crate::index_io::path_is_original_cwd(original_cwd, &self.path) {
                 return Ok(false);
@@ -934,6 +935,15 @@ impl ExistingWorktreeLeaf {
                         | std::io::ErrorKind::NotADirectory
                 ) =>
             {
+                Ok(false)
+            }
+            Err(error) if is_directory => {
+                sley_core::diagnostic!(
+                    Stderr,
+                    true,
+                    "warning: unable to rmdir '{}': {error}",
+                    self.path.display()
+                );
                 Ok(false)
             }
             Err(error) => Err(error.into()),
@@ -963,7 +973,15 @@ impl ExistingWorktreeLeaf {
                 {
                     break;
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    sley_core::diagnostic!(
+                        Stderr,
+                        true,
+                        "warning: unable to rmdir '{}': {error}",
+                        path.display()
+                    );
+                    break;
+                }
             }
         }
         Ok(())
@@ -1029,6 +1047,15 @@ pub(crate) fn write_blob_at_path(
     } else {
         std::env::current_dir()?.join(file_path)
     };
+    // OS paths may contain lexical dots, unlike Git tree paths. Rebuild from
+    // components to discard them without resolving symlinks or parent traversal.
+    if absolute
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        return Err(GitError::InvalidPath(file_path.display().to_string()));
+    }
+    let absolute: PathBuf = absolute.components().collect();
     let mut root = PathBuf::new();
     for component in absolute.components() {
         if matches!(
