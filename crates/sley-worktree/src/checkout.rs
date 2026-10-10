@@ -1643,6 +1643,7 @@ fn checkout_commit_to_index_and_worktree_sparse_with_policy(
         remove_worktree_file(original_cwd, worktree_root, path)?;
     }
 
+    let mut collisions = CheckoutCollisions::new(worktree_root, git_dir, &target_entries)?;
     let mut index_entries = Vec::new();
     let mut prepared_entries = Vec::new();
     let mut delayed_checkout = DelayedCheckoutQueue::default();
@@ -1652,6 +1653,10 @@ fn checkout_commit_to_index_and_worktree_sparse_with_policy(
             |matcher| matcher.includes_file(path),
         );
         let index_entry = if in_cone {
+            if collisions.collides(path)? {
+                index_entries.push(unmaterialized_index_entry(path, entry));
+                continue;
+            }
             match prepare_checkout_entry(
                 &db,
                 format,
@@ -1678,6 +1683,7 @@ fn checkout_commit_to_index_and_worktree_sparse_with_policy(
         };
         index_entries.push(index_entry);
     }
+    collisions.finish();
     let default_config = GitConfig::default();
     index_entries.extend(materialize_prepared_checkout_entries(
         original_cwd,
