@@ -896,7 +896,7 @@ fn legacy_blob_writer_refuses_symlinks_at_leaf_and_in_parents() {
         fs::write(outside.join("file"), b"outside").expect("outside file");
         let path = if parent_link {
             std::os::unix::fs::symlink(&outside, repo.root.join("link")).expect("parent link");
-            repo.root.join("link/file")
+            repo.root.join("link/./file")
         } else {
             std::os::unix::fs::symlink(outside.join("file"), repo.root.join("file"))
                 .expect("leaf link");
@@ -1072,6 +1072,10 @@ fn sparse_parallel_checkout_runs_collision_pass() {
         b"[core]\n bare = false\n ignorecase = true\n[checkout]\n workers = 2\n thresholdForParallelism = 0\n",
     ).expect("parallel case-insensitive config");
     let config = GitConfig::read(repo.git_dir.join("config")).expect("read config");
+    assert_eq!(
+        sley_worktree::ParallelCheckoutPlan::from_config(&config, 2).worker_count,
+        2
+    );
     let commit = repo.commit(&[
         (b"A/file", 0o100644, b"first"),
         (b"a/FILE", 0o100644, b"second"),
@@ -1128,8 +1132,18 @@ fn sparse_parallel_checkout_runs_collision_pass() {
 
 #[test]
 fn legacy_blob_writer_accepts_absolute_dot_components() {
-    let root = tempfile::tempdir().expect("worktree");
-    let path = root.path().join("./file");
+    #[cfg(unix)]
+    let root = tempfile::tempdir_in("/tmp").expect("absolute-path fixture");
+    #[cfg(not(unix))]
+    let root = tempfile::tempdir().expect("absolute-path fixture");
+    // Exercise /tmp/./<unique directory>/./file without sharing a fixed leaf.
+    let path = root
+        .path()
+        .parent()
+        .expect("fixture parent")
+        .join(".")
+        .join(root.path().file_name().expect("fixture name"))
+        .join("./file");
     sley_worktree::write_blob_body_or_symlink(&path, 0o100644, b"new", b"new")
         .expect("absolute OS path with lexical dot");
     assert_eq!(fs::read(root.path().join("file")).expect("file"), b"new");
