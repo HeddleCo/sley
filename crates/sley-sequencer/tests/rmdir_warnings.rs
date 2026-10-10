@@ -26,6 +26,10 @@ impl DiagnosticSink for Warnings {
 }
 
 fn check_rmdir_failure(hard: bool, prune: bool) {
+    check_directory_removal(hard, prune, false);
+}
+
+fn check_directory_removal(hard: bool, prune: bool, populated: bool) {
     let root = tempfile::tempdir().expect("worktree");
     let git_dir = root.path().join(".git");
     fs::create_dir_all(git_dir.join("objects")).expect("object directory");
@@ -65,6 +69,9 @@ fn check_rmdir_failure(hard: bool, prune: bool) {
     } else {
         (b"locked/module".as_slice(), 0o160000)
     };
+    if populated {
+        fs::write(root.path().join("locked/module/untracked"), b"keep").expect("populated gitlink");
+    }
     fs::write(root.path().join("y-later"), b"old").expect("later deletion");
     let index = Index {
         version: 2,
@@ -81,14 +88,16 @@ fn check_rmdir_failure(hard: bool, prune: bool) {
     )
     .expect("old index");
     let locked = root.path().join("locked");
-    fs::create_dir(locked.join("probe")).expect("empty rmdir probe");
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).expect("deny rmdir");
-    // Verify that the permission change actually injects a directory-removal failure.
-    let probe = fs::remove_dir(locked.join("probe"));
-    assert_eq!(
-        probe.expect_err("rmdir must fail").kind(),
-        std::io::ErrorKind::PermissionDenied
-    );
+    if !populated {
+        fs::create_dir(locked.join("probe")).expect("empty rmdir probe");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).expect("deny rmdir");
+        // Verify that the permission change actually injects a directory-removal failure.
+        let probe = fs::remove_dir(locked.join("probe"));
+        assert_eq!(
+            probe.expect_err("rmdir must fail").kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
     let warnings = Warnings::default();
     let result = Diagnostics::new(warnings.clone()).scope(|| {
         if hard {
@@ -117,8 +126,14 @@ fn check_rmdir_failure(hard: bool, prune: bool) {
     result.expect("directory removal failure must warn and continue");
     let warning =
         String::from_utf8(warnings.0.lock().expect("warnings lock").clone()).expect("warning text");
-    assert!(warning.contains("warning: unable to rmdir"), "{warning:?}");
-    assert!(warning.contains("locked/module"), "{warning:?}");
+    let expected = if prune {
+        ""
+    } else if populated {
+        "warning: unable to rmdir 'locked/module': Directory not empty\n"
+    } else {
+        "warning: unable to rmdir 'locked/module': Permission denied\n"
+    };
+    assert_eq!(warning, expected);
     let index = Index::parse(&fs::read(git_dir.join("index")).expect("new index"), format)
         .expect("parse index");
     assert_eq!(index.entries.len(), 1);
@@ -133,8 +148,14 @@ fn check_rmdir_failure(hard: bool, prune: bool) {
         fs::read_dir(root.path().join("locked/module"))
             .expect("retained empty directory")
             .count(),
-        0
+        usize::from(populated)
     );
+    if populated {
+        assert_eq!(
+            fs::read(root.path().join("locked/module/untracked")).expect("retained content"),
+            b"keep"
+        );
+    }
 }
 
 #[test]
@@ -148,12 +169,12 @@ fn hard_reset_warns_and_continues_after_rmdir_failure() {
 }
 
 #[test]
-fn merge_reset_warns_and_continues_after_parent_rmdir_failure() {
+fn merge_reset_silently_continues_after_parent_rmdir_failure() {
     check_rmdir_failure(false, true);
 }
 
 #[test]
-fn hard_reset_warns_and_continues_after_parent_rmdir_failure() {
+fn hard_reset_silently_continues_after_parent_rmdir_failure() {
     check_rmdir_failure(true, true);
 }
 
@@ -175,4 +196,38 @@ fn merge_removal_still_reports_regular_file_unlink_failure() {
         fs::read(locked.join("file")).expect("retained file"),
         b"keep"
     );
+}
+
+#[test]
+fn hard_reset_warns_and_continues_after_populated_gitlink() {
+    check_directory_removal(true, false, true);
+}
+
+#[test]
+fn merge_reset_warns_and_continues_after_populated_gitlink() {
+    check_directory_removal(false, false, true);
+}
+
+#[test]
+fn public_prune_swallows_leaf_and_parent_rmdir_failures() {
+    for parent_failure in [false, true] {
+        let root = tempfile::tempdir().expect("worktree");
+        let locked = root.path().join("locked");
+        let dir = locked.join(if parent_failure {
+            "module/empty"
+        } else {
+            "module"
+        });
+        fs::create_dir_all(&dir).expect("empty directory");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).expect("deny rmdir");
+        let warnings = Warnings::default();
+        Diagnostics::new(warnings.clone()).scope(|| {
+            sley_worktree::prune_empty_dirs(None, root.path(), Some(&dir));
+        });
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755))
+            .expect("restore permissions");
+        assert!(warnings.0.lock().expect("warnings lock").is_empty());
+        assert!(locked.join("module").is_dir());
+        assert_eq!(dir.exists(), !parent_failure);
+    }
 }

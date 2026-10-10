@@ -1132,17 +1132,14 @@ fn sparse_parallel_checkout_runs_collision_pass() {
 
 #[test]
 fn legacy_blob_writer_accepts_absolute_dot_components() {
-    #[cfg(unix)]
-    let root = tempfile::tempdir_in("/tmp").expect("absolute-path fixture");
-    #[cfg(not(unix))]
     let root = tempfile::tempdir().expect("absolute-path fixture");
-    // Exercise /tmp/./<unique directory>/./file without sharing a fixed leaf.
-    let path = root
-        .path()
+    // Resolve temporary-directory symlinks before adding lexical dot components.
+    let canonical_root = fs::canonicalize(root.path()).expect("canonical fixture");
+    let path = canonical_root
         .parent()
         .expect("fixture parent")
         .join(".")
-        .join(root.path().file_name().expect("fixture name"))
+        .join(canonical_root.file_name().expect("fixture name"))
         .join("./file");
     sley_worktree::write_blob_body_or_symlink(&path, 0o100644, b"new", b"new")
         .expect("absolute OS path with lexical dot");

@@ -1014,10 +1014,9 @@ fn materialize_prepared_checkout_entry(
 }
 
 fn checkout_worker_collision_key(path: &[u8]) -> Vec<u8> {
-    path.split(|byte| *byte == b'/')
-        .next()
-        .unwrap_or(path)
-        .to_vec()
+    // Fold even on case-sensitive filesystems: sharing an extra lock is harmless,
+    // and A/x and a/y must serialize creation of their parent on folded filesystems.
+    checkout_ascii_collision_key(path.split(|byte| *byte == b'/').next().unwrap_or(path))
 }
 
 fn materialize_prepared_checkout_entries(
@@ -4956,5 +4955,26 @@ mod checkout_parent_safety_tests {
         assert_eq!(fs::read(root.path().join("D/B")).expect("D/B"), b"D/B");
         assert!(!outside.path().join("A").exists());
         assert!(!outside.path().join("B").exists());
+    }
+}
+
+#[cfg(test)]
+mod worker_lock_tests {
+    use super::checkout_worker_collision_key;
+
+    #[test]
+    fn worker_locks_share_ascii_casefolded_parent() {
+        assert_eq!(
+            checkout_worker_collision_key(b"A/x"),
+            checkout_worker_collision_key(b"a/y")
+        );
+        assert_ne!(
+            checkout_worker_collision_key(b"a/x"),
+            checkout_worker_collision_key(b"b/y")
+        );
+        assert_eq!(
+            checkout_worker_collision_key(b"A/nested/x"),
+            checkout_worker_collision_key(b"a/other/y")
+        );
     }
 }
