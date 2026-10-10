@@ -896,7 +896,7 @@ fn legacy_blob_writer_refuses_symlinks_at_leaf_and_in_parents() {
         fs::write(outside.join("file"), b"outside").expect("outside file");
         let path = if parent_link {
             std::os::unix::fs::symlink(&outside, repo.root.join("link")).expect("parent link");
-            repo.root.join("link/file")
+            repo.root.join("link/./file")
         } else {
             std::os::unix::fs::symlink(outside.join("file"), repo.root.join("file"))
                 .expect("leaf link");
@@ -1060,4 +1060,123 @@ fn legacy_blob_writer_keeps_regular_file_overwrite_behavior() {
     fs::write(&path, b"old and longer").expect("regular file");
     sley_worktree::write_blob_body_or_symlink(&path, 0o100644, b"new", b"new").expect("overwrite");
     assert_eq!(fs::read(path).expect("regular file"), b"new");
+}
+
+#[test]
+fn sparse_parallel_checkout_runs_collision_pass() {
+    let repo = Repo::new();
+    // This forces collision detection on case-sensitive runners as well.
+    // Two surviving entries keep the worker batching path active after filtering.
+    fs::write(
+        repo.git_dir.join("config"),
+        b"[core]\n bare = false\n ignorecase = true\n[checkout]\n workers = 2\n thresholdForParallelism = 0\n",
+    ).expect("parallel case-insensitive config");
+    let config = GitConfig::read(repo.git_dir.join("config")).expect("read config");
+    assert_eq!(
+        sley_worktree::ParallelCheckoutPlan::from_config(&config, 2).worker_count,
+        2
+    );
+    let commit = repo.commit(&[
+        (b"A/file", 0o100644, b"first"),
+        (b"a/FILE", 0o100644, b"second"),
+        (b"b/file", 0o100644, b"worker"),
+        (b"excluded/file", 0o100644, b"skip"),
+    ]);
+    let sparse = sley_worktree::SparseCheckout {
+        patterns: vec![b"/A/".to_vec(), b"/a/".to_vec(), b"/b/".to_vec()],
+        sparse_index: false,
+    };
+    sley_worktree::checkout_commit_to_index_and_worktree_sparse(
+        None,
+        &repo.root,
+        &repo.git_dir,
+        FORMAT,
+        &commit,
+        Some((&sparse, sley_worktree::SparseCheckoutMode::Full)),
+        Some(&config),
+        None,
+    )
+    .expect("sparse parallel checkout");
+    assert_eq!(
+        fs::read(repo.root.join("A/file")).expect("first entry"),
+        b"first"
+    );
+    assert_eq!(
+        fs::read(repo.root.join("b/file")).expect("second worker entry"),
+        b"worker"
+    );
+    let index = sley_index::Index::parse(
+        &fs::read(repo.git_dir.join("index")).expect("index"),
+        FORMAT,
+    )
+    .expect("parse index");
+    let collided = index
+        .entries
+        .iter()
+        .find(|entry| entry.path.as_bytes() == b"a/FILE")
+        .expect("colliding entry retained in index");
+    assert_eq!(
+        collided.size, 0,
+        "collision pass leaves colliding entry without worktree stat"
+    );
+    assert!(!collided.is_skip_worktree());
+    assert!(
+        index
+            .entries
+            .iter()
+            .find(|entry| entry.path.as_bytes() == b"excluded/file")
+            .expect("excluded entry")
+            .is_skip_worktree()
+    );
+}
+
+#[test]
+fn legacy_blob_writer_accepts_absolute_dot_components() {
+    let root = tempfile::tempdir().expect("absolute-path fixture");
+    // Resolve temporary-directory symlinks before adding lexical dot components.
+    let canonical_root = fs::canonicalize(root.path()).expect("canonical fixture");
+    let path = canonical_root
+        .parent()
+        .expect("fixture parent")
+        .join(".")
+        .join(canonical_root.file_name().expect("fixture name"))
+        .join("./file");
+    sley_worktree::write_blob_body_or_symlink(&path, 0o100644, b"new", b"new")
+        .expect("absolute OS path with lexical dot");
+    assert_eq!(fs::read(root.path().join("file")).expect("file"), b"new");
+    let parent_path = root.path().join("../must-not-write");
+    assert!(
+        sley_worktree::write_blob_body_or_symlink(&parent_path, 0o100644, b"new", b"new").is_err()
+    );
+}
+
+#[test]
+fn legacy_blob_writer_accepts_relative_dot_components() {
+    if std::env::var_os("SLEY_DOT_PATH_CHILD").is_some() {
+        sley_worktree::write_blob_body_or_symlink(Path::new("./file"), 0o100644, b"new", b"new")
+            .expect("relative OS path with lexical dot");
+        assert!(
+            sley_worktree::write_blob_body_or_symlink(Path::new("../x"), 0o100644, b"new", b"new")
+                .is_err()
+        );
+        return;
+    }
+    // Isolate cwd without changing process-global state during parallel tests.
+    let root = tempfile::tempdir().expect("worktree");
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "legacy_blob_writer_accepts_relative_dot_components",
+            "--nocapture",
+        ])
+        .env("SLEY_DOT_PATH_CHILD", "1")
+        .current_dir(root.path())
+        .output()
+        .expect("relative writer test");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(root.path().join("file")).expect("file"), b"new");
 }

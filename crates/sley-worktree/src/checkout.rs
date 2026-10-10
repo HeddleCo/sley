@@ -1014,10 +1014,9 @@ fn materialize_prepared_checkout_entry(
 }
 
 fn checkout_worker_collision_key(path: &[u8]) -> Vec<u8> {
-    path.split(|byte| *byte == b'/')
-        .next()
-        .unwrap_or(path)
-        .to_vec()
+    // Fold even on case-sensitive filesystems: sharing an extra lock is harmless,
+    // and A/x and a/y must serialize creation of their parent on folded filesystems.
+    checkout_ascii_collision_key(path.split(|byte| *byte == b'/').next().unwrap_or(path))
 }
 
 fn materialize_prepared_checkout_entries(
@@ -1643,6 +1642,7 @@ fn checkout_commit_to_index_and_worktree_sparse_with_policy(
         remove_worktree_file(original_cwd, worktree_root, path)?;
     }
 
+    let mut collisions = CheckoutCollisions::new(worktree_root, git_dir, &target_entries)?;
     let mut index_entries = Vec::new();
     let mut prepared_entries = Vec::new();
     let mut delayed_checkout = DelayedCheckoutQueue::default();
@@ -1652,6 +1652,10 @@ fn checkout_commit_to_index_and_worktree_sparse_with_policy(
             |matcher| matcher.includes_file(path),
         );
         let index_entry = if in_cone {
+            if collisions.collides(path)? {
+                index_entries.push(unmaterialized_index_entry(path, entry));
+                continue;
+            }
             match prepare_checkout_entry(
                 &db,
                 format,
@@ -1678,6 +1682,7 @@ fn checkout_commit_to_index_and_worktree_sparse_with_policy(
         };
         index_entries.push(index_entry);
     }
+    collisions.finish();
     let default_config = GitConfig::default();
     index_entries.extend(materialize_prepared_checkout_entries(
         original_cwd,
@@ -4950,5 +4955,26 @@ mod checkout_parent_safety_tests {
         assert_eq!(fs::read(root.path().join("D/B")).expect("D/B"), b"D/B");
         assert!(!outside.path().join("A").exists());
         assert!(!outside.path().join("B").exists());
+    }
+}
+
+#[cfg(test)]
+mod worker_lock_tests {
+    use super::checkout_worker_collision_key;
+
+    #[test]
+    fn worker_locks_share_ascii_casefolded_parent() {
+        assert_eq!(
+            checkout_worker_collision_key(b"A/x"),
+            checkout_worker_collision_key(b"a/y")
+        );
+        assert_ne!(
+            checkout_worker_collision_key(b"a/x"),
+            checkout_worker_collision_key(b"b/y")
+        );
+        assert_eq!(
+            checkout_worker_collision_key(b"A/nested/x"),
+            checkout_worker_collision_key(b"a/other/y")
+        );
     }
 }

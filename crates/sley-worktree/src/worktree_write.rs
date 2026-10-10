@@ -824,6 +824,7 @@ struct ExistingWorktreeLeaf {
     names: Vec<std::ffi::OsString>,
     paths: Vec<PathBuf>,
     path: PathBuf,
+    git_path: Vec<u8>,
     dot_git: Option<same_file::Handle>,
 }
 
@@ -849,6 +850,7 @@ impl ExistingWorktreeLeaf {
             names,
             paths: vec![root.to_path_buf()],
             path: absolute,
+            git_path: path.to_vec(),
             dot_git,
         };
         for name in leaf.names.iter().take(leaf.names.len().saturating_sub(1)) {
@@ -907,6 +909,17 @@ impl ExistingWorktreeLeaf {
 
     fn remove(&self, original_cwd: Option<&Path>) -> Result<bool> {
         use cap_fs_ext::DirExt as _;
+        self.remove_with_directory_opener(original_cwd, |parent, name| {
+            parent.open_dir_nofollow(name)
+        })
+    }
+
+    fn remove_with_directory_opener(
+        &self,
+        original_cwd: Option<&Path>,
+        open_dir: impl FnOnce(&cap_std::fs::Dir, &std::ffi::OsStr) -> std::io::Result<cap_std::fs::Dir>,
+    ) -> Result<bool> {
+        use cap_fs_ext::DirExt as _;
         let parent = self.parent()?;
         let name = self.name()?;
         let metadata = match parent.symlink_metadata(name) {
@@ -914,8 +927,20 @@ impl ExistingWorktreeLeaf {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error.into()),
         };
-        let result = if metadata.is_dir() && !metadata.file_type().is_symlink() {
-            self.refuse_dot_git(&parent.open_dir_nofollow(name)?)?;
+        let is_directory = metadata.is_dir() && !metadata.file_type().is_symlink();
+        let result = if is_directory {
+            let dir = match open_dir(parent, name) {
+                Ok(dir) => dir,
+                Err(error) => {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        self.warn_rmdir(&error);
+                    }
+                    return Ok(false);
+                }
+            };
+            self.refuse_dot_git(&dir)?;
+            // Release the leaf handle before rmdir (Windows pins open directories).
+            drop(dir);
             if crate::index_io::path_is_original_cwd(original_cwd, &self.path) {
                 return Ok(false);
             }
@@ -926,18 +951,31 @@ impl ExistingWorktreeLeaf {
         };
         match result {
             Ok(()) => Ok(true),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound
-                        | std::io::ErrorKind::DirectoryNotEmpty
-                        | std::io::ErrorKind::NotADirectory
-                ) =>
-            {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) if is_directory => {
+                self.warn_rmdir(&error);
                 Ok(false)
             }
             Err(error) => Err(error.into()),
         }
+    }
+
+    fn warn_rmdir(&self, error: &std::io::Error) {
+        // Rust appends an errno suffix to OS errors; Git uses only strerror.
+        let message = error.to_string();
+        let reason = if error.raw_os_error().is_some() {
+            message
+                .rsplit_once(" (os error ")
+                .map_or(message.as_str(), |(reason, _)| reason)
+        } else {
+            message.as_str()
+        };
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "warning: unable to rmdir '{}': {reason}",
+            String::from_utf8_lossy(&self.git_path)
+        );
     }
 
     fn prune(mut self, original_cwd: Option<&Path>) -> Result<()> {
@@ -952,18 +990,9 @@ impl ExistingWorktreeLeaf {
             drop(self.dirs.pop());
             let parent = self.parent()?;
             let name = &self.names[position - 1];
-            match parent.remove_dir(name) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::NotADirectory
-                    ) =>
-                {
-                    break;
-                }
-                Err(error) => return Err(error.into()),
+            // Git's empty-parent cleanup stops silently on every rmdir error.
+            if parent.remove_dir(name).is_err() {
+                break;
             }
         }
         Ok(())
@@ -997,9 +1026,21 @@ pub(crate) fn prune_worktree_dirs(
     if let Some(leaf) = ExistingWorktreeLeaf::open(root, &git_path_bytes(relative))? {
         let can_prune = match leaf.parent()?.symlink_metadata(leaf.name()?) {
             Ok(metadata) => {
-                metadata.is_dir()
-                    && !metadata.file_type().is_symlink()
-                    && leaf.remove(original_cwd)?
+                if !metadata.is_dir()
+                    || metadata.file_type().is_symlink()
+                    || crate::index_io::path_is_original_cwd(original_cwd, &leaf.path)
+                {
+                    return Ok(());
+                }
+                use cap_fs_ext::DirExt as _;
+                let dir = match leaf.parent()?.open_dir_nofollow(leaf.name()?) {
+                    Ok(dir) => dir,
+                    Err(_) => return Ok(()),
+                };
+                leaf.refuse_dot_git(&dir)?;
+                drop(dir);
+                // Public pruning swallows errors for the starting directory too.
+                leaf.parent()?.remove_dir(leaf.name()?).is_ok()
             }
             // A move may already have removed this directory. Its held real
             // ancestors can still be empty and should be pruned as before.
@@ -1029,6 +1070,15 @@ pub(crate) fn write_blob_at_path(
     } else {
         std::env::current_dir()?.join(file_path)
     };
+    // OS paths may contain lexical dots, unlike Git tree paths. Rebuild from
+    // components to discard them without resolving symlinks or parent traversal.
+    if absolute
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        return Err(GitError::InvalidPath(file_path.display().to_string()));
+    }
+    let absolute: PathBuf = absolute.components().collect();
     let mut root = PathBuf::new();
     for component in absolute.components() {
         if matches!(
@@ -1084,5 +1134,56 @@ fn git_name_os_string(name: &[u8]) -> std::ffi::OsString {
     #[cfg(not(unix))]
     {
         String::from_utf8_lossy(name).into_owned().into()
+    }
+}
+
+#[cfg(test)]
+mod rmdir_tests {
+    use super::*;
+    use sley_core::diagnostics::{DiagnosticSink, DiagnosticStream, Diagnostics};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Warnings(Arc<Mutex<Vec<u8>>>);
+
+    impl DiagnosticSink for Warnings {
+        fn write(&self, stream: DiagnosticStream, bytes: &[u8]) -> std::io::Result<()> {
+            assert_eq!(stream, DiagnosticStream::Stderr);
+            self.0
+                .lock()
+                .expect("warnings lock")
+                .extend_from_slice(bytes);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn directory_open_failure_warns_and_skips_without_deleting() {
+        let root = tempfile::tempdir().expect("worktree");
+        fs::create_dir_all(root.path().join("locked/module")).expect("directory");
+        let leaf = ExistingWorktreeLeaf::open(root.path(), b"locked/module")
+            .expect("open parent")
+            .expect("existing leaf");
+        let warnings = Warnings::default();
+        let result = Diagnostics::new(warnings.clone()).scope(|| {
+            leaf.remove_with_directory_opener(None, |_, _| {
+                Err(std::io::Error::from_raw_os_error(if cfg!(windows) {
+                    5
+                } else {
+                    13
+                }))
+            })
+        });
+        assert!(!result.expect("open failure must warn and skip"));
+        assert!(root.path().join("locked/module").is_dir());
+        let message = if cfg!(windows) {
+            "warning: unable to rmdir 'locked/module': Access is denied.\n"
+        } else {
+            "warning: unable to rmdir 'locked/module': Permission denied\n"
+        };
+        assert_eq!(
+            *warnings.0.lock().expect("warnings lock"),
+            message.as_bytes()
+        );
     }
 }
