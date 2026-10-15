@@ -1336,13 +1336,12 @@ fn parallel_window_limits_work_and_shared_budget_coordinates_readers() {
         sley_pack::ParallelScanOptions::new(4, 3),
         budget.clone(),
     );
-    assert!(
-        matches!(second.next(), Some(Err(PackReadError::Limit(error))) if error.kind == PackLimitKind::MaterializedBytes)
-    );
+    second.next().expect("second reader").expect("smaller batch fits");
+    assert_eq!(second.stats().entries_inflated, 1);
     assert_eq!(
         budget.used_bytes(),
         2 * 4096,
-        "failed reader releases only its charge"
+        "second reader releases its single output charge"
     );
     drop(first);
     assert_eq!(

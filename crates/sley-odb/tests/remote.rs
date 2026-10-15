@@ -413,3 +413,26 @@ fn completed_cpu_result_keeps_budget_until_async_delivery_or_drop() {
         "dropping the read releases the result"
     );
 }
+
+#[tokio::test]
+async fn full_shared_budget_waits_then_succeeds() {
+    let objects = objects(1);
+    let format = ObjectFormat::Sha1;
+    let written = pack(&objects, format, true);
+    let pool = RemoteBufferPool::new(1024, 2).expect("pool");
+    let budget = Arc::new(PackDecodeBudget::new(2 * 1024 * 1024));
+    let db = RemoteObjectDatabase::open(
+        probe(&written), pool.clone(), budget.clone(), location(&written), limits(),
+    ).await.expect("open");
+    let held = budget.reserve(2 * 1024 * 1024).expect("first reader fills budget");
+    let oid = objects[0].object_id(format).expect("oid");
+    let mut read = std::pin::pin!(db.read_object(&oid));
+    assert!(tokio::time::timeout(Duration::from_millis(20), read.as_mut()).await.is_err(),
+        "second reader must wait for budget instead of returning a limit error");
+    drop(held);
+    let object = tokio::time::timeout(Duration::from_secs(2), read).await
+        .expect("reader resumes").expect("decode");
+    assert_eq!(object.as_ref(), &objects[0]);
+    assert_eq!(budget.used_bytes(), 0);
+    assert_eq!(pool.available_buffers(), 2);
+}
