@@ -1417,7 +1417,7 @@ fn parallel_cursors_reuse_the_supplied_pool() {
         // Building a new pool with this count would fail. The supplied pool
         // must provide the executor instead.
         threads: usize::MAX,
-        pool: Some(pool.clone()),
+        pool: Some(pool),
         ..sley_pack::ParallelScanOptions::default()
     };
     assert_eq!(options.window, 1024);
@@ -1435,13 +1435,12 @@ fn parallel_cursors_reuse_the_supplied_pool() {
         })
         .collect();
     for cursor in &mut cursors {
-        assert_eq!(
-            cursor
-                .by_ref()
-                .map(|object| object.expect("decode"))
-                .count(),
-            objects.len()
-        );
+        let mut count = 0;
+        for object in cursor.by_ref() {
+            object.expect("decode");
+            count += 1;
+        }
+        assert_eq!(count, objects.len());
     }
     drop(cursors);
     assert_eq!(budget.used_bytes(), 0);
@@ -1449,9 +1448,9 @@ fn parallel_cursors_reuse_the_supplied_pool() {
 
 #[test]
 fn parallel_delta_results_shrink_without_reinflating_entries() {
-    let bases: Vec<_> = [b'a', b'b']
-        .into_iter()
-        .map(|byte| EncodedObject::new(ObjectType::Blob, vec![byte; 4096]))
+    let bases: Vec<_> = b"ab"
+        .iter()
+        .map(|&byte| EncodedObject::new(ObjectType::Blob, vec![byte; 4096]))
         .collect();
     let mut entries: Vec<_> = bases
         .iter()
