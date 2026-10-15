@@ -355,3 +355,61 @@ async fn valid_crc_with_wrong_index_identity_is_rejected() {
     assert_eq!(pool.available_buffers(), 2);
     assert_eq!(budget.used_bytes(), 0);
 }
+
+#[test]
+fn completed_cpu_result_keeps_budget_until_async_delivery_or_drop() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .build()
+        .expect("runtime");
+    let objects = objects(1);
+    let format = ObjectFormat::Sha1;
+    let written = pack(&objects, format, true);
+    let backend = Arc::new(MemoryRemoteBackend::new([
+        ("pack".into(), Arc::from(written.pack.clone())),
+        ("index".into(), Arc::from(written.index.clone())),
+    ]));
+    let pool = RemoteBufferPool::new(1024, 1).expect("pool");
+    let budget = Arc::new(PackDecodeBudget::new(4 * 1024 * 1024));
+    let db = runtime
+        .block_on(RemoteObjectDatabase::open(
+            backend,
+            pool,
+            budget.clone(),
+            location(&written),
+            limits(),
+        ))
+        .expect("open");
+    let oid = objects[0].object_id(format).expect("oid");
+    let (release, wait) = std::sync::mpsc::sync_channel(0);
+    let blocker = runtime.spawn_blocking(move || wait.recv().expect("release blocker"));
+    let retained = {
+        let mut read = std::pin::pin!(db.read_object(&oid));
+        {
+            let _entered = runtime.enter();
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(matches!(read.as_mut().poll(&mut context), Poll::Pending));
+        }
+        assert!(budget.used_bytes() > 0, "queued CPU job owns its charge");
+        release.send(()).expect("release CPU worker");
+        runtime.block_on(blocker).expect("blocker");
+        // With one blocking thread this fence runs after the decode job, while
+        // the read future remains unpolled and its completed result is retained.
+        runtime
+            .block_on(runtime.spawn_blocking(|| ()))
+            .expect("CPU fence");
+        budget.used_bytes()
+    };
+    assert!(
+        retained > 0,
+        "completed but undelivered result stays charged"
+    );
+    assert_eq!(
+        budget.used_bytes(),
+        0,
+        "dropping the read releases the result"
+    );
+}

@@ -366,9 +366,8 @@ impl<B: RemoteOdbBackend> RemoteObjectDatabase<B> {
         let limits = self.limits.decode;
         let oid = *oid;
         // Move all large state into the blocking closure, never an async stack.
-        tokio::task::spawn_blocking(move || {
+        let (object, _charge) = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let _charge = charge;
             let source = FetchedRanges { length, ranges };
             let mut bases = RefDeltaBases::new();
             let mut decoder =
@@ -387,10 +386,11 @@ impl<B: RemoteOdbBackend> RemoteObjectDatabase<B> {
                     "remote object identity mismatch".into(),
                 ));
             }
-            Ok(outcome.into_object())
+            Ok((outcome.into_object(), charge))
         })
         .await
-        .map_err(|error| GitError::InvalidObject(format!("remote CPU worker failed: {error}")))?
+        .map_err(|error| GitError::InvalidObject(format!("remote CPU worker failed: {error}")))??;
+        Ok(object)
     }
 }
 fn remote_decode_error(error: sley_pack::PackReadError) -> GitError {

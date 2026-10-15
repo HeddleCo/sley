@@ -48,7 +48,8 @@ cannot read an unfetched neighbor. CPU decoding reuses `BoundedPackDecoder` on
 Tokio blocking workers, with a shared concurrency semaphore. Async futures hold
 heap descriptors rather than recursively nested decode state. Dropping a read
 cancels its I/O; a CPU job already submitted completes while retaining its
-reservation and CPU permit.
+reservation and CPU permit. Completed results retain their byte reservation
+until async delivery or cancellation, including when the consumer stops polling.
 
 The shared byte budget charges fetched encoded closures and reserves the full
 configured decoder materialization ceiling during CPU work. This conservative

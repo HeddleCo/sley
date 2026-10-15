@@ -49,7 +49,7 @@ impl PackDecodeReservation {
             let previous = self
                 .budget
                 .used
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                     used.checked_add(additional)
                         .filter(|next| *next <= self.budget.limit)
                 })
