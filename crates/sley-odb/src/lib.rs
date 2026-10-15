@@ -18,6 +18,7 @@ mod pack;
 mod reachability;
 mod read;
 mod registry;
+#[cfg(feature = "remote-odb")]
 mod remote;
 mod repack;
 
@@ -30,6 +31,7 @@ pub use midx::*;
 pub use pack::*;
 pub use reachability::*;
 pub use registry::*;
+#[cfg(feature = "remote-odb")]
 pub use remote::*;
 pub use repack::*;
 // Cancel types re-exported so callers of cancel-aware install (remote, fetch)

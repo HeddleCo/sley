@@ -11,15 +11,18 @@ transitive dependencies. A ready batch contains at most `window` entries;
 forward REF bases may lie outside the output window. Workers inflate, apply
 ready deltas and hash objects. Each entry is inflated once. Each base is released
 after its last dependent and its own output. Traversal is iterative, including
-forward chains; workers use 2 MiB stacks. Each cursor owns a fixed Rayon pool,
-so batch count does not multiply thread creation. One-worker mode runs inline.
+forward chains; built-in pools use 2 MiB stacks. Supply
+`ParallelScanOptions::pool` to share an `Arc<rayon::ThreadPool>` across
+cursors; otherwise each cursor builds one fixed pool. The default window is
+1,024 entries. One-worker mode runs inline when no pool is supplied.
 
 `ScanLimits` bounds depth, active materialization and live bases. The shared
 budget additionally caps active materialization across simultaneous readers;
 share one instance to enforce a process-wide decoded-byte ceiling. Reservations
 precede allocation and are released on error, cancellation and drop. Errors
-terminate iteration. A work window that cannot fit the selected budget returns
-a limit error; choose its size explicitly for the workload.
+terminate iteration. Ready batches shrink when the next allocation cannot fit
+the available budget.
+An individual job that cannot fit still returns a typed limit error.
 
 These are logical byte limits. Index/graph metadata is proportional to indexed
 object count; allocator capacity/slack, worker stacks, fixed inflation scratch
@@ -30,13 +33,17 @@ synchronous cursor on a blocking CPU executor.
 
 ## Remote ODB
 
+Enable the `sley-odb/remote-odb` feature for these async APIs and their Tokio
+and futures-util dependencies. The default local ODB needs neither dependency.
+
 `RemoteOdbBackend` supplies asynchronous exact ranged reads for immutable keys.
 `MemoryRemoteBackend` implements the same interface for tests. The caller supplies
 pack/index keys, lengths and object format through `RemotePackLocation`.
 The namespace and authorization policy belong to the caller.
 
 `RemoteObjectDatabase::open` fetches a size-limited index and the pack's header
-and trailer. `read_object` fetches only indexed spans in its dependency closure;
+and trailer. Index parsing and offset-table construction run in `spawn_blocking`.
+`read_object` fetches only indexed spans in its dependency closure;
 `read_objects` overlaps independent requests and preserves input order. Large
 spans split into parallel pages. `RemoteBufferPool::new(page_bytes, slots)` caps
 both in-flight requests and scratch bytes across handles. For example, 1 MiB
@@ -45,15 +52,23 @@ pages and eight slots reserve at most 8 MiB of scratch. No locks cross I/O.
 Index checksum, each fetched entry's CRC and the resolved Git ID are checked.
 Sparse sources expose indexed entry ends so header lookahead and inflation
 cannot read an unfetched neighbor. CPU decoding reuses `BoundedPackDecoder` on
-Tokio blocking workers, with a shared concurrency semaphore. Async futures hold
+Tokio blocking workers, with a shared concurrency semaphore sized to the CPU
+worker count independently of I/O slots (`RemoteBufferPool::with_cpu_workers`).
+Async futures hold
 heap descriptors rather than recursively nested decode state. Dropping a read
 cancels its I/O; a CPU job already submitted completes while retaining its
 reservation and CPU permit. Completed results retain their byte reservation
 until async delivery or cancellation, including when the consumer stops polling.
 
-The shared byte budget charges fetched encoded closures and reserves the full
-configured decoder materialization ceiling during CPU work. This conservative
-reservation can reject concurrency before the physical ceiling is reached.
+The shared byte budget uses weighted async permits: remote reads wait for
+capacity before fetching. Admission reserves the configured encoded-closure
+ceiling plus the decoder materialization ceiling, capped at the shared budget,
+then shrinks to the actual encoded bytes plus the decoder ceiling before CPU
+work. Acquiring once avoids deadlock between growing partial reservations. A
+single closure exceeding the shared budget fails with
+`RemoteOdbError::Decode(PackReadError::Limit(_))`; worker join errors retain
+`RemoteOdbError::Worker`. With async admission enabled, byte permits support a
+budget up to `u32::MAX` bytes (or the platform semaphore maximum).
 Index metadata is separately size-limited. This slice opens one ordinary indexed
 pack per handle; external thin bases return a missing-object error. It adds no
 transport adapter, persistent cache, index partition format or local pack copy.
@@ -67,7 +82,7 @@ index loading precedes the timer. `threads=0` measures the existing sequential
 cursor; `threads=1` and `threads=4` measure the new cursor.
 
 ```sh
-export TMPDIR=/home/scratch
+export TMPDIR="$(mktemp -d)"
 cargo build --locked --release -p sley-bench --bin pack-decode-bench
 python3 crates/sley-bench/fixtures/generate_decode_pack.py "$TMPDIR/decode.pack"
 git index-pack "$TMPDIR/decode.pack"

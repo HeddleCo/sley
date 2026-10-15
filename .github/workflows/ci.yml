@@ -141,6 +141,14 @@ jobs:
       - name: HTTP embedding feature isolation and regressions
         run: bash scripts/check-http-embedding.sh
 
+      - name: Remote ODB feature isolation and tests
+        run: |
+          if cargo tree --locked -p sley-odb -e normal --prefix none | grep -E '^(tokio|futures-util) v'; then
+            echo "Async dependencies leaked into the default local ODB" >&2
+            exit 1
+          fi
+          cargo test --locked -p sley-odb --features remote-odb
+
       # 3. Formatting is part of the release gate. Keep this check workspace-wide
       #    so a newly added crate cannot silently fall outside enforcement.
       - name: Format check

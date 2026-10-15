@@ -1336,7 +1336,10 @@ fn parallel_window_limits_work_and_shared_budget_coordinates_readers() {
         sley_pack::ParallelScanOptions::new(4, 3),
         budget.clone(),
     );
-    second.next().expect("second reader").expect("smaller batch fits");
+    second
+        .next()
+        .expect("second reader")
+        .expect("smaller batch fits");
     assert_eq!(second.stats().entries_inflated, 1);
     assert_eq!(
         budget.used_bytes(),
@@ -1388,5 +1391,112 @@ fn shared_decode_budget_is_atomic_between_threads() {
     });
     assert_eq!(used, 4);
     assert_eq!(peak, 4);
+    assert_eq!(budget.used_bytes(), 0);
+}
+
+#[test]
+fn parallel_cursors_reuse_the_supplied_pool() {
+    let objects: Vec<_> = (0..8u8)
+        .map(|n| EncodedObject::new(ObjectType::Blob, vec![n; 4096]))
+        .collect();
+    let written = PackFile::write_packed_with_options(
+        &objects,
+        ObjectFormat::Sha1,
+        &PackWriteOptions::new().with_window(0),
+    )
+    .expect("pack");
+    let index = PackIndex::parse(&written.index, ObjectFormat::Sha1).expect("index");
+    let scan = PackScan::from_slice(&written.pack, &index, limits()).expect("scan");
+    let pool = std::sync::Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("pool"),
+    );
+    let options = sley_pack::ParallelScanOptions {
+        // Building a new pool with this count would fail. The supplied pool
+        // must provide the executor instead.
+        threads: usize::MAX,
+        pool: Some(pool.clone()),
+        ..sley_pack::ParallelScanOptions::default()
+    };
+    assert_eq!(options.window, 1024);
+    let budget = std::sync::Arc::new(sley_pack::PackDecodeBudget::new(16 * 1024 * 1024));
+    let mut cursors: Vec<_> = (0..2)
+        .map(|_| {
+            scan.plan(index.entries.iter().map(|entry| entry.oid))
+                .expect("plan")
+                .parallel_cursor(
+                    lookup(HashMap::new()),
+                    CancelFlag::never(),
+                    options.clone(),
+                    budget.clone(),
+                )
+        })
+        .collect();
+    for cursor in &mut cursors {
+        assert_eq!(
+            cursor
+                .by_ref()
+                .map(|object| object.expect("decode"))
+                .count(),
+            objects.len()
+        );
+    }
+    drop(cursors);
+    assert_eq!(budget.used_bytes(), 0);
+}
+
+#[test]
+fn parallel_delta_results_shrink_without_reinflating_entries() {
+    let bases: Vec<_> = [b'a', b'b']
+        .into_iter()
+        .map(|byte| EncodedObject::new(ObjectType::Blob, vec![byte; 4096]))
+        .collect();
+    let mut entries: Vec<_> = bases
+        .iter()
+        .map(|base| (base.clone(), entry(3, &base.body, &[])))
+        .collect();
+    for base in &bases {
+        let mut body = base.body.clone();
+        body.push(b'!');
+        entries.push((
+            EncodedObject::new(ObjectType::Blob, body),
+            entry(
+                7,
+                &copy_delta(4096, b"!"),
+                base.object_id(ObjectFormat::Sha1)
+                    .expect("base oid")
+                    .as_bytes(),
+            ),
+        ));
+    }
+    let fixture = encoded_fixture(entries);
+    let cap = 3 * 4096 + 64;
+    let scan = PackScan::from_slice(&fixture.pack, &fixture.index, ScanLimits::new(32, cap, cap))
+        .expect("scan");
+    let budget = std::sync::Arc::new(sley_pack::PackDecodeBudget::new(cap));
+    let mut cursor = scan
+        .plan(fixture.index.entries.iter().map(|entry| entry.oid))
+        .expect("plan")
+        .parallel_cursor(
+            lookup(HashMap::new()),
+            CancelFlag::never(),
+            sley_pack::ParallelScanOptions::new(4, 1024),
+            budget.clone(),
+        );
+    let mut count = 0;
+    for output in cursor.by_ref() {
+        let output = output.expect("delta result batch shrinks to fit");
+        assert_eq!(output.object.as_ref(), &fixture.objects[&output.oid]);
+        count += 1;
+    }
+    assert_eq!(count, 4);
+    assert_eq!(
+        cursor.stats().entries_inflated,
+        4,
+        "pending instructions are reused"
+    );
+    assert!(budget.peak_bytes() <= cap);
     assert_eq!(budget.used_bytes(), 0);
 }

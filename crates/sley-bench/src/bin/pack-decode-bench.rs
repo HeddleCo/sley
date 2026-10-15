@@ -1,4 +1,4 @@
-//! Positional streaming decode: <pack> <threads: 0=sequential> [window=256].
+//! Positional streaming decode: <pack> <threads: 0=sequential> [window=1024].
 //! Run fresh processes under /usr/bin/time for independent peak RSS samples.
 use sley_core::{CancelFlag, GitError, ObjectFormat, StreamingDigest};
 use sley_pack::{PackDecodeBudget, PackIndex, PackScan, ParallelScanOptions, ScanLimits};
@@ -12,7 +12,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .next()
         .map(|arg| arg.parse())
         .transpose()?
-        .unwrap_or(256);
+        .unwrap_or(1024);
     let index = PackIndex::parse(
         &std::fs::read(path.with_extension("idx"))?,
         ObjectFormat::Sha1,

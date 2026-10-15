@@ -1,8 +1,10 @@
+#![cfg(feature = "remote-odb")]
+
 use sley_core::{GitError, ObjectFormat};
 use sley_object::{EncodedObject, ObjectType};
 use sley_odb::{
-    MemoryRemoteBackend, RemoteBufferPool, RemoteObjectDatabase, RemoteOdbBackend, RemoteOdbLimits,
-    RemotePackLocation,
+    MemoryRemoteBackend, RemoteBufferPool, RemoteObjectDatabase, RemoteOdbBackend, RemoteOdbError,
+    RemoteOdbLimits, RemotePackLocation,
 };
 use sley_pack::{PackDecodeBudget, PackFile, PackReadLimits, PackWrite, PackWriteOptions};
 use std::{
@@ -235,7 +237,7 @@ async fn missing_base_budget_and_index_limit_are_rejected() {
     assert!(matches!(
         db.read_object(&objects[1].object_id(format).expect("oid"))
             .await,
-        Err(GitError::NotFound(_))
+        Err(RemoteOdbError::Git(GitError::NotFound(_)))
     ));
     let mut small = limits();
     small.max_index_bytes = 1;
@@ -262,13 +264,11 @@ async fn missing_base_budget_and_index_limit_are_rejected() {
     )
     .await
     .expect("open");
-    assert!(
-        db.read_object(&objects[0].object_id(format).expect("oid"))
-            .await
-            .expect_err("budget")
-            .to_string()
-            .contains("limit exceeded")
-    );
+    assert!(matches!(
+        db.read_object(&objects[0].object_id(format).expect("oid")).await,
+        Err(RemoteOdbError::Decode(sley_pack::PackReadError::Limit(error)))
+            if error.kind == sley_pack::PackLimitKind::MaterializedBytes && error.limit == 1
+    ));
     assert_eq!(budget.used_bytes(), 0);
     assert_eq!(pool.available_buffers(), 2);
 }
@@ -314,6 +314,7 @@ fn invalid_pool_dimensions_are_rejected() {
     assert!(RemoteBufferPool::new(0, 1).is_err());
     assert!(RemoteBufferPool::new(1, 0).is_err());
     assert!(RemoteBufferPool::new(usize::MAX, 2).is_err());
+    assert!(RemoteBufferPool::with_cpu_workers(1024, 4, 0).is_err());
 }
 
 #[tokio::test]
@@ -422,17 +423,127 @@ async fn full_shared_budget_waits_then_succeeds() {
     let pool = RemoteBufferPool::new(1024, 2).expect("pool");
     let budget = Arc::new(PackDecodeBudget::new(2 * 1024 * 1024));
     let db = RemoteObjectDatabase::open(
-        probe(&written), pool.clone(), budget.clone(), location(&written), limits(),
-    ).await.expect("open");
-    let held = budget.reserve(2 * 1024 * 1024).expect("first reader fills budget");
+        probe(&written),
+        pool.clone(),
+        budget.clone(),
+        location(&written),
+        limits(),
+    )
+    .await
+    .expect("open");
+    let held = budget
+        .reserve(2 * 1024 * 1024)
+        .expect("first reader fills budget");
     let oid = objects[0].object_id(format).expect("oid");
     let mut read = std::pin::pin!(db.read_object(&oid));
-    assert!(tokio::time::timeout(Duration::from_millis(20), read.as_mut()).await.is_err(),
-        "second reader must wait for budget instead of returning a limit error");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), read.as_mut())
+            .await
+            .is_err(),
+        "second reader must wait for budget instead of returning a limit error"
+    );
     drop(held);
-    let object = tokio::time::timeout(Duration::from_secs(2), read).await
-        .expect("reader resumes").expect("decode");
+    let object = tokio::time::timeout(Duration::from_secs(2), read)
+        .await
+        .expect("reader resumes")
+        .expect("decode");
     assert_eq!(object.as_ref(), &objects[0]);
     assert_eq!(budget.used_bytes(), 0);
     assert_eq!(pool.available_buffers(), 2);
+}
+
+#[tokio::test]
+async fn cancelling_budget_waiter_leaves_capacity_for_next_reader() {
+    let objects = objects(1);
+    let format = ObjectFormat::Sha1;
+    let written = pack(&objects, format, true);
+    let pool = RemoteBufferPool::with_cpu_workers(1024, 4, 1).expect("pool");
+    let budget = Arc::new(PackDecodeBudget::new(2 * 1024 * 1024));
+    let db = RemoteObjectDatabase::open(
+        probe(&written),
+        pool.clone(),
+        budget.clone(),
+        location(&written),
+        limits(),
+    )
+    .await
+    .expect("open");
+    let held = budget.reserve(budget.limit_bytes()).expect("fill budget");
+    let oid = objects[0].object_id(format).expect("oid");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), db.read_object(&oid))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        pool.available_buffers(),
+        4,
+        "waiting does not hold I/O slots"
+    );
+    assert_eq!(budget.used_bytes(), budget.limit_bytes());
+    drop(held);
+    let actual = tokio::time::timeout(Duration::from_secs(2), db.read_object(&oid))
+        .await
+        .expect("cancelled waiter removed")
+        .expect("decode");
+    assert_eq!(actual.as_ref(), &objects[0]);
+    assert_eq!(budget.used_bytes(), 0);
+}
+
+#[tokio::test]
+async fn decoder_limit_stays_typed_after_cpu_handoff() {
+    let objects = objects(1);
+    let format = ObjectFormat::Sha1;
+    let written = pack(&objects, format, true);
+    let mut small = limits();
+    small.decode.max_materialized_bytes = 1;
+    let budget = Arc::new(PackDecodeBudget::new(4 * 1024 * 1024));
+    let db = RemoteObjectDatabase::open(
+        probe(&written),
+        RemoteBufferPool::new(1024, 2).expect("pool"),
+        budget.clone(),
+        location(&written),
+        small,
+    )
+    .await
+    .expect("open");
+    assert!(
+        matches!(db.read_object(&objects[0].object_id(format).expect("oid")).await,
+        Err(RemoteOdbError::Decode(sley_pack::PackReadError::Limit(error)))
+            if error.kind == sley_pack::PackLimitKind::MaterializedBytes && error.limit == 1)
+    );
+    assert_eq!(budget.used_bytes(), 0);
+}
+
+#[tokio::test]
+async fn concurrent_closures_wait_without_holding_partial_reservations() {
+    let objects = objects(4);
+    let format = ObjectFormat::Sha1;
+    let written = pack(&objects, format, false);
+    // One complete closure fits, but two decoder reservations do not. The
+    // configured encoded ceiling is larger than this actual pack.
+    let cap = limits().decode.max_materialized_bytes + written.pack.len();
+    let budget = Arc::new(PackDecodeBudget::new(cap));
+    let db = RemoteObjectDatabase::open(
+        probe(&written),
+        RemoteBufferPool::new(1024, 4).expect("pool"),
+        budget.clone(),
+        location(&written),
+        limits(),
+    )
+    .await
+    .expect("open");
+    let ids: Vec<_> = [3, 2, 1, 0]
+        .into_iter()
+        .map(|i| objects[i].object_id(format).expect("oid"))
+        .collect();
+    let actual = tokio::time::timeout(Duration::from_secs(5), db.read_objects(&ids))
+        .await
+        .expect("concurrent readers make progress")
+        .expect("decode");
+    for (object, i) in actual.iter().zip([3, 2, 1, 0]) {
+        assert_eq!(object.as_ref(), &objects[i]);
+    }
+    assert!(budget.peak_bytes() <= cap);
+    assert_eq!(budget.used_bytes(), 0);
 }

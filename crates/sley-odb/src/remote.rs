@@ -14,6 +14,48 @@ use sley_pack::{
 use std::{collections::BTreeMap, future::Future, io, ops::Range};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+/// Preserve decode limits, storage failures and blocking-worker failures separately.
+#[derive(Debug)]
+pub enum RemoteOdbError {
+    Git(GitError),
+    Decode(sley_pack::PackReadError),
+    Worker(tokio::task::JoinError),
+}
+impl std::fmt::Display for RemoteOdbError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Git(error) => error.fmt(f),
+            Self::Decode(error) => error.fmt(f),
+            Self::Worker(error) => write!(f, "remote CPU worker failed: {error}"),
+        }
+    }
+}
+impl std::error::Error for RemoteOdbError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(match self {
+            Self::Git(error) => error,
+            Self::Decode(error) => error,
+            Self::Worker(error) => error,
+        })
+    }
+}
+impl From<GitError> for RemoteOdbError {
+    fn from(error: GitError) -> Self {
+        Self::Git(error)
+    }
+}
+impl From<sley_pack::PackReadError> for RemoteOdbError {
+    fn from(error: sley_pack::PackReadError) -> Self {
+        Self::Decode(error)
+    }
+}
+impl From<tokio::task::JoinError> for RemoteOdbError {
+    fn from(error: tokio::task::JoinError) -> Self {
+        Self::Worker(error)
+    }
+}
+pub type RemoteOdbResult<T> = std::result::Result<T, RemoteOdbError>;
+
 /// Exact ranged reads of immutable pack and index bytes. Short reads are errors.
 /// Implementations must stop using `output` when their future is dropped.
 /// Returned futures contain only I/O state; CPU decode runs on blocking workers.
@@ -37,7 +79,16 @@ pub struct RemoteBufferPool {
 }
 impl RemoteBufferPool {
     pub fn new(page_bytes: usize, slots: usize) -> Result<Arc<Self>> {
-        if page_bytes == 0
+        let workers = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1);
+        Self::with_cpu_workers(page_bytes, slots, workers)
+    }
+    /// Configure CPU concurrency independently of the number of I/O slots.
+    pub fn with_cpu_workers(page_bytes: usize, slots: usize, workers: usize) -> Result<Arc<Self>> {
+        if workers == 0
+            || workers > Semaphore::MAX_PERMITS
+            || page_bytes == 0
             || slots == 0
             || slots > Semaphore::MAX_PERMITS
             || page_bytes.checked_mul(slots).is_none()
@@ -56,7 +107,7 @@ impl RemoteBufferPool {
             slots,
             available: Arc::new(Semaphore::new(slots)),
             buffers: Mutex::new(buffers),
-            cpu: Arc::new(Semaphore::new(slots)),
+            cpu: Arc::new(Semaphore::new(workers)),
         }))
     }
     pub fn capacity_bytes(&self) -> usize {
@@ -100,7 +151,6 @@ impl RemoteBufferPool {
         output.try_reserve_exact(length).map_err(|error| {
             GitError::InvalidObject(format!("remote range allocation failed: {error}"))
         })?;
-        output.resize(length, 0);
         let chunks = (0..length).step_by(self.page_bytes);
         let mut reads = stream::iter(chunks)
             .map(|start| async move {
@@ -129,10 +179,10 @@ impl RemoteBufferPool {
                 }
                 Ok((start, buffer))
             })
-            .buffer_unordered(self.slots);
+            .buffered(self.slots);
         while let Some(result) = reads.next().await {
-            let (start, buffer) = result?;
-            output[start..start + buffer.bytes.len()].copy_from_slice(&buffer.bytes);
+            let (_, buffer) = result?;
+            output.extend_from_slice(&buffer.bytes);
         }
         Ok(output)
     }
@@ -200,7 +250,7 @@ impl<B: RemoteOdbBackend> RemoteObjectDatabase<B> {
         budget: Arc<PackDecodeBudget>,
         location: RemotePackLocation,
         limits: RemoteOdbLimits,
-    ) -> Result<Self> {
+    ) -> RemoteOdbResult<Self> {
         let index_bytes = pool
             .read(
                 backend.as_ref(),
@@ -209,12 +259,40 @@ impl<B: RemoteOdbBackend> RemoteObjectDatabase<B> {
                 limits.max_index_bytes,
             )
             .await?;
-        let index = PackIndex::parse(&index_bytes, location.format)?;
         let end = location
             .pack_len
             .checked_sub(location.format.raw_len() as u64)
             .filter(|end| *end >= 12)
             .ok_or_else(|| GitError::InvalidFormat("remote pack is too short".into()))?;
+        let format = location.format;
+        let permit = Arc::clone(&pool.cpu)
+            .acquire_owned()
+            .await
+            .map_err(|_| GitError::Cancelled)?;
+        let (index, offsets) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let _permit = permit;
+            let index = PackIndex::parse(&index_bytes, format)?;
+            let mut ordered: Vec<_> = index.entries.iter().collect();
+            ordered.sort_unstable_by_key(|entry| entry.offset);
+            let mut offsets = BTreeMap::new();
+            for (position, entry) in ordered.iter().enumerate() {
+                let next = ordered
+                    .get(position + 1)
+                    .map(|entry| entry.offset)
+                    .unwrap_or(end);
+                if entry.offset < 12 || entry.offset >= next || next > end {
+                    return Err(GitError::InvalidFormat("invalid remote index span".into()));
+                }
+                offsets.insert(entry.offset, (next, entry.oid, entry.crc32));
+            }
+            if ordered.first().map(|entry| entry.offset).unwrap_or(end) != 12 {
+                return Err(GitError::InvalidFormat(
+                    "remote index does not start at pack header".into(),
+                ));
+            }
+            Ok((index, offsets))
+        })
+        .await??;
         let header = pool
             .read(backend.as_ref(), &location.pack_key, 0..12, 12)
             .await?;
@@ -237,25 +315,8 @@ impl<B: RemoteOdbBackend> RemoteObjectDatabase<B> {
         {
             return Err(GitError::InvalidFormat(
                 "remote pack/index header or checksum mismatch".into(),
-            ));
-        }
-        let mut ordered: Vec<_> = index.entries.iter().collect();
-        ordered.sort_unstable_by_key(|entry| entry.offset);
-        let mut offsets = BTreeMap::new();
-        for (position, entry) in ordered.iter().enumerate() {
-            let next = ordered
-                .get(position + 1)
-                .map(|entry| entry.offset)
-                .unwrap_or(end);
-            if entry.offset < 12 || entry.offset >= next || next > end {
-                return Err(GitError::InvalidFormat("invalid remote index span".into()));
-            }
-            offsets.insert(entry.offset, (next, entry.oid, entry.crc32));
-        }
-        if ordered.first().map(|entry| entry.offset).unwrap_or(end) != 12 {
-            return Err(GitError::InvalidFormat(
-                "remote index does not start at pack header".into(),
-            ));
+            )
+            .into());
         }
         Ok(Self {
             backend,
@@ -273,7 +334,10 @@ impl<B: RemoteOdbBackend> RemoteObjectDatabase<B> {
 
     /// Fetch independent requests concurrently; results retain input order.
     /// Each closure's range pages overlap in flight, also for a single object.
-    pub async fn read_objects(&self, oids: &[ObjectId]) -> Result<Vec<Arc<EncodedObject>>> {
+    pub async fn read_objects(
+        &self,
+        oids: &[ObjectId],
+    ) -> RemoteOdbResult<Vec<Arc<EncodedObject>>> {
         stream::iter(oids)
             .map(|oid| self.read_object(oid))
             .buffered(self.pool.slots)
@@ -281,7 +345,7 @@ impl<B: RemoteOdbBackend> RemoteObjectDatabase<B> {
             .await
     }
 
-    pub async fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
+    pub async fn read_object(&self, oid: &ObjectId) -> RemoteOdbResult<Arc<EncodedObject>> {
         let target = self
             .index
             .find(oid)
@@ -291,12 +355,27 @@ impl<B: RemoteOdbBackend> RemoteObjectDatabase<B> {
         let mut ranges = BTreeMap::new();
         let mut locations = Vec::new();
         let mut encoded_bytes = 0usize;
-        let mut charge = self.budget.reserve(0).map_err(remote_decode_error)?;
+        // Acquire one conservative reservation before fetching. Growing separate
+        // partial reservations could deadlock when concurrent closures fill the
+        // budget. A smaller budget is usable if the actual closure fits it.
+        let decode_bytes = self.limits.decode.max_materialized_bytes;
+        let reservation_bytes = self
+            .limits
+            .max_encoded_bytes
+            .saturating_add(decode_bytes)
+            .min(self.budget.limit_bytes());
+        if decode_bytes > reservation_bytes {
+            return Err(sley_pack::PackReadError::Limit(sley_pack::PackLimitError {
+                kind: sley_pack::PackLimitKind::MaterializedBytes,
+                limit: self.budget.limit_bytes(),
+                attempted: decode_bytes,
+            })
+            .into());
+        }
+        let mut charge = self.budget.reserve_async(reservation_bytes).await?;
         loop {
             if ranges.contains_key(&offset) {
-                return Err(GitError::InvalidObject(
-                    "cycle in remote delta bases".into(),
-                ));
+                return Err(GitError::InvalidObject("cycle in remote delta bases".into()).into());
             }
             let &(end, entry_oid, crc) = self.offsets.get(&offset).ok_or_else(|| {
                 GitError::InvalidObject("remote delta base offset is not indexed".into())
@@ -309,7 +388,15 @@ impl<B: RemoteOdbBackend> RemoteObjectDatabase<B> {
                 .ok_or_else(|| {
                     GitError::InvalidObject("remote closure exceeds encoded byte limit".into())
                 })?;
-            charge.resize(encoded_bytes).map_err(remote_decode_error)?;
+            let required = encoded_bytes.saturating_add(decode_bytes);
+            if required > reservation_bytes {
+                return Err(sley_pack::PackReadError::Limit(sley_pack::PackLimitError {
+                    kind: sley_pack::PackLimitKind::MaterializedBytes,
+                    limit: self.budget.limit_bytes(),
+                    attempted: required,
+                })
+                .into());
+            }
             let bytes = self
                 .pool
                 .read(
@@ -320,7 +407,7 @@ impl<B: RemoteOdbBackend> RemoteObjectDatabase<B> {
                 )
                 .await?;
             if crc32fast::hash(&bytes) != crc {
-                return Err(GitError::InvalidObject("remote entry CRC mismatch".into()));
+                return Err(GitError::InvalidObject("remote entry CRC mismatch".into()).into());
             }
             let (_, base) = inspect_pack_entry(&bytes, offset, self.location.format)?;
             ranges.insert(offset, bytes);
@@ -329,9 +416,9 @@ impl<B: RemoteOdbBackend> RemoteObjectDatabase<B> {
                 break;
             };
             if ranges.len() > self.limits.decode.max_delta_depth {
-                return Err(GitError::InvalidObject(
-                    "remote delta depth limit exceeded".into(),
-                ));
+                return Err(
+                    GitError::InvalidObject("remote delta depth limit exceeded".into()).into(),
+                );
             }
             offset = match base {
                 DeltaBase::Offset(base) => base,
@@ -342,21 +429,19 @@ impl<B: RemoteOdbBackend> RemoteObjectDatabase<B> {
                         .offset
                 }
                 _ => {
-                    return Err(GitError::Unsupported(
-                        "unknown remote delta base kind".into(),
-                    ));
+                    return Err(
+                        GitError::Unsupported("unknown remote delta base kind".into()).into(),
+                    );
                 }
             };
         }
-        charge
-            .resize(
-                encoded_bytes
-                    .checked_add(self.limits.decode.max_materialized_bytes)
-                    .ok_or_else(|| {
-                        GitError::InvalidObject("remote decode reservation overflow".into())
-                    })?,
-            )
-            .map_err(remote_decode_error)?;
+        charge.resize(
+            encoded_bytes
+                .checked_add(self.limits.decode.max_materialized_bytes)
+                .ok_or_else(|| {
+                    GitError::InvalidObject("remote decode reservation overflow".into())
+                })?,
+        )?;
         let permit = Arc::clone(&self.pool.cpu)
             .acquire_owned()
             .await
@@ -366,35 +451,28 @@ impl<B: RemoteOdbBackend> RemoteObjectDatabase<B> {
         let limits = self.limits.decode;
         let oid = *oid;
         // Move all large state into the blocking closure, never an async stack.
-        let (object, _charge) = tokio::task::spawn_blocking(move || {
+        let (object, _charge) = tokio::task::spawn_blocking(move || -> RemoteOdbResult<_> {
             let _permit = permit;
             let source = FetchedRanges { length, ranges };
             let mut bases = RefDeltaBases::new();
-            let mut decoder =
-                BoundedPackDecoder::new(source, format, limits).map_err(remote_decode_error)?;
+            let mut decoder = BoundedPackDecoder::new(source, format, limits)?;
             for (oid, offset) in locations {
                 bases.insert_location(
                     oid,
                     PackObjectLocation::new(decoder.primary_source(), offset),
                 );
             }
-            let outcome = decoder
-                .read_object_at(target, &bases)
-                .map_err(remote_decode_error)?;
+            let outcome = decoder.read_object_at(target, &bases)?;
             if outcome.object_id() != oid {
-                return Err(GitError::InvalidObject(
-                    "remote object identity mismatch".into(),
-                ));
+                return Err(
+                    GitError::InvalidObject("remote object identity mismatch".into()).into(),
+                );
             }
             Ok((outcome.into_object(), charge))
         })
-        .await
-        .map_err(|error| GitError::InvalidObject(format!("remote CPU worker failed: {error}")))??;
+        .await??;
         Ok(object)
     }
-}
-fn remote_decode_error(error: sley_pack::PackReadError) -> GitError {
-    GitError::InvalidObject(format!("remote pack decode: {error}"))
 }
 
 struct FetchedRanges {
