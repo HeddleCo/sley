@@ -1370,7 +1370,7 @@ fn shared_decode_budget_is_atomic_between_threads() {
     let budget = std::sync::Arc::new(sley_pack::PackDecodeBudget::new(4));
     let admitted = std::sync::Barrier::new(9);
     let release = std::sync::Barrier::new(9);
-    std::thread::scope(|scope| {
+    let (used, peak) = std::thread::scope(|scope| {
         for _ in 0..8 {
             let budget = &budget;
             let admitted = &admitted;
@@ -1383,9 +1383,11 @@ fn shared_decode_budget_is_atomic_between_threads() {
             });
         }
         admitted.wait();
-        assert_eq!(budget.used_bytes(), 4);
-        assert_eq!(budget.peak_bytes(), 4);
+        let snapshot = (budget.used_bytes(), budget.peak_bytes());
         release.wait();
+        snapshot
     });
+    assert_eq!(used, 4);
+    assert_eq!(peak, 4);
     assert_eq!(budget.used_bytes(), 0);
 }
