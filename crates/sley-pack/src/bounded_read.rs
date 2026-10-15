@@ -39,6 +39,12 @@ pub trait PackReadSource {
         None
     }
 
+    /// Known exclusive end of an indexed entry. Sparse sources supply this
+    /// so header lookahead and inflation never cross into unfetched entries.
+    fn entry_end(&self, _offset: u64) -> Option<u64> {
+        None
+    }
+
     /// Whether this source contains no bytes.
     fn is_empty(&self) -> io::Result<bool> {
         self.len().map(|len| len == 0)
@@ -487,6 +493,11 @@ pub struct PackReadOutcome {
 }
 
 impl PackReadOutcome {
+    /// Transfer the verified allocation without copying its body.
+    pub fn into_object(self) -> Arc<EncodedObject> {
+        self.object
+    }
+
     pub fn object(&self) -> &EncodedObject {
         &self.object
     }
@@ -969,9 +980,15 @@ impl<S: PackReadSource> BoundedPackDecoder<S> {
         if offset >= source.trailer_offset {
             return Err(GitError::InvalidFormat("pack object offset out of range".into()).into());
         }
-        let available =
-            usize::try_from((source.trailer_offset - offset).min(ENTRY_PREFIX_BYTES as u64))
-                .unwrap_or(ENTRY_PREFIX_BYTES);
+        let end = source
+            .source
+            .entry_end(offset)
+            .unwrap_or(source.trailer_offset);
+        if end <= offset || end > source.trailer_offset {
+            return Err(GitError::InvalidFormat("invalid indexed entry end".into()).into());
+        }
+        let available = usize::try_from((end - offset).min(ENTRY_PREFIX_BYTES as u64))
+            .unwrap_or(ENTRY_PREFIX_BYTES);
         let mut prefix = [0u8; ENTRY_PREFIX_BYTES];
         self.read_exact_at(
             location.source,
@@ -1015,14 +1032,19 @@ impl<S: PackReadSource> BoundedPackDecoder<S> {
         let mut body = self.allocate_body(expected, active_bytes, pinned_cache, cancel, stats)?;
 
         let source = &self.source_state(entry.location)?.source;
-        let (consumed, read) = inflate_source_exact_into(
-            source,
-            entry.data_offset,
-            trailer_offset,
-            &mut body,
-            expected,
-            cancel,
-        )?;
+        let indexed_end = source.entry_end(entry.location.offset);
+        let end = indexed_end.unwrap_or(trailer_offset);
+        if end <= entry.data_offset || end > trailer_offset {
+            return Err(GitError::InvalidFormat("invalid indexed entry end".into()).into());
+        }
+        let (consumed, read) =
+            inflate_source_exact_into(source, entry.data_offset, end, &mut body, expected, cancel)?;
+        if indexed_end.is_some() && consumed != end - entry.data_offset {
+            return Err(GitError::InvalidObject(
+                "compressed entry length differs from index span".into(),
+            )
+            .into());
+        }
         stats.compressed_bytes_read = stats.compressed_bytes_read.saturating_add(consumed);
         stats.source_bytes_read = stats.source_bytes_read.saturating_add(read);
         Ok(body)
@@ -1502,6 +1524,20 @@ pub(crate) fn object_type_for_entry(kind: PackObjectKind) -> Result<ObjectType> 
             "delta pack entry decoded without a base".into(),
         )),
     }
+}
+
+/// Inspect an entry prefix using the same header/base grammar as the decoder.
+/// At most 64 bytes are needed. This does not inflate or authenticate the body.
+/// Remote readers can fetch the named dependency before entering CPU decoding.
+pub fn inspect_pack_entry(
+    prefix: &[u8],
+    offset: u64,
+    format: ObjectFormat,
+) -> Result<(u64, Option<DeltaBase>)> {
+    let mut cursor = 0;
+    let header = parse_entry_header(prefix, &mut cursor)?;
+    let base = parse_entry_base(prefix, &mut cursor, offset, format, header.kind)?;
+    Ok((header.size, base))
 }
 
 #[cfg(test)]

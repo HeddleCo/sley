@@ -8,6 +8,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+rayon = "1.12.0"
 crc32fast = "1.5.2"
 # No backend baked into the dep line: the backend is picked by exactly one of
 # the mutually-exclusive `zlib-rs`/`pure-rust` crate features below. flate2's

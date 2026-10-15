@@ -18,6 +18,7 @@ mod pack;
 mod reachability;
 mod read;
 mod registry;
+mod remote;
 mod repack;
 
 pub use gc::*;
@@ -29,6 +30,7 @@ pub use midx::*;
 pub use pack::*;
 pub use reachability::*;
 pub use registry::*;
+pub use remote::*;
 pub use repack::*;
 // Cancel types re-exported so callers of cancel-aware install (remote, fetch)
 // can name them without depending on `sley-pack` or reaching into `sley-core`.

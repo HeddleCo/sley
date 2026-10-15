@@ -1155,3 +1155,237 @@ fn scan_mutates_declared_sizes_delta_instructions_and_zlib_bodies() {
         );
     }
 }
+
+#[test]
+fn parallel_scan_matches_sequential_with_bounded_window() {
+    for format in [ObjectFormat::Sha1, ObjectFormat::Sha256] {
+        for fixture in [
+            fixture(format, true, false),
+            fixture(format, false, true),
+            chain(65, true, format),
+        ] {
+            let scan = PackScan::from_slice(&fixture.pack, &fixture.index, limits()).expect("scan");
+            let expected: Vec<_> = scan
+                .plan(fixture.index.entries.iter().map(|e| e.oid))
+                .expect("plan")
+                .cursor(lookup(fixture.external.clone()), CancelFlag::never())
+                .map(|v| v.expect("sequential"))
+                .collect();
+            for threads in [1, 4] {
+                let budget =
+                    std::sync::Arc::new(sley_pack::PackDecodeBudget::new(16 * 1024 * 1024));
+                let mut cursor = scan
+                    .plan(fixture.index.entries.iter().map(|e| e.oid))
+                    .expect("plan")
+                    .parallel_cursor(
+                        lookup(fixture.external.clone()),
+                        CancelFlag::never(),
+                        sley_pack::ParallelScanOptions::new(threads, 3),
+                        budget.clone(),
+                    );
+                let actual: Vec<_> = cursor.by_ref().map(|v| v.expect("parallel")).collect();
+                assert_eq!(actual.len(), expected.len());
+                for (actual, expected) in actual.iter().zip(&expected) {
+                    assert_eq!(
+                        (actual.oid, actual.offset, actual.requested, &actual.object),
+                        (
+                            expected.oid,
+                            expected.offset,
+                            expected.requested,
+                            &expected.object
+                        )
+                    );
+                }
+                assert_eq!(cursor.stats().entries_inflated, expected.len() as u64);
+                assert!(cursor.peak_in_flight() <= 3);
+                drop(cursor);
+                assert_eq!(budget.used_bytes(), 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn parallel_scan_rejects_wrong_base_and_shared_budget_exhaustion() {
+    let fixture = fixture(ObjectFormat::Sha1, false, true);
+    let scan = PackScan::from_slice(&fixture.pack, &fixture.index, limits()).expect("scan");
+    let plan = || {
+        scan.plan(fixture.index.entries.iter().map(|e| e.oid))
+            .expect("plan")
+    };
+    let budget = std::sync::Arc::new(sley_pack::PackDecodeBudget::new(16 * 1024 * 1024));
+    let mut cursor = plan().parallel_cursor(
+        |_| {
+            Ok(std::sync::Arc::new(EncodedObject::new(
+                ObjectType::Blob,
+                b"wrong".to_vec(),
+            )))
+        },
+        CancelFlag::never(),
+        sley_pack::ParallelScanOptions::new(4, 3),
+        budget.clone(),
+    );
+    assert!(
+        matches!(cursor.next(), Some(Err(PackReadError::Pack(GitError::InvalidObject(message)))) if message.contains("identity mismatch"))
+    );
+    assert!(cursor.next().is_none());
+    drop(cursor);
+    assert_eq!(budget.used_bytes(), 0);
+    let budget = std::sync::Arc::new(sley_pack::PackDecodeBudget::new(4095));
+    let mut cursor = plan().parallel_cursor(
+        lookup(fixture.external),
+        CancelFlag::never(),
+        sley_pack::ParallelScanOptions::new(4, 3),
+        budget.clone(),
+    );
+    assert!(
+        matches!(cursor.next(), Some(Err(PackReadError::Limit(error))) if error.kind == PackLimitKind::MaterializedBytes)
+    );
+    assert!(cursor.next().is_none());
+    drop(cursor);
+    assert_eq!(budget.used_bytes(), 0);
+}
+
+#[test]
+fn parallel_scan_deep_chains_cancel_and_drop_on_two_mib_stack() {
+    std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            for forward in [false, true] {
+                let fixture = chain(1025, forward, ObjectFormat::Sha1);
+                let scan =
+                    PackScan::from_slice(&fixture.pack, &fixture.index, limits()).expect("scan");
+                let budget =
+                    std::sync::Arc::new(sley_pack::PackDecodeBudget::new(16 * 1024 * 1024));
+                let cancel = AtomicCancel::new();
+                let mut cursor = scan
+                    .plan(fixture.index.entries.iter().map(|e| e.oid))
+                    .expect("plan")
+                    .parallel_cursor(
+                        lookup(HashMap::new()),
+                        CancelFlag::new(&cancel),
+                        sley_pack::ParallelScanOptions::new(4, 3),
+                        budget.clone(),
+                    );
+                let first = cursor.next().expect("first").expect("decode");
+                assert_eq!(first.object.as_ref(), &fixture.objects[&first.oid]);
+                cancel.cancel();
+                assert!(matches!(
+                    cursor.next(),
+                    Some(Err(PackReadError::Pack(GitError::Cancelled)))
+                ));
+                assert!(cursor.next().is_none());
+                assert_eq!(budget.used_bytes(), 0);
+                let mut cursor = scan
+                    .plan(fixture.index.entries.iter().map(|e| e.oid))
+                    .expect("plan")
+                    .parallel_cursor(
+                        lookup(HashMap::new()),
+                        CancelFlag::never(),
+                        sley_pack::ParallelScanOptions::new(4, 3),
+                        budget.clone(),
+                    );
+                for object in cursor.by_ref() {
+                    let object = object.expect("deep decode");
+                    assert_eq!(object.object.as_ref(), &fixture.objects[&object.oid]);
+                }
+                assert_eq!(cursor.stats().entries_inflated, 1025);
+                drop(cursor);
+                assert_eq!(budget.used_bytes(), 0);
+            }
+        })
+        .expect("thread")
+        .join()
+        .expect("small stack decode");
+}
+
+#[test]
+fn parallel_window_limits_work_and_shared_budget_coordinates_readers() {
+    let objects: Vec<_> = (0..100u8)
+        .map(|n| EncodedObject::new(ObjectType::Blob, vec![n; 4096]))
+        .collect();
+    let written = PackFile::write_packed_with_options(
+        &objects,
+        ObjectFormat::Sha1,
+        &PackWriteOptions::new().with_window(0),
+    )
+    .expect("pack");
+    let index = PackIndex::parse(&written.index, ObjectFormat::Sha1).expect("index");
+    let scan = PackScan::from_slice(&written.pack, &index, limits()).expect("scan");
+    let plan = || {
+        scan.plan(index.entries.iter().map(|e| e.oid))
+            .expect("plan")
+    };
+    let budget = std::sync::Arc::new(sley_pack::PackDecodeBudget::new(3 * 4096));
+    let mut first = plan().parallel_cursor(
+        lookup(HashMap::new()),
+        CancelFlag::never(),
+        sley_pack::ParallelScanOptions::new(4, 3),
+        budget.clone(),
+    );
+    first.next().expect("first").expect("decode");
+    assert_eq!(
+        first.stats().entries_inflated,
+        3,
+        "next does only a window of work"
+    );
+    assert_eq!(budget.used_bytes(), 2 * 4096);
+    let mut second = plan().parallel_cursor(
+        lookup(HashMap::new()),
+        CancelFlag::never(),
+        sley_pack::ParallelScanOptions::new(4, 3),
+        budget.clone(),
+    );
+    assert!(
+        matches!(second.next(), Some(Err(PackReadError::Limit(error))) if error.kind == PackLimitKind::MaterializedBytes)
+    );
+    assert_eq!(
+        budget.used_bytes(),
+        2 * 4096,
+        "failed reader releases only its charge"
+    );
+    drop(first);
+    assert_eq!(
+        budget.used_bytes(),
+        0,
+        "dropping a partly consumed window releases it"
+    );
+    for options in [
+        sley_pack::ParallelScanOptions::new(0, 3),
+        sley_pack::ParallelScanOptions::new(4, 0),
+    ] {
+        let mut cursor = plan().parallel_cursor(
+            lookup(HashMap::new()),
+            CancelFlag::never(),
+            options,
+            budget.clone(),
+        );
+        assert!(cursor.next().expect("invalid options").is_err());
+        assert!(cursor.next().is_none());
+    }
+}
+
+#[test]
+fn shared_decode_budget_is_atomic_between_threads() {
+    let budget = std::sync::Arc::new(sley_pack::PackDecodeBudget::new(4));
+    let admitted = std::sync::Barrier::new(9);
+    let release = std::sync::Barrier::new(9);
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            let budget = &budget;
+            let admitted = &admitted;
+            let release = &release;
+            scope.spawn(move || {
+                let charge = budget.reserve(1);
+                admitted.wait();
+                release.wait();
+                drop(charge);
+            });
+        }
+        admitted.wait();
+        assert_eq!(budget.used_bytes(), 4);
+        assert_eq!(budget.peak_bytes(), 4);
+        release.wait();
+    });
+    assert_eq!(budget.used_bytes(), 0);
+}

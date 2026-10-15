@@ -12,6 +12,8 @@ license.workspace = true
 # no backend baked into the dep line (see sley-pack for the cfg-cascade rationale).
 crc32fast = "1.5.2"
 flate2 = { version = "1.1.10", default-features = false }
+futures-util = "0.3.32"
+tokio = { version = "1.53.2", features = ["rt", "sync"] }
 parking_lot = "0.12.5"
 smallvec = "1.16.1"
 sley-core.workspace = true
@@ -36,3 +38,6 @@ fetch-profile = ["sley-core/fetch-profile", "sley-pack/fetch-profile"]
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread", "time"] }
