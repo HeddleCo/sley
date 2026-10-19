@@ -1693,8 +1693,23 @@ fn capabilities_parse_and_encode_tokens() {
 }
 
 #[test]
+fn capabilities_skip_empty_separator_tokens() {
+    let expected = parse_capabilities(b"report-status-v2 side-band-64k quiet object-format=sha1")
+        .expect("capability list");
+    assert_eq!(
+        parse_capabilities(b" report-status-v2 side-band-64k quiet object-format=sha1")
+            .expect("leading space"),
+        expected
+    );
+    assert_eq!(
+        parse_capabilities(b"report-status-v2  side-band-64k quiet object-format=sha1 ")
+            .expect("repeated and trailing spaces"),
+        expected
+    );
+}
+
+#[test]
 fn capabilities_reject_empty_or_delimited_fields() {
-    assert!(parse_capabilities(b"multi_ack  thin-pack").is_err());
     assert!(parse_capabilities(b"agent=").is_err());
     assert!(parse_capabilities(b"symref=HEAD:refs/heads/main\nbad").is_err());
     assert!(
@@ -1704,6 +1719,33 @@ fn capabilities_reject_empty_or_delimited_fields() {
         }])
         .is_err()
     );
+}
+
+#[test]
+fn receive_pack_request_accepts_stock_git_leading_capability_space() {
+    let frames = vec![
+        PktLineFrame::Data(
+            b"1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 refs/heads/main\0 report-status-v2 side-band-64k quiet object-format=sha1\n"
+                .to_vec(),
+        ),
+        PktLineFrame::Flush,
+    ];
+    let request = parse_receive_pack_request(ObjectFormat::Sha1, &frames)
+        .expect("stock git receive-pack capability list");
+    assert_eq!(
+        request
+            .capabilities
+            .iter()
+            .map(|capability| capability.name.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "report-status-v2",
+            "side-band-64k",
+            "quiet",
+            "object-format"
+        ]
+    );
+    assert_eq!(request.capabilities[3].value.as_deref(), Some("sha1"));
 }
 
 #[test]
