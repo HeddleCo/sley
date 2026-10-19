@@ -890,6 +890,12 @@ pub(super) fn add_intent_to_add(
     }
 
     if changed {
+        // `git add -N` records the canonical empty blob in the object database.
+        // The index entry names that oid; without the object, `git fsck` reports
+        // `missing blob e69de29…` (or the SHA-256 empty blob).
+        let objects_dir = repository_objects_dir(git_dir);
+        let db = FileObjectDatabase::new(&objects_dir, format);
+        db.write_object(EncodedObject::new(ObjectType::Blob, Vec::new()))?;
         // ITA entries carry an extended flag → the writer needs index v3+.
         if index.version < 3 {
             index.version = 3;

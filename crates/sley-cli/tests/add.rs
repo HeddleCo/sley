@@ -2110,3 +2110,39 @@ fn add_patch_no_auto_advance_selective_multi_file() {
     assert!(cached.contains("+C6"), "expected +C6 staged:\n{cached}");
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn add_intent_to_add_writes_empty_blob_for_stock_fsck() {
+    let root = unique_temp_dir("add-intent-to-add-empty-blob");
+    fs::create_dir_all(&root).expect("create temp repo");
+    git(&root, &["init", "-q", "-b", "main"]);
+    fs::write(root.join("ita"), b"not the empty blob\n").expect("write ita file");
+
+    let output = run_output(sley_testkit::sley_bin!(), &root, &["add", "-N", "ita"]);
+    assert!(
+        output.status.success(),
+        "sley add -N failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let fsck = run_output(sley_testkit::oracle_git(), &root, &["fsck", "--strict"]);
+    assert!(
+        fsck.status.success(),
+        "git fsck --strict failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        fsck.status.code(),
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+    git(
+        &root,
+        &["cat-file", "-e", "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"],
+    );
+    let size = git(
+        &root,
+        &["cat-file", "-s", "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"],
+    );
+    assert_eq!(String::from_utf8_lossy(&size).trim(), "0");
+    let _ = fs::remove_dir_all(&root);
+}
