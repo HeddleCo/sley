@@ -8,6 +8,9 @@ use super::*;
 use crate::bounded_read::{inflate_source_exact_into, object_type_for_entry};
 use std::io;
 
+mod parallel;
+pub use parallel::*;
+
 type ScanResult<T> = std::result::Result<T, PackReadError>;
 
 /// Limits for sequential scans, independently of random-read cache policy.

@@ -856,7 +856,7 @@ fn object_type_for_kind(kind: PackObjectKind) -> Result<ObjectType> {
     }
 }
 
-fn cancellable_object_id_bytes(
+pub(crate) fn cancellable_object_id_bytes(
     object_type: ObjectType,
     body: &[u8],
     format: ObjectFormat,
