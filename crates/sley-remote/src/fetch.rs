@@ -1298,7 +1298,7 @@ fn fetch_impl(
                         format: request.format,
                         config: request.config,
                         wants: starts,
-                        haves: negotiation_haves.clone(),
+                        haves: negotiation_haves,
                         shallow: client_shallow,
                         deepen: options.depth,
                         filter: options.filter.as_ref(),
