@@ -1,0 +1,77 @@
+name: Stock Git Interop
+
+# Pair a pinned stock git with sley. The upstream parity harness runs sley on
+# both ends, so it does not catch mixed-peer bugs (receive-pack capability
+# lists, split commit-graph generation data, intent-to-add objects).
+#
+# This workflow is not a required status check. To make it required, add the
+# job name "Stock git interop" to the branch protection rules for main.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: git-interop-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  STOCK_GIT_TAG: v2.56.0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  interop:
+    name: Stock git interop
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-tests-${{ runner.os }}-interop
+
+      - name: Install git build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends \
+            libcurl4-openssl-dev libexpat1-dev libpcre2-dev gettext zlib1g-dev pkg-config libssl-dev
+
+      - name: Cache stock git
+        id: git-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/git-2.56.0
+          key: git-interop-${{ env.STOCK_GIT_TAG }}-${{ runner.os }}-v1
+
+      - name: Build stock git ${{ env.STOCK_GIT_TAG }}
+        if: steps.git-cache.outputs.cache-hit != 'true'
+        run: |
+          rm -rf /tmp/git-src-interop /tmp/git-2.56.0
+          git clone --depth=1 --branch "$STOCK_GIT_TAG" https://github.com/git/git /tmp/git-src-interop
+          echo "${STOCK_GIT_TAG#v}" > /tmp/git-src-interop/version
+          make -C /tmp/git-src-interop -j"$(nproc)" prefix=/tmp/git-2.56.0 \
+            USE_LIBPCRE2=1 NO_TCLTK=YesPlease all
+          make -C /tmp/git-src-interop -j"$(nproc)" prefix=/tmp/git-2.56.0 \
+            USE_LIBPCRE2=1 NO_TCLTK=YesPlease install
+
+      - name: Assert stock git version
+        run: |
+          test "$(/tmp/git-2.56.0/bin/git version)" = "git version ${STOCK_GIT_TAG#v}"
+
+      - name: Build sley
+        run: cargo build --locked -p sley-cli --bins
+
+      - name: Run stock git interop
+        env:
+          SLEY: ${{ github.workspace }}/target/debug/sley
+          GIT: /tmp/git-2.56.0/bin/git
+        run: bash scripts/git-interop.sh
