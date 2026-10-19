@@ -693,8 +693,7 @@ impl ObjectQuery<'_> {
         let read_oid = self.view.replacement_oid(&oid)?;
         // A broken header is `Err`, not a missing object. Propagating that
         // with `?` would skip the object-info diagnostic and exit 1.
-        if self.view.lazy_fetch
-            && matches!(self.view.db().read_object_header(&read_oid), Ok(None))
+        if self.view.lazy_fetch && matches!(self.view.db().read_object_header(&read_oid), Ok(None))
         {
             match crate::read_object_maybe_prefetch_promisor(
                 policy,
