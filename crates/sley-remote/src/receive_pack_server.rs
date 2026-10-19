@@ -137,7 +137,7 @@ pub fn serve_receive_pack(
     if needs_pack_data(&command_states) {
         let incoming = sley_odb::IncomingPackQuarantine::new(request.git_dir, request.format)?;
         let incoming_db = incoming.database();
-        match install_pack_from_reader(&incoming_db, request.pack_reader) {
+        match install_pack_from_reader(&incoming_db, request.format, request.pack_reader) {
             Ok(installed) => {
                 let roots = command_states
                     .iter()
@@ -537,6 +537,7 @@ fn needs_pack_data(states: &[ReceivePackCommandState]) -> bool {
 
 fn install_pack_from_reader(
     db: &FileObjectDatabase,
+    format: ObjectFormat,
     reader: &mut dyn Read,
 ) -> Result<Vec<sley_core::ObjectId>> {
     let mut prefix = [0u8; 4];
@@ -550,8 +551,13 @@ fn install_pack_from_reader(
             "receive-pack packfile must start with PACK".into(),
         ));
     }
-    let mut stream = Cursor::new(prefix).chain(reader);
-    db.install_raw_pack_from_reader(&mut stream)
+    // Stock send-pack writes the pack and then reads report-status on the same
+    // connection. A pipe signals the end by closing; a git:// socket does not,
+    // because the client still needs it open to read the report. Stop at the
+    // pack trailer instead of waiting for EOF.
+    let stream = Cursor::new(prefix).chain(reader);
+    let mut bounded = sley_odb::PackBoundedReader::new(stream, format);
+    db.install_raw_pack_from_reader(&mut bounded)
         .map(|installed| installed.object_ids)
 }
 
@@ -819,6 +825,107 @@ mod tests {
                 .expect("accepted ref lookup"),
             Some(RefTarget::Direct(valid_oid))
         );
+    }
+
+    #[test]
+    fn receive_pack_reads_pack_without_waiting_for_eof() {
+        let format = ObjectFormat::Sha1;
+        let repo = temp_repo("receive-open-stream");
+        let tree = EncodedObject::new(ObjectType::Tree, Tree { entries: vec![] }.write());
+        let tree_oid = tree.object_id(format).expect("tree oid");
+        let valid = EncodedObject::new(
+            ObjectType::Commit,
+            format!(
+                "tree {tree_oid}\nauthor A <a@example.invalid> 1 +0000\ncommitter A <a@example.invalid> 1 +0000\n\nok\n"
+            )
+            .into_bytes(),
+        );
+        let valid_oid = valid.object_id(format).expect("valid oid");
+        let pack = PackFile::write_packed(&[&tree, &valid], format).expect("pack");
+        let config =
+            GitConfig::parse(b"[receive]\n\tfsckObjects = true\n").expect("receive config");
+        let policy = sley_fsck::FsckPolicy::from_config(
+            &config,
+            sley_fsck::FsckConfigKind::Receive,
+            format,
+            &repo,
+            false,
+        )
+        .expect("receive policy");
+        let mut reader = OpenStream {
+            data: {
+                let mut bytes = pack.pack.clone();
+                bytes.extend_from_slice(b"EXTRA");
+                bytes
+            },
+            pack_len: pack.pack.len(),
+            pos: 0,
+        };
+        let header = ReceivePackPushRequestHeader {
+            commands: sley_protocol::ReceivePackRequest {
+                commands: vec![ReceivePackCommand {
+                    old_id: sley_core::ObjectId::null(format),
+                    new_id: valid_oid,
+                    name: "refs/heads/main".into(),
+                }],
+                ..Default::default()
+            },
+            push_options: None,
+        };
+        let outcome = serve_receive_pack(
+            None,
+            ReceivePackServerRequest {
+                policy: &Default::default(),
+                git_dir: &repo,
+                format,
+                header: &header,
+                pack_reader: &mut reader,
+                config: &config,
+                validation: &policy,
+                options: ReceivePackServerOptions {
+                    quiet: true,
+                    remote_stderr: None,
+                    run_post_hooks: false,
+                },
+            },
+        )
+        .expect("serve receive pack");
+        assert!(matches!(
+            outcome.report,
+            ReceivePackServerReport::V1(ReceivePackReportStatus {
+                unpack: ReceivePackUnpackStatus::Ok,
+                ..
+            })
+        ));
+        assert!(
+            FileObjectDatabase::from_git_dir(&repo, format)
+                .contains(&valid_oid)
+                .expect("object lookup")
+        );
+    }
+
+    /// Pack bytes followed by trailing junk. A read that *starts* at or past
+    /// the pack fails, which is what a socket does when the client is blocked
+    /// waiting for report-status instead of closing.
+    struct OpenStream {
+        data: Vec<u8>,
+        pack_len: usize,
+        pos: usize,
+    }
+
+    impl Read for OpenStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos >= self.pack_len {
+                return Err(std::io::Error::other("read started past the pack"));
+            }
+            let n = (self.data.len() - self.pos).min(buf.len());
+            if n == 0 {
+                return Ok(0);
+            }
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
     }
 
     fn serve_test_pack(
