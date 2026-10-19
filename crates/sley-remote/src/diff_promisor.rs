@@ -121,17 +121,24 @@ pub fn prefetch_promisor_objects(
         if missing.is_empty() {
             break;
         }
-        // Custom upload-pack is an arbitrary shell protocol; leave those to the
-        // single-object fallback rather than inventing a stdin protocol here.
-        if config
-            .get("remote", Some(&remote_name), "uploadpack")
-            .is_some()
-        {
-            continue;
-        }
         let Some(url) = config.get("remote", Some(&remote_name), "url") else {
             continue;
         };
+        // A custom upload-pack is not the in-process local server. SSH still
+        // speaks upload-pack with that command; other transports stay on the
+        // single-object fallback.
+        let custom_upload_pack = config
+            .get("remote", Some(&remote_name), "uploadpack")
+            .is_some();
+        let ssh_remote = sley_transport::parse_remote_url(url).is_ok_and(|remote| {
+            matches!(
+                remote.transport,
+                sley_transport::RemoteTransport::Ssh | sley_transport::RemoteTransport::Ext
+            )
+        });
+        if custom_upload_pack && !ssh_remote {
+            continue;
+        }
         let resolution = crate::RemoteResolutionContext {
             cwd: &resolution_cwd,
             local_git_dir: Some(&git_dir),
@@ -160,6 +167,16 @@ pub fn prefetch_promisor_objects(
                     None,
                 )
                 .is_ok()
+            } else if let Some(hydrated) = maybe_hydrate_promisor_via_ssh(
+                policy,
+                &config,
+                &remote_name,
+                &git_dir,
+                db,
+                url,
+                &missing,
+            ) {
+                hydrated
             } else {
                 maybe_hydrate_promisor_via_http(
                     policy,
@@ -233,6 +250,61 @@ fn prefetch_local_promisor_object(
         }
     }
     Ok(false)
+}
+
+/// Exact-want promisor hydrate over SSH. `None` when `url` is not SSH.
+fn maybe_hydrate_promisor_via_ssh(
+    policy: &crate::RemotePolicy,
+    config: &GitConfig,
+    remote_name: &str,
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    url: &str,
+    missing: &[ObjectId],
+) -> Option<bool> {
+    let remote = sley_transport::parse_remote_url(url).ok()?;
+    if !matches!(
+        remote.transport,
+        sley_transport::RemoteTransport::Ssh | sley_transport::RemoteTransport::Ext
+    ) {
+        return None;
+    }
+    if missing.is_empty() {
+        return Some(false);
+    }
+    let options = crate::ssh::ssh_transport_options_from_config(config);
+    let format = db.object_format();
+    let upload_pack_command = config.get("remote", Some(remote_name), "uploadpack");
+    let features = crate::ssh::ssh_upload_pack_advertisements_with_command(
+        &remote,
+        format,
+        options,
+        upload_pack_command,
+    )
+    .ok()
+    .map(|(_, features)| features)?;
+    let mut progress = crate::SilentProgress;
+    let result = crate::ssh::install_fetch_pack_via_ssh_upload_pack(
+        policy,
+        crate::ssh::SshFetchPackRequest {
+            git_dir,
+            format,
+            remote: &remote,
+            features: &features,
+            wants: missing.to_vec(),
+            haves: Some(Vec::new()),
+            shallow: Vec::new(),
+            deepen: None,
+            filter: None,
+            promisor: true,
+            command_options: options,
+            upload_pack_command,
+            max_input_size: None,
+        },
+        &mut progress,
+        sley_core::CancelFlag::never(),
+    );
+    Some(result.is_ok())
 }
 
 /// Smart-HTTP promisor hydrate (t0410 #39): exact-want, no haves. Returns

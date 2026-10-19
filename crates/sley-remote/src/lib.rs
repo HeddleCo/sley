@@ -155,7 +155,7 @@ pub use receive_pack_server::{
 /// Clone is the important caller: the remote advertisement establishes the
 /// format of the repository that will be created. Fetch and push instead know
 /// their repository format already and continue to use the strict readers.
-pub(crate) fn read_discovered_upload_pack_advertisements(
+pub fn read_discovered_upload_pack_advertisements(
     reader: &mut impl Read,
 ) -> Result<(RefAdvertisementSet, ObjectFormat)> {
     let frames = read_pkt_line_frames_until_flush(reader)?;
@@ -187,6 +187,7 @@ pub(crate) fn read_discovered_upload_pack_advertisements(
     }
 }
 
+mod custom_upload_pack;
 mod local;
 pub use local::{
     INFINITE_DEPTH, LocalDeepenPlan, attach_receive_pack_capabilities,

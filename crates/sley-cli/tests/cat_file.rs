@@ -360,6 +360,101 @@ fn cat_file_typed_full_oid_lazily_hydrates_blob_none_promisor() {
 }
 
 #[test]
+fn cat_file_size_type_and_exists_lazily_hydrate_promisor_blob() {
+    let root = unique_temp_dir("cat-file-header-promisor");
+    let origin = root.join("origin");
+    let client = root.join("client");
+    fs::create_dir_all(&root).expect("create fixture root");
+    run(
+        sley_testkit::sley_bin!(),
+        &root,
+        &["init", origin.to_str().expect("utf8 origin")],
+    );
+    run(
+        sley_testkit::sley_bin!(),
+        &root,
+        &["init", client.to_str().expect("utf8 client")],
+    );
+    let payload = b"promised header blob\n";
+    let oid = String::from_utf8(run_with_stdin(
+        sley_testkit::sley_bin!(),
+        &origin,
+        &["hash-object", "-w", "--stdin"],
+        payload,
+    ))
+    .expect("utf8 oid");
+    let oid = oid.trim().to_string();
+    let configure = |client: &Path| {
+        run(
+            sley_testkit::sley_bin!(),
+            &root,
+            &["init", client.to_str().expect("utf8 client")],
+        );
+        for args in [
+            vec!["config", "core.repositoryFormatVersion", "1"],
+            vec!["config", "extensions.partialClone", "origin"],
+            vec!["config", "remote.origin.promisor", "true"],
+            vec![
+                "config",
+                "remote.origin.url",
+                origin.to_str().expect("utf8 origin"),
+            ],
+            vec!["config", "remote.origin.partialCloneFilter", "blob:none"],
+        ] {
+            run(sley_testkit::sley_bin!(), client, &args);
+        }
+    };
+
+    configure(&client);
+    let size = run_output_with_stdin(
+        sley_testkit::sley_bin!(),
+        &client,
+        &["cat-file", "-s", &oid],
+        b"",
+    );
+    assert!(
+        size.status.success(),
+        "cat-file -s did not lazy-fetch: {}",
+        String::from_utf8_lossy(&size.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&size.stdout).trim(),
+        payload.len().to_string()
+    );
+
+    let client_type = root.join("client-type");
+    configure(&client_type);
+    let kind = run_output_with_stdin(
+        sley_testkit::sley_bin!(),
+        &client_type,
+        &["cat-file", "-t", &oid],
+        b"",
+    );
+    assert!(
+        kind.status.success(),
+        "cat-file -t did not lazy-fetch: {}",
+        String::from_utf8_lossy(&kind.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&kind.stdout).trim(), "blob");
+
+    let client_exists = root.join("client-exists");
+    configure(&client_exists);
+    let exists = run_output_with_stdin(
+        sley_testkit::sley_bin!(),
+        &client_exists,
+        &["cat-file", "-e", &oid],
+        b"",
+    );
+    assert!(
+        exists.status.success(),
+        "cat-file -e did not lazy-fetch: {}",
+        String::from_utf8_lossy(&exists.stderr)
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn cat_file_batch_modes_match_upstream_git() {
     let root = unique_temp_dir("cat-file-batch-check");
     fs::create_dir_all(&root).expect("create temp repo");

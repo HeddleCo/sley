@@ -33,8 +33,6 @@ use std::time::Duration;
 use crate::install::{
     ProgressInstaller, install_upload_pack_raw_promisor_response_from_reader_with_cancel,
     install_upload_pack_raw_response_from_reader_with_cancel,
-    install_upload_pack_shallow_raw_promisor_response_from_reader_with_cancel,
-    install_upload_pack_shallow_raw_response_from_reader_with_cancel,
 };
 use sley_config::GitConfig;
 use sley_core::{
@@ -993,6 +991,10 @@ pub struct SshFetchPackRequest<'a> {
     pub shallow: Vec<ObjectId>,
     /// Requested deepen depth, if this is a shallow fetch.
     pub deepen: Option<u32>,
+    /// Object filter for a partial fetch. Sent only when the server advertised
+    /// `filter`; otherwise the line is omitted (stock upload-pack dies with
+    /// "filtering not recognized" when the capability was not negotiated).
+    pub filter: Option<&'a sley_odb::PackObjectFilter>,
     /// Whether to install the response as a promisor pack.
     pub promisor: bool,
     /// SSH command-line shape (variant and `-4`/`-6`), usually derived by the
@@ -1021,11 +1023,16 @@ pub fn install_fetch_pack_via_ssh_upload_pack(
     if request.deepen.is_none() && all_wants_present(&local_db, &request.wants)? {
         return Ok(Vec::new());
     }
+    let filter = request
+        .filter
+        .filter(|_| request.features.filter)
+        .and_then(crate::local::upload_pack_filter_protocol_spec);
     let upload_request = UploadPackRequest {
         wants: request.wants,
-        capabilities: ssh_shallow_request_capabilities(request.deepen),
+        capabilities: ssh_request_capabilities(request.deepen, filter.is_some()),
         shallow: request.shallow,
         deepen: request.deepen,
+        filter,
         ..UploadPackRequest::default()
     };
     let haves = request.haves.clone().map(Ok).unwrap_or_else(|| {
@@ -1043,6 +1050,18 @@ pub fn install_fetch_pack_via_ssh_upload_pack(
 
     read_ref_advertisement_set(request.format, &mut stdout)?;
     write_upload_pack_request(&mut stdin, Some(&upload_request))?;
+    stdin.flush()?;
+    // A deepen request is stateful: the server writes shallow/unshallow and a
+    // flush before it will read haves. Consume that section first so a large
+    // have list cannot fill the pipe while the server blocks on stdout.
+    let prefetched_shallow = if request.deepen.is_some() {
+        Some(sley_protocol::read_upload_pack_shallow_info_section(
+            request.format,
+            &mut stdout,
+        )?)
+    } else {
+        None
+    };
     write_upload_pack_negotiation_request(
         &mut stdin,
         &UploadPackNegotiationRequest { haves, done: true },
@@ -1054,27 +1073,8 @@ pub fn install_fetch_pack_via_ssh_upload_pack(
     // polls between successful user-space reads).
     let child = Arc::new(Mutex::new(child));
     let install_result = with_ssh_child_cancel_watch(&child, cancel, || {
-        if request.deepen.is_some() {
-            if request.promisor {
-                install_upload_pack_shallow_raw_promisor_response_from_reader_with_cancel(
-                    request.format,
-                    &mut stdout,
-                    &local_db,
-                    request.max_input_size,
-                    cancel,
-                )
-                .map(|(shallow_info, _)| shallow_info)
-            } else {
-                install_upload_pack_shallow_raw_response_from_reader_with_cancel(
-                    request.format,
-                    &mut stdout,
-                    &ProgressInstaller::new(&local_db, progress),
-                    request.max_input_size,
-                    cancel,
-                )
-                .map(|(shallow_info, _)| shallow_info)
-            }
-        } else if request.promisor {
+        let shallow_info = prefetched_shallow.unwrap_or_default();
+        if request.promisor {
             install_upload_pack_raw_promisor_response_from_reader_with_cancel(
                 request.format,
                 &mut stdout,
@@ -1082,7 +1082,7 @@ pub fn install_fetch_pack_via_ssh_upload_pack(
                 request.max_input_size,
                 cancel,
             )
-            .map(|_| Vec::new())
+            .map(|_| shallow_info)
         } else {
             install_upload_pack_raw_response_from_reader_with_cancel(
                 request.format,
@@ -1091,7 +1091,7 @@ pub fn install_fetch_pack_via_ssh_upload_pack(
                 request.max_input_size,
                 cancel,
             )
-            .map(|_| Vec::new())
+            .map(|_| shallow_info)
         }
     });
 
@@ -1139,18 +1139,24 @@ fn all_wants_present(db: &FileObjectDatabase, wants: &[ObjectId]) -> Result<bool
     Ok(true)
 }
 
-/// The want-line capabilities for an SSH fetch: the `shallow` capability when a
-/// deepen is requested, otherwise none (preserving the existing plain-fetch wire
-/// form exactly).
-fn ssh_shallow_request_capabilities(deepen: Option<u32>) -> Vec<Capability> {
+/// Want-line capabilities for an SSH v0 fetch. Side-band stays off: the SSH
+/// reader installs a raw pack. `filter` is sent only when a filter spec will
+/// follow it.
+fn ssh_request_capabilities(deepen: Option<u32>, filter: bool) -> Vec<Capability> {
+    let mut capabilities = Vec::new();
     if deepen.is_some() {
-        vec![Capability {
+        capabilities.push(Capability {
             name: "shallow".into(),
             value: None,
-        }]
-    } else {
-        Vec::new()
+        });
     }
+    if filter {
+        capabilities.push(Capability {
+            name: "filter".into(),
+            value: None,
+        });
+    }
+    capabilities
 }
 
 /// The upload-pack ref advertisements and parsed features for SSH `remote`.
@@ -1270,15 +1276,10 @@ pub fn discover_ssh_upload_pack_advertisements_with_command(
 }
 
 pub fn validate_ssh_fetch_options(
-    filter: Option<&sley_odb::PackObjectFilter>,
+    _filter: Option<&sley_odb::PackObjectFilter>,
     deepen_since: Option<i64>,
     deepen_not: &[String],
 ) -> Result<()> {
-    if filter.is_some() {
-        return Err(GitError::Unsupported(
-            "partial clone --filter over SSH is not supported; use HTTPS".into(),
-        ));
-    }
     if deepen_since.is_some() {
         return Err(GitError::Unsupported(
             "shallow fetch --shallow-since over SSH is not supported; use HTTPS".into(),

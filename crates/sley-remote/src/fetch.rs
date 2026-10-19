@@ -781,6 +781,7 @@ fn fetch_impl(
                     haves: negotiation_haves,
                     shallow: existing_shallow,
                     deepen: options.depth,
+                    filter: options.filter.as_ref(),
                     promisor: promisor_remote,
                     command_options: ssh_options,
                     upload_pack_command: options.upload_pack_command.as_deref(),
@@ -948,6 +949,7 @@ fn fetch_impl(
                     request.format.name()
                 )));
             }
+            let custom_command = options.upload_pack_command.clone();
             // Git's fetch-pack `mark_complete` over local refs: a tip present
             // only in the commit-graph dies before negotiation. Exact-OID wants
             // skip have-building, so this must run for every local fetch
@@ -959,7 +961,14 @@ fn fetch_impl(
             )?;
             // Protocol v2: real `ls-refs` with ref-prefix filtering so the
             // packet log and advertised set match git (t5702 #24/#48/#49).
-            let advertisements = if request.config.get("protocol", None, "version") == Some("2") {
+            let advertisements = if let Some(command) = custom_command.as_deref() {
+                crate::custom_upload_pack::advertise(
+                    command,
+                    remote_git_dir,
+                    request.format,
+                    request.config,
+                )?
+            } else if request.config.get("protocol", None, "version") == Some("2") {
                 let mut prefixes =
                     sley_protocol::refspec_ref_prefixes(&parsed_refspecs, request.format);
                 if options.auto_follow_tags || options.fetch_all_tags {
@@ -1115,7 +1124,13 @@ fn fetch_impl(
                 }
                 heads
             };
-            let mut deepen_plan = plan_deepen(&primary_heads)?;
+            // A custom upload-pack owns deepen. The in-process boundary walk
+            // would also read the remote object database directly.
+            let mut deepen_plan = if custom_command.is_some() {
+                None
+            } else {
+                plan_deepen(&primary_heads)?
+            };
             let local_db = FileObjectDatabase::from_git_dir(request.git_dir, request.format);
             let (mut updates, opportunistic_dsts) = plan_and_adjust_updates(FetchPlanInput {
                 advertisements: &advertisements,
@@ -1209,7 +1224,8 @@ fn fetch_impl(
             } else {
                 updates.iter().map(|update| update.oid).collect()
             };
-            let use_ref_in_want = deepen_plan.is_none()
+            let use_ref_in_want = custom_command.is_none()
+                && deepen_plan.is_none()
                 && !promisor_remote
                 && options.filter.is_none()
                 && !options.refetch
@@ -1268,6 +1284,31 @@ fn fetch_impl(
                     }
                 }
                 (ref_in_want.shallow_info, 0, 0, 0)
+            } else if let Some(command) = custom_command.as_deref()
+                && !(starts.is_empty() && options.depth.is_none() && options.filter.is_none())
+            {
+                let client_shallow = crate::shallow::read_shallow(request.git_dir, request.format)?;
+                let ctx = services.context();
+                let shallow_info = crate::custom_upload_pack::fetch(
+                    crate::custom_upload_pack::CustomUploadPackFetch {
+                        command,
+                        remote_git_dir,
+                        destination_git_dir: transfer_git_dir,
+                        policy: &request.options.policy,
+                        format: request.format,
+                        config: request.config,
+                        wants: starts,
+                        haves: negotiation_haves.clone(),
+                        shallow: client_shallow,
+                        deepen: options.depth,
+                        filter: options.filter.as_ref(),
+                        promisor: promisor_remote,
+                        max_input_size,
+                    },
+                    ctx.progress,
+                    ctx.cancel,
+                )?;
+                (shallow_info, 0, 0, 0)
             } else if starts.is_empty() && deepen_plan.is_none() {
                 if !updates.is_empty() {
                     sley_protocol::trace_packet_write_payload(b"0000");

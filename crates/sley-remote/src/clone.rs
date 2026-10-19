@@ -130,7 +130,7 @@ pub struct CloneOptions<'a> {
     /// out-of-cone history (t5620 sparse backfill expects 44 missing, not 24).
     pub sparse: bool,
     /// Partial-clone object filter (`--filter=blob:none`) to apply to the
-    /// clone fetch. Only honored by the in-process local server.
+    /// clone fetch. Honored by the in-process local server, smart HTTP, and SSH.
     pub filter: Option<sley_odb::PackObjectFilter>,
     /// Resolve `--filter=auto` from accepted promisor advertisements.
     pub filter_auto: bool,
@@ -687,11 +687,69 @@ fn fetch_partial_clone_checkout_blobs(
             cancel,
             http_client,
         ),
-        // SSH/git:// partial clones are gated out by the CLI (the in-process
-        // local server is the only transport that advertises object filtering
-        // aside from HTTP), so there is nothing to materialize here.
+        CloneSource::Ssh(remote) => fetch_ssh_partial_clone_checkout_blobs(
+            request, git_dir, commit_oid, config, remote, cancel,
+        ),
+        // git:// partial checkout top-up is not implemented; the caller still
+        // receives the filtered pack.
         _ => Ok(()),
     }
+}
+
+/// SSH arm of [`fetch_partial_clone_checkout_blobs`]: exact blob wants, no
+/// haves, raw pack (SSH does not negotiate side-band).
+fn fetch_ssh_partial_clone_checkout_blobs(
+    request: &CloneRequest<'_>,
+    git_dir: &Path,
+    commit_oid: ObjectId,
+    config: &GitConfig,
+    remote: &RemoteUrl,
+    cancel: DynCancelFlag<'_>,
+) -> Result<()> {
+    let local_db = FileObjectDatabase::from_git_dir(git_dir, request.format);
+    let mut wants = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    collect_checkout_materialization_wants(
+        &local_db,
+        &local_db,
+        request.format,
+        commit_oid,
+        request.options.sparse,
+        &mut seen,
+        &mut wants,
+    )?;
+    if wants.is_empty() {
+        return Ok(());
+    }
+    let options = request.options.ssh_options.unwrap_or_default();
+    let (_, features) = crate::ssh::ssh_upload_pack_advertisements_with_command(
+        remote,
+        request.format,
+        options,
+        request.options.upload_pack_command,
+    )?;
+    let mut progress = crate::SilentProgress;
+    crate::ssh::install_fetch_pack_via_ssh_upload_pack(
+        &request.options.policy,
+        crate::ssh::SshFetchPackRequest {
+            git_dir,
+            format: request.format,
+            remote,
+            features: &features,
+            wants,
+            haves: Some(Vec::new()),
+            shallow: Vec::new(),
+            deepen: None,
+            filter: None,
+            promisor: true,
+            command_options: options,
+            upload_pack_command: request.options.upload_pack_command,
+            max_input_size: crate::fetch::fetch_max_input_size(config),
+        },
+        &mut progress,
+        cancel,
+    )?;
+    Ok(())
 }
 
 /// HTTP arm of [`fetch_partial_clone_checkout_blobs`]: fetch the checkout blobs

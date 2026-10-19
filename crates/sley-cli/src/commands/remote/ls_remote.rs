@@ -9,7 +9,7 @@ use super::fetch::{
     check_transport_allowed_url, configured_server_options, transport_policy_config_for_context,
 };
 use super::pack::{
-    configured_legacy_protocol, configured_protocol_version,
+    client_requests_protocol_v2, configured_legacy_protocol, configured_protocol_version,
     trace_configured_local_protocol_version, trace_protocol_v2_ls_refs_request,
     trace_protocol_v2_upload_pack_capabilities,
 };
@@ -17,6 +17,7 @@ use super::resolve::{RemoteCommandContext, ls_remote_git_dir};
 use crate::*;
 use sley_odb::ObjectReader;
 use sley_remote::LsRemoteRecord;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as Proc;
 
@@ -327,8 +328,12 @@ pub(crate) fn cmd_ls_remote(
     }
 
     if let Some(command) = options.upload_pack_command.as_deref() {
-        let mut records = ls_remote_upload_pack_command_records(command, &repository, &options)?;
-        let format = ObjectFormat::Sha1;
+        let (mut records, format) = ls_remote_upload_pack_command_records(
+            command,
+            &repository,
+            &options,
+            &transport_config,
+        )?;
         if options.exit_code && records.is_empty() {
             return Err(crate::cli_exit(2));
         }
@@ -406,25 +411,93 @@ fn ls_remote_repository_not_found(repository: &str) -> Result<()> {
     Err(crate::cli_exit(128))
 }
 
+fn upload_pack_command_repository_argument(repository: &str) -> String {
+    match parse_remote_url(repository) {
+        Ok(url)
+            if matches!(
+                url.transport,
+                RemoteTransport::File | RemoteTransport::Local
+            ) =>
+        {
+            url.path
+        }
+        _ => repository.to_string(),
+    }
+}
+
 fn ls_remote_upload_pack_command_records(
     command: &str,
     repository: &str,
     options: &LsRemoteOptions,
-) -> Result<Vec<LsRemoteRecord>> {
-    let command = format!("{command} {}", sley_config::sq_quote(repository));
-    let output = Proc::new("/bin/sh")
-        .arg("-c")
-        .arg(&command)
-        .stdin(std::process::Stdio::null())
-        .output()?;
-    if !output.status.success() {
+    config: &GitConfig,
+) -> Result<(Vec<LsRemoteRecord>, ObjectFormat)> {
+    let argument = upload_pack_command_repository_argument(repository);
+    let command_line = format!("{command} {}", sley_config::sq_quote(&argument));
+    let protocol_v2 = client_requests_protocol_v2(Some(config));
+    let mut proc = Proc::new("/bin/sh");
+    proc.arg("-c").arg(&command_line);
+    if protocol_v2 {
+        proc.env("GIT_PROTOCOL", "version=2");
+    } else {
+        proc.env_remove("GIT_PROTOCOL");
+    }
+    proc.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = proc.spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| GitError::Command("upload-pack stdin was not piped".into()))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| GitError::Command("upload-pack stdout was not piped".into()))?;
+    let stderr = child.stderr.take();
+    let stderr_thread = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut stderr) = stderr {
+            let _ = stderr.read_to_end(&mut bytes);
+        }
+        bytes
+    });
+    let (set, format) = if protocol_v2 {
+        let handshake = sley_protocol::read_protocol_v2_advertisement(&mut stdout)?;
+        let format = sley_protocol::protocol_v2_object_format(&handshake.capabilities)?;
+        let mut request = sley_protocol::ProtocolV2LsRefsRequest {
+            peel: true,
+            symrefs: true,
+            unborn: true,
+            ref_prefixes: vec!["HEAD".into(), "refs/heads/".into(), "refs/tags/".into()],
+        }
+        .to_command_request()?;
+        request.capabilities = sley_protocol::encode_protocol_v2_command_options(
+            &sley_protocol::ProtocolV2CommandOptions {
+                object_format: Some(format),
+                ..sley_protocol::ProtocolV2CommandOptions::default()
+            },
+        )?;
+        sley_protocol::write_protocol_v2_command_request(&mut stdin, &request)?;
+        stdin.flush()?;
+        drop(stdin);
+        let set = sley_protocol::read_protocol_v2_ls_refs_response_as_ref_advertisement_set(
+            format,
+            &mut stdout,
+        )?;
+        (set, format)
+    } else {
+        drop(stdin);
+        let (set, format) = sley_remote::read_discovered_upload_pack_advertisements(&mut stdout)?;
+        (set, format)
+    };
+    let status = child.wait()?;
+    let stderr = stderr_thread.join().unwrap_or_else(|_| Vec::new());
+    if !status.success() {
         return Err(GitError::Command(format!(
             "upload-pack command failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            String::from_utf8_lossy(&stderr).trim()
         )));
     }
-    let mut stdout = output.stdout.as_slice();
-    let set = read_ref_advertisement_set(ObjectFormat::Sha1, &mut stdout)?;
     let features = set
         .refs
         .first()
@@ -462,7 +535,7 @@ fn ls_remote_upload_pack_command_records(
             name: advertisement.name,
         });
     }
-    Ok(records)
+    Ok((records, format))
 }
 
 fn validate_ls_remote_sort_context(
