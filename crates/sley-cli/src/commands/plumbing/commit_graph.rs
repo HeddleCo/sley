@@ -498,6 +498,12 @@ fn write_split_commit_graph_file(
         .iter()
         .flat_map(|layer| layer.graph.commits.iter().map(|entry| entry.oid))
         .collect::<Vec<_>>();
+    let mut base_corrected_dates = HashMap::with_capacity(base_oids.len());
+    for layer in &layers {
+        for entry in &layer.graph.commits {
+            base_corrected_dates.insert(entry.oid, entry.stored_generation());
+        }
+    }
     let write_generation_data = if let Some(top) = layers.last() {
         commit_graph_has_chunk(&top.graph, *b"GDA2")
     } else {
@@ -520,6 +526,7 @@ fn write_split_commit_graph_file(
         write_generation_data,
         &base_hashes,
         &base_oids,
+        &base_corrected_dates,
     )?;
     let hash = graph_file_checksum(&graph, format)?;
     let graph_path = graphs.join(format!("graph-{hash}.graph"));
