@@ -362,7 +362,7 @@ fn append_included_tags(
 /// complete packet vector.
 ///
 /// Shallow lines are not written here. Callers that saw `deepen` must write
-/// [`V0UploadPackTransfer::shallow_info`] and flush before reading haves.
+/// the prepared transfer's shallow lines and flush before reading haves.
 pub fn write_upload_pack_from_local_repository(
     git_dir: &Path,
     format: ObjectFormat,
