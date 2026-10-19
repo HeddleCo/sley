@@ -512,3 +512,154 @@ fn commit_graph_git_object_directory_default_matches_upstream_git() {
     };
     let _ = fs::remove_dir_all(&root);
 }
+
+fn commit_dated(root: &Path, name: &str, date: &str) {
+    fs::write(root.join(name), format!("{name}\n")).expect("write file");
+    run_success(sley_testkit::oracle_git(), root, &["add", name]);
+    run_success_with_env(
+        sley_testkit::oracle_git(),
+        root,
+        &[
+            "-c",
+            "user.name=Example User",
+            "-c",
+            "user.email=example@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            name,
+        ],
+        &[("GIT_AUTHOR_DATE", date), ("GIT_COMMITTER_DATE", date)],
+    );
+}
+
+fn assert_contains_matches_graph_off(root: &Path, commit: &str) {
+    let args_on = [
+        "-c",
+        "core.commitGraph=true",
+        "branch",
+        "--contains",
+        commit,
+    ];
+    let args_off = [
+        "-c",
+        "core.commitGraph=false",
+        "branch",
+        "--contains",
+        commit,
+    ];
+    let on = run(sley_testkit::oracle_git(), root, &args_on);
+    let off = run(sley_testkit::oracle_git(), root, &args_off);
+    assert_same_output(on, off, &["branch", "--contains", commit]);
+}
+
+#[test]
+fn sley_split_commit_graph_verifies_under_stock_git() {
+    let root = unique_temp_dir("sley-split-commit-graph-interop");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        run_success(
+            sley_testkit::oracle_git(),
+            &root,
+            &["init", "-q", "-b", "main"],
+        );
+        let equal = "1700000000 +0000";
+        let newer = "1700000005 +0000";
+        for name in ["c0", "c1", "c2"] {
+            commit_dated(&root, name, equal);
+        }
+        commit_dated(&root, "c3", newer);
+        // Child committer date is older than its parent.
+        commit_dated(&root, "c4", equal);
+        for name in ["c5", "c6", "c7"] {
+            commit_dated(&root, name, equal);
+        }
+        let early = String::from_utf8(run_success(
+            sley_testkit::oracle_git(),
+            &root,
+            &["rev-parse", "HEAD~6"],
+        ))
+        .expect("early oid");
+        let early = early.trim().to_string();
+
+        run_success(
+            sley_testkit::sley_bin!(),
+            &root,
+            &["commit-graph", "write", "--reachable", "--split=no-merge"],
+        );
+        for name in ["c8", "c9"] {
+            commit_dated(&root, name, equal);
+        }
+        run_success(
+            sley_testkit::sley_bin!(),
+            &root,
+            &["commit-graph", "write", "--reachable", "--split=no-merge"],
+        );
+        let chain_path = root
+            .join(".git")
+            .join("objects")
+            .join("info")
+            .join("commit-graphs")
+            .join("commit-graph-chain");
+        let chain = fs::read_to_string(&chain_path).expect("read chain");
+        assert_eq!(chain.lines().filter(|line| !line.is_empty()).count(), 2);
+
+        run_success(
+            sley_testkit::oracle_git(),
+            &root,
+            &["commit-graph", "verify"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &root,
+            &["branch", "topic", "HEAD~3"],
+        );
+        assert_contains_matches_graph_off(&root, &early);
+
+        for name in ["c10", "c11", "c12"] {
+            commit_dated(&root, name, equal);
+        }
+        run_success(
+            sley_testkit::sley_bin!(),
+            &root,
+            &[
+                "commit-graph",
+                "write",
+                "--reachable",
+                "--split",
+                "--size-multiple=1",
+            ],
+        );
+        let chain = fs::read_to_string(&chain_path).expect("read merged chain");
+        assert_eq!(
+            chain.lines().filter(|line| !line.is_empty()).count(),
+            2,
+            "compaction should keep the base layer and merge the tip"
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &root,
+            &["commit-graph", "verify"],
+        );
+        assert_contains_matches_graph_off(&root, &early);
+
+        run_success(
+            sley_testkit::sley_bin!(),
+            &root,
+            &["commit-graph", "write", "--reachable"],
+        );
+        assert!(
+            single_commit_graph_path(&root).exists(),
+            "single-file graph should replace the chain"
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &root,
+            &["commit-graph", "verify"],
+        );
+        assert_contains_matches_graph_off(&root, &early);
+    }
+    let _ = fs::remove_dir_all(&root);
+}

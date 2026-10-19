@@ -1,3 +1,4 @@
+use flate2::{Decompress, FlushDecompress, Status};
 use sley_core::{
     CancelFlag, CancellableRead, GitError, MissingObjectContext, ObjectFormat, ObjectId, Result,
 };
@@ -9,7 +10,7 @@ use sley_pack::{
 };
 use std::collections::HashSet;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
@@ -1292,6 +1293,334 @@ impl FileObjectDatabase {
     }
 }
 
+/// Reads one pack from a stream and then reports EOF.
+///
+/// Stock `send-pack` writes the pack and reads `report-status` on the same
+/// connection. Closing the write side of a pipe delivers EOF; closing one
+/// descriptor of a `git://` socket does not, because the client keeps the
+/// socket open to read the report. Waiting for EOF there deadlocks. This
+/// reader stops after the pack trailer (header, each entry's zlib member, and
+/// the checksum) so the caller can answer on the still-open stream.
+pub struct PackBoundedReader<R> {
+    inner: R,
+    end: PackEnd,
+    finished: bool,
+}
+
+impl<R> PackBoundedReader<R> {
+    /// Bound `inner` to a single pack whose trailer is `format`'s hash length.
+    pub fn new(inner: R, format: ObjectFormat) -> Self {
+        Self {
+            inner,
+            end: PackEnd::new(format.raw_len()),
+            finished: false,
+        }
+    }
+}
+
+impl<R: Read> Read for PackBoundedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.finished || buf.is_empty() {
+            return Ok(0);
+        }
+        let read = self.inner.read(buf)?;
+        if read == 0 {
+            if self.end.complete() {
+                self.finished = true;
+                return Ok(0);
+            }
+            return Err(bound_io("truncated pack"));
+        }
+        let keep = self.end.push(&buf[..read])?;
+        if keep == 0 {
+            return Err(bound_io("pack parser made no progress"));
+        }
+        if self.end.complete() {
+            self.finished = true;
+        }
+        Ok(keep)
+    }
+}
+
+const MAX_PACK_ENTRY_HEADER: usize = 16;
+const MAX_OFS_DELTA_OFFSET: usize = 16;
+
+struct PackEnd {
+    hash_len: usize,
+    phase: PackPhase,
+    decompress: Decompress,
+}
+
+enum PackPhase {
+    Header { buf: [u8; 12], filled: usize },
+    Entry { left: u64, step: EntryStep },
+    Trailer { filled: usize },
+    Done,
+}
+
+enum EntryStep {
+    Header { buf: Vec<u8> },
+    Ofs { buf: Vec<u8> },
+    Ref { filled: usize },
+    Zlib,
+}
+
+impl PackEnd {
+    fn new(hash_len: usize) -> Self {
+        Self {
+            hash_len,
+            phase: PackPhase::Header {
+                buf: [0; 12],
+                filled: 0,
+            },
+            decompress: Decompress::new(true),
+        }
+    }
+
+    fn complete(&self) -> bool {
+        matches!(self.phase, PackPhase::Done)
+    }
+
+    fn push(&mut self, input: &[u8]) -> io::Result<usize> {
+        let mut index = 0;
+        while index < input.len() && !self.complete() {
+            let phase = std::mem::replace(&mut self.phase, PackPhase::Done);
+            let used = self.consume(phase, &input[index..])?;
+            if used == 0 {
+                return Err(bound_io("pack parser made no progress"));
+            }
+            index += used;
+        }
+        Ok(index)
+    }
+
+    fn consume(&mut self, phase: PackPhase, input: &[u8]) -> io::Result<usize> {
+        if input.is_empty() {
+            self.phase = phase;
+            return Err(bound_io("pack parser made no progress"));
+        }
+        match phase {
+            PackPhase::Header { mut buf, filled } => {
+                let need = 12 - filled;
+                let take = need.min(input.len());
+                buf[filled..filled + take].copy_from_slice(&input[..take]);
+                let filled = filled + take;
+                if filled == 12 {
+                    self.finish_header(buf)?;
+                } else {
+                    self.phase = PackPhase::Header { buf, filled };
+                }
+                Ok(take)
+            }
+            PackPhase::Entry { left, step } => self.consume_entry(left, step, input),
+            PackPhase::Trailer { filled } => {
+                let need = self.hash_len - filled;
+                let take = need.min(input.len());
+                let filled = filled + take;
+                if filled == self.hash_len {
+                    self.phase = PackPhase::Done;
+                } else {
+                    self.phase = PackPhase::Trailer { filled };
+                }
+                Ok(take)
+            }
+            PackPhase::Done => {
+                self.phase = PackPhase::Done;
+                Err(bound_io("pack parser made no progress"))
+            }
+        }
+    }
+
+    fn finish_header(&mut self, buf: [u8; 12]) -> io::Result<()> {
+        if &buf[..4] != b"PACK" {
+            return Err(bound_io("pack must start with PACK"));
+        }
+        let version = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        if version != 2 && version != 3 {
+            return Err(bound_io("unsupported pack version"));
+        }
+        let count = u64::from(u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]));
+        if count == 0 {
+            self.phase = PackPhase::Trailer { filled: 0 };
+        } else {
+            self.phase = PackPhase::Entry {
+                left: count,
+                step: EntryStep::Header { buf: Vec::new() },
+            };
+        }
+        Ok(())
+    }
+
+    fn consume_entry(&mut self, left: u64, step: EntryStep, input: &[u8]) -> io::Result<usize> {
+        match step {
+            EntryStep::Header { mut buf } => {
+                buf.push(input[0]);
+                if buf.len() > MAX_PACK_ENTRY_HEADER {
+                    return Err(bound_io("pack entry header is too long"));
+                }
+                if entry_header_done(&buf)? {
+                    let kind = (buf[0] >> 4) & 7;
+                    self.begin_after_header(left, kind)?;
+                } else {
+                    self.phase = PackPhase::Entry {
+                        left,
+                        step: EntryStep::Header { buf },
+                    };
+                }
+                Ok(1)
+            }
+            EntryStep::Ofs { mut buf } => {
+                let byte = input[0];
+                buf.push(byte);
+                if buf.len() > MAX_OFS_DELTA_OFFSET {
+                    return Err(bound_io("ofs-delta offset is too long"));
+                }
+                if byte & 0x80 == 0 {
+                    self.begin_zlib(left);
+                } else {
+                    self.phase = PackPhase::Entry {
+                        left,
+                        step: EntryStep::Ofs { buf },
+                    };
+                }
+                Ok(1)
+            }
+            EntryStep::Ref { filled } => {
+                let need = self.hash_len - filled;
+                let take = need.min(input.len());
+                let filled = filled + take;
+                if filled == self.hash_len {
+                    self.begin_zlib(left);
+                } else {
+                    self.phase = PackPhase::Entry {
+                        left,
+                        step: EntryStep::Ref { filled },
+                    };
+                }
+                Ok(take)
+            }
+            EntryStep::Zlib => self.consume_zlib(left, input),
+        }
+    }
+
+    fn begin_after_header(&mut self, left: u64, kind: u8) -> io::Result<()> {
+        match kind {
+            1..=4 => {
+                self.begin_zlib(left);
+                Ok(())
+            }
+            6 => {
+                self.phase = PackPhase::Entry {
+                    left,
+                    step: EntryStep::Ofs { buf: Vec::new() },
+                };
+                Ok(())
+            }
+            7 => {
+                self.phase = PackPhase::Entry {
+                    left,
+                    step: EntryStep::Ref { filled: 0 },
+                };
+                Ok(())
+            }
+            _ => Err(bound_io("invalid pack object type")),
+        }
+    }
+
+    fn begin_zlib(&mut self, left: u64) {
+        self.decompress.reset(true);
+        self.phase = PackPhase::Entry {
+            left,
+            step: EntryStep::Zlib,
+        };
+    }
+
+    fn finish_object(&mut self, left: u64) -> io::Result<()> {
+        let Some(left) = left.checked_sub(1) else {
+            return Err(bound_io("pack object count underflow"));
+        };
+        if left == 0 {
+            self.phase = PackPhase::Trailer { filled: 0 };
+        } else {
+            self.phase = PackPhase::Entry {
+                left,
+                step: EntryStep::Header { buf: Vec::new() },
+            };
+        }
+        Ok(())
+    }
+
+    fn consume_zlib(&mut self, left: u64, input: &[u8]) -> io::Result<usize> {
+        let mut offset = 0;
+        let mut output = [0u8; 8192];
+        loop {
+            let before_in = self.decompress.total_in();
+            let before_out = self.decompress.total_out();
+            let status = self
+                .decompress
+                .decompress(&input[offset..], &mut output, FlushDecompress::None)
+                .map_err(|_| bound_io("invalid pack zlib stream"))?;
+            let consumed = usize::try_from(self.decompress.total_in() - before_in)
+                .map_err(|_| bound_io("pack zlib input overflow"))?;
+            let produced = self.decompress.total_out() - before_out;
+            offset += consumed;
+            match status {
+                Status::StreamEnd => {
+                    self.finish_object(left)?;
+                    return Ok(offset);
+                }
+                Status::Ok | Status::BufError => {
+                    if consumed == 0 && produced == 0 {
+                        if offset < input.len() {
+                            return Err(bound_io("invalid pack zlib stream"));
+                        }
+                        self.phase = PackPhase::Entry {
+                            left,
+                            step: EntryStep::Zlib,
+                        };
+                        return Ok(offset);
+                    }
+                    if offset >= input.len() {
+                        self.phase = PackPhase::Entry {
+                            left,
+                            step: EntryStep::Zlib,
+                        };
+                        return Ok(offset);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn entry_header_done(buf: &[u8]) -> io::Result<bool> {
+    let first = buf[0];
+    let kind = (first >> 4) & 7;
+    if kind == 0 || kind == 5 {
+        return Err(bound_io("invalid pack object type"));
+    }
+    // The size varint shares its first byte with the type. Only the continuation
+    // bits matter here: zlib members are self-delimiting, so the declared size
+    // is not needed to find the next entry.
+    let mut index = 0usize;
+    let mut byte = first;
+    while byte & 0x80 != 0 {
+        index += 1;
+        if index >= buf.len() {
+            return Ok(false);
+        }
+        byte = buf[index];
+    }
+    Ok(true)
+}
+
+fn bound_io(message: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        GitError::InvalidFormat(message.to_string()),
+    )
+}
+
 pub(crate) fn write_pack_component(path: &Path, bytes: &[u8]) -> Result<()> {
     if path.exists() {
         return Ok(());
@@ -1387,4 +1716,174 @@ pub(crate) fn write_promisor_pack_sidecar(
     let path = pack_dir.join(format!("{pack_name}.promisor"));
     write_pack_component(&path, b"")?;
     Ok(Some(path))
+}
+
+#[cfg(test)]
+mod pack_bound_tests {
+    use super::PackBoundedReader;
+    use flate2::Compression;
+    use flate2::write::ZlibEncoder;
+    use sley_core::{ObjectFormat, StreamingDigest};
+    use sley_object::{EncodedObject, ObjectType};
+    use sley_pack::{PackFile, PackWriteOptions};
+    use std::io::{self, Read, Write};
+
+    /// Yields `data` and then fails. A reader that stops on the pack boundary
+    /// never starts a read at or past `pack_len`.
+    struct StrictTail {
+        data: Vec<u8>,
+        pack_len: usize,
+        pos: usize,
+    }
+
+    impl Read for StrictTail {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.pos >= self.pack_len {
+                return Err(io::Error::other("read started past the pack"));
+            }
+            let n = (self.data.len() - self.pos).min(buf.len());
+            if n == 0 {
+                return Ok(0);
+            }
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    struct OneByte {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl Read for OneByte {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            if self.pos >= self.data.len() {
+                return Err(io::Error::other("read started past the pack"));
+            }
+            buf[0] = self.data[self.pos];
+            self.pos += 1;
+            Ok(1)
+        }
+    }
+
+    fn assert_stops_at_pack(pack: &[u8], format: ObjectFormat) {
+        let mut data = pack.to_vec();
+        data.extend_from_slice(b"EXTRA");
+        let mut bounded = PackBoundedReader::new(
+            StrictTail {
+                data,
+                pack_len: pack.len(),
+                pos: 0,
+            },
+            format,
+        );
+        let mut out = Vec::new();
+        bounded.read_to_end(&mut out).expect("bounded read");
+        assert_eq!(out, pack);
+
+        let mut bytewise = PackBoundedReader::new(
+            OneByte {
+                data: pack.to_vec(),
+                pos: 0,
+            },
+            format,
+        );
+        let mut out = Vec::new();
+        bytewise.read_to_end(&mut out).expect("bytewise read");
+        assert_eq!(out, pack);
+    }
+
+    fn zlib_member(payload: &[u8]) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(payload).expect("zlib payload");
+        encoder.finish().expect("zlib finish")
+    }
+
+    fn write_entry_header(out: &mut Vec<u8>, kind: u8, size: u64) {
+        let mut size_bits = size;
+        let low = (size_bits & 0x0f) as u8;
+        size_bits >>= 4;
+        let mut byte = (kind << 4) | low;
+        if size_bits != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        while size_bits != 0 {
+            let mut next = (size_bits & 0x7f) as u8;
+            size_bits >>= 7;
+            if size_bits != 0 {
+                next |= 0x80;
+            }
+            out.push(next);
+        }
+    }
+
+    fn finish_pack(mut body: Vec<u8>, format: ObjectFormat) -> Vec<u8> {
+        let mut digest = StreamingDigest::new(format);
+        digest.update(&body);
+        let oid = digest.finalize().expect("pack checksum");
+        body.extend_from_slice(oid.as_bytes());
+        body
+    }
+
+    fn framed_pack(entries: &[&[u8]], format: ObjectFormat) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"PACK");
+        body.extend_from_slice(&2u32.to_be_bytes());
+        body.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+        for entry in entries {
+            body.extend_from_slice(entry);
+        }
+        finish_pack(body, format)
+    }
+
+    #[test]
+    fn pack_bounded_reader_stops_without_eof() {
+        let blob = EncodedObject::new(ObjectType::Blob, b"hello-interop".to_vec());
+        let written = PackFile::write_packed(&[blob], ObjectFormat::Sha1).expect("pack");
+        assert_stops_at_pack(&written.pack, ObjectFormat::Sha1);
+
+        let mut blob_entry = Vec::new();
+        let payload = b"0123456789abcdefghij";
+        write_entry_header(&mut blob_entry, 3, payload.len() as u64);
+        blob_entry.extend(zlib_member(payload));
+        let mut ofs_entry = Vec::new();
+        let delta = b"delta-bytes";
+        write_entry_header(&mut ofs_entry, 6, delta.len() as u64);
+        ofs_entry.push(12);
+        ofs_entry.extend(zlib_member(delta));
+        let mut ref_entry = Vec::new();
+        write_entry_header(&mut ref_entry, 7, delta.len() as u64);
+        ref_entry.extend_from_slice(&[0xab; 20]);
+        ref_entry.extend(zlib_member(delta));
+        let mixed = framed_pack(&[&blob_entry, &ofs_entry, &ref_entry], ObjectFormat::Sha1);
+        assert_stops_at_pack(&mixed, ObjectFormat::Sha1);
+
+        let empty = framed_pack(&[], ObjectFormat::Sha256);
+        assert_stops_at_pack(&empty, ObjectFormat::Sha256);
+    }
+
+    #[test]
+    fn pack_bounded_reader_matches_real_ofs_and_ref_packs() {
+        let base = EncodedObject::new(ObjectType::Blob, vec![b'a'; 64]);
+        let next = EncodedObject::new(ObjectType::Blob, vec![b'a'; 60]);
+        let ofs = PackFile::write_packed_with_options(
+            &[base.clone(), next.clone()],
+            ObjectFormat::Sha1,
+            &PackWriteOptions::new().with_prefer_ofs_delta(true),
+        )
+        .expect("ofs pack");
+        assert_stops_at_pack(&ofs.pack, ObjectFormat::Sha1);
+        let refs = PackFile::write_packed_with_options(
+            &[base, next],
+            ObjectFormat::Sha256,
+            &PackWriteOptions::new().with_prefer_ofs_delta(false),
+        )
+        .expect("ref pack");
+        assert_stops_at_pack(&refs.pack, ObjectFormat::Sha256);
+    }
 }

@@ -286,7 +286,14 @@ pub fn parse_capabilities(input: &[u8]) -> Result<Vec<Capability>> {
     }
     let text =
         std::str::from_utf8(input).map_err(|err| GitError::InvalidFormat(err.to_string()))?;
+    // Stock `send-pack` writes the capability list as `\0 report-status ...`
+    // (a space immediately after the NUL). Upstream `parse_feature_request`
+    // treats spaces as separators and ignores the empty segments that creates,
+    // including a leading space, a trailing space, and repeated spaces.
+    // Empty names, empty values, and delimiter bytes inside a token stay
+    // invalid.
     text.split(' ')
+        .filter(|token| !token.is_empty())
         .map(parse_capability_token)
         .collect::<Result<Vec<_>>>()
 }

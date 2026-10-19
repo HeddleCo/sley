@@ -1369,6 +1369,17 @@ impl CommitGraphEntry {
     pub fn parent_indices(&self) -> impl ExactSizeIterator<Item = u32> + '_ {
         self.parents.iter().copied()
     }
+
+    /// Generation number Git reads for this commit.
+    ///
+    /// A GDA2 offset makes that the corrected commit date (`commit_time +
+    /// offset`). Without GDA2 it is the topological level stored in CDAT.
+    pub fn stored_generation(&self) -> u64 {
+        match self.corrected_commit_date_offset {
+            Some(offset) => self.commit_time.saturating_add(offset),
+            None => u64::from(self.generation),
+        }
+    }
 }
 
 /// Borrowed iterator over a commit-graph entry's parent object ids.
@@ -1471,8 +1482,12 @@ impl CommitGraph {
             (*b"CDAT", cdat),
         ];
         if write_generation_data {
-            chunks.push((*b"GDA2", write_commit_graph_generation_data(&entries)?));
-            let gdo2 = write_commit_graph_generation_overflow(&entries)?;
+            let no_base = HashMap::new();
+            chunks.push((
+                *b"GDA2",
+                write_commit_graph_generation_data(&entries, &no_base)?,
+            ));
+            let gdo2 = write_commit_graph_generation_overflow(&entries, &no_base)?;
             if !gdo2.is_empty() {
                 chunks.push((*b"GDO2", gdo2));
             }
@@ -1494,6 +1509,12 @@ impl CommitGraph {
     /// the commit ids from those base layers in graph-position order. Parent
     /// positions in this layer are encoded against `base_oids + entries`, which
     /// matches Git's split commit-graph addressing model.
+    ///
+    /// `base_corrected_dates` maps each base commit to the generation number
+    /// Git will read for it ([`CommitGraphEntry::stored_generation`]). GDA2
+    /// offsets in this layer are computed from those values, so a parent that
+    /// lives in an older layer still contributes its corrected commit date.
+    /// Pass an empty map when `base_oids` is empty.
     pub fn write_with_base_options(
         format: ObjectFormat,
         entries: &[CommitGraphWriteEntry],
@@ -1501,6 +1522,7 @@ impl CommitGraph {
         write_generation_data: bool,
         base_graphs: &[ObjectId],
         base_oids: &[ObjectId],
+        base_corrected_dates: &HashMap<ObjectId, u64>,
     ) -> Result<Vec<u8>> {
         validate_commit_graph_bloom_settings(bloom_settings)?;
         if base_graphs.len() > u8::MAX as usize {
@@ -1528,14 +1550,13 @@ impl CommitGraph {
             (*b"CDAT", cdat),
         ];
         if write_generation_data {
-            if base_oids.is_empty() {
-                chunks.push((*b"GDA2", write_commit_graph_generation_data(&entries)?));
-                let gdo2 = write_commit_graph_generation_overflow(&entries)?;
-                if !gdo2.is_empty() {
-                    chunks.push((*b"GDO2", gdo2));
-                }
-            } else {
-                chunks.push((*b"GDA2", vec![0; entries.len() * 4]));
+            chunks.push((
+                *b"GDA2",
+                write_commit_graph_generation_data(&entries, base_corrected_dates)?,
+            ));
+            let gdo2 = write_commit_graph_generation_overflow(&entries, base_corrected_dates)?;
+            if !gdo2.is_empty() {
+                chunks.push((*b"GDO2", gdo2));
             }
         }
         if !edge.is_empty() {
@@ -1876,8 +1897,11 @@ fn write_commit_graph_commit_data_with_positions(
     Ok((cdat, edge))
 }
 
-fn write_commit_graph_generation_data(entries: &[CommitGraphWriteEntry]) -> Result<Vec<u8>> {
-    let corrected_dates = corrected_commit_dates(entries)?;
+fn write_commit_graph_generation_data(
+    entries: &[CommitGraphWriteEntry],
+    base_corrected_dates: &HashMap<ObjectId, u64>,
+) -> Result<Vec<u8>> {
+    let corrected_dates = corrected_commit_dates(entries, base_corrected_dates)?;
     let mut overflow_index = 0u32;
     let mut out = Vec::with_capacity(entries.len() * 4);
     for (entry, corrected) in entries.iter().zip(corrected_dates) {
@@ -1896,8 +1920,11 @@ fn write_commit_graph_generation_data(entries: &[CommitGraphWriteEntry]) -> Resu
     Ok(out)
 }
 
-fn write_commit_graph_generation_overflow(entries: &[CommitGraphWriteEntry]) -> Result<Vec<u8>> {
-    let corrected_dates = corrected_commit_dates(entries)?;
+fn write_commit_graph_generation_overflow(
+    entries: &[CommitGraphWriteEntry],
+    base_corrected_dates: &HashMap<ObjectId, u64>,
+) -> Result<Vec<u8>> {
+    let corrected_dates = corrected_commit_dates(entries, base_corrected_dates)?;
     let mut out = Vec::new();
     for (entry, corrected) in entries.iter().zip(corrected_dates) {
         let offset = corrected.saturating_sub(entry.commit_time);
@@ -1908,23 +1935,22 @@ fn write_commit_graph_generation_overflow(entries: &[CommitGraphWriteEntry]) -> 
     Ok(out)
 }
 
-fn corrected_commit_dates(entries: &[CommitGraphWriteEntry]) -> Result<Vec<u64>> {
+fn corrected_commit_dates(
+    entries: &[CommitGraphWriteEntry],
+    base_corrected_dates: &HashMap<ObjectId, u64>,
+) -> Result<Vec<u64>> {
     // corrected[idx] = max(commit_time, max over parents of corrected[parent] + 1)
+    //
+    // Parents that already live in a base split layer contribute the generation
+    // Git stored for them (`base_corrected_dates`) instead of being walked.
+    // Writing those offsets as zeros makes every generation equal the raw
+    // commit date, which fails `git commit-graph verify` and drops commits from
+    // reachability queries when timestamps are equal or skewed.
     //
     // Computed with an explicit work stack rather than recursion: a recursive
     // post-order walk overflows the call stack on deep histories (the commit-graph
     // write covers every reachable commit, which can be tens of thousands deep —
     // e.g. `git describe`'s deep-repo fixtures). The memoised result is identical.
-    let resolve_parent = |parent: &ObjectId| -> Result<usize> {
-        entries
-            .binary_search_by(|entry| entry.oid.as_bytes().cmp(parent.as_bytes()))
-            .map_err(|_| {
-                GitError::InvalidFormat(format!(
-                    "commit-graph parent {parent} is missing from graph"
-                ))
-            })
-    };
-
     let mut cache: Vec<Option<u64>> = vec![None; entries.len()];
     let mut stack: Vec<usize> = Vec::new();
     for start in 0..entries.len() {
@@ -1941,14 +1967,25 @@ fn corrected_commit_dates(entries: &[CommitGraphWriteEntry]) -> Result<Vec<u64>>
             let mut corrected = entry.commit_time;
             let mut ready = true;
             for parent in &entry.parents {
-                let parent_idx = resolve_parent(parent)?;
-                match cache[parent_idx] {
-                    Some(value) => corrected = corrected.max(value.saturating_add(1)),
-                    None => {
-                        // Defer until the parent is resolved; it is pushed above
-                        // `idx`, which is re-examined once all parents are ready.
-                        stack.push(parent_idx);
-                        ready = false;
+                match entries
+                    .binary_search_by(|candidate| candidate.oid.as_bytes().cmp(parent.as_bytes()))
+                {
+                    Ok(parent_idx) => match cache[parent_idx] {
+                        Some(value) => corrected = corrected.max(value.saturating_add(1)),
+                        None => {
+                            // Defer until the parent is resolved; it is pushed above
+                            // `idx`, which is re-examined once all parents are ready.
+                            stack.push(parent_idx);
+                            ready = false;
+                        }
+                    },
+                    Err(_) => {
+                        let Some(value) = base_corrected_dates.get(parent).copied() else {
+                            return Err(GitError::InvalidFormat(format!(
+                                "commit-graph parent {parent} is missing from graph"
+                            )));
+                        };
+                        corrected = corrected.max(value.saturating_add(1));
                     }
                 }
             }
@@ -4636,6 +4673,73 @@ mod tests {
         assert_eq!(
             parsed.commits[1].corrected_commit_date_offset,
             Some(0x1_0000_0007)
+        );
+    }
+
+    #[test]
+    fn split_layer_generation_data_uses_base_corrected_dates() {
+        let tree = oid("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let base_commit = oid("1111111111111111111111111111111111111111");
+        let equal_child = oid("2222222222222222222222222222222222222222");
+        let skewed_child = oid("3333333333333333333333333333333333333333");
+        let grandchild = oid("4444444444444444444444444444444444444444");
+        let base_time = 1_700_000_000u64;
+        let skewed_parent_time = 1_700_000_005u64;
+        let mut base_dates = HashMap::new();
+        base_dates.insert(base_commit, base_time);
+        let skewed_parent = oid("5555555555555555555555555555555555555555");
+        base_dates.insert(skewed_parent, skewed_parent_time);
+
+        let bytes = CommitGraph::write_with_base_options(
+            ObjectFormat::Sha1,
+            &[
+                CommitGraphWriteEntry {
+                    oid: equal_child,
+                    tree,
+                    parents: vec![base_commit],
+                    generation: 2,
+                    commit_time: base_time,
+                    bloom_filter: None,
+                },
+                CommitGraphWriteEntry {
+                    oid: skewed_child,
+                    tree,
+                    parents: vec![skewed_parent],
+                    generation: 2,
+                    commit_time: base_time,
+                    bloom_filter: None,
+                },
+                CommitGraphWriteEntry {
+                    oid: grandchild,
+                    tree,
+                    parents: vec![equal_child],
+                    generation: 3,
+                    commit_time: base_time,
+                    bloom_filter: None,
+                },
+            ],
+            DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS,
+            true,
+            &[oid("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")],
+            &[base_commit, skewed_parent],
+            &base_dates,
+        )
+        .expect("write split layer");
+        let parsed = CommitGraph::parse(&bytes, ObjectFormat::Sha1).expect("parse split layer");
+        let offset = |oid: ObjectId| {
+            parsed
+                .find(&oid)
+                .expect("layer commit")
+                .corrected_commit_date_offset
+        };
+        assert_eq!(offset(equal_child), Some(1));
+        assert_eq!(offset(skewed_child), Some(6));
+        assert_eq!(offset(grandchild), Some(2));
+        assert!(
+            parsed
+                .commits
+                .iter()
+                .all(|entry| entry.corrected_commit_date_offset != Some(0))
         );
     }
 

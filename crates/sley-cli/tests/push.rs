@@ -1993,3 +1993,67 @@ fn push_delete_sha256_remote_branch() {
 
     assert_ref_missing(&remote, "refs/heads/old");
 }
+
+#[test]
+fn stock_git_push_file_url_to_sley_receive_pack() {
+    let root = unique_temp_dir("stock-git-push-sley-receive-pack");
+    fs::create_dir_all(&root).expect("create temp root");
+    let remote = root.join("remote.git");
+    let work = root.join("work");
+    fs::create_dir_all(&work).expect("create work");
+    fs::create_dir_all(&remote).expect("create remote");
+    create_bare_repo(&remote, None);
+    create_work_repo(&work, None);
+
+    let receive_pack = format!("{} receive-pack", sley_testkit::sley_bin!());
+    let remote_url = percent_encoded_file_url(&remote);
+    let push = |args: &[&str]| {
+        let mut command = vec![
+            "push",
+            "-q",
+            "--receive-pack",
+            receive_pack.as_str(),
+            remote_url.as_str(),
+        ];
+        command.extend_from_slice(args);
+        run_success(sley_testkit::oracle_git(), &work, &command);
+    };
+    push(&["HEAD:refs/heads/main"]);
+    let local = run_success(sley_testkit::oracle_git(), &work, &["rev-parse", "HEAD"]);
+    let stored = run_success(
+        sley_testkit::oracle_git(),
+        &remote,
+        &["rev-parse", "refs/heads/main"],
+    );
+    assert_eq!(local, stored);
+
+    fs::write(work.join("payload.txt"), b"pushed again\n").expect("write update");
+    run_success(sley_testkit::oracle_git(), &work, &["add", "payload.txt"]);
+    run_success(
+        sley_testkit::oracle_git(),
+        &work,
+        &[
+            "-c",
+            "user.name=Example User",
+            "-c",
+            "user.email=example@example.invalid",
+            "commit",
+            "-m",
+            "update",
+            "-q",
+        ],
+    );
+    push(&["HEAD:refs/heads/main"]);
+    let updated = run_success(sley_testkit::oracle_git(), &work, &["rev-parse", "HEAD"]);
+    let stored = run_success(
+        sley_testkit::oracle_git(),
+        &remote,
+        &["rev-parse", "refs/heads/main"],
+    );
+    assert_eq!(updated, stored);
+
+    push(&[":refs/heads/main"]);
+    assert_ref_missing(&remote, "refs/heads/main");
+    run_success(sley_testkit::oracle_git(), &remote, &["fsck", "--strict"]);
+    let _ = fs::remove_dir_all(&root);
+}
