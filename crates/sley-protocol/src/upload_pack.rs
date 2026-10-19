@@ -41,6 +41,7 @@ pub struct UploadPackFeatures {
     pub shallow: bool,
     pub deepen_since: bool,
     pub deepen_not: bool,
+    pub deepen_relative: bool,
     pub include_tag: bool,
     pub no_progress: bool,
     pub allow_tip_sha1_in_want: bool,
@@ -359,6 +360,7 @@ pub fn parse_upload_pack_features(capabilities: &[Capability]) -> Result<UploadP
             "shallow" => set_upload_pack_flag(&mut features.shallow, capability)?,
             "deepen-since" => set_upload_pack_flag(&mut features.deepen_since, capability)?,
             "deepen-not" => set_upload_pack_flag(&mut features.deepen_not, capability)?,
+            "deepen-relative" => set_upload_pack_flag(&mut features.deepen_relative, capability)?,
             "include-tag" => set_upload_pack_flag(&mut features.include_tag, capability)?,
             "no-progress" => set_upload_pack_flag(&mut features.no_progress, capability)?,
             "allow-tip-sha1-in-want" => {
@@ -438,6 +440,11 @@ pub fn encode_upload_pack_features(features: &UploadPackFeatures) -> Result<Vec<
     push_upload_pack_flag(&mut capabilities, "shallow", features.shallow);
     push_upload_pack_flag(&mut capabilities, "deepen-since", features.deepen_since);
     push_upload_pack_flag(&mut capabilities, "deepen-not", features.deepen_not);
+    push_upload_pack_flag(
+        &mut capabilities,
+        "deepen-relative",
+        features.deepen_relative,
+    );
     push_upload_pack_flag(&mut capabilities, "include-tag", features.include_tag);
     push_upload_pack_flag(&mut capabilities, "no-progress", features.no_progress);
     push_upload_pack_flag(
@@ -551,12 +558,11 @@ pub fn validate_upload_pack_request_features(
                         .into(),
                 ));
             }
-            "filter" if !features.filter => {
-                return Err(GitError::InvalidFormat(
-                    "upload-pack request uses filter capability without advertised capability"
-                        .into(),
-                ));
-            }
+            // Stock fetch-pack puts `filter` on the first want line whenever
+            // `--filter` was requested, then omits the `filter <spec>` line
+            // when the server did not advertise it. Ignore that token; a
+            // filter line without the advertisement is still rejected below.
+            "filter" => {}
             "agent" => {
                 let Some(agent) = &capability.value else {
                     return Err(GitError::InvalidFormat(
@@ -621,6 +627,16 @@ pub fn validate_upload_pack_request_features(
     if !features.deepen_not && !request.deepen_not.is_empty() {
         return Err(GitError::InvalidFormat(
             "upload-pack request uses deepen-not without advertised capability".into(),
+        ));
+    }
+    if !features.deepen_relative
+        && request
+            .capabilities
+            .iter()
+            .any(|capability| capability.name == "deepen-relative")
+    {
+        return Err(GitError::InvalidFormat(
+            "upload-pack request uses deepen-relative without advertised capability".into(),
         ));
     }
     if !features.filter && request.filter.is_some() {
@@ -1380,6 +1396,7 @@ fn is_known_upload_pack_capability(name: &str) -> bool {
             | "shallow"
             | "deepen-since"
             | "deepen-not"
+            | "deepen-relative"
             | "include-tag"
             | "no-progress"
             | "allow-tip-sha1-in-want"
@@ -1404,6 +1421,7 @@ fn is_upload_pack_flag_capability(name: &str) -> bool {
             | "shallow"
             | "deepen-since"
             | "deepen-not"
+            | "deepen-relative"
             | "include-tag"
             | "no-progress"
             | "allow-tip-sha1-in-want"

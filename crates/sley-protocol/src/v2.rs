@@ -631,25 +631,26 @@ pub fn trace_protocol_v2_advertisement_read(handshake: &TransportHandshake) -> R
 pub fn parse_protocol_v2_command_request(
     frames: &[PktLineFrame],
 ) -> Result<ProtocolV2CommandRequest> {
-    let Some((first, rest)) = frames.split_first() else {
+    if frames.is_empty() {
         return Err(GitError::InvalidFormat(
             "protocol v2 command request is empty".into(),
         ));
-    };
-    let command = match first {
-        PktLineFrame::Data(payload) => parse_protocol_v2_command_line(payload)?,
-        _ => {
-            return Err(GitError::InvalidFormat(
-                "protocol v2 command request must start with a command line".into(),
-            ));
-        }
-    };
+    }
+    // A flush with no command ends the session. Capability lines may precede
+    // `command=` (stock `send_capabilities` writes agent/object-format before
+    // `command=bundle-uri`); only a non-data first frame is "not a command".
+    if !matches!(frames.first(), Some(PktLineFrame::Data(_))) {
+        return Err(GitError::InvalidFormat(
+            "protocol v2 command request must start with a command line".into(),
+        ));
+    }
 
+    let mut command = None;
     let mut capabilities = Vec::new();
     let mut arguments = Vec::new();
     let mut in_arguments = false;
     let mut saw_flush = false;
-    for (idx, frame) in rest.iter().enumerate() {
+    for (idx, frame) in frames.iter().enumerate() {
         match frame {
             PktLineFrame::Data(payload) if !in_arguments => {
                 if saw_flush {
@@ -657,7 +658,18 @@ pub fn parse_protocol_v2_command_request(
                         "protocol v2 command request has data after flush".into(),
                     ));
                 }
-                capabilities.push(parse_protocol_v2_capability_line(payload)?);
+                let text = parse_protocol_v2_line_text("protocol v2 command request", payload)?;
+                if let Some(name) = text.strip_prefix("command=") {
+                    if command.is_some() {
+                        return Err(GitError::InvalidFormat(
+                            "protocol v2 command request has multiple commands".into(),
+                        ));
+                    }
+                    validate_capability_name(name)?;
+                    command = Some(name.to_string());
+                } else {
+                    capabilities.push(parse_protocol_v2_capability_line(payload)?);
+                }
             }
             PktLineFrame::Data(payload) => {
                 if saw_flush {
@@ -685,7 +697,7 @@ pub fn parse_protocol_v2_command_request(
                 if in_arguments {
                     return Err(GitError::InvalidFormat(format!(
                         "expected flush after {} arguments",
-                        command
+                        command.as_deref().unwrap_or("command")
                     )));
                 }
                 if saw_flush {
@@ -697,7 +709,7 @@ pub fn parse_protocol_v2_command_request(
             }
             PktLineFrame::Flush => {
                 saw_flush = true;
-                if idx + 1 != rest.len() {
+                if idx + 1 != frames.len() {
                     return Err(GitError::InvalidFormat(
                         "protocol v2 command request has frames after flush".into(),
                     ));
@@ -715,6 +727,11 @@ pub fn parse_protocol_v2_command_request(
             "protocol v2 command request missing flush".into(),
         ));
     }
+    let Some(command) = command else {
+        return Err(GitError::InvalidFormat(
+            "protocol v2 command request missing command prefix".into(),
+        ));
+    };
 
     Ok(ProtocolV2CommandRequest {
         command,
@@ -788,7 +805,7 @@ pub fn read_protocol_v2_command_request(
     let mut frames = Vec::new();
     loop {
         let Some(frame) = read_pkt_line_frame(reader)? else {
-            if let Some(command) = frames.first().and_then(|frame| match frame {
+            if let Some(command) = frames.iter().find_map(|frame| match frame {
                 PktLineFrame::Data(payload) => parse_protocol_v2_command_line(payload).ok(),
                 _ => None,
             }) && frames
@@ -1950,6 +1967,14 @@ pub fn parse_protocol_v2_command_options(
                 };
                 validate_protocol_v2_capability_value(value)?;
                 out.server_options.push(value.clone());
+            }
+            // Git 2.56 dies when a client sends `promisor-remote` with no
+            // value (`promisor_remote_receive`). The reply parser rejects an
+            // empty value; a missing `=` is the same rejection.
+            "promisor-remote" => {
+                let value = capability.value.as_deref().unwrap_or("");
+                crate::promisor::parse_promisor_remote_reply(value)?;
+                out.extra.push(capability.clone());
             }
             _ => out.extra.push(capability.clone()),
         }

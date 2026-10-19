@@ -5741,6 +5741,56 @@ fn protocol_v2_command_request_streams_round_trip() {
 }
 
 #[test]
+fn protocol_v2_command_request_accepts_capabilities_before_command() {
+    let frames = vec![
+        PktLineFrame::data(b"agent=git/2.56.0\n".to_vec()).expect("agent frame"),
+        PktLineFrame::data(b"object-format=sha1\n".to_vec()).expect("object-format frame"),
+        PktLineFrame::data(b"command=bundle-uri\n".to_vec()).expect("command frame"),
+        PktLineFrame::Flush,
+    ];
+    let request =
+        parse_protocol_v2_command_request(&frames).expect("test operation should succeed");
+    assert_eq!(request.command, "bundle-uri");
+    assert_eq!(
+        request.capabilities,
+        vec![
+            Capability {
+                name: "agent".into(),
+                value: Some("git/2.56.0".into()),
+            },
+            Capability {
+                name: "object-format".into(),
+                value: Some("sha1".into()),
+            },
+        ]
+    );
+}
+
+#[test]
+fn protocol_v2_promisor_remote_without_value_is_rejected() {
+    let missing = parse_protocol_v2_command_options(&[Capability {
+        name: "promisor-remote".into(),
+        value: None,
+    }])
+    .expect_err("missing promisor-remote value");
+    assert!(
+        missing
+            .to_string()
+            .contains("promisor-remote reply is empty"),
+        "{missing}"
+    );
+    let empty = parse_protocol_v2_command_options(&[Capability {
+        name: "promisor-remote".into(),
+        value: Some(String::new()),
+    }])
+    .expect_err("empty promisor-remote value");
+    assert!(
+        empty.to_string().contains("promisor-remote reply is empty"),
+        "{empty}"
+    );
+}
+
+#[test]
 fn protocol_v2_command_request_rejects_malformed_sequences() {
     assert!(parse_protocol_v2_command_request(&[]).is_err());
     assert!(
