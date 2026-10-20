@@ -92,10 +92,10 @@ pub(crate) fn resolve_client_upload_pack_version(
     config: Option<&GitConfig>,
     test_protocol: Option<&str>,
 ) -> ProtocolVersion {
-    if let Some(value) = git_protocol {
-        if let Some(version) = protocol_version_from_git_protocol_value(value) {
-            return version;
-        }
+    if let Some(value) = git_protocol
+        && let Some(version) = protocol_version_from_git_protocol_value(value)
+    {
+        return version;
     }
     if let Some(version) = config.and_then(protocol_version_from_config) {
         return version;
