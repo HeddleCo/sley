@@ -1397,11 +1397,21 @@ fn apply_clean_filter_for_index_comparison(
 #[derive(Default)]
 pub struct StatCleanFilterValidator {
     clean_filter: Option<TrackedOnlyCleanFilter>,
+    /// Read system, global, and repository config. Filter commands such as
+    /// `filter.<name>.clean` often live only in the global file.
+    effective_config: bool,
 }
 
 impl StatCleanFilterValidator {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Resolve clean-filter commands from the full config stack (system,
+    /// global, repository), not only `<git_dir>/config`.
+    pub fn with_effective_config(mut self) -> Self {
+        self.effective_config = true;
+        self
     }
 
     pub fn validate_path(
@@ -1419,8 +1429,23 @@ impl StatCleanFilterValidator {
         if !metadata.is_file() {
             return Ok(None);
         }
-        let clean_filter =
-            tracked_only_clean_filter(&mut self.clean_filter, worktree_root, git_dir);
+        let clean_filter = if self.effective_config {
+            if self.clean_filter.is_none() {
+                let config =
+                    sley_config::read_effective_worktree_config(git_dir, None).unwrap_or_default();
+                let _ = tracked_only_clean_filter_with_config(
+                    &mut self.clean_filter,
+                    worktree_root,
+                    &config,
+                );
+            }
+            match self.clean_filter.as_mut() {
+                Some(filter) => filter,
+                None => return Ok(None),
+            }
+        } else {
+            tracked_only_clean_filter(&mut self.clean_filter, worktree_root, git_dir)
+        };
         clean_filter.read_attributes_for_path(worktree_root, git_path)?;
         let checks =
             clean_filter

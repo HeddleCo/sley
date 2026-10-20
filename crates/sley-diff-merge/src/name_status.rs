@@ -350,6 +350,7 @@ pub fn diff_name_status_head_worktree_with_options(
         Some(&stat_cache),
         Some(&missing_skip_worktree_entries),
         Some(&present_skip_worktree_entries),
+        None,
     )?;
     let changes = if options.detect_inexact {
         let cache = worktree_blob_cache_for_path_set(
@@ -556,8 +557,50 @@ pub fn diff_name_status_tree_worktree_with_options(
     tree_oid: &ObjectId,
     options: DiffNameStatusOptions,
 ) -> Result<Vec<NameStatusEntry>> {
-    let worktree_root = worktree_root.as_ref();
-    let git_dir = git_dir.as_ref();
+    diff_name_status_tree_worktree_with_options_validated(
+        worktree_root,
+        git_dir,
+        format,
+        tree_oid,
+        options,
+        None,
+    )
+}
+
+/// [`diff_name_status_tree_worktree_with_options`], plus git's racy-stat
+/// content check (`ce_compare_data`).
+///
+/// A racily-clean index entry cannot trust its cached stat. When `validator`
+/// is set, that entry is re-hashed through the clean filter before it is
+/// compared with the tree. Checkout's post-switch summary needs this: a
+/// smudged worktree file whose stat matches the index still hashes to the
+/// index blob once the clean filter runs.
+pub fn diff_name_status_tree_worktree_with_options_validated(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    options: DiffNameStatusOptions,
+    stat_clean_validator: Option<&mut IndexWorktreeStatCleanValidator<'_>>,
+) -> Result<Vec<NameStatusEntry>> {
+    diff_name_status_tree_worktree_inner(
+        worktree_root.as_ref(),
+        git_dir.as_ref(),
+        format,
+        tree_oid,
+        options,
+        stat_clean_validator,
+    )
+}
+
+fn diff_name_status_tree_worktree_inner(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    options: DiffNameStatusOptions,
+    stat_clean_validator: Option<&mut IndexWorktreeStatCleanValidator<'_>>,
+) -> Result<Vec<NameStatusEntry>> {
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let tree = tree_entries(tree_oid, format, &db)?;
     let IndexSnapshot {
@@ -576,6 +619,7 @@ pub fn diff_name_status_tree_worktree_with_options(
         Some(&stat_cache),
         Some(&missing_skip_worktree_entries),
         Some(&present_skip_worktree_entries),
+        stat_clean_validator,
     )?;
     let changes = if options.detect_inexact {
         let cache = worktree_blob_cache_for_path_set(
@@ -1014,6 +1058,7 @@ fn diff_name_status_index_worktree_changes_from_snapshot(
             Some(&stat_cache),
             Some(&missing_skip_worktree_entries),
             Some(&present_skip_worktree_entries),
+            &mut None,
         )?;
         if conflict_stages.is_some() {
             // git's `diff_unmerge` makes a pair with a null old side and the
@@ -3455,6 +3500,7 @@ fn candidate_path_set<'a>(candidate_paths: impl Iterator<Item = &'a Vec<u8>>) ->
     candidate_paths.cloned().collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn worktree_entries_for_path_set(
     worktree_root: &Path,
     format: ObjectFormat,
@@ -3463,6 +3509,7 @@ fn worktree_entries_for_path_set(
     stat_cache: Option<&IndexStatCache>,
     missing_skip_worktree_entries: Option<&BTreeMap<Vec<u8>, TrackedEntry>>,
     present_skip_worktree_entries: Option<&BTreeMap<Vec<u8>, TrackedEntry>>,
+    stat_clean_validator: Option<&mut IndexWorktreeStatCleanValidator<'_>>,
 ) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
     worktree_entries_for_unique_paths(
         worktree_root,
@@ -3472,9 +3519,11 @@ fn worktree_entries_for_path_set(
         stat_cache,
         missing_skip_worktree_entries,
         present_skip_worktree_entries,
+        stat_clean_validator,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn worktree_entries_for_unique_paths<'a>(
     worktree_root: &Path,
     format: ObjectFormat,
@@ -3483,6 +3532,7 @@ fn worktree_entries_for_unique_paths<'a>(
     stat_cache: Option<&IndexStatCache>,
     missing_skip_worktree_entries: Option<&BTreeMap<Vec<u8>, TrackedEntry>>,
     present_skip_worktree_entries: Option<&BTreeMap<Vec<u8>, TrackedEntry>>,
+    mut stat_clean_validator: Option<&mut IndexWorktreeStatCleanValidator<'_>>,
 ) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
     let mut entries = BTreeMap::new();
     for git_path in candidates {
@@ -3494,6 +3544,7 @@ fn worktree_entries_for_unique_paths<'a>(
             stat_cache,
             missing_skip_worktree_entries,
             present_skip_worktree_entries,
+            &mut stat_clean_validator,
         )? {
             entries.insert(git_path.clone(), entry);
         }
@@ -3501,6 +3552,7 @@ fn worktree_entries_for_unique_paths<'a>(
     Ok(entries)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn worktree_entry_for_path(
     worktree_root: &Path,
     format: ObjectFormat,
@@ -3509,6 +3561,7 @@ fn worktree_entry_for_path(
     stat_cache: Option<&IndexStatCache>,
     missing_skip_worktree_entries: Option<&BTreeMap<Vec<u8>, TrackedEntry>>,
     present_skip_worktree_entries: Option<&BTreeMap<Vec<u8>, TrackedEntry>>,
+    stat_clean_validator: &mut Option<&mut IndexWorktreeStatCleanValidator<'_>>,
 ) -> Result<Option<TrackedEntry>> {
     if let Some(entry) = present_skip_worktree_entries.and_then(|entries| {
         entries
@@ -3556,7 +3609,56 @@ fn worktree_entry_for_path(
     if let Some(entry) = stat_cache.and_then(|cache| cache.reusable_entry(git_path, &metadata)) {
         return Ok(Some(tracked_entry_from_index(entry)));
     }
+    if let Some(entry) =
+        racy_clean_validated_entry(git_path, &path, &metadata, stat_cache, stat_clean_validator)?
+    {
+        return Ok(Some(entry));
+    }
     Ok(Some(classify_worktree_entry(&path, &metadata, format)?))
+}
+
+/// Re-hash a racily-clean index entry through the caller's clean filter.
+///
+/// Git's `ce_compare_data` does this before reporting the path modified.
+/// Returning `None` leaves the raw worktree hash in place.
+fn racy_clean_validated_entry(
+    git_path: &[u8],
+    path: &Path,
+    metadata: &fs::Metadata,
+    stat_cache: Option<&IndexStatCache>,
+    stat_clean_validator: &mut Option<&mut IndexWorktreeStatCleanValidator<'_>>,
+) -> Result<Option<TrackedEntry>> {
+    let Some(validator) = stat_clean_validator.as_deref_mut() else {
+        return Ok(None);
+    };
+    let Some(cache) = stat_cache else {
+        return Ok(None);
+    };
+    let Some(index_entry) = cache.entry_for_git_path(git_path) else {
+        return Ok(None);
+    };
+    if cache.index_entry_worktree_stat_verdict(index_entry, metadata)
+        != sley_index::StatVerdict::RacyNeedsContentCheck
+    {
+        return Ok(None);
+    }
+    let Some(validated) = validator(
+        IndexWorktreeValidationEntry {
+            path: git_path,
+            mode: index_entry.mode,
+            oid: index_entry.oid,
+            size: index_entry.size,
+        },
+        path,
+        metadata,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(TrackedEntry {
+        mode: validated.mode,
+        oid: validated.oid,
+    }))
 }
 
 fn index_worktree_change_for_entry(

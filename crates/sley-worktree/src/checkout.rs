@@ -116,12 +116,32 @@ pub fn checkout_change_summary(
         detect_renames: false,
         ..Default::default()
     };
-    let changes = sley_diff_merge::diff_name_status_tree_worktree_with_options(
+    // A just-written index is often racily clean against the smudged worktree
+    // file. Re-hash through the clean filter (including global `filter.*`
+    // commands) so a matching blob is not reported as `M`.
+    let mut stat_clean_validator = StatCleanFilterValidator::new().with_effective_config();
+    let mut validate_stat_clean = |entry: sley_diff_merge::IndexWorktreeValidationEntry<'_>,
+                                   absolute_path: &Path,
+                                   metadata: &fs::Metadata| {
+        stat_clean_validator.validate_path(
+            worktree_root,
+            git_dir,
+            format,
+            entry.mode,
+            entry.oid,
+            entry.size,
+            entry.path,
+            absolute_path,
+            metadata,
+        )
+    };
+    let changes = sley_diff_merge::diff_name_status_tree_worktree_with_options_validated(
         worktree_root,
         git_dir,
         format,
         &commit.tree,
         options,
+        Some(&mut validate_stat_clean),
     )?;
     Ok(CheckoutChangeSummary { changes })
 }

@@ -4190,6 +4190,87 @@ pub(crate) fn print_update_index_needs_update(path: &[u8]) {
     sley_core::diagnostic!(Stdout, true, "{path}: needs update");
 }
 
+/// Message `git write-tree` dies with after `verify_cache` prints the conflicts.
+pub const WRITE_TREE_BUILD_ERROR: &str = "git-write-tree: error building trees";
+
+fn verify_write_tree_cache<'a>(
+    entries: impl IntoIterator<Item = (&'a [u8], Stage, ObjectId)>,
+) -> Result<()> {
+    let entries: Vec<(&[u8], Stage, ObjectId)> = entries.into_iter().collect();
+    let mut funny = 0_u32;
+    for (path, stage, oid) in &entries {
+        if *stage == Stage::Normal {
+            continue;
+        }
+        funny += 1;
+        if funny > 10 {
+            sley_core::diagnostic!(Stderr, true, "...");
+            break;
+        }
+        let path = String::from_utf8_lossy(path);
+        sley_core::diagnostic!(Stderr, true, "{path}: unmerged ({oid})");
+    }
+    if funny != 0 {
+        return Err(GitError::Command(WRITE_TREE_BUILD_ERROR.into()));
+    }
+
+    let paths: Vec<&[u8]> = entries.iter().map(|(path, _, _)| *path).collect();
+    funny = 0;
+    for index in 0..paths.len().saturating_sub(1) {
+        let Some(conflict) = find_df_conflict(&paths, index) else {
+            continue;
+        };
+        funny += 1;
+        if funny > 10 {
+            sley_core::diagnostic!(Stderr, true, "...");
+            break;
+        }
+        let this_name = String::from_utf8_lossy(paths[index]);
+        let conflict_name = String::from_utf8_lossy(conflict);
+        sley_core::diagnostic!(
+            Stderr,
+            true,
+            "You have both {this_name} and {conflict_name}"
+        );
+    }
+    if funny != 0 {
+        return Err(GitError::Command(WRITE_TREE_BUILD_ERROR.into()));
+    }
+    Ok(())
+}
+
+/// git's `find_df_conflict`. Adjacent `path` + `path/file` conflicts, and so
+/// does a non-adjacent pair when another name sorts between them because its
+/// next byte is less than `/` (for example `docs` / `docs-internal` / `docs/file`).
+fn find_df_conflict<'a>(paths: &[&'a [u8]], index: usize) -> Option<&'a [u8]> {
+    let this_name = paths[index];
+    let next_name = paths[index + 1];
+    let this_len = this_name.len();
+    if this_len >= next_name.len()
+        || next_name[this_len] > b'/'
+        || &next_name[..this_len] != this_name
+    {
+        return None;
+    }
+    if next_name[this_len] == b'/' {
+        return Some(next_name);
+    }
+    let mut probe = Vec::with_capacity(this_len + 1);
+    probe.extend_from_slice(this_name);
+    probe.push(b'/');
+    let pos = match paths.binary_search_by(|path| path.cmp(&probe.as_slice())) {
+        Ok(pos) | Err(pos) => pos,
+    };
+    if pos >= paths.len() {
+        return None;
+    }
+    let other = paths[pos];
+    if other.len() > this_len && other[this_len] == b'/' && &other[..this_len] == this_name {
+        return Some(other);
+    }
+    None
+}
+
 pub fn write_tree_from_index(git_dir: impl AsRef<Path>, format: ObjectFormat) -> Result<ObjectId> {
     write_tree_from_index_with_options(git_dir, format, WriteTreeOptions::default())
 }
@@ -4272,6 +4353,14 @@ pub(crate) fn write_tree_from_borrowed_index(
     odb: &FileObjectDatabase,
     checker: &mut ObjectPresenceChecker,
 ) -> Result<ObjectId> {
+    if options.verify_cache {
+        verify_write_tree_cache(
+            index
+                .entries
+                .iter()
+                .map(|entry| (entry.path, entry.stage(), entry.oid)),
+        )?;
+    }
     let cache_tree = if options.prefix.is_none() {
         index.cache_tree(format).ok().flatten()
     } else {
@@ -4315,6 +4404,14 @@ pub(crate) fn write_tree_from_owned_index(
     odb: &FileObjectDatabase,
     checker: &mut ObjectPresenceChecker,
 ) -> Result<ObjectId> {
+    if options.verify_cache {
+        verify_write_tree_cache(
+            index
+                .entries
+                .iter()
+                .map(|entry| (entry.path.as_bytes(), entry.stage(), entry.oid)),
+        )?;
+    }
     let cache_tree = if options.prefix.is_none() {
         index.cache_tree(format).ok().flatten()
     } else {
