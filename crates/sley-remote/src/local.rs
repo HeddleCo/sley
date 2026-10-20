@@ -23,7 +23,8 @@ use sley_core::{
 use sley_object::{Commit, ObjectType, Tag};
 use sley_odb::{
     FileObjectDatabase, ObjectReader, RawPackInstallOptions, ReachablePackMissingPolicy,
-    ReachablePackReuseWrite, ReachablePackThinBaseCandidates, build_and_install_reachable_pack,
+    ReachablePackReuseStats, ReachablePackReuseWrite, ReachablePackThinBaseCandidates,
+    ReachablePackWriteSummary, build_and_install_reachable_pack,
     build_and_install_reachable_pack_filtered_with_thin_bases, build_reachable_pack,
     build_reachable_pack_filtered, collect_reachable_object_ids, repository_common_dir,
     write_reachable_pack_with_reuse_stats_to_writer,
@@ -41,15 +42,16 @@ use sley_protocol::{
     UploadPackRawPackfileResponse, UploadPackRequest, apply_receive_pack_push_request,
     build_upload_pack_raw_packfile_response, classify_protocol_v2_command_request,
     encode_protocol_v2_fetch_capability, encode_protocol_v2_ls_refs_capability,
-    encode_receive_pack_features, encode_upload_pack_features, prepare_upload_pack_response,
+    encode_receive_pack_features, encode_upload_pack_features,
     protocol_v2_ls_refs_records_to_ref_advertisement_set, read_protocol_v2_command_request,
     read_upload_pack_acknowledgment, read_upload_pack_negotiation_request,
-    read_upload_pack_request, validate_receive_pack_push_request_features, write_error_line,
-    write_pkt_line_frame, write_pkt_line_payload, write_protocol_v2_advertisement,
-    write_protocol_v2_command_request, write_protocol_v2_fetch_request,
-    write_protocol_v2_fetch_response, write_protocol_v2_fetch_response_with_streaming_packfile,
-    write_protocol_v2_ls_refs_response, write_upload_pack_acknowledgment,
-    write_upload_pack_negotiation_request, write_upload_pack_request,
+    read_upload_pack_request, validate_receive_pack_push_request_features,
+    validate_upload_pack_request_features, write_error_line, write_pkt_line_frame,
+    write_pkt_line_payload, write_protocol_v2_advertisement, write_protocol_v2_command_request,
+    write_protocol_v2_fetch_request, write_protocol_v2_fetch_response,
+    write_protocol_v2_fetch_response_with_streaming_packfile, write_protocol_v2_ls_refs_response,
+    write_upload_pack_acknowledgment, write_upload_pack_negotiation_request,
+    write_upload_pack_request,
 };
 use sley_refs::{
     DeleteRef, FileRefStore, Ref, RefDeletePrecondition, RefPrecondition, RefTarget, ReflogEntry,
@@ -82,8 +84,14 @@ fn resolve_for_each_ref_target(
     Ok(None)
 }
 
-/// The upload-pack capabilities advertised for the repository at `git_dir`:
-/// the object format, side-band-64k, and a `HEAD` symref hint if present.
+/// The upload-pack capabilities advertised for the repository at `git_dir`.
+///
+/// These are the v0 flags sley can honor. `multi_ack` / `multi_ack_detailed`
+/// stay off: the v0 server answers with a single NAK after `done` (plus a NAK
+/// for each earlier have-flush), which is the non-multi-ack negotiator.
+/// `filter` follows `uploadpack.allowFilter`, matching upload-pack and the v2
+/// advertisement. `allow-tip-sha1-in-want` and `allow-reachable-sha1-in-want`
+/// are advertised because any object present in the repository may be wanted.
 pub fn upload_pack_features(
     policy: &crate::RemotePolicy,
     git_dir: &Path,
@@ -102,9 +110,26 @@ pub fn upload_pack_features(
             .to_string();
         symrefs.push(format!("HEAD:{logical_target}"));
     }
+    let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
+    let allow_filter = config
+        .get_bool("uploadpack", None, "allowfilter")
+        .unwrap_or(false);
     Ok(UploadPackFeatures {
-        object_format: Some(format),
+        side_band: true,
         side_band_64k: true,
+        thin_pack: true,
+        ofs_delta: true,
+        shallow: true,
+        deepen_since: true,
+        deepen_not: true,
+        deepen_relative: true,
+        no_progress: true,
+        include_tag: true,
+        allow_tip_sha1_in_want: true,
+        allow_reachable_sha1_in_want: true,
+        filter: allow_filter,
+        agent: Some(format!("git/{UPSTREAM_GIT_COMPAT_VERSION}")),
+        object_format: Some(format),
         symrefs,
         ..UploadPackFeatures::default()
     })
@@ -181,9 +206,163 @@ pub fn upload_pack_from_local_repository(
     )
 }
 
+/// Shallow boundary and pack inputs for one v0 upload-pack request.
+///
+/// The shallow lines must be written (and flushed) before the server reads
+/// `have` lines: stock fetch-pack waits for that flush before it sends haves
+/// when `deepen` was requested.
+pub struct V0UploadPackTransfer {
+    pub deepening: bool,
+    pub shallow_info: Vec<ProtocolV2FetchShallowInfo>,
+    pub wants: Vec<ObjectId>,
+    pub filter: Option<sley_odb::PackObjectFilter>,
+    pub boundary_excluded: HashSet<ObjectId>,
+}
+
+/// Validate a v0 upload-pack request and compute its shallow boundary.
+pub fn prepare_v0_upload_pack_transfer(
+    policy: &crate::RemotePolicy,
+    git_dir: &Path,
+    format: ObjectFormat,
+    features: &UploadPackFeatures,
+    request: &UploadPackRequest,
+) -> Result<V0UploadPackTransfer> {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    validate_upload_pack_request_features(features, request)?;
+    for want in &request.wants {
+        if !db.contains(want)? {
+            return Err(GitError::InvalidObject(format!(
+                "upload-pack requested missing object {want}"
+            )));
+        }
+    }
+
+    let deepen_relative = request
+        .capabilities
+        .iter()
+        .any(|capability| capability.name == "deepen-relative");
+    let deepening = request.deepen.is_some()
+        || request.deepen_since.is_some()
+        || !request.deepen_not.is_empty();
+    let deepen_plan = if request.deepen_since.is_some() || !request.deepen_not.is_empty() {
+        let advertisements = local_fetch_advertisements(policy, git_dir, format)?;
+        let mut deepen_not = Vec::with_capacity(request.deepen_not.len());
+        for name in &request.deepen_not {
+            let advertisement = advertisements
+                .iter()
+                .find(|advertisement| {
+                    advertisement.name == *name
+                        || advertisement.name == format!("refs/tags/{name}")
+                        || advertisement.name == format!("refs/heads/{name}")
+                        || advertisement.name == format!("refs/{name}")
+                })
+                .ok_or_else(|| {
+                    GitError::Command(format!("git upload-pack: deepen-not is not a ref: {name}"))
+                })?;
+            deepen_not.push(advertisement.oid);
+        }
+        let since = request
+            .deepen_since
+            .map(|value| {
+                i64::try_from(value).map_err(|_| {
+                    GitError::InvalidFormat(format!("invalid deepen-since timestamp {value}"))
+                })
+            })
+            .transpose()?;
+        Some(compute_local_deepen_by_rev_list(
+            &db,
+            format,
+            &request.wants,
+            request.shallow.clone(),
+            since,
+            &deepen_not,
+        )?)
+    } else if let Some(depth) = request.deepen {
+        Some(compute_local_deepen(
+            &db,
+            format,
+            &request.wants,
+            request.shallow.clone(),
+            depth,
+            deepen_relative,
+        )?)
+    } else {
+        None
+    };
+
+    let mut wants = request.wants.clone();
+    let mut boundary_excluded = HashSet::new();
+    let shallow_info = if let Some(plan) = deepen_plan {
+        wants.extend(plan.extra_wants);
+        boundary_excluded = plan.excluded;
+        plan.shallow_info
+    } else {
+        Vec::new()
+    };
+    if request
+        .capabilities
+        .iter()
+        .any(|capability| capability.name == "include-tag")
+    {
+        append_included_tags(&db, git_dir, format, &mut wants)?;
+    }
+    let filter = if features.filter {
+        request
+            .filter
+            .as_deref()
+            .and_then(crate::pack_filter_from_spec)
+    } else {
+        None
+    };
+    Ok(V0UploadPackTransfer {
+        deepening,
+        shallow_info,
+        wants,
+        filter,
+        boundary_excluded,
+    })
+}
+
+fn append_included_tags(
+    db: &FileObjectDatabase,
+    git_dir: &Path,
+    format: ObjectFormat,
+    wants: &mut Vec<ObjectId>,
+) -> Result<()> {
+    let store = FileRefStore::new(git_dir, format);
+    let wanted: HashSet<ObjectId> = wants.iter().copied().collect();
+    for reference in store.list_refs()? {
+        if !reference.name.starts_with("refs/tags/") {
+            continue;
+        }
+        let Some((oid, _)) = resolve_for_each_ref_target(&store, &reference)? else {
+            continue;
+        };
+        if wanted.contains(&oid) {
+            continue;
+        }
+        let Ok(object) = db.read_object(&oid) else {
+            continue;
+        };
+        if object.object_type != ObjectType::Tag {
+            continue;
+        }
+        let Ok(peeled) = sley_rev::peel_tags(db, format, &oid) else {
+            continue;
+        };
+        if wanted.contains(&peeled) {
+            wants.push(oid);
+        }
+    }
+    Ok(())
+}
+
 /// Serve a v0/v1 upload-pack response directly to `writer`. Raw pack bytes pass
 /// through a bounded sideband adapter instead of being duplicated into a
 /// complete packet vector.
+///
+/// Shallow lines are not written here. Callers that saw `deepen` must write
+/// the prepared transfer's shallow lines and flush before reading haves.
 pub fn write_upload_pack_from_local_repository(
     git_dir: &Path,
     format: ObjectFormat,
@@ -193,11 +372,68 @@ pub fn write_upload_pack_from_local_repository(
     sideband: bool,
     writer: &mut impl std::io::Write,
 ) -> Result<ReachablePackReuseWrite> {
+    let transfer = prepare_v0_upload_pack_transfer(
+        &crate::RemotePolicy::default(),
+        git_dir,
+        format,
+        features,
+        &request,
+    )?;
+    write_prepared_v0_upload_pack(git_dir, format, &transfer, haves, sideband, writer)
+}
+
+/// Write the NAK and pack for a transfer prepared by
+/// [`prepare_v0_upload_pack_transfer`].
+pub fn write_prepared_v0_upload_pack(
+    git_dir: &Path,
+    format: ObjectFormat,
+    transfer: &V0UploadPackTransfer,
+    haves: HashSet<ObjectId>,
+    sideband: bool,
+    writer: &mut impl std::io::Write,
+) -> Result<ReachablePackReuseWrite> {
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let plan = prepare_upload_pack_response(features, request, haves, |oid| db.contains(oid))?;
-    let excluded = collect_reachable_object_ids(&db, format, plan.known_haves)?;
-    for acknowledgment in &plan.acknowledgments {
-        write_upload_pack_acknowledgment(writer, acknowledgment)?;
+    let known_haves = haves
+        .into_iter()
+        .filter_map(|oid| match db.contains(&oid) {
+            Ok(true) => Some(Ok(oid)),
+            Ok(false) => None,
+            Err(err) => Some(Err(err)),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    write_upload_pack_acknowledgment(writer, &UploadPackAcknowledgment::Nak)?;
+    let mut excluded = collect_reachable_object_ids(&db, format, known_haves)?;
+    excluded.extend(transfer.boundary_excluded.iter().copied());
+
+    if transfer.filter.is_some() {
+        let generated = build_reachable_pack_filtered(
+            &db,
+            format,
+            transfer.wants.clone(),
+            &excluded,
+            transfer.filter.clone(),
+        )?
+        .ok_or_else(|| GitError::InvalidObject("upload-pack request produced empty pack".into()))?;
+        let summary = ReachablePackWriteSummary {
+            index: generated.index.clone(),
+            checksum: generated.checksum,
+            object_count: generated.entries.len(),
+            delta_count: generated.delta_count,
+            pack_size: u64::try_from(generated.pack.len()).unwrap_or(u64::MAX),
+        };
+        if sideband {
+            {
+                let mut packfile = StreamingSidebandWriter::new(writer);
+                std::io::Write::write_all(&mut packfile, &generated.pack)?;
+            }
+            std::io::Write::write_all(writer, b"0000")?;
+        } else {
+            std::io::Write::write_all(writer, &generated.pack)?;
+        }
+        return Ok(ReachablePackReuseWrite {
+            summary,
+            reuse: ReachablePackReuseStats::default(),
+        });
     }
 
     let build = if sideband {
@@ -206,7 +442,7 @@ pub fn write_upload_pack_from_local_repository(
             write_reachable_pack_with_reuse_stats_to_writer(
                 &db,
                 format,
-                plan.wants,
+                transfer.wants.clone(),
                 &excluded,
                 &mut packfile,
             )?
@@ -214,7 +450,13 @@ pub fn write_upload_pack_from_local_repository(
         std::io::Write::write_all(writer, b"0000")?;
         build
     } else {
-        write_reachable_pack_with_reuse_stats_to_writer(&db, format, plan.wants, &excluded, writer)?
+        write_reachable_pack_with_reuse_stats_to_writer(
+            &db,
+            format,
+            transfer.wants.clone(),
+            &excluded,
+            writer,
+        )?
     };
     build.ok_or_else(|| GitError::InvalidObject("upload-pack request produced empty pack".into()))
 }
@@ -793,6 +1035,7 @@ pub fn local_fetch_advertisements(
     format: ObjectFormat,
 ) -> Result<Vec<RefAdvertisement>> {
     let store = FileRefStore::new_without_reference_backend_env(git_dir, format);
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let namespace_prefix = policy.namespace.prefix().to_owned();
     let hidden = transfer_upload_hidden_ref_patterns(git_dir);
     let mut advertisements = Vec::new();
@@ -844,6 +1087,21 @@ pub fn local_fetch_advertisements(
             name: logical.to_string(),
             capabilities: Vec::new(),
         });
+        // Peeled tag lines (`refs/tags/v1^{}`) follow the tag, matching
+        // upload-pack's `write_v0_ref`. Lightweight tags already point at the
+        // peeled object, so they do not get a second line.
+        if logical.starts_with("refs/tags/")
+            && let Ok(object) = db.read_object(&oid)
+            && object.object_type == ObjectType::Tag
+            && let Ok(peeled) = sley_rev::peel_tags(&db, format, &oid)
+            && peeled != oid
+        {
+            advertisements.push(RefAdvertisement {
+                oid: peeled,
+                name: format!("{logical}^{{}}"),
+                capabilities: Vec::new(),
+            });
+        }
     }
     Ok(advertisements)
 }
@@ -3111,7 +3369,9 @@ fn write_bundle_uri_command_response(
             continue;
         }
         for entry in &section.entries {
-            let Some(value) = entry.value.as_deref() else {
+            // Git 2.56 omits `bundle.*` keys whose value is missing or empty
+            // (`config_to_packet_line` only writes a non-empty value).
+            let Some(value) = entry.value.as_deref().filter(|value| !value.is_empty()) else {
                 continue;
             };
             let key = match &section.subsection {
@@ -3200,6 +3460,10 @@ fn serve_upload_pack_v2_inner(
         // `command=bundle-uri` is not part of the fetch/ls-refs classification;
         // handle it directly by streaming the repository's `bundle.*` config as
         // `key=value` packet lines (upstream `bundle_uri_command`).
+        // Client capabilities (agent, object-format, promisor-remote) are
+        // accepted in any order around `command=`. An empty promisor-remote
+        // value is rejected here, including on `command=bundle-uri`.
+        sley_protocol::parse_protocol_v2_command_options(&request.capabilities)?;
         if request.command == "bundle-uri" {
             write_bundle_uri_command_response(config, writer)?;
             writer.flush()?;

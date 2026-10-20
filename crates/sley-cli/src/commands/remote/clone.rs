@@ -1088,6 +1088,7 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
                 alternates: &alternates,
                 copy_source_alternates: local_source,
                 local_object_install,
+                upload_pack_command: (!local_source).then_some(upload_pack.as_deref()).flatten(),
                 dissociate,
                 config_overrides: &config_overrides,
                 submodule_active: &submodule_active,
@@ -1246,7 +1247,9 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
         branch_explicit: branch_explicit && branch_tag_oid.is_none(),
         ref_storage,
         ssh_options: None,
-        upload_pack_command: None,
+        // A plain local path clone hardlinks and ignores `-u`. `file://` and
+        // `--no-local` go through upload-pack, so the command must run.
+        upload_pack_command: (!local_source).then_some(upload_pack.as_deref()).flatten(),
         reject_shallow: reject_shallow_config.unwrap_or(false),
         // Partial-clone checkout top-up must stay in-cone under `--sparse`
         // (t5620: tip cone only → 44 missing blobs, not full tip tree).
@@ -2813,6 +2816,9 @@ struct CloneLocalOptions<'a> {
     alternates: &'a [PathBuf],
     copy_source_alternates: bool,
     local_object_install: LocalObjectInstall,
+    /// `--upload-pack` for a `file://` / `--no-local` transport clone. A plain
+    /// local path keeps this unset so hardlink clone does not spawn upload-pack.
+    upload_pack_command: Option<&'a str>,
     dissociate: bool,
     config_overrides: &'a [GlobalConfigOverride],
     submodule_active: &'a [String],
@@ -2973,7 +2979,7 @@ fn clone_bare_or_mirror_local_repository(
             deepen_since: None,
             deepen_not: Vec::new(),
             ssh_options: None,
-            upload_pack_command: None,
+            upload_pack_command: options.upload_pack_command.map(str::to_string),
             atomic: false,
             negotiation_restrict: None,
             negotiation_include: None,

@@ -140,6 +140,8 @@ done
 s -C "${WT}" branch topic HEAD~1
 s clone -q --bare "${WT}" "${SRV}"
 s -C "${SRV}" config http.receivepack true
+s -C "${SRV}" config uploadpack.allowFilter true
+g -C "${SRV}" tag -a v1 -m v1 HEAD
 
 UPLOAD="${SLEY} upload-pack"
 RECEIVE="${SLEY} receive-pack"
@@ -174,6 +176,48 @@ if g -C "${SRV}" rev-parse -q --verify refs/heads/pushed >/dev/null; then
 fi
 g -C "${SRV}" fsck --strict >/dev/null
 
+say "v0 ls-remote peeled tags and capabilities"
+V0_SLEY=${ROOT}/v0-sley-ls
+V0_STOCK=${ROOT}/v0-stock-ls
+g -c protocol.version=0 ls-remote --upload-pack="${UPLOAD}" "file://${SRV}" >"${V0_SLEY}"
+g -c protocol.version=0 ls-remote "file://${SRV}" >"${V0_STOCK}"
+diff -u "${V0_STOCK}" "${V0_SLEY}"
+grep -F -q 'refs/tags/v1^{}' "${V0_SLEY}"
+V0_TRACE=${ROOT}/v0-caps.trace
+g -c protocol.version=0 ls-remote --upload-pack="${UPLOAD}" "file://${SRV}" >/dev/null
+GIT_TRACE_PACKET=${V0_TRACE} g -c protocol.version=0 ls-remote --upload-pack="${UPLOAD}" "file://${SRV}" >/dev/null
+for token in shallow side-band-64k ofs-delta include-tag filter symref agent object-format; do
+    if ! grep -q "${token}" "${V0_TRACE}"; then
+        echo "v0 advertisement missing ${token}" >&2
+        exit 1
+    fi
+done
+
+say "v0 shallow and partial clone"
+V0_SHALLOW=${ROOT}/v0-shallow
+g -c protocol.version=0 clone -q --no-local --depth=1 -u "${UPLOAD}" "file://${SRV}" "${V0_SHALLOW}"
+test "$(g -C "${V0_SHALLOW}" rev-list --count HEAD)" = 1
+# `clone -u` applies only to the initial fetch. Checkout's promisor child
+# looks up git-upload-pack on GIT_EXEC_PATH, so point that name at sley or
+# the lazy blob fetch would hit stock upload-pack (allowReachable defaults off).
+SLEY_EXEC=${ROOT}/sley-exec
+mkdir -p "${SLEY_EXEC}"
+ln -s "${GIT%/*}/../libexec/git-core/"* "${SLEY_EXEC}/"
+rm -f "${SLEY_EXEC}/git-upload-pack"
+cat >"${SLEY_EXEC}/git-upload-pack" <<EOF
+#!/bin/sh
+exec "${SLEY}" upload-pack "\$@"
+EOF
+chmod +x "${SLEY_EXEC}/git-upload-pack"
+V0_PARTIAL=${ROOT}/v0-partial
+GIT_EXEC_PATH="${SLEY_EXEC}" g -c protocol.version=0 clone -q --no-checkout --no-local --filter=blob:none -u "${UPLOAD}" "file://${SRV}" "${V0_PARTIAL}"
+test "$(g -C "${V0_PARTIAL}" config remote.origin.promisor)" = true
+test "$(g -C "${V0_PARTIAL}" config remote.origin.partialclonefilter)" = blob:none
+# Confirm the filtered pack omitted blobs before checkout hydrates them.
+GIT_NO_LAZY_FETCH=1 g -C "${V0_PARTIAL}" rev-list --objects --all --missing=print | grep -q '^?'
+GIT_EXEC_PATH="${SLEY_EXEC}" g -C "${V0_PARTIAL}" checkout -q
+test -f "${V0_PARTIAL}/a"
+
 say "git:// clone and push"
 DPORT=$(free_port)
 DAEMON_LOG=${ROOT}/daemon.log
@@ -191,6 +235,15 @@ g -C "${GIT_CLONE}" -c commit.gpgsign=false commit -qm via-git
 g -C "${GIT_CLONE}" push -q origin HEAD:refs/heads/viagit
 test "$(g -C "${SRV}" rev-parse viagit)" = "$(g -C "${GIT_CLONE}" rev-parse HEAD)"
 g -C "${SRV}" fsck --strict >/dev/null
+say "git:// v0 shallow and partial"
+V0_GIT_SHALLOW=${ROOT}/v0-git-shallow
+g -c protocol.version=0 clone -q --depth=1 "${GIT_URL}" "${V0_GIT_SHALLOW}"
+test "$(g -C "${V0_GIT_SHALLOW}" rev-list --count HEAD)" = 1
+V0_GIT_PARTIAL=${ROOT}/v0-git-partial
+g -c protocol.version=0 clone -q --no-checkout --filter=blob:none "${GIT_URL}" "${V0_GIT_PARTIAL}"
+GIT_NO_LAZY_FETCH=1 g -C "${V0_GIT_PARTIAL}" rev-list --objects --all --missing=print | grep -q '^?'
+g -C "${V0_GIT_PARTIAL}" checkout -q
+test -f "${V0_GIT_PARTIAL}/a"
 kill "${DAEMON_PID}" 2>/dev/null || true
 wait "${DAEMON_PID}" 2>/dev/null || true
 DAEMON_PID=
@@ -311,6 +364,10 @@ g -C "${HTTP_CLONE}" -c commit.gpgsign=false commit -qm via-http
 g -C "${HTTP_CLONE}" push -q origin HEAD:refs/heads/viahttp
 test "$(g -C "${SRV}" rev-parse viahttp)" = "$(g -C "${HTTP_CLONE}" rev-parse HEAD)"
 g -C "${SRV}" fsck --strict >/dev/null
+say "smart HTTP v0 clone"
+HTTP_V0=${ROOT}/http-v0
+g -c protocol.version=0 clone -q "${HTTP_URL}" "${HTTP_V0}"
+same_commit "${HTTP_V0}" "${WT}" "http v0 clone"
 kill "${HTTP_PID}" 2>/dev/null || true
 wait "${HTTP_PID}" 2>/dev/null || true
 HTTP_PID=
@@ -369,5 +426,100 @@ printf 'intent\n' >"${FMT}/ita"
 s -C "${FMT}" add -N ita
 g -C "${FMT}" fsck --strict >/dev/null
 g -C "${FMT}" cat-file -e e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+
+say "bundle-uri capability order and empty values"
+s -C "${SRV}" config uploadpack.advertiseBundleURIs true
+s -C "${SRV}" config bundle.version 1
+s -C "${SRV}" config bundle.mode all
+s -C "${SRV}" config bundle.x.uri ""
+BUNDLE_TRACE=${ROOT}/bundle.trace
+BUNDLE_CLONE=${ROOT}/bundle-clone
+GIT_TRACE_PACKET=${BUNDLE_TRACE} g -c transfer.bundleURI=true -c protocol.version=2 \
+    clone -q --no-local -u "${UPLOAD}" "file://${SRV}" "${BUNDLE_CLONE}"
+if grep -q 'bundle.x.uri=$' "${BUNDLE_TRACE}"; then
+    echo "server sent empty bundle.x.uri=" >&2
+    exit 1
+fi
+same_commit "${BUNDLE_CLONE}" "${WT}" "bundle-uri clone"
+
+say "promisor-remote without a value is rejected"
+python3 - "${SLEY}" "${SRV}" <<'PY'
+import subprocess, sys
+sley, repo = sys.argv[1], sys.argv[2]
+def pkt(payload: bytes) -> bytes:
+    return f"{len(payload) + 4:04x}".encode() + payload
+body = b"".join([
+    pkt(b"agent=git/2.56.0\n"),
+    pkt(b"command=bundle-uri\n"),
+    pkt(b"promisor-remote\n"),
+    b"0000",
+])
+proc = subprocess.run(
+    [sley, "upload-pack", repo],
+    input=body,
+    capture_output=True,
+    env={**dict(**{k: v for k, v in __import__("os").environ.items()}), "GIT_PROTOCOL": "version=2"},
+)
+text = proc.stderr.decode("utf-8", "replace") + proc.stdout.decode("utf-8", "replace")
+if proc.returncode == 0 or "promisor-remote" not in text:
+    sys.stderr.write(text)
+    sys.exit("promisor-remote with no value was accepted\n")
+PY
+
+say "sley client against stock upload-pack"
+# Change `a` so the previous blob is not in the tip. Checkout top-up fetches
+# the tip blob; cat-file must still lazy-fetch the historical one.
+printf 'a2\n' >"${WT}/a"
+s -C "${WT}" add a
+GIT_AUTHOR_DATE="${EQUAL}" GIT_COMMITTER_DATE="${EQUAL}" \
+    s -C "${WT}" -c user.name='Interop User' -c user.email='interop@example.invalid' \
+    -c commit.gpgsign=false commit -qm a2
+STOCK=${ROOT}/stock.git
+g clone -q --bare "${WT}" "${STOCK}"
+g -C "${STOCK}" config uploadpack.allowFilter true
+g -C "${STOCK}" config uploadpack.allowReachableSHA1InWant true
+GU="$("${GIT}" --exec-path)/git-upload-pack"
+SLEY_LS=${ROOT}/sley-ls
+STOCK_LS=${ROOT}/stock-ls
+s ls-remote --upload-pack="${GU}" "file://${STOCK}" >"${SLEY_LS}"
+g ls-remote "file://${STOCK}" >"${STOCK_LS}"
+diff -u "${STOCK_LS}" "${SLEY_LS}"
+
+INVOKE_LOG=${ROOT}/clone-u-invoked
+WRAPPER=${ROOT}/upload-pack-wrapper
+cat >"${WRAPPER}" <<EOF
+#!/bin/sh
+echo invoked >> "${INVOKE_LOG}"
+exec "${GU}" "\$@"
+EOF
+chmod +x "${WRAPPER}"
+SLEY_FILE_CLONE=${ROOT}/sley-file-clone
+s clone -q -u "${WRAPPER}" "file://${STOCK}" "${SLEY_FILE_CLONE}"
+grep -q invoked "${INVOKE_LOG}"
+same_commit "${SLEY_FILE_CLONE}" "${WT}" "sley clone -u stock upload-pack"
+
+SLEY_SSH=${ROOT}/sley-ssh-partial
+GIT_SSH_COMMAND="${FAKE_SSH}" GIT_SSH_VARIANT=simple \
+    s clone -q --filter=blob:none -u "${GU}" "ssh://git@127.0.0.1${STOCK}" "${SLEY_SSH}"
+test -f "${SLEY_SSH}/a"
+OLD_BLOB=$(g -C "${STOCK}" rev-parse 'HEAD~1:a')
+if GIT_NO_LAZY_FETCH=1 g -C "${SLEY_SSH}" cat-file -e "${OLD_BLOB}" >/dev/null 2>&1; then
+    echo "ssh partial clone contained historical blob ${OLD_BLOB}" >&2
+    exit 1
+fi
+# Later fetches use the remote's `git-upload-pack` (clone -u is clone-time
+# only, matching stock git). Point that name at the stock binary, and keep
+# the same SSH stand-in the clone used.
+export PATH="$(dirname "${GU}"):${PATH}"
+export GIT_SSH_COMMAND="${FAKE_SSH}"
+export GIT_SSH_VARIANT=simple
+s -C "${SLEY_SSH}" cat-file -s "${OLD_BLOB}" >/dev/null
+
+SLEY_FILE_PARTIAL=${ROOT}/sley-file-partial
+# In-process file:// promisor hydrate (stock smart HTTP is not running here).
+s clone -q --no-checkout --filter=blob:none "file://${STOCK}" "${SLEY_FILE_PARTIAL}"
+s -C "${SLEY_FILE_PARTIAL}" cat-file -s "${OLD_BLOB}" >/dev/null
+s -C "${SLEY_FILE_PARTIAL}" cat-file -t "${OLD_BLOB}" >/dev/null
+s -C "${SLEY_FILE_PARTIAL}" cat-file -e "${OLD_BLOB}"
 
 say "interop ok"

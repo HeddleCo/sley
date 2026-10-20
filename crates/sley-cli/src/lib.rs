@@ -35,9 +35,11 @@ use sley_odb::{
 use sley_pack::{MultiPackIndex, PackFile, PackIndex};
 use sley_protocol::{
     FetchHeadRecord, ProtocolVersion, ReceivePackCommand, RefAdvertisement, RefAdvertisementSet,
-    UploadPackFeatures, parse_refspec, read_fetch_head, read_receive_pack_push_options,
-    read_receive_pack_request, read_ref_advertisement_set, read_upload_pack_negotiation_request,
-    read_upload_pack_request, refspec_map_source, write_ref_advertisement_set,
+    UploadPackAcknowledgment, UploadPackFeatures, parse_refspec, read_fetch_head,
+    read_receive_pack_push_options, read_receive_pack_request,
+    read_upload_pack_negotiation_request, read_upload_pack_request, refspec_map_source,
+    write_ref_advertisement_set, write_upload_pack_acknowledgment,
+    write_upload_pack_shallow_update,
 };
 use sley_refs::{
     FileRefStore, PackRefDecision, Ref, RefTransactionHookUpdate, RefTransactionPhase, RefUpdate,

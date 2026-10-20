@@ -543,9 +543,9 @@ impl ObjectQuery<'_> {
         mode: CatFileCmdMode,
     ) -> Result<()> {
         match mode {
-            CatFileCmdMode::Exists => self.print_exists(),
-            CatFileCmdMode::Type => self.print_type(),
-            CatFileCmdMode::Size => self.print_size(),
+            CatFileCmdMode::Exists => self.print_exists(policy),
+            CatFileCmdMode::Type => self.print_type(policy),
+            CatFileCmdMode::Size => self.print_size(policy),
             CatFileCmdMode::Pretty => self.print_pretty(policy),
             // `--textconv`/`--filters` are dispatched to `print_transform` before
             // reaching here (they need the recorded path + mode, not just an oid).
@@ -660,11 +660,23 @@ impl ObjectQuery<'_> {
 
     /// `-e`: existence only. Upstream uses `odb_has_object`, which never parses the object, so
     /// a structurally broken object (bogus type header) still counts as present.
-    fn print_exists(&self) -> Result<()> {
+    fn print_exists(&self, policy: &sley_remote::RemotePolicy) -> Result<()> {
         let (oid, _) = self.resolve_command_oid()?;
         let read_oid = self.view.replacement_oid(&oid)?;
         if self.view.db().contains(&read_oid)? {
             return Ok(());
+        }
+        if self.view.lazy_fetch {
+            match crate::read_object_maybe_prefetch_promisor(
+                policy,
+                self.view.db(),
+                &read_oid,
+                true,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(GitError::NotFound(_)) => {}
+                Err(err) => return Err(err),
+            }
         }
         // Upstream's `-e` exits 1 with no message when the object is absent.
         Err(crate::cli_exit(1))
@@ -672,9 +684,34 @@ impl ObjectQuery<'_> {
 
     /// `-t` / `-s`: read only object info. A missing full-hex oid yields "could not get object
     /// info"; a broken header yields the object-file diagnostics (invalid type / too-long).
-    fn print_header_field(&self, want_type: bool) -> Result<()> {
+    fn print_header_field(
+        &self,
+        policy: &sley_remote::RemotePolicy,
+        want_type: bool,
+    ) -> Result<()> {
         let (oid, is_full_hex) = self.resolve_command_oid()?;
         let read_oid = self.view.replacement_oid(&oid)?;
+        // A broken header is `Err`, not a missing object. Propagating that
+        // with `?` would skip the object-info diagnostic and exit 1.
+        if self.view.lazy_fetch && matches!(self.view.db().read_object_header(&read_oid), Ok(None))
+        {
+            match crate::read_object_maybe_prefetch_promisor(
+                policy,
+                self.view.db(),
+                &read_oid,
+                true,
+            ) {
+                Ok(_) => {}
+                Err(GitError::NotFound(_)) => {}
+                Err(err) => {
+                    return cat_file_object_info_error(
+                        &err,
+                        &read_oid,
+                        CatFileObjectInfoUser::Header,
+                    );
+                }
+            }
+        }
         match self.view.db().read_object_header(&read_oid) {
             Ok(Some((object_type, size))) => {
                 if want_type {
@@ -708,12 +745,12 @@ impl ObjectQuery<'_> {
         }
     }
 
-    fn print_type(&self) -> Result<()> {
-        self.print_header_field(true)
+    fn print_type(&self, policy: &sley_remote::RemotePolicy) -> Result<()> {
+        self.print_header_field(policy, true)
     }
 
-    fn print_size(&self) -> Result<()> {
-        self.print_header_field(false)
+    fn print_size(&self, policy: &sley_remote::RemotePolicy) -> Result<()> {
+        self.print_header_field(policy, false)
     }
 
     /// `-p`: read object info, then emit the body (pretty-printing a tree). Upstream routes a

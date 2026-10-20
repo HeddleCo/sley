@@ -258,10 +258,12 @@ pub(crate) fn cmd_upload_pack(
     // the lone positional argument. Mirrors builtin/upload-pack.c's options.
     let mut repository: Option<&String> = None;
     let mut stateless_rpc = false;
+    let mut advertise_refs = false;
     for arg in args {
         match arg.as_str() {
             "--stateless-rpc" => stateless_rpc = true,
-            "--strict" | "--advertise-refs" | "--http-backend-info-refs" => {}
+            "--advertise-refs" | "--http-backend-info-refs" => advertise_refs = true,
+            "--strict" => {}
             value if value.starts_with("--timeout=") => {}
             value if value.starts_with('-') => {
                 return Err(GitError::Command(format!(
@@ -326,8 +328,12 @@ pub(crate) fn cmd_upload_pack(
     let mut advertisements =
         sley_remote::local_fetch_advertisements(&cli_session.remote_policy, &git_dir, format)?;
     sley_remote::attach_upload_pack_capabilities(&mut advertisements, format, &features)?;
+    let shallow = sley_remote::read_shallow(&git_dir, format)?;
 
-    {
+    // Smart HTTP discovers refs with GET info/refs. `--stateless-rpc` POSTs
+    // must not repeat that advertisement or the client parses a ref line as
+    // an ACK. `--advertise-refs` writes the advertisement and exits.
+    if !stateless_rpc {
         let stdout = io::stdout();
         let mut stdout = stdout.lock();
         write_ref_advertisement_set(
@@ -335,10 +341,13 @@ pub(crate) fn cmd_upload_pack(
             &RefAdvertisementSet {
                 protocol: requested_protocol,
                 refs: advertisements,
-                shallow: Vec::new(),
+                shallow,
             },
         )?;
         stdout.flush()?;
+    }
+    if advertise_refs {
+        return Ok(());
     }
 
     let stdin = io::stdin();
@@ -353,23 +362,52 @@ pub(crate) fn cmd_upload_pack(
         }
         Err(err) => return Err(err),
     };
+    let transfer = sley_remote::prepare_v0_upload_pack_transfer(
+        &cli_session.remote_policy,
+        &git_dir,
+        format,
+        &features,
+        &request,
+    )?;
+    if transfer.deepening {
+        let stdout = io::stdout();
+        let mut stdout = stdout.lock();
+        write_upload_pack_shallow_update(&mut stdout, &transfer.shallow_info)?;
+        stdout.flush()?;
+    }
+
     let mut haves = HashSet::new();
     loop {
-        let negotiation = read_upload_pack_negotiation_request(format, &mut stdin)?;
+        let negotiation = match read_upload_pack_negotiation_request(format, &mut stdin) {
+            Ok(negotiation) => negotiation,
+            Err(GitError::InvalidFormat(message))
+                if stateless_rpc
+                    && message
+                        == "pkt-line stream ended before upload-pack negotiation terminator" =>
+            {
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        };
         haves.extend(negotiation.haves);
         if negotiation.done {
             break;
         }
+        // Without multi_ack the client still flushes have windows and waits
+        // for a NAK before sending the next window.
+        let stdout = io::stdout();
+        let mut stdout = stdout.lock();
+        write_upload_pack_acknowledgment(&mut stdout, &UploadPackAcknowledgment::Nak)?;
+        stdout.flush()?;
     }
 
     let sideband = sley_remote::upload_pack_request_uses_sideband(&request);
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
-    sley_remote::write_upload_pack_from_local_repository(
+    sley_remote::write_prepared_v0_upload_pack(
         &git_dir,
         format,
-        &features,
-        request,
+        &transfer,
         haves,
         sideband,
         &mut stdout,
