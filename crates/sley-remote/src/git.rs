@@ -77,9 +77,9 @@ pub struct GitFetchPackRequest<'a> {
     pub deepen_relative: bool,
     pub filter: Option<&'a sley_odb::PackObjectFilter>,
     pub promisor: bool,
-    /// Historical caller hint. The connection negotiates from
-    /// [`crate::v2_client::client_upload_pack_version`] and the server greeting,
-    /// so this flag does not force protocol v0.
+    /// Historical caller hint. The connection negotiates from the configured
+    /// protocol version and the server greeting, so this flag does not force
+    /// protocol v0.
     pub protocol_v2: bool,
     /// Maximum raw pack bytes to accept from the remote (`fetch.maxInputSize` /
     /// `transfer.maxSize`). `None` means unlimited.
