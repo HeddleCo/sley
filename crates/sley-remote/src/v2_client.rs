@@ -156,6 +156,10 @@ pub(crate) fn wire_protocol_for_service(
     }
 }
 
+/// HTTP `ls-refs`. Does not request `unborn`.
+///
+/// Only the HTTP client calls this, so it is compiled with the `http` feature.
+#[cfg(feature = "http")]
 pub(crate) fn protocol_v2_ls_refs_command_request(
     format: ObjectFormat,
     handshake: &TransportHandshake,
@@ -166,8 +170,7 @@ pub(crate) fn protocol_v2_ls_refs_command_request(
 /// `ls-refs` for a stateful transport.
 ///
 /// Requests `unborn` when the server advertised it, so an empty repository's
-/// symbolic HEAD is visible. HTTP keeps [`protocol_v2_ls_refs_command_request`],
-/// which does not ask for `unborn`.
+/// symbolic HEAD is visible. The HTTP path does not ask for `unborn`.
 pub(crate) fn stateful_v2_ls_refs_command_request(
     format: ObjectFormat,
     handshake: &TransportHandshake,
