@@ -522,4 +522,257 @@ s -C "${SLEY_FILE_PARTIAL}" cat-file -s "${OLD_BLOB}" >/dev/null
 s -C "${SLEY_FILE_PARTIAL}" cat-file -t "${OLD_BLOB}" >/dev/null
 s -C "${SLEY_FILE_PARTIAL}" cat-file -e "${OLD_BLOB}"
 
+# The partial-clone section exports a simple SSH variant, which never sends
+# GIT_PROTOCOL. Protocol v2 tests below select the OpenSSH variant explicitly.
+unset GIT_SSH_VARIANT || true
+
+trace_has_ls_refs() {
+    local trace=$1
+    local label=$2
+    if ! grep -q 'command=ls-refs' "${trace}"; then
+        echo "${label}: packet trace missing command=ls-refs" >&2
+        cat "${trace}" >&2 || true
+        exit 1
+    fi
+}
+
+trace_lacks_ls_refs() {
+    local trace=$1
+    local label=$2
+    if grep -q 'command=ls-refs' "${trace}"; then
+        echo "${label}: packet trace contained command=ls-refs" >&2
+        exit 1
+    fi
+}
+
+say "sley client protocol v2 over ssh against stock upload-pack"
+g -C "${STOCK}" tag -a interop-tag -m 'interop tag' HEAD
+SSH_URL="ssh://git@127.0.0.1${STOCK}"
+SLEY_V2_LS=${ROOT}/sley-ssh-v2-ls
+STOCK_V2_LS=${ROOT}/stock-v2-ls
+SSH_V2_TRACE=${ROOT}/ssh-v2-ls.trace
+GIT_TRACE_PACKET="${SSH_V2_TRACE}" GIT_SSH_COMMAND="${FAKE_SSH}" GIT_SSH_VARIANT=ssh \
+    s ls-remote "${SSH_URL}" >"${SLEY_V2_LS}"
+g ls-remote "${STOCK}" >"${STOCK_V2_LS}"
+diff -u "${STOCK_V2_LS}" "${SLEY_V2_LS}"
+trace_has_ls_refs "${SSH_V2_TRACE}" "ssh v2 ls-remote"
+grep -F -q 'refs/tags/interop-tag' "${SLEY_V2_LS}"
+
+SLEY_SSH_V2=${ROOT}/sley-ssh-v2
+SSH_V2_CLONE_TRACE=${ROOT}/ssh-v2-clone.trace
+GIT_TRACE_PACKET="${SSH_V2_CLONE_TRACE}" GIT_SSH_COMMAND="${FAKE_SSH}" GIT_SSH_VARIANT=ssh \
+    s clone -q -u "${GU}" "${SSH_URL}" "${SLEY_SSH_V2}"
+trace_has_ls_refs "${SSH_V2_CLONE_TRACE}" "ssh v2 clone"
+same_commit "${SLEY_SSH_V2}" "${WT}" "ssh v2 clone"
+
+STOCK_WT=${ROOT}/stock-wt
+g clone -q "${STOCK}" "${STOCK_WT}"
+printf 'v2fetch\n' >"${STOCK_WT}/v2fetch"
+g -C "${STOCK_WT}" add v2fetch
+GIT_AUTHOR_DATE="${EQUAL}" GIT_COMMITTER_DATE="${EQUAL}" \
+    g -C "${STOCK_WT}" -c commit.gpgsign=false commit -qm v2fetch
+g -C "${STOCK_WT}" push -q origin HEAD:refs/heads/main
+SSH_V2_FETCH_TRACE=${ROOT}/ssh-v2-fetch.trace
+GIT_TRACE_PACKET="${SSH_V2_FETCH_TRACE}" GIT_SSH_COMMAND="${FAKE_SSH}" GIT_SSH_VARIANT=ssh \
+    s -C "${SLEY_SSH_V2}" fetch -q origin
+trace_has_ls_refs "${SSH_V2_FETCH_TRACE}" "ssh v2 fetch"
+test "$(g -C "${SLEY_SSH_V2}" rev-parse origin/main)" = "$(g -C "${STOCK_WT}" rev-parse HEAD)"
+
+SLEY_SSH_SHALLOW=${ROOT}/sley-ssh-shallow
+SSH_SHALLOW_TRACE=${ROOT}/ssh-shallow.trace
+GIT_TRACE_PACKET="${SSH_SHALLOW_TRACE}" GIT_SSH_COMMAND="${FAKE_SSH}" GIT_SSH_VARIANT=ssh \
+    s clone -q --depth=1 -u "${GU}" "${SSH_URL}" "${SLEY_SSH_SHALLOW}"
+trace_has_ls_refs "${SSH_SHALLOW_TRACE}" "ssh v2 shallow clone"
+test "$(g -C "${SLEY_SSH_SHALLOW}" rev-list --count HEAD)" = 1
+
+SLEY_SSH_V2_PARTIAL=${ROOT}/sley-ssh-v2-partial
+SSH_PARTIAL_TRACE=${ROOT}/ssh-v2-partial.trace
+GIT_TRACE_PACKET="${SSH_PARTIAL_TRACE}" GIT_SSH_COMMAND="${FAKE_SSH}" GIT_SSH_VARIANT=ssh \
+    s clone -q --filter=blob:none -u "${GU}" "${SSH_URL}" "${SLEY_SSH_V2_PARTIAL}"
+trace_has_ls_refs "${SSH_PARTIAL_TRACE}" "ssh v2 partial clone"
+test -f "${SLEY_SSH_V2_PARTIAL}/a"
+if GIT_NO_LAZY_FETCH=1 g -C "${SLEY_SSH_V2_PARTIAL}" cat-file -e "${OLD_BLOB}" >/dev/null 2>&1; then
+    echo "ssh v2 partial clone contained historical blob ${OLD_BLOB}" >&2
+    exit 1
+fi
+GIT_SSH_COMMAND="${FAKE_SSH}" GIT_SSH_VARIANT=ssh \
+    s -C "${SLEY_SSH_V2_PARTIAL}" cat-file -s "${OLD_BLOB}" >/dev/null
+
+say "ssh protocol.version and GIT_PROTOCOL overrides"
+SSH_V0_TRACE=${ROOT}/ssh-v0-config.trace
+GIT_TRACE_PACKET="${SSH_V0_TRACE}" GIT_SSH_COMMAND="${FAKE_SSH}" GIT_SSH_VARIANT=ssh \
+    s -c protocol.version=0 ls-remote "${SSH_URL}" >"${ROOT}/sley-ssh-v0-ls"
+trace_lacks_ls_refs "${SSH_V0_TRACE}" "ssh protocol.version=0"
+diff -u <(g -c protocol.version=0 ls-remote "${STOCK}") "${ROOT}/sley-ssh-v0-ls"
+
+SSH_ENV_V0_TRACE=${ROOT}/ssh-env-v0.trace
+GIT_PROTOCOL=version=0 GIT_TRACE_PACKET="${SSH_ENV_V0_TRACE}" \
+    GIT_SSH_COMMAND="${FAKE_SSH}" GIT_SSH_VARIANT=ssh \
+    s ls-remote "${SSH_URL}" >/dev/null
+trace_lacks_ls_refs "${SSH_ENV_V0_TRACE}" "GIT_PROTOCOL=version=0"
+
+SSH_ENV_V2_TRACE=${ROOT}/ssh-env-v2.trace
+GIT_PROTOCOL=version=2 GIT_TRACE_PACKET="${SSH_ENV_V2_TRACE}" \
+    GIT_SSH_COMMAND="${FAKE_SSH}" GIT_SSH_VARIANT=ssh \
+    s -c protocol.version=0 ls-remote "${SSH_URL}" >/dev/null
+trace_has_ls_refs "${SSH_ENV_V2_TRACE}" "GIT_PROTOCOL overrides protocol.version=0"
+
+SLEY_SSH_V1=${ROOT}/sley-ssh-v1
+SSH_V1_TRACE=${ROOT}/ssh-v1.trace
+GIT_TRACE_PACKET="${SSH_V1_TRACE}" GIT_SSH_COMMAND="${FAKE_SSH}" GIT_SSH_VARIANT=ssh \
+    s -c protocol.version=1 clone -q -u "${GU}" "${SSH_URL}" "${SLEY_SSH_V1}"
+trace_lacks_ls_refs "${SSH_V1_TRACE}" "ssh protocol.version=1"
+same_commit "${SLEY_SSH_V1}" "${STOCK_WT}" "ssh protocol.version=1 clone"
+
+say "ssh v2 request falls back when stock upload-pack speaks v0"
+V0_UP=${ROOT}/v0-upload-pack
+cat >"${V0_UP}" <<EOF
+#!/bin/sh
+unset GIT_PROTOCOL
+exec "${GU}" "\$@"
+EOF
+chmod +x "${V0_UP}"
+SLEY_SSH_FALLBACK=${ROOT}/sley-ssh-v0-fallback
+SSH_FALLBACK_TRACE=${ROOT}/ssh-v0-fallback.trace
+GIT_TRACE_PACKET="${SSH_FALLBACK_TRACE}" GIT_SSH_COMMAND="${FAKE_SSH}" GIT_SSH_VARIANT=ssh \
+    s clone -q -u "${V0_UP}" "${SSH_URL}" "${SLEY_SSH_FALLBACK}"
+trace_lacks_ls_refs "${SSH_FALLBACK_TRACE}" "ssh v0 fallback"
+same_commit "${SLEY_SSH_FALLBACK}" "${STOCK_WT}" "ssh v0 fallback clone"
+SSH_FALLBACK_SHALLOW=${ROOT}/sley-ssh-v0-fallback-shallow
+GIT_SSH_COMMAND="${FAKE_SSH}" GIT_SSH_VARIANT=ssh \
+    s -c protocol.version=0 clone -q --depth=1 -u "${GU}" "${SSH_URL}" "${SSH_FALLBACK_SHALLOW}"
+test "$(g -C "${SSH_FALLBACK_SHALLOW}" rev-list --count HEAD)" = 1
+
+printf 'from-sley\n' >"${SLEY_SSH_V2}/from-sley"
+s -C "${SLEY_SSH_V2}" add from-sley
+GIT_AUTHOR_DATE="${EQUAL}" GIT_COMMITTER_DATE="${EQUAL}" \
+    s -C "${SLEY_SSH_V2}" -c user.name='Interop User' -c user.email='interop@example.invalid' \
+    -c commit.gpgsign=false commit -qm from-sley
+GR="$(dirname "${GU}")/git-receive-pack"
+SSH_PUSH_TRACE=${ROOT}/ssh-push.trace
+GIT_TRACE_PACKET="${SSH_PUSH_TRACE}" GIT_SSH_COMMAND="${FAKE_SSH}" GIT_SSH_VARIANT=ssh \
+    s -C "${SLEY_SSH_V2}" push -q --receive-pack="${GR}" origin HEAD:refs/heads/from-sley
+trace_lacks_ls_refs "${SSH_PUSH_TRACE}" "ssh push stays v0"
+test "$(g -C "${STOCK}" rev-parse from-sley)" = "$(g -C "${SLEY_SSH_V2}" rev-parse HEAD)"
+
+say "sley client protocol v2 over git:// against stock git daemon"
+DPORT=$(free_port)
+DAEMON_LOG=${ROOT}/stock-daemon.log
+"${GIT}" daemon --listen=127.0.0.1 --port="${DPORT}" --export-all --reuseaddr \
+    --informative-errors --verbose --base-path="${ROOT}" "${ROOT}" >"${DAEMON_LOG}" 2>&1 &
+DAEMON_PID=$!
+wait_for_log "${DAEMON_PID}" "${DAEMON_LOG}" "Ready to rumble"
+GIT_URL="git://127.0.0.1:${DPORT}/stock.git"
+GIT_V2_TRACE=${ROOT}/git-v2-ls.trace
+GIT_TRACE_PACKET="${GIT_V2_TRACE}" s ls-remote "${GIT_URL}" >"${ROOT}/sley-git-v2-ls"
+g ls-remote "${STOCK}" >"${ROOT}/stock-git-v2-ls"
+diff -u "${ROOT}/stock-git-v2-ls" "${ROOT}/sley-git-v2-ls"
+trace_has_ls_refs "${GIT_V2_TRACE}" "git:// v2 ls-remote"
+
+SLEY_GIT_V2=${ROOT}/sley-git-v2
+GIT_V2_CLONE_TRACE=${ROOT}/git-v2-clone.trace
+GIT_TRACE_PACKET="${GIT_V2_CLONE_TRACE}" s clone -q "${GIT_URL}" "${SLEY_GIT_V2}"
+trace_has_ls_refs "${GIT_V2_CLONE_TRACE}" "git:// v2 clone"
+same_commit "${SLEY_GIT_V2}" "${STOCK_WT}" "git:// v2 clone"
+GIT_V2_FETCH_TRACE=${ROOT}/git-v2-fetch.trace
+printf 'daemon-fetch\n' >"${STOCK_WT}/daemon-fetch"
+g -C "${STOCK_WT}" add daemon-fetch
+GIT_AUTHOR_DATE="${EQUAL}" GIT_COMMITTER_DATE="${EQUAL}" \
+    g -C "${STOCK_WT}" -c commit.gpgsign=false commit -qm daemon-fetch
+g -C "${STOCK_WT}" push -q origin HEAD:refs/heads/main
+GIT_TRACE_PACKET="${GIT_V2_FETCH_TRACE}" s -C "${SLEY_GIT_V2}" fetch -q origin
+trace_has_ls_refs "${GIT_V2_FETCH_TRACE}" "git:// v2 fetch"
+test "$(g -C "${SLEY_GIT_V2}" rev-parse origin/main)" = "$(g -C "${STOCK_WT}" rev-parse HEAD)"
+
+SLEY_GIT_SHALLOW=${ROOT}/sley-git-shallow
+GIT_SHALLOW_TRACE=${ROOT}/git-shallow.trace
+GIT_TRACE_PACKET="${GIT_SHALLOW_TRACE}" \
+    s clone -q --depth=1 "${GIT_URL}" "${SLEY_GIT_SHALLOW}"
+trace_has_ls_refs "${GIT_SHALLOW_TRACE}" "git:// v2 shallow clone"
+test "$(g -C "${SLEY_GIT_SHALLOW}" rev-list --count HEAD)" = 1
+
+SLEY_GIT_PARTIAL=${ROOT}/sley-git-partial
+GIT_PARTIAL_TRACE=${ROOT}/git-partial.trace
+GIT_TRACE_PACKET="${GIT_PARTIAL_TRACE}" \
+    s clone -q --filter=blob:none "${GIT_URL}" "${SLEY_GIT_PARTIAL}"
+trace_has_ls_refs "${GIT_PARTIAL_TRACE}" "git:// v2 partial clone"
+test -f "${SLEY_GIT_PARTIAL}/a"
+if GIT_NO_LAZY_FETCH=1 g -C "${SLEY_GIT_PARTIAL}" cat-file -e "${OLD_BLOB}" >/dev/null 2>&1; then
+    echo "git:// v2 partial clone contained historical blob ${OLD_BLOB}" >&2
+    exit 1
+fi
+
+GIT_V0_CFG_TRACE=${ROOT}/git-v0-config.trace
+GIT_TRACE_PACKET="${GIT_V0_CFG_TRACE}" \
+    s -c protocol.version=0 ls-remote "${GIT_URL}" >"${ROOT}/sley-git-v0-ls"
+trace_lacks_ls_refs "${GIT_V0_CFG_TRACE}" "git:// protocol.version=0"
+diff -u <(g -c protocol.version=0 ls-remote "${STOCK}") "${ROOT}/sley-git-v0-ls"
+
+kill "${DAEMON_PID}" 2>/dev/null || true
+wait "${DAEMON_PID}" 2>/dev/null || true
+DAEMON_PID=
+
+say "git:// v2 request falls back when stock upload-pack speaks v0"
+V0_EXEC=${ROOT}/v0-stock-exec
+mkdir -p "${V0_EXEC}"
+STOCK_EXEC_PATH="$("${GIT}" --exec-path)"
+for helper in "${STOCK_EXEC_PATH}/"*; do
+    ln -s "${helper}" "${V0_EXEC}/$(basename "${helper}")"
+done
+rm -f "${V0_EXEC}/git" "${V0_EXEC}/git-upload-pack"
+# git-daemon runs the upload-pack builtin via `git upload-pack`, resolved
+# from GIT_EXEC_PATH. Strip the client's version=2 before that builtin.
+cat >"${V0_EXEC}/git" <<EOF
+#!/bin/sh
+if [ "\$1" = "upload-pack" ]; then
+    unset GIT_PROTOCOL
+fi
+exec "${GIT}" "\$@"
+EOF
+chmod +x "${V0_EXEC}/git"
+cat >"${V0_EXEC}/git-upload-pack" <<EOF
+#!/bin/sh
+unset GIT_PROTOCOL
+exec "${GU}" "\$@"
+EOF
+chmod +x "${V0_EXEC}/git-upload-pack"
+DPORT=$(free_port)
+DAEMON_LOG=${ROOT}/stock-v0-daemon.log
+GIT_EXEC_PATH="${V0_EXEC}" "${GIT}" daemon --listen=127.0.0.1 --port="${DPORT}" \
+    --export-all --reuseaddr --informative-errors --verbose \
+    --base-path="${ROOT}" "${ROOT}" >"${DAEMON_LOG}" 2>&1 &
+DAEMON_PID=$!
+wait_for_log "${DAEMON_PID}" "${DAEMON_LOG}" "Ready to rumble"
+GIT_URL="git://127.0.0.1:${DPORT}/stock.git"
+SLEY_GIT_FALLBACK=${ROOT}/sley-git-v0-fallback
+GIT_FALLBACK_TRACE=${ROOT}/git-v0-fallback.trace
+GIT_TRACE_PACKET="${GIT_FALLBACK_TRACE}" s clone -q "${GIT_URL}" "${SLEY_GIT_FALLBACK}"
+trace_lacks_ls_refs "${GIT_FALLBACK_TRACE}" "git:// v0 fallback"
+same_commit "${SLEY_GIT_FALLBACK}" "${STOCK_WT}" "git:// v0 fallback clone"
+kill "${DAEMON_PID}" 2>/dev/null || true
+wait "${DAEMON_PID}" 2>/dev/null || true
+DAEMON_PID=
+
+say "stock git client protocol v2 over ssh against sley upload-pack"
+STOCK_SSH_V2=${ROOT}/stock-ssh-v2
+STOCK_SSH_TRACE=${ROOT}/stock-ssh-v2.trace
+GIT_TRACE_PACKET="${STOCK_SSH_TRACE}" GIT_SSH_COMMAND="${FAKE_SSH}" GIT_SSH_VARIANT=ssh \
+    g clone -q -u "${UPLOAD}" "ssh://git@127.0.0.1${SRV}" "${STOCK_SSH_V2}"
+trace_has_ls_refs "${STOCK_SSH_TRACE}" "stock ssh client v2"
+# WT moved on (the a2 commit) without being pushed to SRV. The clone must
+# match the server it talked to.
+same_commit "${STOCK_SSH_V2}" "${SRV}" "stock ssh v2 clone"
+s -C "${WT}" push -q "${SRV}" main
+STOCK_SSH_FETCH_TRACE=${ROOT}/stock-ssh-v2-fetch.trace
+GIT_TRACE_PACKET="${STOCK_SSH_FETCH_TRACE}" GIT_SSH_COMMAND="${FAKE_SSH}" GIT_SSH_VARIANT=ssh \
+    g -C "${STOCK_SSH_V2}" fetch -q --upload-pack="${UPLOAD}" origin
+trace_has_ls_refs "${STOCK_SSH_FETCH_TRACE}" "stock ssh client v2 fetch"
+test "$(g -C "${STOCK_SSH_V2}" rev-parse origin/main)" = "$(g -C "${SRV}" rev-parse HEAD)"
+STOCK_SSH_V0=${ROOT}/stock-ssh-v0
+STOCK_SSH_V0_TRACE=${ROOT}/stock-ssh-v0.trace
+GIT_TRACE_PACKET="${STOCK_SSH_V0_TRACE}" GIT_SSH_COMMAND="${FAKE_SSH}" GIT_SSH_VARIANT=ssh \
+    g -c protocol.version=0 clone -q -u "${UPLOAD}" "ssh://git@127.0.0.1${SRV}" "${STOCK_SSH_V0}"
+trace_lacks_ls_refs "${STOCK_SSH_V0_TRACE}" "stock ssh client v0"
+same_commit "${STOCK_SSH_V0}" "${SRV}" "stock ssh v0 clone"
+
 say "interop ok"

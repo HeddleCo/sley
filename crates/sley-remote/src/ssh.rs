@@ -31,8 +31,12 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::install::{
-    ProgressInstaller, install_upload_pack_raw_promisor_response_from_reader_with_cancel,
+    ProgressInstaller, emit_remote_sideband_progress,
+    install_protocol_v2_fetch_promisor_response_from_reader_with_cancel,
+    install_protocol_v2_fetch_response_from_reader_with_cancel,
+    install_upload_pack_raw_promisor_response_from_reader_with_cancel,
     install_upload_pack_raw_response_from_reader_with_cancel,
+    shallow_info_from_protocol_v2_fetch_header,
 };
 use sley_config::GitConfig;
 use sley_core::{
@@ -45,7 +49,7 @@ use sley_protocol::{
     GitService, ProtocolV2FetchShallowInfo, ProtocolVersion, ReceivePackCommand,
     ReceivePackFeatures, RefAdvertisement, TransportLimits, UploadPackFeatures,
     UploadPackNegotiationRequest, UploadPackRequest, parse_receive_pack_features,
-    parse_upload_pack_features, read_ref_advertisement_set, read_to_end_bounded,
+    protocol_v2_object_format, read_ref_advertisement_set, read_to_end_bounded,
     write_upload_pack_negotiation_request, write_upload_pack_request,
 };
 use sley_refs::FileRefStore;
@@ -78,8 +82,7 @@ pub fn ssh_transport_options_from_config(config: &GitConfig) -> SshTransportOpti
             .get("ssh", None, "variant")
             .and_then(ssh_variant_from_config_value),
         ip_version: None,
-        protocol: (config.get("protocol", None, "version") == Some("1"))
-            .then_some(ProtocolVersion::V1),
+        protocol: Some(crate::v2_client::client_upload_pack_version(Some(config))),
     }
 }
 
@@ -114,7 +117,11 @@ fn ssh_process_command_for_remote(
     }
     let (program, mut args) = ssh_program_and_prefix_args()?;
     let variant = ssh_command_variant(&program, options.variant);
-    let (protocol_args, protocol_env) = ssh_protocol_command_metadata(variant, options.protocol);
+    let requested = options
+        .protocol
+        .unwrap_or_else(|| crate::v2_client::client_upload_pack_version(None));
+    let wire = crate::v2_client::wire_protocol_for_service(service, requested);
+    let (protocol_args, protocol_env) = ssh_protocol_command_metadata(variant, wire);
     args.extend(protocol_args);
     args.extend(ssh_process_args_with_ip_and_command(
         remote,
@@ -135,13 +142,22 @@ fn ssh_protocol_command_metadata(
     variant: SshCommandVariant,
     protocol: Option<ProtocolVersion>,
 ) -> (Vec<String>, Vec<(String, String)>) {
-    if variant == SshCommandVariant::OpenSsh && protocol == Some(ProtocolVersion::V1) {
-        return (
-            vec!["-o".into(), "SendEnv=GIT_PROTOCOL".into()],
-            vec![("GIT_PROTOCOL".into(), "version=1".into())],
-        );
+    let Some(protocol) = protocol else {
+        return (Vec::new(), Vec::new());
+    };
+    let Some(value) = crate::v2_client::git_protocol_environment_value(protocol) else {
+        return (Vec::new(), Vec::new());
+    };
+    // Stock git's `push_ssh_options` adds `SendEnv=GIT_PROTOCOL` only for the
+    // OpenSSH variant. Plink and simple cannot pass the variable, so the
+    // server speaks v0 and the client falls back from the greeting.
+    if variant != SshCommandVariant::OpenSsh {
+        return (Vec::new(), Vec::new());
     }
-    (Vec::new(), Vec::new())
+    (
+        vec!["-o".into(), "SendEnv=GIT_PROTOCOL".into()],
+        vec![("GIT_PROTOCOL".into(), value.into())],
+    )
 }
 
 struct ServiceProcessCommand {
@@ -490,7 +506,7 @@ fn spawn_service_process(
     let mut process = ProcessCommand::new(&command.program);
     process
         .args(&command.args)
-        .envs(command.env)
+        .envs(command.env.iter().cloned())
         .env_remove("GIT_EXEC_PATH")
         .stdin(if keep_stdin || command.git_request.is_some() {
             Stdio::piped()
@@ -499,6 +515,9 @@ fn spawn_service_process(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if !command.env.iter().any(|(key, _)| key == "GIT_PROTOCOL") {
+        process.env_remove("GIT_PROTOCOL");
+    }
     // Export effective `-c` / `GIT_CONFIG_PARAMETERS` so child upload-pack /
     // receive-pack processes inherit hideRefs and other overrides the parent
     // received on the command line (git mutates the real env; we cannot).
@@ -884,46 +903,17 @@ pub(crate) fn ls_remote_ssh(
     remote: &RemoteUrl,
     filter: &crate::ls_remote::LsRemoteFilter,
     matches: &dyn Fn(&str) -> bool,
+    config: Option<&GitConfig>,
 ) -> Result<(Vec<crate::ls_remote::LsRemoteRecord>, ObjectFormat)> {
-    if !matches!(
-        remote.transport,
-        RemoteTransport::Ssh | RemoteTransport::Ext
-    ) {
-        return Err(GitError::InvalidFormat(
-            "SSH upload-pack requires an SSH remote".into(),
-        ));
-    }
-    let (mut child, _stdin, mut stdout, stderr_drain) = spawn_service_process(
-        remote,
-        GitService::UploadPack,
-        false,
-        SshTransportOptions::default(),
-        None,
-    )?;
-    let set_result = read_ref_advertisement_set(ObjectFormat::Sha1, &mut stdout);
-    let status = child.wait()?;
-    let stderr = stderr_drain.finish();
-    let set = match set_result {
-        Ok(set) => set,
-        Err(err) if is_ssh_protocol_v2_advertisement_error(&err) => {
-            return Err(ssh_protocol_v2_unsupported_error());
-        }
-        Err(_) if !status.success() => {
-            return Err(GitError::Command(format!(
-                "ssh upload-pack failed for {}: {}",
-                ssh_remote_display(remote),
-                ssh_command_failure_message("ssh upload-pack", &stderr, status)
-            )));
-        }
-        Err(err) => return Err(err),
+    let options = match config {
+        Some(config) => ssh_transport_options_from_config(config),
+        None => SshTransportOptions::default(),
     };
-    let features = set
-        .refs
-        .first()
-        .map(|advertisement| parse_upload_pack_features(&advertisement.capabilities))
-        .transpose()?
-        .unwrap_or_default();
+    let discovered =
+        read_ssh_upload_pack_discovery(remote, Some(ObjectFormat::Sha1), options, None)?;
+    let features = discovered.features;
     let format = features.object_format.unwrap_or(ObjectFormat::Sha1);
+    let set_refs = discovered.refs;
     if format != ObjectFormat::Sha1 {
         return Err(GitError::Unsupported(format!(
             "ssh ls-remote currently supports SHA-1 advertisements, got {}",
@@ -937,7 +927,7 @@ pub(crate) fn ls_remote_ssh(
         .map(|(name, target)| (name.to_string(), target.to_string()))
         .collect::<HashMap<_, _>>();
     let mut records = Vec::new();
-    for advertisement in set.refs {
+    for advertisement in set_refs {
         if advertisement.oid.is_null() {
             continue;
         }
@@ -1017,24 +1007,15 @@ pub fn install_fetch_pack_via_ssh_upload_pack(
         return Ok(Vec::new());
     }
     let local_db = FileObjectDatabase::from_git_dir(request.git_dir, request.format);
-    // A deepen request must always reach the server (the shallow boundary may move
-    // even when every wanted object is already present), so only the plain fetch
-    // takes the "everything is local already" shortcut.
-    if request.deepen.is_none() && all_wants_present(&local_db, &request.wants)? {
+    // A deepen or filtered request must always reach the server (the shallow
+    // boundary may move, and a filter can omit blobs of commits already present),
+    // so only the plain fetch takes the "everything is local already" shortcut.
+    if request.deepen.is_none()
+        && request.filter.is_none()
+        && all_wants_present(&local_db, &request.wants)?
+    {
         return Ok(Vec::new());
     }
-    let filter = request
-        .filter
-        .filter(|_| request.features.filter)
-        .and_then(crate::local::upload_pack_filter_protocol_spec);
-    let upload_request = UploadPackRequest {
-        wants: request.wants,
-        capabilities: ssh_request_capabilities(request.deepen, filter.is_some()),
-        shallow: request.shallow,
-        deepen: request.deepen,
-        filter,
-        ..UploadPackRequest::default()
-    };
     let haves = request.haves.clone().map(Ok).unwrap_or_else(|| {
         crate::local::local_have_oids(policy, request.git_dir, request.format)
     })?;
@@ -1048,50 +1029,130 @@ pub fn install_fetch_pack_via_ssh_upload_pack(
     let mut stdin =
         stdin.ok_or_else(|| GitError::Command("ssh upload-pack stdin was not piped".into()))?;
 
-    read_ref_advertisement_set(request.format, &mut stdout)?;
-    write_upload_pack_request(&mut stdin, Some(&upload_request))?;
-    stdin.flush()?;
-    // A deepen request is stateful: the server writes shallow/unshallow and a
-    // flush before it will read haves. Consume that section first so a large
-    // have list cannot fill the pipe while the server blocks on stdout.
-    let prefetched_shallow = if request.deepen.is_some() {
-        Some(sley_protocol::read_upload_pack_shallow_info_section(
-            request.format,
-            &mut stdout,
-        )?)
-    } else {
-        None
+    let greeting =
+        crate::v2_client::read_stateful_upload_pack_greeting(request.format, &mut stdout)?;
+    enum PreparedSshFetch {
+        V2 {
+            sideband_all: bool,
+        },
+        Legacy {
+            shallow_info: Vec<ProtocolV2FetchShallowInfo>,
+        },
+    }
+    let prepared = match greeting {
+        crate::v2_client::StatefulUploadPackGreeting::V2(handshake) => {
+            let remote_format = protocol_v2_object_format(&handshake.capabilities)?;
+            if remote_format != request.format {
+                return Err(GitError::InvalidObjectId(format!(
+                    "remote repository uses {}, local repository uses {}",
+                    remote_format.name(),
+                    request.format.name()
+                )));
+            }
+            let sideband_all = crate::v2_client::write_stateful_v2_fetch(
+                &mut stdin,
+                crate::v2_client::StatefulV2FetchParams {
+                    format: request.format,
+                    handshake: &handshake,
+                    wants: request.wants.clone(),
+                    want_refs: Vec::new(),
+                    haves,
+                    shallow: request.shallow.clone(),
+                    deepen: request.deepen,
+                    deepen_since: None,
+                    deepen_not: Vec::new(),
+                    deepen_relative: false,
+                    filter: request.filter,
+                    packfile_uri_protocols: None,
+                },
+            )?;
+            stdin.flush()?;
+            drop(stdin);
+            PreparedSshFetch::V2 { sideband_all }
+        }
+        crate::v2_client::StatefulUploadPackGreeting::Legacy(set) => {
+            let advertised = crate::v2_client::legacy_upload_pack_features(&set.refs)?;
+            let filter = request
+                .filter
+                .filter(|_| advertised.filter)
+                .and_then(crate::local::upload_pack_filter_protocol_spec);
+            let upload_request = UploadPackRequest {
+                wants: request.wants.clone(),
+                capabilities: ssh_request_capabilities(request.deepen, filter.is_some()),
+                shallow: request.shallow.clone(),
+                deepen: request.deepen,
+                filter,
+                ..UploadPackRequest::default()
+            };
+            write_upload_pack_request(&mut stdin, Some(&upload_request))?;
+            stdin.flush()?;
+            // A deepen request is stateful: the server writes shallow/unshallow and a
+            // flush before it will read haves. Consume that section first so a large
+            // have list cannot fill the pipe while the server blocks on stdout.
+            let shallow_info = if request.deepen.is_some() {
+                sley_protocol::read_upload_pack_shallow_info_section(request.format, &mut stdout)?
+            } else {
+                Vec::new()
+            };
+            write_upload_pack_negotiation_request(
+                &mut stdin,
+                &UploadPackNegotiationRequest { haves, done: true },
+            )?;
+            drop(stdin);
+            PreparedSshFetch::Legacy { shallow_info }
+        }
     };
-    write_upload_pack_negotiation_request(
-        &mut stdin,
-        &UploadPackNegotiationRequest { haves, done: true },
-    )?;
-    drop(stdin);
 
     // Share the child with a cancel watcher so a mid-transfer cancel can kill
     // the ssh process and wake a blocked stdout read (CancellableRead alone only
     // polls between successful user-space reads).
     let child = Arc::new(Mutex::new(child));
-    let install_result = with_ssh_child_cancel_watch(&child, cancel, || {
-        let shallow_info = prefetched_shallow.unwrap_or_default();
-        if request.promisor {
-            install_upload_pack_raw_promisor_response_from_reader_with_cancel(
-                request.format,
-                &mut stdout,
-                &local_db,
-                request.max_input_size,
-                cancel,
-            )
-            .map(|_| shallow_info)
-        } else {
-            install_upload_pack_raw_response_from_reader_with_cancel(
-                request.format,
-                &mut stdout,
-                &ProgressInstaller::new(&local_db, progress),
-                request.max_input_size,
-                cancel,
-            )
-            .map(|_| shallow_info)
+    let install_result = with_ssh_child_cancel_watch(&child, cancel, || match prepared {
+        PreparedSshFetch::V2 { sideband_all } => {
+            let (header, _) = if request.promisor {
+                install_protocol_v2_fetch_promisor_response_from_reader_with_cancel(
+                    request.format,
+                    &mut stdout,
+                    sideband_all,
+                    &local_db,
+                    request.max_input_size,
+                    cancel,
+                    Some(&mut |chunk: &[u8]| emit_remote_sideband_progress(&mut *progress, chunk)),
+                )?
+            } else {
+                let installer = ProgressInstaller::new(&local_db, progress);
+                install_protocol_v2_fetch_response_from_reader_with_cancel(
+                    request.format,
+                    &mut stdout,
+                    sideband_all,
+                    &installer,
+                    request.max_input_size,
+                    cancel,
+                    Some(&mut installer.remote_sideband_forwarder()),
+                )?
+            };
+            Ok(shallow_info_from_protocol_v2_fetch_header(&header))
+        }
+        PreparedSshFetch::Legacy { shallow_info } => {
+            if request.promisor {
+                install_upload_pack_raw_promisor_response_from_reader_with_cancel(
+                    request.format,
+                    &mut stdout,
+                    &local_db,
+                    request.max_input_size,
+                    cancel,
+                )
+                .map(|_| shallow_info)
+            } else {
+                install_upload_pack_raw_response_from_reader_with_cancel(
+                    request.format,
+                    &mut stdout,
+                    &ProgressInstaller::new(&local_db, progress),
+                    request.max_input_size,
+                    cancel,
+                )
+                .map(|_| shallow_info)
+            }
         }
     });
 
@@ -1183,50 +1244,23 @@ pub fn ssh_upload_pack_advertisements_with_command(
     options: SshTransportOptions,
     upload_pack_command: Option<&str>,
 ) -> Result<(Vec<RefAdvertisement>, UploadPackFeatures)> {
-    if !matches!(
-        remote.transport,
-        RemoteTransport::Ssh | RemoteTransport::Ext
-    ) {
-        return Err(GitError::InvalidFormat(
-            "SSH upload-pack requires an SSH remote".into(),
-        ));
-    }
-    let (mut child, _stdin, mut stdout, stderr_drain) = spawn_service_process(
-        remote,
-        GitService::UploadPack,
-        false,
-        options,
-        upload_pack_command,
-    )?;
-    let set_result = read_ref_advertisement_set(format, &mut stdout);
-    let status = child.wait()?;
-    let stderr = stderr_drain.finish();
-    let set = match set_result {
-        Ok(set) => set,
-        Err(err) if is_ssh_protocol_v2_advertisement_error(&err) => {
-            return Err(ssh_protocol_v2_unsupported_error());
-        }
-        Err(_) if !status.success() => {
-            return Err(GitError::Command(format!(
-                "ssh upload-pack failed for {}: {}",
-                ssh_remote_display(remote),
-                ssh_command_failure_message("ssh upload-pack", &stderr, status)
-            )));
-        }
-        Err(err) => return Err(err),
-    };
-    let features = set
-        .refs
-        .first()
-        .map(|advertisement| parse_upload_pack_features(&advertisement.capabilities))
-        .transpose()?
-        .unwrap_or_default();
-    Ok((set.refs, features))
+    let discovered =
+        read_ssh_upload_pack_discovery(remote, Some(format), options, upload_pack_command)?;
+    Ok((discovered.refs, discovered.features))
 }
 
 /// Discover upload-pack capabilities and object format before creating a clone.
 pub fn discover_ssh_upload_pack_advertisements_with_command(
     remote: &RemoteUrl,
+    options: SshTransportOptions,
+    upload_pack_command: Option<&str>,
+) -> Result<SshUploadPackDiscovery> {
+    read_ssh_upload_pack_discovery(remote, None, options, upload_pack_command)
+}
+
+fn read_ssh_upload_pack_discovery(
+    remote: &RemoteUrl,
+    format: Option<ObjectFormat>,
     options: SshTransportOptions,
     upload_pack_command: Option<&str>,
 ) -> Result<SshUploadPackDiscovery> {
@@ -1238,40 +1272,101 @@ pub fn discover_ssh_upload_pack_advertisements_with_command(
             "SSH upload-pack requires an SSH remote".into(),
         ));
     }
-    let (mut child, _stdin, mut stdout, stderr_drain) = spawn_service_process(
+    let (mut child, stdin, mut stdout, stderr_drain) = spawn_service_process(
         remote,
         GitService::UploadPack,
-        false,
+        true,
         options,
         upload_pack_command,
     )?;
-    let set_result = crate::read_discovered_upload_pack_advertisements(&mut stdout);
+    let stdin =
+        stdin.ok_or_else(|| GitError::Command("ssh upload-pack stdin was not piped".into()))?;
+    let discovered = match format {
+        Some(format) => {
+            match crate::v2_client::read_stateful_upload_pack_greeting(format, &mut stdout) {
+                Ok(crate::v2_client::StatefulUploadPackGreeting::V2(handshake)) => {
+                    finish_ssh_v2_ls_refs(stdin, &mut stdout, format, &handshake)
+                }
+                Ok(crate::v2_client::StatefulUploadPackGreeting::Legacy(set)) => {
+                    drop(stdin);
+                    match crate::v2_client::legacy_upload_pack_features(&set.refs) {
+                        Ok(features) => Ok(SshUploadPackDiscovery {
+                            refs: set.refs,
+                            features,
+                            object_format: format,
+                        }),
+                        Err(err) => Err(err),
+                    }
+                }
+                Err(err) => {
+                    drop(stdin);
+                    Err(err)
+                }
+            }
+        }
+        None => {
+            match crate::v2_client::read_discovered_stateful_upload_pack_greeting(&mut stdout) {
+                Ok(crate::v2_client::DiscoveredStatefulUploadPack::V2 {
+                    handshake,
+                    object_format,
+                }) => finish_ssh_v2_ls_refs(stdin, &mut stdout, object_format, &handshake),
+                Ok(crate::v2_client::DiscoveredStatefulUploadPack::Legacy {
+                    set,
+                    object_format,
+                }) => {
+                    drop(stdin);
+                    match crate::v2_client::legacy_upload_pack_features(&set.refs) {
+                        Ok(features) => Ok(SshUploadPackDiscovery {
+                            refs: set.refs,
+                            features,
+                            object_format,
+                        }),
+                        Err(err) => Err(err),
+                    }
+                }
+                Err(err) => {
+                    drop(stdin);
+                    Err(err)
+                }
+            }
+        }
+    };
     let status = child.wait()?;
     let stderr = stderr_drain.finish();
-    let (set, object_format) = match set_result {
-        Ok(discovered) => discovered,
-        Err(err) if is_ssh_protocol_v2_advertisement_error(&err) => {
-            return Err(ssh_protocol_v2_unsupported_error());
-        }
-        Err(_) if !status.success() => {
-            return Err(GitError::Command(format!(
-                "ssh upload-pack failed for {}: {}",
-                ssh_remote_display(remote),
-                ssh_command_failure_message("ssh upload-pack", &stderr, status)
-            )));
-        }
-        Err(err) => return Err(err),
-    };
-    let features = set
-        .refs
-        .first()
-        .map(|advertisement| parse_upload_pack_features(&advertisement.capabilities))
-        .transpose()?
-        .unwrap_or_default();
+    match discovered {
+        Ok(discovered) => Ok(discovered),
+        Err(_) if !status.success() => Err(GitError::Command(format!(
+            "ssh upload-pack failed for {}: {}",
+            ssh_remote_display(remote),
+            ssh_command_failure_message("ssh upload-pack", &stderr, status)
+        ))),
+        Err(err) => Err(err),
+    }
+}
+
+fn finish_ssh_v2_ls_refs(
+    mut stdin: ChildStdin,
+    stdout: &mut ChildStdout,
+    format: ObjectFormat,
+    handshake: &sley_protocol::TransportHandshake,
+) -> Result<SshUploadPackDiscovery> {
+    let remote_format = protocol_v2_object_format(&handshake.capabilities)?;
+    if remote_format != format {
+        return Err(GitError::InvalidObjectId(format!(
+            "remote repository uses {}, local repository uses {}",
+            remote_format.name(),
+            format.name()
+        )));
+    }
+    crate::v2_client::write_stateful_v2_ls_refs(&mut stdin, format, handshake)?;
+    stdin.flush()?;
+    drop(stdin);
+    let set = crate::v2_client::read_stateful_v2_ls_refs(format, stdout)?;
+    let features = crate::v2_client::upload_pack_features_from_v2(handshake, &set.refs)?;
     Ok(SshUploadPackDiscovery {
         refs: set.refs,
         features,
-        object_format,
+        object_format: format,
     })
 }
 
@@ -1291,18 +1386,6 @@ pub fn validate_ssh_fetch_options(
         ));
     }
     Ok(())
-}
-
-fn is_ssh_protocol_v2_advertisement_error(err: &GitError) -> bool {
-    matches!(err, GitError::InvalidFormat(message)
-        if message.contains("unsupported advertised ref protocol version"))
-}
-
-fn ssh_protocol_v2_unsupported_error() -> GitError {
-    GitError::Unsupported(
-        "protocol v2 over SSH is not supported; use HTTPS or configure the remote for upload-pack v0/v1"
-            .into(),
-    )
 }
 
 /// A human-readable rendering of an SSH `remote` for error messages. The CLI built
@@ -1380,6 +1463,16 @@ mod tests {
 
         let (args, env) =
             ssh_protocol_command_metadata(SshCommandVariant::OpenSsh, Some(ProtocolVersion::V2));
+        assert_eq!(args, ["-o", "SendEnv=GIT_PROTOCOL"]);
+        assert_eq!(env, [("GIT_PROTOCOL".into(), "version=2".into())]);
+
+        let (args, env) =
+            ssh_protocol_command_metadata(SshCommandVariant::Simple, Some(ProtocolVersion::V2));
+        assert!(args.is_empty());
+        assert!(env.is_empty());
+
+        let (args, env) =
+            ssh_protocol_command_metadata(SshCommandVariant::OpenSsh, Some(ProtocolVersion::V0));
         assert!(args.is_empty());
         assert!(env.is_empty());
     }

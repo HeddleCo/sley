@@ -195,14 +195,10 @@ fn ls_remote_with_impl(
         LsRemoteSource::Http(_) => Err(GitError::Unsupported(
             "HTTP transport is not enabled in this build".into(),
         )),
-        LsRemoteSource::Ssh(remote) => crate::ssh::ls_remote_ssh(remote, filter, matches),
-        LsRemoteSource::Git(remote) => crate::git::ls_remote_git(
-            remote,
-            filter,
-            matches,
-            config.and_then(|config| config.get("protocol", None, "version")) == Some("2"),
-            config,
-        ),
+        LsRemoteSource::Ssh(remote) => crate::ssh::ls_remote_ssh(remote, filter, matches, config),
+        LsRemoteSource::Git(remote) => {
+            crate::git::ls_remote_git(remote, filter, matches, false, config)
+        }
         LsRemoteSource::Local { git_dir } => {
             ls_remote_local(policy, git_dir, format, filter, matches, config)
         }
