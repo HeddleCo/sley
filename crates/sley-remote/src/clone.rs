@@ -750,6 +750,7 @@ fn fetch_git_partial_clone_checkout_blobs(
             promisor: true,
             protocol_v2: discovered.protocol_v2,
             max_input_size: crate::fetch::fetch_max_input_size(config),
+            no_progress: true,
         },
         &mut progress,
         cancel,
@@ -758,7 +759,8 @@ fn fetch_git_partial_clone_checkout_blobs(
 }
 
 /// SSH arm of [`fetch_partial_clone_checkout_blobs`]: exact blob wants, no
-/// haves, raw pack (SSH does not negotiate side-band).
+/// haves, installed as a promisor pack. The connection negotiates v2 and falls
+/// back to v0 when the server does not speak it.
 fn fetch_ssh_partial_clone_checkout_blobs(
     request: &CloneRequest<'_>,
     git_dir: &Path,
@@ -806,6 +808,7 @@ fn fetch_ssh_partial_clone_checkout_blobs(
             command_options: options,
             upload_pack_command: request.options.upload_pack_command,
             max_input_size: crate::fetch::fetch_max_input_size(config),
+            no_progress: true,
         },
         &mut progress,
         cancel,

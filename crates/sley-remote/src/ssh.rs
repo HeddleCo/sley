@@ -995,6 +995,9 @@ pub struct SshFetchPackRequest<'a> {
     /// Maximum raw pack bytes to accept from the remote (`fetch.maxInputSize` /
     /// `transfer.maxSize`). `None` means unlimited.
     pub max_input_size: Option<u64>,
+    /// Send v2 `no-progress` so a quiet or non-terminal fetch does not print
+    /// sideband progress. Ignored on the v0 path, which installs a raw pack.
+    pub no_progress: bool,
 }
 
 pub fn install_fetch_pack_via_ssh_upload_pack(
@@ -1064,6 +1067,7 @@ pub fn install_fetch_pack_via_ssh_upload_pack(
                     deepen_relative: false,
                     filter: request.filter,
                     packfile_uri_protocols: None,
+                    no_progress: request.no_progress,
                 },
             )?;
             stdin.flush()?;

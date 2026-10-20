@@ -84,6 +84,9 @@ pub struct GitFetchPackRequest<'a> {
     /// Maximum raw pack bytes to accept from the remote (`fetch.maxInputSize` /
     /// `transfer.maxSize`). `None` means unlimited.
     pub max_input_size: Option<u64>,
+    /// Send v2 `no-progress` so a quiet or non-terminal fetch does not print
+    /// sideband progress. Ignored on the v0 path, which installs a raw pack.
+    pub no_progress: bool,
 }
 
 pub struct GitUploadPackAdvertisements {
@@ -299,6 +302,7 @@ pub fn install_fetch_pack_via_git_upload_pack(
                     deepen_relative: request.deepen_relative,
                     filter: request.filter,
                     packfile_uri_protocols: None,
+                    no_progress: request.no_progress,
                 },
             )?;
             stream.flush()?;

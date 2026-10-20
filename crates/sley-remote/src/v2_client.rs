@@ -7,7 +7,7 @@
 //! v0 advertisement, and any other data line is itself the first v0 ref line.
 
 use std::env;
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 
 use sley_config::GitConfig;
 use sley_core::{
@@ -282,6 +282,18 @@ pub(crate) fn deepen_since_u64(deepen_since: Option<i64>) -> Option<u64> {
     deepen_since.and_then(|value| u64::try_from(value).ok())
 }
 
+/// Whether a stateful upload-pack fetch should send `no-progress`.
+///
+/// Matches `transport.c`: an explicit `--progress` / `--no-progress` wins;
+/// otherwise progress is shown only when the command is not quiet and stderr
+/// is a terminal.
+pub(crate) fn upload_pack_no_progress(quiet: bool, progress: Option<bool>) -> bool {
+    match progress {
+        Some(enabled) => !enabled,
+        None => quiet || !std::io::stderr().is_terminal(),
+    }
+}
+
 pub(crate) struct StatefulV2FetchParams<'a> {
     pub format: ObjectFormat,
     pub handshake: &'a TransportHandshake,
@@ -295,6 +307,9 @@ pub(crate) struct StatefulV2FetchParams<'a> {
     pub deepen_relative: bool,
     pub filter: Option<&'a sley_odb::PackObjectFilter>,
     pub packfile_uri_protocols: Option<&'a str>,
+    /// Ask the server to omit sideband progress. Stock git sends this unless
+    /// `--progress` is set or stderr is a terminal and the command is not quiet.
+    pub no_progress: bool,
 }
 
 /// Write one stateful `command=fetch` and report whether the request asked for
@@ -321,6 +336,7 @@ pub(crate) fn write_stateful_v2_fetch(
     // upload-pack deltify against haves, which then fails to index. HTTP keeps
     // the builder's `thin_pack: true` and its own negotiation.
     fetch.thin_pack = false;
+    fetch.no_progress = params.no_progress;
     let sideband_all = fetch.sideband_all;
     let command = protocol_v2_fetch_command_request(params.format, params.handshake, &fetch)?;
     write_protocol_v2_command_request(writer, &command)?;

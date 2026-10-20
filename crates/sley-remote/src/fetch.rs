@@ -784,6 +784,10 @@ fn fetch_impl(
                     command_options: ssh_options,
                     upload_pack_command: options.upload_pack_command.as_deref(),
                     max_input_size,
+                    no_progress: crate::v2_client::upload_pack_no_progress(
+                        options.quiet,
+                        options.progress,
+                    ),
                 },
                 ctx.progress,
                 ctx.cancel,
@@ -900,6 +904,10 @@ fn fetch_impl(
                     promisor: promisor_remote,
                     protocol_v2: discovered.protocol_v2,
                     max_input_size,
+                    no_progress: crate::v2_client::upload_pack_no_progress(
+                        options.quiet,
+                        options.progress,
+                    ),
                 },
                 ctx.progress,
                 ctx.cancel,
