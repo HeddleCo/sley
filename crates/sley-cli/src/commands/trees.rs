@@ -41,7 +41,11 @@ pub(crate) fn cmd_write_tree(
     let oid = match sley_worktree::write_tree_from_index_with_options(
         git_dir,
         format,
-        sley_worktree::WriteTreeOptions { missing_ok, prefix },
+        sley_worktree::WriteTreeOptions {
+            missing_ok,
+            prefix,
+            verify_cache: true,
+        },
     ) {
         Ok(oid) => oid,
         Err(GitError::Command(message)) if message == sley_worktree::WRITE_TREE_BUILD_ERROR => {

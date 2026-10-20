@@ -4353,12 +4353,14 @@ pub(crate) fn write_tree_from_borrowed_index(
     odb: &FileObjectDatabase,
     checker: &mut ObjectPresenceChecker,
 ) -> Result<ObjectId> {
-    verify_write_tree_cache(
-        index
-            .entries
-            .iter()
-            .map(|entry| (entry.path, entry.stage(), entry.oid)),
-    )?;
+    if options.verify_cache {
+        verify_write_tree_cache(
+            index
+                .entries
+                .iter()
+                .map(|entry| (entry.path, entry.stage(), entry.oid)),
+        )?;
+    }
     let cache_tree = if options.prefix.is_none() {
         index.cache_tree(format).ok().flatten()
     } else {
@@ -4402,12 +4404,14 @@ pub(crate) fn write_tree_from_owned_index(
     odb: &FileObjectDatabase,
     checker: &mut ObjectPresenceChecker,
 ) -> Result<ObjectId> {
-    verify_write_tree_cache(
-        index
-            .entries
-            .iter()
-            .map(|entry| (entry.path.as_bytes(), entry.stage(), entry.oid)),
-    )?;
+    if options.verify_cache {
+        verify_write_tree_cache(
+            index
+                .entries
+                .iter()
+                .map(|entry| (entry.path.as_bytes(), entry.stage(), entry.oid)),
+        )?;
+    }
     let cache_tree = if options.prefix.is_none() {
         index.cache_tree(format).ok().flatten()
     } else {

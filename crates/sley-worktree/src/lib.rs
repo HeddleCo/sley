@@ -668,7 +668,16 @@ mod tests {
         let sink = Stderr::default();
         let recorded = sink.0.clone();
         let err = sley_core::diagnostics::Diagnostics::new(sink)
-            .scope(|| write_tree_from_index(&git_dir, ObjectFormat::Sha1))
+            .scope(|| {
+                write_tree_from_index_with_options(
+                    &git_dir,
+                    ObjectFormat::Sha1,
+                    WriteTreeOptions {
+                        verify_cache: true,
+                        ..WriteTreeOptions::default()
+                    },
+                )
+            })
             .expect_err("D/F index must not write a tree");
         match err {
             GitError::Command(message) => assert_eq!(message, WRITE_TREE_BUILD_ERROR),
