@@ -31,12 +31,10 @@ use sley_odb::{
     FileObjectDatabase, ObjectReader, collect_reachable_object_ids_excluding,
     collect_reachable_object_ids_tolerating_promised_missing,
 };
-#[cfg(feature = "http")]
-use sley_protocol::ProtocolVersion;
 use sley_protocol::{
-    FetchHeadRecord, FetchRefUpdate, PromisorRemoteAdvertisement, RefAdvertisement, RefSpec,
-    encode_fetch_head, fetch_ref_updates_to_fetch_head, parse_refspec, plan_fetch_ref_updates,
-    refname_matches, refspec_map_source,
+    FetchHeadRecord, FetchRefUpdate, PromisorRemoteAdvertisement, ProtocolVersion,
+    RefAdvertisement, RefSpec, encode_fetch_head, fetch_ref_updates_to_fetch_head, parse_refspec,
+    plan_fetch_ref_updates, refname_matches, refspec_map_source,
 };
 use sley_refs::{FileRefStore, Ref, RefTarget, RefUpdate, ReflogEntry};
 #[cfg(feature = "http")]
@@ -786,6 +784,10 @@ fn fetch_impl(
                     command_options: ssh_options,
                     upload_pack_command: options.upload_pack_command.as_deref(),
                     max_input_size,
+                    no_progress: crate::v2_client::upload_pack_no_progress(
+                        options.quiet,
+                        options.progress,
+                    ),
                 },
                 ctx.progress,
                 ctx.cancel,
@@ -830,8 +832,9 @@ fn fetch_impl(
             remote,
             protocol_v2,
         } => {
-            let protocol_v2 =
-                *protocol_v2 || request.config.get("protocol", None, "version") == Some("2");
+            let _ = protocol_v2;
+            let requests_v2 = crate::v2_client::client_upload_pack_version(Some(request.config))
+                == ProtocolVersion::V2;
             let exact_oid_only = parsed_refspecs.iter().any(|refspec| !refspec.negative)
                 && parsed_refspecs.iter().all(|refspec| {
                     refspec.negative
@@ -840,7 +843,7 @@ fn fetch_impl(
                                 ObjectId::from_hex(request.format, source).is_ok()
                             }))
                 });
-            let discovered = if protocol_v2 && exact_oid_only && !options.auto_follow_tags {
+            let discovered = if requests_v2 && exact_oid_only && !options.auto_follow_tags {
                 // Protocol v2 permits an exact-OID fetch to start directly with
                 // `command=fetch`; no `ls-refs` command is needed. The fetch
                 // connection below still validates the server handshake and
@@ -858,7 +861,7 @@ fn fetch_impl(
                 crate::git::git_upload_pack_advertisements_with_protocol(
                     remote,
                     request.format,
-                    protocol_v2,
+                    requests_v2,
                     Some(request.config),
                 )?
             };
@@ -894,9 +897,17 @@ fn fetch_impl(
                     haves: negotiation_haves,
                     shallow: existing_shallow,
                     deepen: options.depth,
+                    deepen_since: options.deepen_since,
+                    deepen_not: options.deepen_not.clone(),
+                    deepen_relative: options.deepen_relative,
+                    filter: options.filter.as_ref(),
                     promisor: promisor_remote,
                     protocol_v2: discovered.protocol_v2,
                     max_input_size,
+                    no_progress: crate::v2_client::upload_pack_no_progress(
+                        options.quiet,
+                        options.progress,
+                    ),
                 },
                 ctx.progress,
                 ctx.cancel,

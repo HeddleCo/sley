@@ -300,6 +300,7 @@ fn maybe_hydrate_promisor_via_ssh(
             command_options: options,
             upload_pack_command,
             max_input_size: None,
+            no_progress: true,
         },
         &mut progress,
         sley_core::CancelFlag::never(),

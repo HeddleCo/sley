@@ -690,14 +690,77 @@ fn fetch_partial_clone_checkout_blobs(
         CloneSource::Ssh(remote) => fetch_ssh_partial_clone_checkout_blobs(
             request, git_dir, commit_oid, config, remote, cancel,
         ),
-        // git:// partial checkout top-up is not implemented; the caller still
-        // receives the filtered pack.
-        _ => Ok(()),
+        CloneSource::Git { remote, .. } => fetch_git_partial_clone_checkout_blobs(
+            request, git_dir, commit_oid, config, remote, cancel,
+        ),
+        #[cfg(not(feature = "http"))]
+        CloneSource::Http(_) => Ok(()),
     }
 }
 
+/// git:// arm of [`fetch_partial_clone_checkout_blobs`]: exact blob wants, no
+/// haves, installed as a promisor pack. The connection negotiates v2 and falls
+/// back to v0 when the daemon does not speak it.
+fn fetch_git_partial_clone_checkout_blobs(
+    request: &CloneRequest<'_>,
+    git_dir: &Path,
+    commit_oid: ObjectId,
+    config: &GitConfig,
+    remote: &RemoteUrl,
+    cancel: DynCancelFlag<'_>,
+) -> Result<()> {
+    let local_db = FileObjectDatabase::from_git_dir(git_dir, request.format);
+    let mut wants = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    collect_checkout_materialization_wants(
+        &local_db,
+        &local_db,
+        request.format,
+        commit_oid,
+        request.options.sparse,
+        &mut seen,
+        &mut wants,
+    )?;
+    if wants.is_empty() {
+        return Ok(());
+    }
+    let discovered = crate::git::git_upload_pack_advertisements_with_protocol(
+        remote,
+        request.format,
+        false,
+        Some(config),
+    )?;
+    let mut progress = crate::SilentProgress;
+    crate::git::install_fetch_pack_via_git_upload_pack(
+        &request.options.policy,
+        crate::git::GitFetchPackRequest {
+            git_dir,
+            format: request.format,
+            remote,
+            config: Some(config),
+            features: &discovered.features,
+            wants,
+            haves: Some(Vec::new()),
+            shallow: Vec::new(),
+            deepen: None,
+            deepen_since: None,
+            deepen_not: Vec::new(),
+            deepen_relative: false,
+            filter: None,
+            promisor: true,
+            protocol_v2: discovered.protocol_v2,
+            max_input_size: crate::fetch::fetch_max_input_size(config),
+            no_progress: true,
+        },
+        &mut progress,
+        cancel,
+    )?;
+    Ok(())
+}
+
 /// SSH arm of [`fetch_partial_clone_checkout_blobs`]: exact blob wants, no
-/// haves, raw pack (SSH does not negotiate side-band).
+/// haves, installed as a promisor pack. The connection negotiates v2 and falls
+/// back to v0 when the server does not speak it.
 fn fetch_ssh_partial_clone_checkout_blobs(
     request: &CloneRequest<'_>,
     git_dir: &Path,
@@ -745,6 +808,7 @@ fn fetch_ssh_partial_clone_checkout_blobs(
             command_options: options,
             upload_pack_command: request.options.upload_pack_command,
             max_input_size: crate::fetch::fetch_max_input_size(config),
+            no_progress: true,
         },
         &mut progress,
         cancel,

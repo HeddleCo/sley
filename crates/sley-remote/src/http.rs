@@ -25,23 +25,20 @@ use crate::install::{
     shallow_info_from_protocol_v2_fetch_header, transfer_from_pack,
 };
 use sley_config::GitConfig;
-use sley_core::{
-    CancelFlag, Capability, GitError, ObjectFormat, ObjectId, Result, UPSTREAM_GIT_COMPAT_VERSION,
-};
+use sley_core::{CancelFlag, Capability, GitError, ObjectFormat, ObjectId, Result};
 use sley_odb::{FileObjectDatabase, ObjectReader, RawPackInstallOptions};
 use sley_protocol::{
-    GitService, ProtocolV2CommandOptions, ProtocolV2CommandRequest, ProtocolV2FetchAcknowledgment,
+    GitService, ProtocolV2CommandRequest, ProtocolV2FetchAcknowledgment,
     ProtocolV2FetchPackfileUri, ProtocolV2FetchRequest, ProtocolV2FetchResponseSection,
-    ProtocolV2FetchShallowInfo, ProtocolV2FetchWantedRef, ProtocolV2LsRefsRequest, ProtocolVersion,
-    RefAdvertisement, RefAdvertisementSet, TransportHandshake, UploadPackFeatures,
-    UploadPackNegotiationRequest, UploadPackRequest, encode_protocol_v2_command_options,
-    parse_protocol_v2_fetch_features, parse_upload_pack_features, protocol_v2_object_format,
-    read_protocol_v2_fetch_negotiation_response, read_protocol_v2_fetch_response,
-    read_protocol_v2_fetch_response_header, read_protocol_v2_fetch_sideband_all_response,
+    ProtocolV2FetchShallowInfo, ProtocolV2FetchWantedRef, ProtocolVersion, RefAdvertisement,
+    RefAdvertisementSet, TransportHandshake, UploadPackFeatures, UploadPackNegotiationRequest,
+    UploadPackRequest, parse_protocol_v2_fetch_features, parse_upload_pack_features,
+    protocol_v2_object_format, read_protocol_v2_fetch_negotiation_response,
+    read_protocol_v2_fetch_response, read_protocol_v2_fetch_response_header,
+    read_protocol_v2_fetch_sideband_all_response,
     read_protocol_v2_ls_refs_response_as_ref_advertisement_set,
     smart_http_advertisement_content_type, smart_http_rpc_request_content_type,
-    trace_protocol_v2_advertisement_read, validate_protocol_v2_fetch_command_request,
-    validate_protocol_v2_ls_refs_command_request, write_protocol_v2_command_request,
+    trace_protocol_v2_advertisement_read, write_protocol_v2_command_request,
     write_upload_pack_negotiation_request, write_upload_pack_request,
 };
 use sley_transport::{
@@ -345,39 +342,7 @@ fn protocol_v2_ls_refs_command_request(
     format: ObjectFormat,
     handshake: &TransportHandshake,
 ) -> Result<ProtocolV2CommandRequest> {
-    let ls_refs = ProtocolV2LsRefsRequest {
-        peel: true,
-        symrefs: true,
-        unborn: false,
-        ref_prefixes: vec!["HEAD".into(), "refs/heads/".into(), "refs/tags/".into()],
-    };
-    let mut command = ls_refs.to_command_request()?;
-    let mut options = ProtocolV2CommandOptions::default();
-    if handshake
-        .capabilities
-        .iter()
-        .any(|capability| capability.name == "agent")
-    {
-        options.agent = Some(format!("git/{UPSTREAM_GIT_COMPAT_VERSION}"));
-    }
-    if handshake
-        .capabilities
-        .iter()
-        .any(|capability| capability.name == "object-format")
-    {
-        let advertised_format = protocol_v2_object_format(&handshake.capabilities)?;
-        if advertised_format != format {
-            return Err(GitError::InvalidObjectId(format!(
-                "remote repository uses {}, local repository uses {}",
-                advertised_format.name(),
-                format.name()
-            )));
-        }
-        options.object_format = Some(format);
-    }
-    command.capabilities = encode_protocol_v2_command_options(&options)?;
-    validate_protocol_v2_ls_refs_command_request(handshake, &command)?;
-    Ok(command)
+    crate::v2_client::protocol_v2_ls_refs_command_request(format, handshake)
 }
 
 fn protocol_v2_fetch_command_request(
@@ -385,33 +350,7 @@ fn protocol_v2_fetch_command_request(
     handshake: &TransportHandshake,
     fetch: &ProtocolV2FetchRequest,
 ) -> Result<ProtocolV2CommandRequest> {
-    let mut command = fetch.to_command_request()?;
-    let mut options = ProtocolV2CommandOptions::default();
-    if handshake
-        .capabilities
-        .iter()
-        .any(|capability| capability.name == "agent")
-    {
-        options.agent = Some(format!("git/{UPSTREAM_GIT_COMPAT_VERSION}"));
-    }
-    if handshake
-        .capabilities
-        .iter()
-        .any(|capability| capability.name == "object-format")
-    {
-        let advertised_format = protocol_v2_object_format(&handshake.capabilities)?;
-        if advertised_format != format {
-            return Err(GitError::InvalidObjectId(format!(
-                "remote repository uses {}, local repository uses {}",
-                advertised_format.name(),
-                format.name()
-            )));
-        }
-        options.object_format = Some(format);
-    }
-    command.capabilities = encode_protocol_v2_command_options(&options)?;
-    validate_protocol_v2_fetch_command_request(handshake, format, &command)?;
-    Ok(command)
+    crate::v2_client::protocol_v2_fetch_command_request(format, handshake, fetch)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -428,37 +367,19 @@ fn protocol_v2_fetch_request_from_upload_pack_semantics(
     packfile_uri_protocols: Option<&str>,
     handshake: &TransportHandshake,
 ) -> Result<ProtocolV2FetchRequest> {
-    let v2_features =
-        parse_protocol_v2_fetch_features(&handshake.capabilities)?.unwrap_or_default();
-    Ok(ProtocolV2FetchRequest {
+    crate::v2_client::protocol_v2_fetch_request_from_upload_pack_semantics(
         wants,
         want_refs,
         haves,
         shallow,
         deepen,
-        deepen_since: deepen_since_u64(deepen_since),
+        deepen_since,
         deepen_not,
         deepen_relative,
-        filter: filter.and_then(crate::local::upload_pack_filter_protocol_spec),
-        packfile_uris: if v2_features.packfile_uris {
-            packfile_uri_protocols.map(str::to_owned)
-        } else {
-            None
-        },
-        thin_pack: true,
-        include_tag: true,
-        ofs_delta: true,
-        done: true,
-        // Normal fetch negotiation expects the pack immediately after `ready`.
-        // `wait-for-done` is reserved for callers such as `--negotiate-only`.
-        wait_for_done: false,
-        sideband_all: v2_features.sideband_all,
-        ..ProtocolV2FetchRequest::default()
-    })
-}
-
-fn deepen_since_u64(deepen_since: Option<i64>) -> Option<u64> {
-    deepen_since.and_then(|value| u64::try_from(value).ok())
+        filter,
+        packfile_uri_protocols,
+        handshake,
+    )
 }
 
 fn build_http_upload_pack_request(
@@ -479,7 +400,7 @@ fn build_http_upload_pack_request(
         ),
         shallow,
         deepen,
-        deepen_since: deepen_since_u64(deepen_since),
+        deepen_since: crate::v2_client::deepen_since_u64(deepen_since),
         deepen_not,
         filter: filter.and_then(crate::local::upload_pack_filter_protocol_spec),
     }
@@ -745,26 +666,9 @@ pub fn http_upload_pack_features(
     handshake: Option<&TransportHandshake>,
 ) -> Result<UploadPackFeatures> {
     if let Some(handshake) = handshake {
-        let v2 = parse_protocol_v2_fetch_features(&handshake.capabilities)?.unwrap_or_default();
-        let mut features = UploadPackFeatures {
-            object_format: Some(protocol_v2_object_format(&handshake.capabilities)?),
-            shallow: v2.shallow,
-            deepen_since: v2.shallow,
-            deepen_not: v2.shallow,
-            filter: v2.filter,
-            ..UploadPackFeatures::default()
-        };
-        if let Some(first) = advertisements.first() {
-            let bridged = parse_upload_pack_features(&first.capabilities)?;
-            features.symrefs = bridged.symrefs;
-        }
-        return Ok(features);
+        return crate::v2_client::upload_pack_features_from_v2(handshake, advertisements);
     }
-    Ok(advertisements
-        .first()
-        .map(|advertisement| parse_upload_pack_features(&advertisement.capabilities))
-        .transpose()?
-        .unwrap_or_default())
+    crate::v2_client::legacy_upload_pack_features(advertisements)
 }
 
 /// Post an upload-pack RPC `request` + `haves` and return the validated HTTP
@@ -1644,11 +1548,12 @@ fn request_negotiation_haves(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sley_core::UPSTREAM_GIT_COMPAT_VERSION;
     use sley_object::{EncodedObject, ObjectType};
     use sley_pack::PackFile;
     use sley_protocol::{
         ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo, ProtocolV2LsRefsRecord,
-        ProtocolVersion, RefAdvertisement, StreamingSidebandReader,
+        ProtocolV2LsRefsRequest, ProtocolVersion, RefAdvertisement, StreamingSidebandReader,
         read_protocol_v2_command_request, read_protocol_v2_fetch_response,
         write_protocol_v2_fetch_response, write_protocol_v2_fetch_sideband_all_response,
         write_protocol_v2_ls_refs_response,
