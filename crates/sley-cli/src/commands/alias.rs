@@ -235,7 +235,10 @@ fn load_alias_stack(cli_session: &crate::session::CliSession) -> Result<sley_con
     let branch = snapshot
         .as_ref()
         .and_then(|snapshot| snapshot.branch.clone());
-    let context = ConfigIncludeContext::new(common_git_dir.clone(), branch);
+    let mut context = ConfigIncludeContext::new(common_git_dir.clone(), branch);
+    // Alias lookup is git's `read_early_config`: the work tree is not
+    // available yet, so `includeIf worktree:` does not match.
+    context.skip_work_tree = true;
     let mut stack = sley_config::ConfigStack::new();
     for (path, scope) in sley_config::default_config_layer_paths() {
         stack.push_file(&path, scope, true, &context)?;

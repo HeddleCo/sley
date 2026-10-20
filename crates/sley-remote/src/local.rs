@@ -2661,6 +2661,12 @@ fn trace_local_upload_pack_v2_capabilities(remote_git_dir: &Path, format: Object
     sley_protocol::trace_packet_read_payload(
         format!("object-format={}\n", format.name()).as_bytes(),
     );
+    if config
+        .get_bool("transfer", None, "advertiseobjectinfo")
+        .unwrap_or(false)
+    {
+        sley_protocol::trace_packet_read_payload(b"object-info=size type\n");
+    }
     sley_protocol::trace_packet_read_payload(b"0000");
 }
 
@@ -2836,8 +2842,16 @@ fn upload_pack_v2_capabilities(
             value: Some("sley".into()),
         });
     }
-    if let Some(capability) = crate::promisor_remote_server_capability(config)? {
-        capabilities.push(capability);
+    // `object-info=size type` is off unless `transfer.advertiseObjectInfo` is
+    // set, matching git's `object_info_advertise`.
+    if config
+        .get_bool("transfer", None, "advertiseobjectinfo")
+        .unwrap_or(false)
+    {
+        capabilities.push(Capability {
+            name: "object-info".into(),
+            value: Some("size type".into()),
+        });
     }
     // Advertise the `bundle-uri` command when the server is configured to hand
     // out bundle URIs (upstream `bundle_uri_advertise` reads
@@ -2851,6 +2865,9 @@ fn upload_pack_v2_capabilities(
             name: "bundle-uri".into(),
             value: None,
         });
+    }
+    if let Some(capability) = crate::promisor_remote_server_capability(config)? {
+        capabilities.push(capability);
     }
     Ok(capabilities)
 }
@@ -3387,6 +3404,96 @@ fn write_bundle_uri_command_response(
     Ok(())
 }
 
+fn object_info_database(git_dir: &Path, format: ObjectFormat) -> FileObjectDatabase {
+    // `git upload-pack` calls `disable_replace_refs()` before serving, so
+    // `OBJECT_INFO_LOOKUP_REPLACE` is a no-op. Report the stored object.
+    FileObjectDatabase::from_git_dir(git_dir, format)
+}
+
+fn object_info_error(writer: &mut impl std::io::Write, message: String) -> Result<()> {
+    write_error_line(writer, &ProtocolErrorLine { message })
+}
+
+/// Answer `command=object-info` the way git's `cap_object_info` does.
+///
+/// Attribute lines are `size` then `type` when requested, independent of the
+/// order the client asked. Each oid line is `<oid> [size] [type]`, or `<oid> `
+/// (trailing space) when the object is not present. Lookup skips replace refs,
+/// matching `upload-pack`'s `disable_replace_refs()`, and does not lazy-fetch.
+fn write_object_info_command_response(
+    git_dir: &Path,
+    format: ObjectFormat,
+    arguments: &[Vec<u8>],
+    writer: &mut impl std::io::Write,
+) -> Result<()> {
+    let mut want_size = false;
+    let mut want_type = false;
+    let mut oids = Vec::new();
+    for argument in arguments {
+        let Ok(text) = std::str::from_utf8(argument) else {
+            object_info_error(
+                writer,
+                format!(
+                    "object-info: unexpected line: '{}'",
+                    String::from_utf8_lossy(argument)
+                ),
+            )?;
+            continue;
+        };
+        if text == "size" {
+            want_size = true;
+            continue;
+        }
+        if text == "type" {
+            want_type = true;
+            continue;
+        }
+        if let Some(oid) = text.strip_prefix("oid ") {
+            oids.push(oid.to_string());
+            continue;
+        }
+        object_info_error(writer, format!("object-info: unexpected line: '{text}'"))?;
+    }
+    if oids.is_empty() {
+        write_pkt_line_frame(writer, &PktLineFrame::Flush)?;
+        return Ok(());
+    }
+    if want_size {
+        write_pkt_line_payload(writer, b"size\n")?;
+    }
+    if want_type {
+        write_pkt_line_payload(writer, b"type\n")?;
+    }
+    let database = object_info_database(git_dir, format);
+    for oid_text in &oids {
+        let Ok(oid) = ObjectId::from_hex(format, oid_text) else {
+            object_info_error(
+                writer,
+                format!("object-info: protocol error, expected to get oid, not '{oid_text}'"),
+            )?;
+            continue;
+        };
+        let mut line = oid_text.clone();
+        match database.read_object_header_without_replacement(&oid)? {
+            None => line.push(' '),
+            Some((object_type, size)) => {
+                if want_size {
+                    line.push(' ');
+                    line.push_str(&size.to_string());
+                }
+                if want_type {
+                    line.push(' ');
+                    line.push_str(object_type.as_str());
+                }
+            }
+        }
+        line.push('\n');
+        write_pkt_line_payload(writer, line.as_bytes())?;
+    }
+    write_pkt_line_frame(writer, &PktLineFrame::Flush)?;
+    Ok(())
+}
+
 pub fn serve_upload_pack_v2(
     policy: &crate::RemotePolicy,
     git_dir: &Path,
@@ -3466,6 +3573,20 @@ fn serve_upload_pack_v2_inner(
         sley_protocol::parse_protocol_v2_command_options(&request.capabilities)?;
         if request.command == "bundle-uri" {
             write_bundle_uri_command_response(config, writer)?;
+            writer.flush()?;
+            continue;
+        }
+        if request.command == "object-info" {
+            if !handshake
+                .capabilities
+                .iter()
+                .any(|capability| capability.name == "object-info")
+            {
+                return Err(GitError::InvalidFormat(
+                    "invalid command 'object-info'".into(),
+                ));
+            }
+            write_object_info_command_response(git_dir, format, &request.arguments, writer)?;
             writer.flush()?;
             continue;
         }
@@ -4064,6 +4185,83 @@ mod tests {
             .expect("encode test advertisement");
         assert_eq!(long_lived_response, advertisement);
         fs::remove_dir_all(git_dir).expect("remove test repository");
+    }
+
+    #[test]
+    fn object_info_is_off_by_default_and_ignores_replace_refs() {
+        let git_dir = unique_local_test_dir("object-info");
+        fs::create_dir_all(git_dir.join("objects")).expect("objects");
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").expect("HEAD");
+        let format = ObjectFormat::Sha1;
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let small = write_test_object(&db, &EncodedObject::new(ObjectType::Blob, b"x".to_vec()));
+        let big = write_test_object(
+            &db,
+            &EncodedObject::new(ObjectType::Blob, b"yyyyyyyy\n".to_vec()),
+        );
+        let off = GitConfig::default();
+        let caps = upload_pack_v2_capabilities(format, &off).expect("caps");
+        assert!(
+            caps.iter()
+                .all(|capability| capability.name != "object-info")
+        );
+
+        fs::create_dir_all(git_dir.join("refs").join("replace")).expect("replace dir");
+        fs::write(
+            git_dir.join("refs").join("replace").join(small.to_hex()),
+            format!("{big}\n"),
+        )
+        .expect("replace ref");
+        let config =
+            GitConfig::parse(b"[transfer]\n\tadvertiseObjectInfo = true\n").expect("config");
+        let caps = upload_pack_v2_capabilities(format, &config).expect("caps");
+        assert!(caps.iter().any(|capability| {
+            capability.name == "object-info" && capability.value.as_deref() == Some("size type")
+        }));
+
+        let mut request = Vec::new();
+        write_pkt_line_payload(&mut request, b"command=object-info\n").expect("command");
+        write_pkt_line_frame(&mut request, &PktLineFrame::Delimiter).expect("delim");
+        write_pkt_line_payload(&mut request, b"type\n").expect("type");
+        write_pkt_line_payload(&mut request, b"size\n").expect("size");
+        write_pkt_line_payload(&mut request, format!("oid {small}\n").as_bytes()).expect("oid");
+        write_pkt_line_payload(&mut request, b"oid not-an-oid\n").expect("bad oid");
+        write_pkt_line_frame(&mut request, &PktLineFrame::Flush).expect("flush");
+
+        let mut response = Vec::new();
+        serve_upload_pack_v2_stateless_with_config(
+            &crate::RemotePolicy::default(),
+            &git_dir,
+            format,
+            &config,
+            &mut request.as_slice(),
+            &mut response,
+        )
+        .expect("serve object-info");
+        let frames = sley_protocol::read_pkt_line_frames_until_flush(&mut response.as_slice())
+            .expect("response frames");
+        let lines: Vec<String> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                PktLineFrame::Data(payload) => Some(
+                    String::from_utf8_lossy(payload)
+                        .trim_end_matches('\n')
+                        .to_string(),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "size".to_string(),
+                "type".to_string(),
+                format!("{small} 1 blob"),
+                "ERR object-info: protocol error, expected to get oid, not 'not-an-oid'"
+                    .to_string(),
+            ]
+        );
+        fs::remove_dir_all(git_dir).expect("cleanup");
     }
 
     #[test]

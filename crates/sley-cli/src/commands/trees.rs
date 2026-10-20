@@ -38,11 +38,18 @@ pub(crate) fn cmd_write_tree(
     }
     let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
-    let oid = sley_worktree::write_tree_from_index_with_options(
+    let oid = match sley_worktree::write_tree_from_index_with_options(
         git_dir,
         format,
         sley_worktree::WriteTreeOptions { missing_ok, prefix },
-    )?;
+    ) {
+        Ok(oid) => oid,
+        Err(GitError::Command(message)) if message == sley_worktree::WRITE_TREE_BUILD_ERROR => {
+            eprintln!("fatal: {}", sley_worktree::WRITE_TREE_BUILD_ERROR);
+            return Err(crate::cli_exit(128));
+        }
+        Err(err) => return Err(err),
+    };
     println!("{oid}");
     Ok(())
 }

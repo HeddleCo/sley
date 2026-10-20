@@ -610,6 +610,80 @@ mod tests {
     }
 
     #[test]
+    fn write_tree_from_index_rejects_directory_file_conflicts() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        let oid = ObjectId::empty_blob(ObjectFormat::Sha1);
+        let mut entries = Vec::new();
+        for path in [
+            "a",
+            "a/b",
+            "docs",
+            "docs-internal/README.md",
+            "docs/requirements.txt",
+        ] {
+            let mut entry = IndexEntry {
+                ctime_seconds: 0,
+                ctime_nanoseconds: 0,
+                mtime_seconds: 0,
+                mtime_nanoseconds: 0,
+                dev: 0,
+                ino: 0,
+                mode: 0o100644,
+                uid: 0,
+                gid: 0,
+                size: 0,
+                oid,
+                flags: 0,
+                flags_extended: 0,
+                path: BString::from(path),
+            };
+            entry.refresh_name_length();
+            entries.push(entry);
+        }
+        let index = Index {
+            version: 2,
+            entries,
+            extensions: Vec::new(),
+            checksum: None,
+        };
+        let bytes = index.write(ObjectFormat::Sha1).expect("write index");
+        fs::write(repository_index_path(&git_dir), bytes).expect("store index");
+
+        #[derive(Clone, Default)]
+        struct Stderr(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl sley_core::diagnostics::DiagnosticSink for Stderr {
+            fn write(
+                &self,
+                stream: sley_core::diagnostics::DiagnosticStream,
+                bytes: &[u8],
+            ) -> std::io::Result<()> {
+                if stream == sley_core::diagnostics::DiagnosticStream::Stderr {
+                    self.0.lock().expect("stderr lock").extend_from_slice(bytes);
+                }
+                Ok(())
+            }
+        }
+        let sink = Stderr::default();
+        let recorded = sink.0.clone();
+        let err = sley_core::diagnostics::Diagnostics::new(sink)
+            .scope(|| write_tree_from_index(&git_dir, ObjectFormat::Sha1))
+            .expect_err("D/F index must not write a tree");
+        match err {
+            GitError::Command(message) => assert_eq!(message, WRITE_TREE_BUILD_ERROR),
+            other => panic!("unexpected error {other}"),
+        }
+        let text = String::from_utf8(recorded.lock().expect("stderr").clone()).expect("utf8");
+        assert!(text.contains("You have both a and a/b\n"), "{text}");
+        assert!(
+            text.contains("You have both docs and docs/requirements.txt\n"),
+            "{text}"
+        );
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
     fn write_tree_from_index_expands_empty_primary_split_index() {
         let root = temp_root();
         let git_dir = root.join(".git");
