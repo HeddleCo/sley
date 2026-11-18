@@ -12,6 +12,8 @@ license.workspace = true
 # no backend baked into the dep line (see sley-pack for the cfg-cascade rationale).
 crc32fast = "1.5.2"
 flate2 = { version = "1.1.10", default-features = false }
+futures-util = { version = "0.3.32", optional = true, default-features = false, features = ["alloc"] }
+tokio = { version = "1.53.2", optional = true, default-features = false, features = ["rt", "sync"] }
 parking_lot = "0.12.5"
 smallvec = "1.16.1"
 sley-core.workspace = true
@@ -22,6 +24,7 @@ sley-pack = { path = "../sley-pack", version = "0.13.0", default-features = fals
 
 [features]
 default = ["zlib-rs"]
+remote-odb = ["dep:tokio", "dep:futures-util", "sley-pack/async-budget"]
 # Default backend: zlib-rs (pure Rust, ~zlib-ng speed, no C). Forwarded to sley-pack.
 zlib-rs = ["flate2/zlib-rs", "sley-pack/zlib-rs"]
 # Fallback backend: flate2's miniz_oxide (`rust_backend`), forwarded to sley-pack.
@@ -36,3 +39,6 @@ fetch-profile = ["sley-core/fetch-profile", "sley-pack/fetch-profile"]
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread", "time"] }
