@@ -1294,6 +1294,11 @@ fn in_flight_gate_serializes_sixteen_roots_and_bounds_peak_memory() {
         },
         CancelFlag::never(),
         &|o| {
+            let held = o.body.len() + o.delta.as_ref().map_or(0, |d| d.instructions.len());
+            assert!(
+                metrics.in_flight_bytes() >= held,
+                "lease released while callback borrows buffers"
+            );
             calls.fetch_add(1, Ordering::Relaxed);
             if o.depth == 0 {
                 std::thread::sleep(std::time::Duration::from_millis(50));

@@ -177,7 +177,8 @@ pub(crate) fn infallible_error(error: ResolveError<std::convert::Infallible>) ->
 ///
 /// Decoded buffers occupy at most `max_in_flight_bytes + max_live_base_bytes`
 /// across ALL threads. RSS additionally includes the borrowed input, O(object
-/// count) metadata/index, allocator slack, per-worker zlib/thread scratch, and
+/// count, capped by `max_objects`) metadata/index, allocator slack, per-worker
+/// zlib/thread scratch, and
 /// callback-owned output (discovery uses a fixed 64 KiB scratch buffer). Actual
 /// worker count also fits the gate to bound idle allocator arenas. Each worker
 /// reserves a complete worst-case workspace
