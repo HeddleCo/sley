@@ -123,6 +123,8 @@ add('cancel-polls','cancel_mid_pass_and_visitor_error_set_cancel_and_preserve_fi
 add('replayed-result-work','replayed_delta_result_budget_is_shared_across_workers',rp,lambda s:s.replace('        self.work(plan.result_size, Work::Decoded)?;',''))
 add('compressed-replay-work','low_output_deflate_replay_spends_encoded_work_budget',rp,lambda s:s.replace('        self.work((d.end - d.data) as u64, Work::Compressed)?;',''))
 
+add('iterative-parent-cleanup', 'custom_deep_limit_releases_parent_chain_without_recursive_drop', rp, lambda s: region(s, '// Custom depth limits may exceed', "impl Node<'_> {", lambda _: ''))
+
 results = []
 try:
     for name, test, path, mutate, features in probes:

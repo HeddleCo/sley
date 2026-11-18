@@ -2148,6 +2148,7 @@ fn one_hot_family_is_stolen_by_multiple_workers() {
     }
     let p = finish(p, 513);
     let workers = Mutex::new(HashSet::new());
+    let serial_work = std::sync::atomic::AtomicU64::new(0);
     let start = Instant::now();
     let metrics = sley_pack::ResolveMetrics::default();
     let built = sley_pack::resolve_pack_with_metrics(
@@ -2161,19 +2162,22 @@ fn one_hot_family_is_stolen_by_multiple_workers() {
                 .lock()
                 .expect("worker ids")
                 .insert(std::thread::current().id());
+            let sleeping = Instant::now();
             std::thread::sleep(Duration::from_millis(5));
+            serial_work.fetch_add(sleeping.elapsed().as_nanos() as u64, Ordering::Relaxed);
             Ok::<_, ()>(())
         },
         &metrics,
     )
     .expect("hot family resolves");
     let elapsed = start.elapsed();
+    let serial = Duration::from_nanos(serial_work.load(Ordering::Relaxed));
     let worker_count = workers.into_inner().expect("worker ids").len();
-    eprintln!("hot family: workers={worker_count}, elapsed={elapsed:?}, serial=2.565s");
+    eprintln!("hot family: workers={worker_count}, elapsed={elapsed:?}, serial={serial:?}");
     assert_eq!(built.entries.len(), 513);
     assert!(worker_count >= 2, "one family must use multiple workers");
     assert!(
-        elapsed.as_secs_f64() < 0.6 * 2.565,
+        elapsed.as_secs_f64() < 0.6 * serial.as_secs_f64(),
         "family remained serial: {elapsed:?}"
     );
     assert_eq!(metrics.in_flight_bytes(), 0);
@@ -2202,7 +2206,7 @@ fn panicking_visitor_stops_idle_workers_before_watchdog() {
         ObjectFormat::Sha1,
         4,
         ResolveLimits::default(),
-        CancelFlag::new(&*cancel),
+        CancelFlag::new(&cancel),
         &|o| {
             if o.depth == 1 {
                 panic!("visitor failure");
@@ -2222,4 +2226,47 @@ fn panicking_visitor_stops_idle_workers_before_watchdog() {
     );
     assert_eq!(metrics.in_flight_bytes(), 0);
     assert_eq!(metrics.live_base_bytes(), 0);
+}
+
+#[test]
+fn custom_deep_limit_releases_parent_chain_without_recursive_drop() {
+    const NAME: &str = "custom_deep_limit_releases_parent_chain_without_recursive_drop";
+    if std::env::var_os("SLEY_RESOLVE_DEEP_CHILD").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", NAME, "--nocapture"])
+            .env("SLEY_RESOLVE_DEEP_CHILD", "1")
+            .output()
+            .expect("deep-chain child");
+        eprintln!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "deep-chain cleanup failed: {}",
+            output.status
+        );
+        return;
+    }
+    let p = chains(1, 60_000, 1, false);
+    let metrics = ResolveMetrics::default();
+    let built = resolve_pack_with_metrics(
+        &p,
+        ObjectFormat::Sha1,
+        1,
+        ResolveLimits {
+            max_delta_depth: 60_000,
+            max_live_base_bytes: 1,
+            ..ResolveLimits::default()
+        },
+        CancelFlag::never(),
+        &|_| Ok::<_, ()>(()),
+        &metrics,
+    )
+    .expect("configured deep chain resolves and drops iteratively");
+    assert_eq!(built.objects.len(), 60_001);
+    assert_eq!(metrics.in_flight_bytes(), 0);
+    assert_eq!(metrics.live_base_bytes(), 0);
+    println!("custom-depth cleanup: objects=60001, flight=0, live=0");
 }

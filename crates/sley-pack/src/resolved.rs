@@ -656,6 +656,16 @@ struct Node<'a> {
     body: Mutex<Option<Arc<Retained<'a>>>>,
     external: Option<&'a [u8]>,
 }
+// Custom depth limits may exceed a worker's call stack. Drain unique parents
+// iteratively; shared ancestors are drained by their eventual last owner.
+impl Drop for Node<'_> {
+    fn drop(&mut self) {
+        let mut parent = self.parent.take();
+        while let Some(node) = parent {
+            parent = Arc::into_inner(node).and_then(|mut node| node.parent.take());
+        }
+    }
+}
 impl Node<'_> {
     fn release(&self) -> Result<()> {
         if self.pending.fetch_sub(1, AtomicOrdering::AcqRel) == 1 {
