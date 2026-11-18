@@ -6,19 +6,37 @@ use flate2::{Decompress, FlushDecompress};
 ///
 /// `threads` is explicit so callers and tests can prove scheduling-independent
 /// output. [`Default`] uses all logical CPUs reported by the operating system.
+/// Legacy defaults preserve unlimited trusted whole-pack sizes/work. Untrusted
+/// callers opt into [`ResolveLimits`] using [`Self::with_resolve_limits`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackIndexOptions {
     pub limits: PackReadLimits,
     threads: usize,
+    resolve_limits: ResolveLimits,
 }
 
 impl PackIndexOptions {
     pub fn new(limits: PackReadLimits) -> Self {
         Self {
             limits,
+            resolve_limits: ResolveLimits::unlimited(),
             threads: std::thread::available_parallelism()
                 .map(|count| count.get())
                 .unwrap_or(1),
+        }
+    }
+
+    /// Opt into bounded resolution. Trusted legacy defaults remain unlimited.
+    pub fn with_resolve_limits(mut self, limits: ResolveLimits) -> Self {
+        self.limits.max_delta_depth = limits.max_delta_depth;
+        self.resolve_limits = limits;
+        self
+    }
+
+    pub fn resolve_limits(self) -> ResolveLimits {
+        ResolveLimits {
+            max_delta_depth: self.limits.max_delta_depth,
+            ..self.resolve_limits
         }
     }
 
@@ -54,14 +72,12 @@ where
         pack,
         format,
         options.threads(),
-        ResolveLimits {
-            max_delta_depth: options.limits.max_delta_depth,
-            ..ResolveLimits::default()
-        },
+        options.resolve_limits(),
         cancel,
         &|_| Ok::<_, std::convert::Infallible>(()),
         external,
         progress,
+        &ResolveMetrics::default(),
     )
     .map_err(resolved::infallible_error)
 }
@@ -81,10 +97,7 @@ where
         pack,
         format,
         options.threads(),
-        ResolveLimits {
-            max_delta_depth: options.limits.max_delta_depth,
-            ..ResolveLimits::default()
-        },
+        options.resolve_limits(),
         cancel,
         &|object: &ResolvedObject<'_>| {
             objects
@@ -99,9 +112,13 @@ where
         },
         external,
         &mut |_| {},
+        &ResolveMetrics::default(),
     )
     .map_err(|error| match error {
         ResolveError::Pack(error) | ResolveError::Visitor(error) => error,
+        ResolveError::ResolveOps { limit, attempted } => GitError::InvalidFormat(format!(
+            "resolve_ops budget {limit} exceeded at operation {attempted}"
+        )),
     })?;
     let mut objects = objects
         .into_inner()

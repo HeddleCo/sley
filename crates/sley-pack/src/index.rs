@@ -5,7 +5,12 @@
 use super::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Indexing success does not perform SHA-1 collision detection. For untrusted
+/// SHA-1 packs, use `resolve_pack` and verify every canonical header/body with
+/// sha1dc before admission; discard all staged effects on any error.
 pub struct PackIndexBuild {
+    /// Git idx bytes using plain SHA-1/SHA-256. SHA-1 IDs/checksums have NOT been
+    /// collision checked: untrusted objects require caller-owned sha1dc re-hashing.
     pub index: Vec<u8>,
     pub pack_checksum: ObjectId,
     pub entries: Vec<PackIndexEntry>,

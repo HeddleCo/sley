@@ -3,7 +3,8 @@ use flate2::{Compression, write::ZlibEncoder};
 use sley_core::{AtomicCancel, CancelFlag, GitError, ObjectFormat, digest_bytes};
 use sley_object::{EncodedObject, ObjectType};
 use sley_pack::{
-    PackIndex, PackIndexOptions, ResolveError, ResolveLimits, ResolvedObject, resolve_pack,
+    PackFile, PackIndex, PackIndexOptions, ResolveError, ResolveLimits, ResolveMetrics,
+    ResolvedObject, resolve_pack, resolve_pack_with_metrics,
 };
 use std::collections::HashMap;
 use std::io::Write;
@@ -62,6 +63,10 @@ fn delta(size: usize, marker: u8) -> Vec<u8> {
     let mut d = Vec::new();
     varint(size as u64, &mut d);
     varint(size as u64, &mut d);
+    if size == 1 {
+        d.extend([1, marker]);
+        return d;
+    }
     // Copy all but the final byte, then insert the replacement byte.
     let n = size - 1;
     d.push(0xf0);
@@ -121,6 +126,9 @@ fn pack_message(error: ResolveError<()>) -> String {
     match error {
         ResolveError::Pack(e) => e.to_string(),
         ResolveError::Visitor(()) => panic!("no failing visitor"),
+        ResolveError::ResolveOps { limit, attempted } => {
+            format!("resolve_ops budget {limit} exceeded at operation {attempted}")
+        }
     }
 }
 fn apply(base: &[u8], d: &[u8]) -> Vec<u8> {
@@ -530,6 +538,7 @@ fn thin_pack_is_an_unresolved_base_error() {
     compressed(&[4, 0], &mut late);
     let late = finish(late, 2);
     let seen = AtomicUsize::new(0);
+    let staged = Mutex::new(Vec::new());
     let result = resolve_pack(
         &late,
         ObjectFormat::Sha1,
@@ -538,6 +547,7 @@ fn thin_pack_is_an_unresolved_base_error() {
         CancelFlag::never(),
         &|o| {
             assert!(o.delta.is_none());
+            staged.lock().expect("provisional store").push(o.oid);
             seen.fetch_add(1, Ordering::Relaxed);
             Ok::<_, ()>(())
         },
@@ -551,6 +561,19 @@ fn thin_pack_is_an_unresolved_base_error() {
         1,
         "valid-prefix visitor effects stay provisional"
     );
+    let mut admitted = Vec::new();
+    let mut staged = staged.into_inner().expect("staging store");
+    if result.is_ok() {
+        admitted.append(&mut staged);
+    } else {
+        staged.clear();
+    }
+    assert!(
+        admitted.is_empty(),
+        "thin suffix must discard provisional admission"
+    );
+    assert!(staged.is_empty());
+    println!("late thin pack: 1 provisional callback, 0 admitted objects, no returned index");
 }
 
 #[test]
@@ -1193,4 +1216,397 @@ fn low_output_deflate_replay_spends_encoded_work_budget() {
         1,
         "refuse before re-inflating the low-output base"
     );
+}
+
+#[test]
+fn trusted_legacy_defaults_remain_unlimited_and_explicit_caps_apply() {
+    let p = chains(1, 2, 64, false);
+    let capped = ResolveLimits {
+        max_total_decoded: 128,
+        ..ResolveLimits::default()
+    };
+    let defaults = PackIndexOptions::default();
+    assert_eq!(defaults.resolve_limits().max_total_decoded, u64::MAX);
+    assert_eq!(defaults.resolve_limits().max_object_bytes, u64::MAX);
+    assert_eq!(defaults.resolve_limits().max_objects, usize::MAX);
+    assert_eq!(defaults.resolve_limits().max_resolve_ops, u64::MAX);
+    assert_eq!(defaults.resolve_limits().max_in_flight_bytes, usize::MAX);
+    let run = |options| {
+        PackIndex::write_v2_for_pack_with_options(
+            &p,
+            ObjectFormat::Sha1,
+            |_| Ok(None),
+            options,
+            CancelFlag::never(),
+            |_| {},
+        )
+    };
+    assert!(
+        run(defaults.with_resolve_limits(capped))
+            .expect_err("explicit 128-byte cap")
+            .to_string()
+            .contains("max_total_decoded")
+    );
+    assert!(
+        PackFile::parse_with_options(&p, ObjectFormat::Sha1, defaults.with_resolve_limits(capped))
+            .expect_err("explicit parse cap")
+            .to_string()
+            .contains("max_total_decoded")
+    );
+    let expected = run(defaults).expect("trusted default index");
+    assert_eq!(
+        PackIndex::write_v2_for_pack(&p, ObjectFormat::Sha1).expect("legacy index"),
+        expected
+    );
+    let parsed = PackFile::parse(&p, ObjectFormat::Sha1).expect("trusted parse");
+    assert_eq!(parsed.entries.len(), 3);
+    for threads in [1, 2, 16] {
+        assert_eq!(
+            run(defaults.with_threads(threads)).expect("trusted thread count"),
+            expected
+        );
+    }
+    println!(
+        "trusted defaults: unlimited; explicit 128-byte cap refused; 192 decoded bytes accepted by both legacy paths"
+    );
+}
+
+#[test]
+fn in_flight_gate_serializes_sixteen_roots_and_bounds_peak_memory() {
+    #[cfg(target_os = "linux")]
+    if !memory_child("in_flight_gate_serializes_sixteen_roots_and_bounds_peak_memory") {
+        return;
+    }
+    const SIZE: usize = 8 * 1024 * 1024;
+    const GATE: usize = 3 * SIZE;
+    const BASES: usize = SIZE;
+    let p = chains(16, 1, SIZE, false);
+    let metrics = ResolveMetrics::default();
+    let calls = AtomicUsize::new(0);
+    let built = resolve_pack_with_metrics(
+        &p,
+        ObjectFormat::Sha1,
+        16,
+        ResolveLimits {
+            max_in_flight_bytes: GATE,
+            max_live_base_bytes: BASES,
+            ..ResolveLimits::default()
+        },
+        CancelFlag::never(),
+        &|o| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            if o.depth == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Ok::<_, ()>(())
+        },
+        &metrics,
+    )
+    .expect("workers serialize within one shared gate");
+    println!(
+        "flight: peak={}, gate={GATE}, after={}",
+        metrics.peak_in_flight_bytes(),
+        metrics.in_flight_bytes()
+    );
+    #[cfg(target_os = "linux")]
+    {
+        let peak = peak_bytes();
+        // Isolated child: 64 MiB covers the input, test builder, allocator,
+        // thread stacks, zlib state and metadata for these 32 objects.
+        let bound = GATE + BASES + 64 * 1024 * 1024;
+        println!("flight RSS: peak={peak}, gate+live+64MiB={bound}");
+        assert!(peak < bound, "in-flight working memory exceeded RSS bound");
+    }
+    assert!(
+        metrics.peak_in_flight_bytes() <= GATE,
+        "in-flight counter exceeded shared gate"
+    );
+    assert_eq!(metrics.in_flight_bytes(), 0);
+    assert_eq!(calls.load(Ordering::Relaxed), 32);
+    assert_eq!(built.entries.len(), 32);
+}
+
+#[test]
+fn flight_reservations_release_after_errors_and_waiters_observe_cancel() {
+    let p = chains(16, 2, 32768, false);
+    for visitor_error in [false, true] {
+        let metrics = ResolveMetrics::default();
+        let cancel = AtomicCancel::new();
+        let calls = AtomicUsize::new(0);
+        let result = resolve_pack_with_metrics(
+            &p,
+            ObjectFormat::Sha1,
+            16,
+            ResolveLimits {
+                max_in_flight_bytes: 3 * 32768,
+                ..ResolveLimits::default()
+            },
+            CancelFlag::new(&cancel),
+            &|_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                if visitor_error {
+                    cancel.cancel();
+                    Err(7)
+                } else {
+                    cancel.cancel();
+                    Ok(())
+                }
+            },
+            &metrics,
+        );
+        if visitor_error {
+            assert!(matches!(result, Err(ResolveError::Visitor(7))));
+        } else {
+            assert!(matches!(
+                result,
+                Err(ResolveError::Pack(GitError::Cancelled))
+            ));
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(cancel.is_cancelled());
+        assert_eq!(
+            metrics.in_flight_bytes(),
+            0,
+            "all workspace leases must drop on error"
+        );
+    }
+    let metrics = ResolveMetrics::default();
+    let err = resolve_pack_with_metrics(
+        &p,
+        ObjectFormat::Sha1,
+        16,
+        ResolveLimits {
+            max_in_flight_bytes: 1,
+            ..ResolveLimits::default()
+        },
+        CancelFlag::never(),
+        &|_| Ok::<_, ()>(()),
+        &metrics,
+    )
+    .expect_err("one workspace cannot fit");
+    assert!(pack_message(err).contains("max_in_flight_bytes"));
+    assert_eq!(metrics.peak_in_flight_bytes(), 0);
+    let calls = AtomicUsize::new(0);
+    let e = resolve_pack(
+        &p,
+        ObjectFormat::Sha1,
+        16,
+        ResolveLimits {
+            max_in_flight_bytes: 2 * 32768,
+            ..ResolveLimits::default()
+        },
+        CancelFlag::never(),
+        &|_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok::<_, ()>(())
+        },
+    )
+    .expect_err("two bodies alone leave no room for the delta stream");
+    assert!(pack_message(e).contains("max_in_flight_bytes"));
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    println!(
+        "flight: visitor/cancel errors release all leases; oversized workspace refused before allocation"
+    );
+}
+
+#[test]
+fn resolve_ops_counts_discovery_inflate_apply_and_replay() {
+    let p = chains(1, 2, 32, false);
+    for (live, expected) in [(1024, 8), (0, 12)] {
+        let metrics = ResolveMetrics::default();
+        let limits = ResolveLimits {
+            max_live_base_bytes: live,
+            max_resolve_ops: expected,
+            ..ResolveLimits::default()
+        };
+        resolve_pack_with_metrics(
+            &p,
+            ObjectFormat::Sha1,
+            1,
+            limits,
+            CancelFlag::never(),
+            &|_| Ok::<_, ()>(()),
+            &metrics,
+        )
+        .expect("exact operation budget");
+        assert_eq!(metrics.resolve_ops(), expected);
+        let metrics = ResolveMetrics::default();
+        let e = resolve_pack_with_metrics(
+            &p,
+            ObjectFormat::Sha1,
+            1,
+            ResolveLimits {
+                max_resolve_ops: expected - 1,
+                ..limits
+            },
+            CancelFlag::never(),
+            &|_| Ok::<_, ()>(()),
+            &metrics,
+        )
+        .expect_err("next op refused");
+        assert!(
+            matches!(e, ResolveError::ResolveOps { limit, attempted } if limit == expected - 1 && attempted == expected)
+        );
+        assert_eq!(metrics.resolve_ops(), expected - 1);
+        assert_eq!(metrics.in_flight_bytes(), 0);
+        println!(
+            "resolve ops: live={live}, exact successful count={expected}; budget={} refused attempted={expected}",
+            expected - 1
+        );
+    }
+    let metrics = ResolveMetrics::default();
+    let calls = AtomicUsize::new(0);
+    let e = resolve_pack_with_metrics(
+        &p,
+        ObjectFormat::Sha1,
+        16,
+        ResolveLimits {
+            max_resolve_ops: 2,
+            ..ResolveLimits::default()
+        },
+        CancelFlag::never(),
+        &|_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok::<_, ()>(())
+        },
+        &metrics,
+    )
+    .expect_err("discovery spends budget too");
+    assert!(matches!(
+        e,
+        ResolveError::ResolveOps {
+            limit: 2,
+            attempted: 3
+        }
+    ));
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    let metrics = ResolveMetrics::default();
+    let p = chains(16, 2, 32, false);
+    let e = resolve_pack_with_metrics(
+        &p,
+        ObjectFormat::Sha1,
+        16,
+        ResolveLimits {
+            max_resolve_ops: 120,
+            ..ResolveLimits::default()
+        },
+        CancelFlag::never(),
+        &|_| Ok::<_, ()>(()),
+        &metrics,
+    )
+    .expect_err("all workers share one op ceiling");
+    assert!(matches!(
+        e,
+        ResolveError::ResolveOps {
+            limit: 120,
+            attempted: 121
+        }
+    ));
+    assert_eq!(metrics.resolve_ops(), 120);
+    assert_eq!(metrics.in_flight_bytes(), 0);
+    println!("resolve ops: 16 roots share cap=120, attempted=121");
+}
+
+#[test]
+fn million_tiny_leaves_stop_at_resolve_op_budget() {
+    const LEAVES: usize = 1_000_000;
+    // Keep the one-byte root retained with a second child; the 49 intermediate
+    // bodies cannot enter the full live pool. Each depth-50 leaf replays them.
+    let mut p = pack_start();
+    header(3, 1, &mut p);
+    compressed(&[0], &mut p);
+    let mut parent = 12;
+    for level in 1..=49 {
+        parent = append_delta(&mut p, parent, 1, level);
+    }
+    let mut encoded = Vec::new();
+    compressed(&[1, 1, 1, 99], &mut encoded);
+    for _ in 0..LEAVES {
+        let at = p.len();
+        header(6, 4, &mut p);
+        ofs(at - parent, &mut p);
+        p.extend_from_slice(&encoded);
+    }
+    append_delta(&mut p, 12, 1, 128);
+    let objects = LEAVES + 51;
+    let p = finish(p, objects as u32);
+    let limit = objects as u64 + 10_000;
+    let metrics = ResolveMetrics::default();
+    let calls = AtomicUsize::new(0);
+    let cancel = AtomicCancel::new();
+    let done = (Mutex::new(false), std::sync::Condvar::new());
+    let result = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let guard = done.0.lock().expect("watchdog");
+            let (finished, timeout) = done
+                .1
+                .wait_timeout_while(guard, std::time::Duration::from_secs(30), |v| !*v)
+                .expect("watchdog wait");
+            if timeout.timed_out() && !*finished {
+                cancel.cancel();
+            }
+        });
+        let result = resolve_pack_with_metrics(
+            &p,
+            ObjectFormat::Sha1,
+            16,
+            ResolveLimits {
+                max_live_base_bytes: 1,
+                max_resolve_ops: limit,
+                ..ResolveLimits::default()
+            },
+            CancelFlag::new(&cancel),
+            &|_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok::<_, ()>(())
+            },
+            &metrics,
+        );
+        *done.0.lock().expect("finish") = true;
+        done.1.notify_one();
+        result
+    });
+    println!(
+        "tiny replay: pack={} bytes, objects={objects}, ops={}, limit={limit}, visits={}",
+        p.len(),
+        metrics.resolve_ops(),
+        calls.load(Ordering::Relaxed)
+    );
+    assert!(
+        matches!(result, Err(ResolveError::ResolveOps { limit: n, attempted }) if n == limit && attempted == limit + 1),
+        "operation budget must fire during replay: {result:?}"
+    );
+    assert_eq!(metrics.resolve_ops(), limit);
+    assert_eq!(metrics.in_flight_bytes(), 0);
+    assert!(cancel.is_cancelled());
+    assert!(
+        calls.load(Ordering::Relaxed) < 1000,
+        "must stop before walking the million leaves"
+    );
+}
+
+#[test]
+fn declared_count_preallocation_is_capped_before_parsing() {
+    #[cfg(target_os = "linux")]
+    if !memory_child("declared_count_preallocation_is_capped_before_parsing") {
+        return;
+    }
+    let mut p = pack_start();
+    // Enough bytes for the existing conservative count/length test, but no real
+    // entries: parsing fails immediately after bounded initial reservation.
+    p.resize(12 + 3_000_000, 0);
+    let p = finish(p, 1_000_000);
+    #[cfg(target_os = "linux")]
+    let before = status_bytes("VmPeak:");
+    let e = error(&p, ResolveLimits::unlimited());
+    #[cfg(target_os = "linux")]
+    {
+        let growth = status_bytes("VmPeak:").saturating_sub(before);
+        println!("declared count: virtual peak growth={growth}, bound=8388608");
+        assert!(
+            growth < 8 * 1024 * 1024,
+            "reservation followed unparsed header count"
+        );
+    }
+    assert!(e.contains("pack object type"), "{e}");
 }

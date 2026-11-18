@@ -79,6 +79,8 @@ jobs:
           shared-key: rust-tests-${{ runner.os }}-worktree
       - name: Test sley-worktree on Windows
         run: cargo test --locked -p sley-worktree
+      - name: Test resolved-object visitor on Windows
+        run: cargo test --locked -p sley-pack --test resolved
 
   # Build once, then clippy + test + format checks reuse the same target/ directory.
   # Avoids 4 separate cold builds; total compute time is ~70% lower at modest

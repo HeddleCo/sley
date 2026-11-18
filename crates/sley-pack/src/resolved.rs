@@ -1,16 +1,16 @@
 //! Bounded, sequential discovery and parallel depth-first pack resolution.
 //!
 //! Visitors run on workers and borrow bodies only for the call. The live-base
-//! gate counts retained ancestor bodies across all workers. Transient decoding
-//! needs at most two object bodies and one delta stream per worker in addition
-//! to that gate, metadata proportional to `max_objects`, and zlib scratch space.
+//! gate counts retained ancestor bodies across all workers. A separate shared
+//! in-flight gate reserves complete decoding workspaces before admitting workers.
+//! Metadata is proportional to `max_objects`; zlib scratch is separate.
 //! A full gate trades repeated decoding for memory; replay never calls visitors.
 use super::*;
 use flate2::{Decompress, FlushDecompress};
 use sley_core::AtomicCancel;
 use std::sync::{
-    Mutex,
-    atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    Condvar, Mutex,
+    atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
     mpsc,
 };
 
@@ -29,6 +29,10 @@ pub struct ResolveLimits {
     pub max_total_decoded: u64,
     /// Shared retained ancestor-body budget; defaults to 64 MiB. Zero forces replay.
     pub max_live_base_bytes: usize,
+    /// Shared transient workspace ceiling; defaults to 1 GiB. Workers wait for space.
+    pub max_in_flight_bytes: usize,
+    /// Discovery inflations plus every resolve/replay inflate or apply; defaults to 100M.
+    pub max_resolve_ops: u64,
 }
 impl Default for ResolveLimits {
     fn default() -> Self {
@@ -38,8 +42,55 @@ impl Default for ResolveLimits {
             max_object_bytes: 512 * 1024 * 1024,
             max_total_decoded: 16 * 1024 * 1024 * 1024,
             max_live_base_bytes: 64 * 1024 * 1024,
+            max_in_flight_bytes: 1024 * 1024 * 1024,
+            max_resolve_ops: 100_000_000,
         }
     }
+}
+impl ResolveLimits {
+    /// Trusted legacy policy: no object, work or memory caps; retain the depth limit.
+    pub fn unlimited() -> Self {
+        Self {
+            max_objects: usize::MAX,
+            max_object_bytes: u64::MAX,
+            max_total_decoded: u64::MAX,
+            max_live_base_bytes: usize::MAX,
+            max_in_flight_bytes: usize::MAX,
+            max_resolve_ops: u64::MAX,
+            ..Self::default()
+        }
+    }
+}
+/// Counters for one resolution. Use a fresh value for each call.
+/// Workspace reservations conservatively cover all transient decoding buffers.
+#[derive(Debug, Default)]
+pub struct ResolveMetrics {
+    in_flight: AtomicUsize,
+    peak_in_flight: AtomicUsize,
+    ops: AtomicU64,
+}
+impl ResolveMetrics {
+    pub fn in_flight_bytes(&self) -> usize {
+        self.in_flight.load(AtomicOrdering::Acquire)
+    }
+    pub fn peak_in_flight_bytes(&self) -> usize {
+        self.peak_in_flight.load(AtomicOrdering::Acquire)
+    }
+    pub fn resolve_ops(&self) -> u64 {
+        self.ops.load(AtomicOrdering::Acquire)
+    }
+}
+fn resolve_op<E>(metrics: &ResolveMetrics, limit: u64) -> std::result::Result<(), ResolveError<E>> {
+    metrics
+        .ops
+        .try_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |used| {
+            used.checked_add(1).filter(|next| *next <= limit)
+        })
+        .map(|_| ())
+        .map_err(|used| ResolveError::ResolveOps {
+            limit,
+            attempted: used.saturating_add(1),
+        })
 }
 /// Verified, inflated Git delta instructions and their immediate resolved base.
 #[derive(Debug)]
@@ -51,6 +102,9 @@ pub struct ResolvedDelta<'a> {
 /// One resolved pack entry. Order is unspecified; each entry is visited once.
 #[derive(Debug)]
 pub struct ResolvedObject<'a> {
+    /// Plain SHA-1/SHA-256, NOT SHA-1 collision detection. For untrusted SHA-1
+    /// input, re-hash canonical header + body with sha1dc and reject collisions
+    /// or a digest mismatch before admitting this object.
     pub oid: ObjectId,
     pub object_type: ObjectType,
     pub body: &'a [u8],
@@ -63,12 +117,21 @@ pub struct ResolvedObject<'a> {
 pub enum ResolveError<E> {
     Pack(GitError),
     Visitor(E),
+    /// Map to IMPORT_BUDGET_EXCEEDED{resolve_ops}; the attempted op did not run.
+    ResolveOps {
+        limit: u64,
+        attempted: u64,
+    },
 }
 impl<E: fmt::Display> fmt::Display for ResolveError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Pack(e) => e.fmt(f),
             Self::Visitor(e) => write!(f, "pack visitor: {e}"),
+            Self::ResolveOps { limit, attempted } => write!(
+                f,
+                "resolve_ops budget {limit} exceeded at operation {attempted}"
+            ),
         }
     }
 }
@@ -77,6 +140,7 @@ impl<E: std::error::Error + 'static> std::error::Error for ResolveError<E> {
         Some(match self {
             Self::Pack(e) => e,
             Self::Visitor(e) => e,
+            Self::ResolveOps { .. } => return None,
         })
     }
 }
@@ -89,6 +153,9 @@ pub(crate) fn infallible_error(error: ResolveError<std::convert::Infallible>) ->
     match error {
         ResolveError::Pack(error) => error,
         ResolveError::Visitor(never) => match never {},
+        ResolveError::ResolveOps { limit, attempted } => invalid(&format!(
+            "resolve_ops budget {limit} exceeded at operation {attempted}"
+        )),
     }
 }
 /// Resolve a self-contained pack, visiting each entry exactly once on workers.
@@ -105,7 +172,18 @@ pub(crate) fn infallible_error(error: ResolveError<std::convert::Infallible>) ->
 /// FAST-IMPORT design assigns this check to heddle's admission hasher).
 ///
 /// An error returns no index. Visitor calls already made cannot be rolled back:
-/// keep callback effects provisional until this function returns `Ok`.
+/// keep callback effects provisional until this function returns `Ok`. Stage
+/// writes/spool admissions and discard them on error, including a late thin pack.
+///
+/// Decoded buffers occupy at most `max_in_flight_bytes + max_live_base_bytes`
+/// across ALL threads. RSS additionally includes the borrowed input, O(object
+/// count) metadata/index, allocator slack, per-worker zlib/thread scratch, and
+/// callback-owned output (discovery uses a fixed 64 KiB scratch buffer). Actual
+/// worker count also fits the gate to bound idle allocator arenas. Each worker
+/// reserves a complete worst-case workspace
+/// (base + instructions + result) before decoding, so waiting cannot deadlock
+/// while holding transient buffers. A workspace larger than the gate is refused.
+/// [`resolve_pack_with_metrics`] exposes the shared reservation/operation counters.
 pub fn resolve_pack<V, E>(
     pack: &[u8],
     format: ObjectFormat,
@@ -113,6 +191,30 @@ pub fn resolve_pack<V, E>(
     limits: ResolveLimits,
     cancel: CancelFlag<'_>,
     visit: &V,
+) -> std::result::Result<PackIndexBuild, ResolveError<E>>
+where
+    V: Fn(&ResolvedObject<'_>) -> std::result::Result<(), E> + Sync,
+    E: Send,
+{
+    resolve_pack_with_metrics(
+        pack,
+        format,
+        threads,
+        limits,
+        cancel,
+        visit,
+        &ResolveMetrics::default(),
+    )
+}
+/// [`resolve_pack`] with observable workspace and operation accounting.
+pub fn resolve_pack_with_metrics<V, E>(
+    pack: &[u8],
+    format: ObjectFormat,
+    threads: usize,
+    limits: ResolveLimits,
+    cancel: CancelFlag<'_>,
+    visit: &V,
+    metrics: &ResolveMetrics,
 ) -> std::result::Result<PackIndexBuild, ResolveError<E>>
 where
     V: Fn(&ResolvedObject<'_>) -> std::result::Result<(), E> + Sync,
@@ -127,6 +229,7 @@ where
         visit,
         &mut |_| Ok(None),
         &mut |_| {},
+        metrics,
     )
 }
 
@@ -226,23 +329,24 @@ fn measure(
     }
 }
 
-fn discover(
+fn discover<E>(
     pack: &[u8],
     format: ObjectFormat,
     limits: ResolveLimits,
     cancel: CancelFlag<'_>,
-) -> Result<(ObjectId, Vec<Descriptor>)> {
+    metrics: &ResolveMetrics,
+) -> std::result::Result<(ObjectId, Vec<Descriptor>), ResolveError<E>> {
     cancel.check()?;
     if pack.len() < 12 + format.raw_len() || &pack[..4] != b"PACK" {
-        return Err(invalid("truncated pack or missing PACK signature"));
+        return Err(invalid("truncated pack or missing PACK signature").into());
     }
     if !matches!(u32_be(&pack[4..8]), 2 | 3) {
-        return Err(invalid("unsupported pack version"));
+        return Err(invalid("unsupported pack version").into());
     }
     let end = pack.len() - format.raw_len();
     let count = u32_be(&pack[8..12]) as usize;
     if count > limits.max_objects {
-        return Err(invalid("ResolveLimits::max_objects exceeded"));
+        return Err(invalid("ResolveLimits::max_objects exceeded").into());
     }
     checked_pack_object_count(count as u32, (end - 12) as u64)?;
     let mut digest = StreamingDigest::new(format);
@@ -252,9 +356,9 @@ fn discover(
     }
     let checksum = digest.finalize()?;
     if checksum.as_bytes() != &pack[end..] {
-        return Err(invalid("pack checksum mismatch"));
+        return Err(invalid("pack checksum mismatch").into());
     }
-    let mut entries = reserve(count)?;
+    let mut entries = reserve(pack_entry_prealloc(count))?;
     // Fixed discovery scratch, independent of attacker-declared body sizes.
     let mut scratch = reserve(64 * 1024)?;
     scratch.resize(64 * 1024, 0);
@@ -280,6 +384,7 @@ fn discover(
             base,
             result_size: 0,
         };
+        resolve_op(metrics, limits.max_resolve_ops)?;
         measure(
             &pack[..end],
             &mut d,
@@ -289,10 +394,16 @@ fn discover(
             &mut scratch,
         )?;
         offset = d.end;
+        if entries.len() == entries.capacity() {
+            let extra = entries.len().max(1).min(count - entries.len());
+            entries
+                .try_reserve_exact(extra)
+                .map_err(|_| invalid("could not grow pack metadata"))?;
+        }
         entries.push(d);
     }
     if offset != end {
-        return Err(invalid("pack has trailing bytes before checksum"));
+        return Err(invalid("pack has trailing bytes before checksum").into());
     }
     Ok((checksum, entries))
 }
@@ -316,6 +427,10 @@ struct Engine<'a, 'c, V, E> {
     visit: &'a V,
     state: Mutex<State<E>>,
     live: AtomicUsize,
+    metrics: &'a ResolveMetrics,
+    workspace: usize,
+    flight_wait: Mutex<()>,
+    flight_wake: Condvar,
 }
 /// Own the byte charge with its body, including error unwinds.
 struct Retained<'a> {
@@ -324,7 +439,21 @@ struct Retained<'a> {
 }
 impl Drop for Retained<'_> {
     fn drop(&mut self) {
-        self.live.fetch_sub(self.body.len(), AtomicOrdering::AcqRel);
+        let size = self.body.len();
+        drop(std::mem::take(&mut self.body));
+        self.live.fetch_sub(size, AtomicOrdering::AcqRel);
+    }
+}
+// This lease is declared before any walk buffers and drops after all of them.
+struct Flight<'a> {
+    used: &'a AtomicUsize,
+    wake: &'a Condvar,
+    bytes: usize,
+}
+impl Drop for Flight<'_> {
+    fn drop(&mut self) {
+        self.used.fetch_sub(self.bytes, AtomicOrdering::AcqRel);
+        self.wake.notify_all();
     }
 }
 struct Frame<'a> {
@@ -396,8 +525,54 @@ where
             },
         )
     }
+    fn operation(&self) -> Result<()> {
+        if let Err(error) = resolve_op(self.metrics, self.limits.max_resolve_ops) {
+            self.fail(error);
+            return Err(GitError::Cancelled);
+        }
+        Ok(())
+    }
+    fn flight(&self) -> Result<Flight<'_>> {
+        let bytes = self.workspace;
+        if bytes > self.limits.max_in_flight_bytes {
+            return Err(invalid(
+                "ResolveLimits::max_in_flight_bytes cannot fit workspace",
+            ));
+        }
+        let mut wait = self
+            .flight_wait
+            .lock()
+            .map_err(|_| invalid("pack gate poisoned"))?;
+        loop {
+            self.check()?;
+            if let Ok(used) = self.metrics.in_flight.try_update(
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+                |used| {
+                    used.checked_add(bytes)
+                        .filter(|next| *next <= self.limits.max_in_flight_bytes)
+                },
+            ) {
+                self.metrics
+                    .peak_in_flight
+                    .fetch_max(used + bytes, AtomicOrdering::AcqRel);
+                return Ok(Flight {
+                    used: &self.metrics.in_flight,
+                    wake: &self.flight_wake,
+                    bytes,
+                });
+            }
+            // Timed waits also poll cancellation and tolerate a missed notification.
+            wait = self
+                .flight_wake
+                .wait_timeout(wait, std::time::Duration::from_millis(10))
+                .map_err(|_| invalid("pack gate poisoned"))?
+                .0;
+        }
+    }
     fn inflate(&self, index: usize) -> Result<Vec<u8>> {
         self.check()?;
+        self.operation()?;
         let d = &self.entries[index];
         let size = size_check(d.header.size, self.limits)?;
         self.work((d.end - d.data) as u64, Work::Compressed)?;
@@ -410,6 +585,7 @@ where
     }
     fn apply(&self, index: usize, base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
         self.check()?;
+        self.operation()?;
         let plan = plan_pack_delta(base, delta)?;
         let size = size_check(plan.result_size, self.limits)?;
         self.work(plan.result_size, Work::Decoded)?;
@@ -423,7 +599,7 @@ where
     fn retain<'a>(&'a self, body: Vec<u8>) -> Option<Retained<'a>> {
         let size = body.len();
         self.live
-            .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |used| {
+            .try_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |used| {
                 used.checked_add(size)
                     .filter(|sum| *sum <= self.limits.max_live_base_bytes)
             })
@@ -523,6 +699,7 @@ where
         root: Root<'_>,
         completed: &mpsc::SyncSender<()>,
     ) -> std::result::Result<(), ResolveError<E>> {
+        let _flight = self.flight()?;
         let (mut frame, body, external) = match root {
             Root::Entry(index) => {
                 let body = self.inflate(index)?;
@@ -609,7 +786,15 @@ where
         count: &mut u64,
     ) {
         let cursor = AtomicUsize::new(0);
-        let workers = threads.max(1).min(roots.len());
+        // Also limit actual threads: otherwise serial admissions can leave a
+        // separate allocator arena full of freed buffers on every idle worker.
+        let slots = self
+            .limits
+            .max_in_flight_bytes
+            .checked_div(self.workspace)
+            .unwrap_or(usize::MAX)
+            .max(1);
+        let workers = threads.max(1).min(roots.len()).min(slots);
         let (send, recv) = mpsc::sync_channel(workers.max(1));
         std::thread::scope(|scope| {
             let mut handles = Vec::new();
@@ -676,6 +861,7 @@ pub(crate) fn resolve_with_base<V, E, F, P>(
     visit: &V,
     external: &mut F,
     progress: &mut P,
+    metrics: &ResolveMetrics,
 ) -> std::result::Result<PackIndexBuild, ResolveError<E>>
 where
     V: Fn(&ResolvedObject<'_>) -> std::result::Result<(), E> + Sync,
@@ -684,7 +870,19 @@ where
     P: FnMut(PackIndexProgress),
 {
     let result = (|| {
-        let (checksum, entries) = discover(pack, format, limits, cancel)?;
+        let (checksum, entries) = discover(pack, format, limits, cancel, metrics)?;
+        let max_body = entries.iter().map(|d| d.result_size).max().unwrap_or(0);
+        let mut workspace = max_body;
+        for d in entries.iter().filter(|d| d.base.is_some()) {
+            workspace = workspace.max(
+                max_body
+                    .checked_add(d.result_size)
+                    .and_then(|size| size.checked_add(d.header.size))
+                    .ok_or_else(|| invalid("pack workspace size overflow"))?,
+            );
+        }
+        let workspace =
+            usize::try_from(workspace).map_err(|_| invalid("pack workspace overflows usize"))?;
         let mut children: Vec<Vec<usize>> = reserve(entries.len())?;
         children.resize_with(entries.len(), Vec::new);
         let mut refs = BTreeMap::<ObjectId, Vec<usize>>::new();
@@ -724,6 +922,10 @@ where
                 compressed_work: 0,
             }),
             live: AtomicUsize::new(0),
+            metrics,
+            workspace,
+            flight_wait: Mutex::new(()),
+            flight_wake: Condvar::new(),
         };
         let mut count = 0;
         if entries.is_empty() {

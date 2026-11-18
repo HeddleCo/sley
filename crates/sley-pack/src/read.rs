@@ -18,6 +18,21 @@ impl PackFile {
         Self::parse_with_limits(bytes, format, PackReadLimits::default())
     }
 
+    /// Parse with explicit resolver limits; default options preserve trusted policy.
+    pub fn parse_with_options(
+        bytes: &[u8],
+        format: ObjectFormat,
+        options: PackIndexOptions,
+    ) -> Result<Self> {
+        parse_parallel_pack(
+            bytes,
+            format,
+            &mut |_| Ok(None),
+            options,
+            CancelFlag::never(),
+        )
+    }
+
     /// Parse and resolve a complete pack with explicit read limits.
     pub fn parse_with_limits(
         bytes: &[u8],
