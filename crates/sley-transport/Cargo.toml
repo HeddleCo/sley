@@ -22,8 +22,8 @@ sley-core.workspace = true
 sley-protocol.workspace = true
 tempfile = "3.27.0"
 # gzip is required for smart-HTTP; TLS features are forwarded separately above.
-ureq = { version = "3.4.2", optional = true, default-features = false, features = ["gzip"] }
-webpki-root-certs = { version = "1.0.9", optional = true }
+ureq = { version = "3.5.2", optional = true, default-features = false, features = ["gzip"] }
+webpki-root-certs = { version = "1.0.12", optional = true }
 
 [dev-dependencies]
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
