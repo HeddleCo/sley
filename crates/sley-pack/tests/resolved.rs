@@ -7,8 +7,10 @@ use sley_pack::{
 };
 use std::collections::HashMap;
 use std::io::Write;
+#[cfg(target_os = "linux")]
+use std::sync::Barrier;
 use std::sync::{
-    Barrier, Mutex,
+    Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 
@@ -302,10 +304,16 @@ fn forward_ref_chain_and_duplicate_oids_visit_each_entry() {
         },
         CancelFlag::never(),
         &|o| {
+            assert_eq!(o.oid, ids[o.depth as usize]);
+            assert_eq!(o.body, bodies[o.depth as usize]);
+            if let Some(d) = &o.delta {
+                assert_eq!(d.base, ids[o.depth as usize - 1]);
+                assert_eq!(apply(&bodies[o.depth as usize - 1], d.instructions), o.body);
+            }
             assert!(
                 seen.lock()
                     .expect("seen")
-                    .insert(o.offset, o.depth)
+                    .insert(o.offset, o.delta.as_ref().map(|d| (d.base, d.base_offset)))
                     .is_none()
             );
             Ok::<_, ()>(())
@@ -313,7 +321,16 @@ fn forward_ref_chain_and_duplicate_oids_visit_each_entry() {
     )
     .expect("forward refs resolved from final root");
     assert_eq!(built.entries.len(), depth as usize + 2);
-    assert_eq!(seen.into_inner().expect("seen").len(), depth as usize + 2);
+    let seen = seen.into_inner().expect("seen");
+    assert_eq!(seen.len(), depth as usize + 2);
+    for (base_oid, base_offset) in seen.values().flatten() {
+        assert!(
+            built
+                .entries
+                .iter()
+                .any(|entry| entry.offset == *base_offset && entry.oid == *base_oid)
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]

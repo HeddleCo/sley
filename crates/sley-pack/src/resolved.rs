@@ -665,8 +665,17 @@ where
             progress(PackIndexProgress::default());
         }
         engine.run(&roots, threads, progress, &mut count);
-        let mut missing = HashSet::new();
-        loop {
+        // The pending REF map only shrinks. Snapshot once: repeatedly searching
+        // past missing bases would make a thin pack with distinct bases quadratic.
+        let pending: Vec<_> = engine
+            .state
+            .lock()
+            .map_err(|_| invalid("pack state poisoned"))?
+            .refs
+            .keys()
+            .copied()
+            .collect();
+        for oid in pending {
             let mut state = engine
                 .state
                 .lock()
@@ -674,36 +683,35 @@ where
             if let Some(error) = state.error.take() {
                 return Err(error);
             }
-            if count == entries.len() as u64 {
-                break;
+            if !state.refs.contains_key(&oid) {
+                continue;
             }
-            let oid = state
-                .refs
-                .keys()
-                .find(|oid| !missing.contains(*oid))
-                .copied();
             drop(state);
-            let Some(oid) = oid else {
-                return Err(invalid("unresolved, cyclic, or external delta base").into());
-            };
             cancel.check()?;
-            match external(&oid)? {
-                Some(object) => {
-                    size_check(object.body.len() as u64, limits)?;
-                    if object.object_id(format)? != oid {
-                        return Err(invalid("external delta base identity mismatch").into());
-                    }
-                    engine.run(
-                        &[Root::External(oid, &object)],
-                        threads,
-                        progress,
-                        &mut count,
-                    );
+            if let Some(object) = external(&oid)? {
+                size_check(object.body.len() as u64, limits)?;
+                if object.object_id(format)? != oid {
+                    return Err(invalid("external delta base identity mismatch").into());
                 }
-                None => {
-                    missing.insert(oid);
-                }
+                engine.run(
+                    &[Root::External(oid, &object)],
+                    threads,
+                    progress,
+                    &mut count,
+                );
             }
+        }
+        {
+            let mut state = engine
+                .state
+                .lock()
+                .map_err(|_| invalid("pack state poisoned"))?;
+            if let Some(error) = state.error.take() {
+                return Err(error);
+            }
+        }
+        if count != entries.len() as u64 {
+            return Err(invalid("unresolved, cyclic, or external delta base").into());
         }
         cancel.check()?;
         let state = engine
