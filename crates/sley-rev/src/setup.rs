@@ -721,7 +721,7 @@ where
                 self.setup.options.positives.push(RevisionTip {
                     oid,
                     rev: reference.name.clone(),
-                    source_name: Some(reference.name.clone()),
+                    source_name: Some(reference.name),
                     from_ref_selector: true,
                 });
             }

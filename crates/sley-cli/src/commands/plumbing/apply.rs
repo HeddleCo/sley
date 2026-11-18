@@ -2875,7 +2875,7 @@ fn apply_patch_whitespace(
                     let content = if trailing_nl {
                         fixed[..fixed.len() - 1].to_vec()
                     } else {
-                        fixed.clone()
+                        fixed
                     };
                     let completed = incomplete && trailing_nl;
                     let HunkLine::Insert(bytes) = &mut hunk.lines[index] else {

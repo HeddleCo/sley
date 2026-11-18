@@ -327,8 +327,7 @@ impl Graph {
     }
 
     fn is_mapping_correct(&self) -> bool {
-        for i in 0..self.mapping_size {
-            let target = self.mapping[i];
+        for (i, &target) in self.mapping[..self.mapping_size].iter().enumerate() {
             if target < 0 {
                 continue;
             }

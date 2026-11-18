@@ -4602,7 +4602,7 @@ impl FileRefStore {
                         update_index: 0,
                         value: ReftableRefValue::Deletion,
                     });
-                    delete_names.push(delete.name.clone());
+                    delete_names.push(delete.name);
                 }
             }
         }

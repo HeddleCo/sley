@@ -686,10 +686,7 @@ where
 
         // If a structural (fatal) content problem stopped parsing, do not also
         // run the link walk — git aborts the object too.
-        if had_fatal {
-            return true;
-        }
-        false
+        had_fatal
     }
 
     fn check_commit(&mut self, oid: ObjectId, body: &[u8]) {
