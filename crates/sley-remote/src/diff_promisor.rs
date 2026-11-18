@@ -185,7 +185,7 @@ pub fn prefetch_promisor_objects(
                     db,
                     url,
                     &missing,
-                    filter.clone(),
+                    filter,
                 )
                 .unwrap_or_default()
             };

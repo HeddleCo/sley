@@ -494,10 +494,7 @@ fn curl_url_is_normalizable(url: &str) -> bool {
         .as_bytes()
         .first()
         .is_none_or(|c| matches!(c, b':' | b'/' | b'?' | b'#'));
-    if host_missing && !scheme.eq_ignore_ascii_case("file") {
-        return false;
-    }
-    true
+    !host_missing || scheme.eq_ignore_ascii_case("file")
 }
 
 /// `starts_with_dot_slash` (git `dir.h`, XPLATFORM): a leading `./` where the

@@ -401,7 +401,7 @@ pub fn compute_blame(
             // `.git/info/grafts` overrides this commit's parents.
             grafted.clone()
         } else {
-            commit.parents.clone()
+            commit.parents
         };
         if first_parent {
             parents.truncate(1);

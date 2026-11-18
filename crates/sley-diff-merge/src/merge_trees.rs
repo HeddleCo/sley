@@ -1293,7 +1293,7 @@ fn resolve_directory_file_conflicts(
                     *path = new_path.clone();
                 }
             }
-            slot.path = new_path.clone();
+            slot.path = new_path;
             slot.result = Some(entry);
             // Preserve any pre-existing higher-order stages; a clean file leaf has
             // none, so seed ours/theirs from the effective maps for `ls-files -u`.
@@ -1319,7 +1319,7 @@ fn resolve_directory_file_conflicts(
             });
         } else {
             paths.push(MergedPath {
-                path: new_path.clone(),
+                path: new_path,
                 stages: MergeStages {
                     base: None,
                     ours: if from_ours { Some(entry) } else { None },
@@ -1867,13 +1867,13 @@ fn collect_side_renames(
             // The destination may still be occupied by an unrelated add or a
             // second rename; merge-ort stacks rename/delete with that add/add.
             if base_map.contains_key(&old) {
-                let conflicts = renames.rename_deletes.entry(new.clone()).or_default();
+                let conflicts = renames.rename_deletes.entry(new).or_default();
                 if !conflicts
                     .iter()
                     .any(|conflict| conflict.source == old && conflict.side == side)
                 {
                     conflicts.push(RenameDelete {
-                        source: old.clone(),
+                        source: old,
                         side,
                     });
                 }
@@ -2794,7 +2794,7 @@ fn apply_dir_rename_two_to_one_conflicts(
             )
         } else {
             MergeBlobResult {
-                content: ours_bytes.clone(),
+                content: ours_bytes,
                 conflicted: true,
             }
         };

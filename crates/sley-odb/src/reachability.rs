@@ -3723,7 +3723,7 @@ fn bitmap_num_maximal_commits(
                     std::collections::hash_map::Entry::Vacant(vacant) => {
                         // Fresh parent mask: c_not_p, !p_not_c -> not maximal.
                         vacant.insert(MaximalEnt {
-                            mask: ent.mask.clone(),
+                            mask: ent.mask,
                             maximal: false,
                         });
                     }
