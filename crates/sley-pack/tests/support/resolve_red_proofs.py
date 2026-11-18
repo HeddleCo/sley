@@ -110,6 +110,19 @@ add('subtree-stealing', 'one_hot_family_is_stolen_by_multiple_workers', rp, lamb
 add('panic-unwind-stop', 'panicking_visitor_stops_idle_workers_before_watchdog', rp, lambda s: s.replace('let _unwind = UnwindStop(&self.stop);', 'let _unwind = ();'))
 add('dependent-release-order', 'last_dependent_releases_base_before_visiting_child', rp, lambda s: s.replace('        parent.release()?;\n', '').replace('        let base = self.replay(&parent)?;', '        parent.release()?;\n        let base = self.replay(&parent)?;'))
 
+# Original hostile-input contracts retained by the scheduler change.
+add('shared-live-gate', 'live_base_bound_is_shared_and_replay_stays_within_peak_memory', rp, lambda s: s.replace('.filter(|sum| *sum <= self.limits.max_live_base_bytes)', '.filter(|_| true)'))
+for name,test in [('declared-body-bomb','declared_size_bomb_is_refused_before_allocation'), ('declared-result-bomb','delta_result_bomb_and_running_budgets_are_checked_before_visits')]:
+    add(name,test,rp,lambda s: region(s,'fn size_check(', 'fn charge(',lambda b:b.replace('if size > limit {','if false {')))
+add('depth-before-apply','depth_51_is_refused_before_visiting_the_deep_object',pp,lambda s:s.replace('if depth <= limits.max_delta_depth {','if true {'))
+add('truncated-discovery','truncation_and_trailing_bytes_are_errors',rp,lambda s:s.replace('return Err(invalid("truncated pack zlib stream"));','d.end = d.data + z.total_in() as usize; return Ok(());'))
+def cancel_off(s):
+    s=s.replace('        self.cancel.check()?;\n        self.stop_flag().check()', '        self.stop_flag().check()')
+    return s.replace('                if let Err(error) = self.cancel.check() {\n                    self.fail(error.into());\n                }','')
+add('cancel-polls','cancel_mid_pass_and_visitor_error_set_cancel_and_preserve_first_error',rp,cancel_off)
+add('replayed-result-work','replayed_delta_result_budget_is_shared_across_workers',rp,lambda s:s.replace('        self.work(plan.result_size, Work::Decoded)?;',''))
+add('compressed-replay-work','low_output_deflate_replay_spends_encoded_work_budget',rp,lambda s:s.replace('        self.work((d.end - d.data) as u64, Work::Compressed)?;',''))
+
 results = []
 try:
     for name, test, path, mutate, features in probes:
