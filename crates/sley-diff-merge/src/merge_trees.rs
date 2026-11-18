@@ -1872,10 +1872,7 @@ fn collect_side_renames(
                     .iter()
                     .any(|conflict| conflict.source == old && conflict.side == side)
                 {
-                    conflicts.push(RenameDelete {
-                        source: old,
-                        side,
-                    });
+                    conflicts.push(RenameDelete { source: old, side });
                 }
             }
             continue;

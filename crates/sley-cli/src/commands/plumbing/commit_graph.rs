@@ -868,7 +868,7 @@ fn commit_graph_stdin_packs_starts(
         let pack_path = resolve_cli_path(cwd, line);
         // git resolves the named pack relative to the object dir's pack/ dir
         // when it is not an absolute existing path.
-        let candidates = [pack_path.clone(), object_dir.join("pack").join(line)];
+        let candidates = [pack_path, object_dir.join("pack").join(line)];
         let resolved = candidates.iter().find(|path| path.exists());
         let Some(resolved) = resolved else {
             eprintln!("error: error adding pack {line}");

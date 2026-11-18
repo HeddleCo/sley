@@ -1145,7 +1145,7 @@ fn patch_update_file(
         if line.is_empty() {
             continue;
         }
-        let answer = line.clone();
+        let answer = line;
         let Some(ch) = answer.chars().next() else {
             continue;
         };

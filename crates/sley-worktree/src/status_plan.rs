@@ -477,7 +477,7 @@ fn status_entries_with_exact_renames(
             }
             output.push(StatusOutputEntry {
                 entry: renamed,
-                rename_from: Some(deleted.path.clone()),
+                rename_from: Some(deleted.path),
             });
             if entry.worktree != b' ' {
                 let mut residual = entry.clone();
@@ -540,7 +540,7 @@ fn status_entries_with_exact_renames(
             }
             output.push(StatusOutputEntry {
                 entry: renamed,
-                rename_from: Some(deleted.path.clone()),
+                rename_from: Some(deleted.path),
             });
             continue;
         }

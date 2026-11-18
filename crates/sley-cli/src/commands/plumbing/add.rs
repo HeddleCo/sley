@@ -2333,7 +2333,7 @@ fn resolve_add_regular_tracked_exact_actions(
                 }
                 if single_path {
                     exact_tracked = Some(ExactTrackedAdd {
-                        git_path: git_path.clone(),
+                        git_path,
                         needs_index_update,
                     });
                 }
@@ -2350,7 +2350,7 @@ fn resolve_add_regular_tracked_exact_actions(
                 }
                 if single_path {
                     exact_tracked = Some(ExactTrackedAdd {
-                        git_path: git_path.clone(),
+                        git_path,
                         needs_index_update,
                     });
                 }
