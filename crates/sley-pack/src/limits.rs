@@ -56,8 +56,8 @@ pub(crate) fn checked_pack_object_count(
 
 /// Capacity to reserve up front for a declared object count (sley#4).
 ///
-/// The count is attacker-controlled, so it selects the reservation but never
-/// dictates it; anything above [`PACK_OBJECT_COUNT_PREALLOC_CAP`] grows on
+/// The count is attacker-controlled and is first bounded by the bytes present.
+/// The same physical bound applies to trusted and bounded discovery. Above [`PACK_OBJECT_COUNT_PREALLOC_CAP`] grows on
 /// demand as entries are actually parsed.
 pub(crate) fn pack_entry_prealloc(count: usize, entry_bytes: usize) -> usize {
     count

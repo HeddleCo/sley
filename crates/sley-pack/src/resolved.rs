@@ -82,7 +82,8 @@ impl ResolveMetrics {
     pub fn peak_in_flight_bytes(&self) -> usize {
         self.peak_in_flight.load(AtomicOrdering::Acquire)
     }
-    /// Peak allocated resolver/index metadata bytes, excluding decoding buffers.
+    /// Conservative peak metadata capacity (vectors, REF slots, conversion/index
+    /// scratch); excludes fixed worker/zlib state and allocator overhead.
     pub fn peak_metadata_bytes(&self) -> usize {
         self.metadata.load(AtomicOrdering::Acquire)
     }
@@ -164,9 +165,9 @@ pub(crate) fn infallible_error(error: ResolveError<std::convert::Infallible>) ->
     match error {
         ResolveError::Pack(error) => error,
         ResolveError::Visitor(never) => match never {},
-        ResolveError::ResolveOps { limit, attempted } => invalid(&format!(
-            "resolve_ops budget {limit} exceeded at operation {attempted}"
-        )),
+        ResolveError::ResolveOps { limit, attempted } => {
+            budget(ResourceLimitKind::ResolveOps, limit, attempted)
+        }
     }
 }
 /// Resolve a self-contained pack, visiting each entry exactly once on workers.
@@ -1011,7 +1012,16 @@ where
                 let finished = handles
                     .iter()
                     .all(std::thread::ScopedJoinHandle::is_finished);
-                *count = initial + completed.load(AtomicOrdering::Acquire) as u64;
+                let next = initial + completed.load(AtomicOrdering::Acquire) as u64;
+                // Coalescing must still expose an intermediate completed object
+                // when a small pack finishes between coordinator polls.
+                if *count == initial && next > initial + 1 {
+                    progress(PackIndexProgress {
+                        completed_objects: initial + 1,
+                        total_objects: self.entries.len() as u64,
+                    });
+                }
+                *count = next;
                 progress(PackIndexProgress {
                     completed_objects: *count,
                     total_objects: self.entries.len() as u64,

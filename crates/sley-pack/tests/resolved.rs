@@ -1652,6 +1652,10 @@ fn lying_maximum_object_count_over_one_kib_has_bounded_allocation() {
             metrics.peak_metadata_bytes()
         );
         assert!(metrics.peak_metadata_bytes() <= 8 * 1024 * 1024);
+        assert!(
+            metrics.peak_metadata_bytes() <= 16 * 1024,
+            "reservation must follow the one-KiB input, not just a fixed count cap"
+        );
         #[cfg(target_os = "linux")]
         assert!(status_bytes("VmPeak:").saturating_sub(before) <= 8 * 1024 * 1024);
     }
@@ -1933,4 +1937,129 @@ fn million_objects_fit_metadata_coefficient() {
             "metadata RSS exceeded coefficient plus slack"
         );
     }
+}
+
+#[test]
+fn legacy_operation_budget_remains_typed() {
+    let p = chains(1, 1, 32, false);
+    let options = PackIndexOptions::default().with_resolve_limits(ResolveLimits {
+        max_resolve_ops: 1,
+        ..ResolveLimits::default()
+    });
+    for e in [
+        PackIndex::write_v2_for_pack_with_options(
+            &p,
+            ObjectFormat::Sha1,
+            |_| Ok(None),
+            options,
+            CancelFlag::never(),
+            |_| {},
+        )
+        .expect_err("index ops cap"),
+        PackFile::parse_with_options(&p, ObjectFormat::Sha1, options).expect_err("parse ops cap"),
+    ] {
+        assert!(matches!(
+            e,
+            GitError::ResourceLimit {
+                kind: sley_core::ResourceLimitKind::ResolveOps,
+                limit: 1,
+                attempted: 2
+            }
+        ));
+    }
+    println!("legacy budget: index and parse preserve typed resolve_ops (limit=1, attempted=2)");
+}
+
+#[test]
+fn ref_slots_and_pending_snapshot_are_in_metadata_accounting() {
+    const N: usize = 32_768;
+    let mut p = pack_start();
+    for n in 0..N {
+        header(7, 4, &mut p);
+        let mut oid = [0; 20];
+        oid[..8].copy_from_slice(&(n as u64).to_be_bytes());
+        p.extend(oid);
+        compressed(&[1, 1, 1, b'x'], &mut p);
+    }
+    let p = finish(p, N as u32);
+    let metrics = ResolveMetrics::default();
+    resolve_pack_with_metrics(
+        &p,
+        ObjectFormat::Sha1,
+        16,
+        ResolveLimits::default(),
+        CancelFlag::never(),
+        &|_| Ok::<_, ()>(()),
+        &metrics,
+    )
+    .expect_err("missing bases");
+    let bytes = metrics.peak_metadata_bytes();
+    println!(
+        "REF metadata: count={N}, accounted={bytes}, bytes/object={:.3}",
+        bytes as f64 / N as f64
+    );
+    // Includes descriptor/output/child vectors, sorted REF slots and lists,
+    // grouping input and the pending snapshot, including capacity overlap.
+    assert!(bytes >= 200 * N && bytes <= 300 * N);
+}
+
+#[cfg(feature = "fetch-profile")]
+#[test]
+fn trusted_index_restores_inflate_and_delta_profile_spans() {
+    use sley_core::fetch_profile::{Stage, snapshot};
+    let p = chains(16, 2, 4096, false);
+    let before = snapshot();
+    PackIndex::write_v2_for_pack_with_options(
+        &p,
+        ObjectFormat::Sha1,
+        |_| Ok(None),
+        PackIndexOptions::default().with_threads(16),
+        CancelFlag::never(),
+        |_| {},
+    )
+    .expect("profiled index");
+    let after = snapshot();
+    for stage in [Stage::Inflate, Stage::DeltaResolution] {
+        assert!(
+            after.stages[stage as usize].duration > before.stages[stage as usize].duration,
+            "missing profile stage {stage:?}"
+        );
+    }
+    println!("fetch-profile: Inflate and DeltaResolution both recorded");
+}
+
+#[test]
+fn trusted_small_packs_keep_intermediate_progress() {
+    let p = chains(24, 0, 1, false);
+    for threads in [1, 16] {
+        for _ in 0..8 {
+            let mut samples = Vec::new();
+            let built = PackIndex::write_v2_for_pack_with_options(
+                &p,
+                ObjectFormat::Sha1,
+                |_| Ok(None),
+                PackIndexOptions::default().with_threads(threads),
+                CancelFlag::never(),
+                |progress| samples.push(progress),
+            )
+            .expect("small trusted pack");
+            assert_eq!(built.objects.len(), 24);
+            assert!(
+                samples
+                    .iter()
+                    .any(|s| s.completed_objects > 0 && s.completed_objects < 24),
+                "coalescing lost intermediate object progress"
+            );
+            assert!(
+                samples
+                    .windows(2)
+                    .all(|w| w[0].completed_objects <= w[1].completed_objects)
+            );
+            assert_eq!(
+                samples.last().expect("progress sample").completed_objects,
+                24
+            );
+        }
+    }
+    println!("trusted progress: intermediate samples preserved at threads 1/16");
 }

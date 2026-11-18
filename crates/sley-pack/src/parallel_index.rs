@@ -116,9 +116,11 @@ where
     )
     .map_err(|error| match error {
         ResolveError::Pack(error) | ResolveError::Visitor(error) => error,
-        ResolveError::ResolveOps { limit, attempted } => GitError::InvalidFormat(format!(
-            "resolve_ops budget {limit} exceeded at operation {attempted}"
-        )),
+        ResolveError::ResolveOps { limit, attempted } => GitError::ResourceLimit {
+            kind: ResourceLimitKind::ResolveOps,
+            limit,
+            attempted,
+        },
     })?;
     let mut objects = objects
         .into_inner()
