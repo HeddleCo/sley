@@ -2085,6 +2085,72 @@ fn clone_local_repository_reference_flags_match_upstream_git() {
 }
 
 #[test]
+fn clone_no_hardlinks_preserves_read_only_object_bytes_and_timestamps() {
+    let root = unique_temp_dir("clone-copy-object-times");
+    let source = root.join("source");
+    fs::create_dir_all(&source).expect("create source");
+    create_source_repo(&source);
+    // Keep this object unreachable so clone's later validation does not read
+    // its copied body and legitimately advance its access time.
+    fs::write(source.join("unreachable.txt"), b"timestamp fixture\n").expect("write fixture");
+    let oid = run_success(
+        sley_testkit::oracle_git(),
+        &source,
+        &["hash-object", "-w", "unreachable.txt"],
+    );
+    let oid = std::str::from_utf8(&oid)
+        .expect("object id is ASCII")
+        .trim();
+    let source_object = loose_object_path(&source.join(".git"), oid);
+    let original_bytes = fs::read(&source_object).expect("read source object");
+    let accessed = UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+    let modified = UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    fs::File::open(&source_object)
+        .expect("open read-only source object")
+        .set_times(
+            fs::FileTimes::new()
+                .set_accessed(accessed)
+                .set_modified(modified),
+        )
+        .expect("age source object");
+    assert!(
+        fs::metadata(&source_object)
+            .expect("stat source")
+            .permissions()
+            .readonly()
+    );
+
+    let destination = root.join("copy.git");
+    run_success(
+        sley_testkit::sley_bin!(),
+        &root,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            "--no-hardlinks",
+            source.to_str().expect("source path"),
+            destination.to_str().expect("destination path"),
+        ],
+    );
+    let copied = loose_object_path(&destination, oid);
+    // Inspect metadata before reading, which can update atime.
+    let metadata = fs::metadata(&copied).expect("stat copied object");
+    assert_eq!(metadata.accessed().expect("copied atime"), accessed);
+    assert_eq!(metadata.modified().expect("copied mtime"), modified);
+    assert!(metadata.permissions().readonly());
+    assert_ne!(
+        metadata.ino(),
+        fs::metadata(&source_object).expect("source inode").ino()
+    );
+    assert_eq!(
+        fs::read(copied).expect("read copied object"),
+        original_bytes
+    );
+    fs::remove_dir_all(root).expect("remove repositories");
+}
+
+#[test]
 fn clone_local_repository_local_transport_flags_match_upstream_git() {
     let root = unique_temp_dir("clone-local-transport-flags");
     let source = root.join("source");

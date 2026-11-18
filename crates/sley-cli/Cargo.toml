@@ -38,10 +38,10 @@ sley-diff-merge.workspace = true
 sley-core.workspace = true
 sley-config.workspace = true
 # SIGINT/Ctrl-C → cooperative AtomicCancel for fetch/clone/push (no unsafe in sley).
-ctrlc = "3.5.2"
-filetime = "0.2.29"
-regex = "1.13.1"
-pprof = { version = "0.15", optional = true }
+ctrlc = "3.5.3"
+filetime = "0.2.30"
+regex = "1.13.2"
+pprof = { version = "0.15.0", optional = true }
 sley = { workspace = true, features = ["full"] }
 sley-archive.workspace = true
 sley-grep.workspace = true

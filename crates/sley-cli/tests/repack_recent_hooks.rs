@@ -1,3 +1,6 @@
+#[path = "support/times.rs"]
+mod times;
+
 use filetime::FileTime;
 use std::fs;
 #[cfg(unix)]
@@ -145,7 +148,7 @@ fn gc_cruft_expiration_respects_recent_hook_roots() {
     let oid = write_unreachable_blob(&repo, b"precious unreachable\n");
     let loose = repo.join(".git/objects").join(&oid[..2]).join(&oid[2..]);
     let old = FileTime::from_unix_time(946_684_800, 0);
-    filetime::set_file_mtime(&loose, old).expect("age unreachable object");
+    times::set_mtime(&loose, old).expect("age unreachable object");
     success(git, &repo, &["repack", "-a", "-d", "--cruft"]);
     success(
         git,

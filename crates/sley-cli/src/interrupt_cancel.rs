@@ -50,3 +50,70 @@ pub(crate) fn reset_process_interrupt_cancel(flag: &AtomicCancel) {
 pub(crate) fn dyn_cancel_flag(flag: &AtomicCancel) -> CancelFlag<'_> {
     CancelFlag::new(flag)
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn sigint_cancels_then_exits_130() {
+        const CHILD: &str = "SLEY_INTERRUPT_DEPENDENCY_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            let flag = process_interrupt_cancel();
+            let mut output = std::io::stdout().lock();
+            writeln!(output, "handler ready").expect("announce handler");
+            output.flush().expect("flush readiness");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !flag.is_cancelled() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                dyn_cancel_flag(&flag).is_cancelled(),
+                "first SIGINT must cancel"
+            );
+            writeln!(output, "cancelled").expect("announce cancellation");
+            output.flush().expect("flush cancellation");
+            std::thread::sleep(Duration::from_secs(5));
+            panic!("second SIGINT must exit immediately");
+        }
+        let mut child = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "interrupt_cancel::tests::sigint_cancels_then_exits_130",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("start isolated signal test");
+        let mut output = BufReader::new(child.stdout.take().expect("child stdout"));
+        for expected in ["handler ready", "cancelled"] {
+            let mut line = String::new();
+            loop {
+                assert_ne!(
+                    output.read_line(&mut line).expect("read child status"),
+                    0,
+                    "child exited before {expected}"
+                );
+                if line.trim() == expected {
+                    break;
+                }
+                line.clear();
+            }
+            assert!(
+                Command::new("kill")
+                    .args(["-INT", &child.id().to_string()])
+                    .status()
+                    .expect("send SIGINT")
+                    .success()
+            );
+        }
+        assert_eq!(
+            child.wait().expect("wait for interrupted process").code(),
+            Some(130)
+        );
+    }
+}

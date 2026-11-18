@@ -7,6 +7,9 @@
 //! stdout includes a diffstat that sley does not emit yet, so stdout is checked
 //! loosely (contains) rather than byte-for-byte.
 
+#[path = "support/times.rs"]
+mod times;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -1002,8 +1005,8 @@ fn clean_directory_to_file_merge_preserves_unchanged_worktree_file() {
     copy_dir_all(&reference, &candidate);
 
     let old_mtime = FileTime::from_unix_time(1_700_000_000, 0);
-    filetime::set_file_mtime(reference.join("df"), old_mtime).expect("set reference mtime");
-    filetime::set_file_mtime(candidate.join("df"), old_mtime).expect("set candidate mtime");
+    times::set_mtime(reference.join("df"), old_mtime).expect("set reference mtime");
+    times::set_mtime(candidate.join("df"), old_mtime).expect("set candidate mtime");
 
     let ref_out = git(&reference, &["merge", "side"]);
     let rs_out = sley(&candidate, &["merge", "side"]);
@@ -1018,8 +1021,11 @@ fn clean_directory_to_file_merge_preserves_unchanged_worktree_file() {
         b"main file\n"
     );
     assert_eq!(
-        FileTime::from_last_modification_time(
-            &fs::metadata(candidate.join("df")).expect("stat merged path"),
+        FileTime::from_system_time(
+            fs::metadata(candidate.join("df"))
+                .expect("stat merged path")
+                .modified()
+                .expect("read modification time"),
         ),
         old_mtime,
         "an absent flattened child must not make D/F blocker cleanup unlink the surviving file"

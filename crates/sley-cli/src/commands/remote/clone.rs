@@ -3477,9 +3477,20 @@ fn copy_or_link_local_object_directory(
             }
         }
         fs::copy(&source, &destination)?;
-        let accessed = filetime::FileTime::from_last_access_time(&metadata);
-        let modified = filetime::FileTime::from_last_modification_time(&metadata);
-        filetime::set_file_times(&destination, accessed, modified)?;
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            // Preserve times even when the copied object is read-only.
+            const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+            options.access_mode(FILE_WRITE_ATTRIBUTES);
+        }
+        options.open(&destination)?.set_times(
+            fs::FileTimes::new()
+                .set_accessed(metadata.accessed()?)
+                .set_modified(metadata.modified()?),
+        )?;
     }
     Ok(())
 }

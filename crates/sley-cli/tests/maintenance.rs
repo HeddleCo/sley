@@ -1,6 +1,9 @@
 //! Differential interop tests for `git apply`, `git gc`, `git maintenance run`,
 //! and `git repack` against the system `git` binary.
 
+#[path = "support/times.rs"]
+mod times;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -689,8 +692,7 @@ fn backdate_mtime(path: &Path, hours_ago: i64) {
         .expect("system time")
         .as_secs() as i64
         - hours_ago * 3600;
-    filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(stamp, 0))
-        .expect("backdate mtime");
+    times::set_mtime(path, filetime::FileTime::from_unix_time(stamp, 0)).expect("backdate mtime");
 }
 
 /// A failing task must not leak maintenance.lock: after one failed run, the
