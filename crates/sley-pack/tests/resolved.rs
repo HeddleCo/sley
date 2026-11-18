@@ -2000,7 +2000,7 @@ fn ref_slots_and_pending_snapshot_are_in_metadata_accounting() {
     );
     // Includes descriptor/output/child vectors, sorted REF slots and lists,
     // grouping input and the pending snapshot, including capacity overlap.
-    assert!(bytes >= 200 * N && bytes <= 300 * N);
+    assert!((200 * N..=300 * N).contains(&bytes));
 }
 
 #[cfg(feature = "fetch-profile")]
