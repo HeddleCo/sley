@@ -1,4 +1,4 @@
-//! Bounded, sequential discovery and parallel depth-first pack resolution.
+//! Bounded, sequential discovery and parallel work-stealing pack resolution.
 //!
 //! Visitors run on workers and borrow bodies only for the call. The live-base
 //! gate counts retained ancestor bodies across all workers. A separate shared
@@ -8,9 +8,10 @@
 use super::*;
 use flate2::{Decompress, FlushDecompress};
 use sley_core::{AtomicCancel, ResourceLimitKind};
+use std::collections::VecDeque;
 use std::sync::{
-    Condvar, Mutex,
-    atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
+    Arc, Condvar, Mutex,
+    atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
 };
 
 /// Limits checked before reserving entry metadata, delta streams or bodies.
@@ -74,8 +75,16 @@ pub struct ResolveMetrics {
     peak_in_flight: AtomicUsize,
     ops: AtomicU64,
     metadata: AtomicUsize,
+    live: AtomicUsize,
+    peak_live: AtomicUsize,
 }
 impl ResolveMetrics {
+    pub fn live_base_bytes(&self) -> usize {
+        self.live.load(AtomicOrdering::Acquire)
+    }
+    pub fn peak_live_base_bytes(&self) -> usize {
+        self.peak_live.load(AtomicOrdering::Acquire)
+    }
     pub fn in_flight_bytes(&self) -> usize {
         self.in_flight.load(AtomicOrdering::Acquire)
     }
@@ -173,7 +182,9 @@ pub(crate) fn infallible_error(error: ResolveError<std::convert::Infallible>) ->
 /// Resolve a self-contained pack, visiting each entry exactly once on workers.
 ///
 /// A thin pack is an error. On any error the supplied cancel source is set.
-/// `threads == 0` selects one worker. Output is independent of worker count.
+/// `threads == 0` selects one worker. Index bytes are independent of worker count.
+/// With duplicate OIDs, REF children attach to the first duplicate published;
+/// visitor depth/base offsets and depth-limit acceptance can therefore race.
 /// Delta stream sizes are bounded as well as result sizes; the decoded budget
 /// separately bounds discovery, inflated streams and whole/delta result work,
 /// including replay. Exhausting a replay budget refuses the pack.
@@ -604,7 +615,6 @@ struct Engine<'a, 'c, V, E> {
     stop: AtomicCancel,
     visit: &'a V,
     state: Mutex<State<E>>,
-    live: AtomicUsize,
     metrics: &'a ResolveMetrics,
     workspace: usize,
     flight_wait: Mutex<()>,
@@ -634,14 +644,50 @@ impl Drop for Flight<'_> {
         self.wake.notify_all();
     }
 }
-struct Frame<'a> {
-    index: Option<usize>,
+struct Node<'a> {
+    index: Option<u32>,
     oid: ObjectId,
     object_type: ObjectType,
     offset: u64,
-    depth: usize,
-    body: Option<Retained<'a>>,
-    children: std::vec::IntoIter<u32>,
+    depth: u16,
+    parent: Option<Arc<Node<'a>>>,
+    children: Mutex<std::vec::IntoIter<u32>>,
+    pending: AtomicU32,
+    body: Mutex<Option<Arc<Retained<'a>>>>,
+    external: Option<&'a [u8]>,
+}
+impl Node<'_> {
+    fn release(&self) -> Result<()> {
+        if self.pending.fetch_sub(1, AtomicOrdering::AcqRel) == 1 {
+            self.body
+                .lock()
+                .map_err(|_| invalid("pack body poisoned"))?
+                .take();
+        }
+        Ok(())
+    }
+}
+enum Base<'a> {
+    Retained(Arc<Retained<'a>>),
+    Owned(Vec<u8>),
+    External(&'a [u8]),
+}
+impl AsRef<[u8]> for Base<'_> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Retained(body) => &body.body,
+            Self::Owned(body) => body,
+            Self::External(body) => body,
+        }
+    }
+}
+struct UnwindStop<'a>(&'a AtomicCancel);
+impl Drop for UnwindStop<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.cancel();
+        }
+    }
 }
 #[derive(Clone, Copy)]
 enum Root<'a> {
@@ -786,52 +832,70 @@ where
         }
         Ok(body)
     }
-    fn retain<'a>(&'a self, body: Vec<u8>) -> Option<Retained<'a>> {
+    fn retain<'a>(&'a self, body: Vec<u8>) -> Option<Arc<Retained<'a>>> {
         let size = body.len();
-        self.live
+        self.metrics
+            .live
             .try_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |used| {
                 used.checked_add(size)
                     .filter(|sum| *sum <= self.limits.max_live_base_bytes)
             })
             .ok()
-            .map(|_| Retained {
-                body,
-                live: &self.live,
+            .map(|used| {
+                self.metrics
+                    .peak_live
+                    .fetch_max(used + size, AtomicOrdering::AcqRel);
+                Arc::new(Retained {
+                    body,
+                    live: &self.metrics.live,
+                })
             })
     }
-    fn replay<'a>(
-        &self,
-        frames: &'a [Frame<'_>],
-        external: Option<&'a [u8]>,
-    ) -> Result<std::borrow::Cow<'a, [u8]>> {
-        let start = frames.iter().rposition(|f| f.body.is_some()).unwrap_or(0);
-        let first = &frames[start];
-        let mut body = match &first.body {
-            Some(retained) => std::borrow::Cow::Borrowed(retained.body.as_slice()),
-            None => match first.index {
-                Some(index) => std::borrow::Cow::Owned(self.inflate(index)?),
-                None => std::borrow::Cow::Borrowed(
-                    external.ok_or_else(|| invalid("missing external base"))?,
-                ),
-            },
+    fn replay<'a>(&'a self, node: &Arc<Node<'a>>) -> Result<Base<'a>> {
+        let mut chain = Vec::new();
+        let mut current = Arc::clone(node);
+        let mut body = loop {
+            let retained = current
+                .body
+                .lock()
+                .map_err(|_| invalid("pack body poisoned"))?
+                .clone();
+            if let Some(body) = retained {
+                break Base::Retained(body);
+            }
+            if let Some(parent) = &current.parent {
+                let parent = Arc::clone(parent);
+                chain.push(current);
+                current = parent;
+            } else {
+                break match current.index {
+                    Some(index) => Base::Owned(self.inflate(index as usize)?),
+                    None => Base::External(
+                        current
+                            .external
+                            .ok_or_else(|| invalid("missing external base"))?,
+                    ),
+                };
+            }
         };
-        for frame in &frames[start + 1..] {
-            let index = frame.index.ok_or_else(|| invalid("missing replay entry"))?;
+        for node in chain.into_iter().rev() {
+            let index = node.index.ok_or_else(|| invalid("missing replay entry"))? as usize;
             let delta = self.inflate(index)?;
-            body = std::borrow::Cow::Owned(self.apply(index, &body, &delta)?);
+            body = Base::Owned(self.apply(index, body.as_ref(), &delta)?);
         }
         Ok(body)
     }
-    fn publish(
-        &self,
+    fn publish<'a>(
+        &'a self,
         index: usize,
         body: &[u8],
         object_type: ObjectType,
-        depth: usize,
+        parent: Option<Arc<Node<'a>>>,
         delta: Option<ResolvedDelta<'_>>,
         completed: &AtomicUsize,
-    ) -> std::result::Result<Frame<'_>, ResolveError<E>> {
+    ) -> std::result::Result<Node<'a>, ResolveError<E>> {
         self.check()?;
+        let depth = parent.as_ref().map_or(0, |p| p.depth + 1);
         let d = &self.entries[index];
         let oid = parallel_index::cancellable_object_id_bytes(
             object_type,
@@ -859,103 +923,94 @@ where
         ));
         drop(state);
         completed.fetch_add(1, AtomicOrdering::Release);
-        Ok(Frame {
-            index: Some(index),
+        let pending = AtomicU32::new(children.len() as u32);
+        Ok(Node {
+            index: Some(index as u32),
             oid,
             object_type,
             offset: d.offset as u64,
             depth,
-            body: None,
-            children: children.into_iter(),
+            parent,
+            body: Mutex::new(None),
+            children: Mutex::new(children.into_iter()),
+            pending,
+            external: None,
         })
     }
-    fn walk(
-        &self,
-        root: Root<'_>,
+    fn root<'a>(
+        &'a self,
+        root: Root<'a>,
         completed: &AtomicUsize,
-    ) -> std::result::Result<(), ResolveError<E>> {
-        let _flight = if self.limits.is_unlimited() {
-            None
-        } else {
-            Some(self.flight()?)
-        };
-        let (mut frame, body, external) = match root {
+    ) -> std::result::Result<Node<'a>, ResolveError<E>> {
+        match root {
             Root::Entry(index) => {
                 let body = self.inflate(index)?;
                 let ty = parallel_index::object_type_for_kind(self.entries[index].header.kind)?;
-                (
-                    self.publish(index, &body, ty, 0, None, completed)?,
-                    Some(body),
-                    None,
-                )
+                let mut node = self.publish(index, &body, ty, None, None, completed)?;
+                if node.pending.load(AtomicOrdering::Relaxed) != 0 {
+                    *node
+                        .body
+                        .get_mut()
+                        .map_err(|_| invalid("pack body poisoned"))? = self.retain(body);
+                }
+                Ok(node)
             }
             Root::External(oid, object) => {
                 let children = self.state()?.take_refs(&oid);
-                (
-                    Frame {
-                        index: None,
-                        oid,
-                        object_type: object.object_type,
-                        offset: 0,
-                        depth: 0,
-                        body: None,
-                        children: children.into_iter(),
-                    },
-                    None,
-                    Some(object.body.as_slice()),
-                )
-            }
-        };
-        if frame.children.len() == 0 {
-            return Ok(());
-        }
-        frame.body = body.and_then(|body| self.retain(body));
-        let mut frames = vec![frame];
-        while !frames.is_empty() {
-            self.check()?;
-            let last = frames.len() - 1;
-            let Some(index) = frames[last].children.next() else {
-                frames.pop();
-                continue;
-            };
-            let index = index as usize;
-            let parent = &frames[last];
-            let depth = parent.depth + 1;
-            parallel_index::check_delta_depth(
-                self.entries[index].offset,
-                depth,
-                PackReadLimits {
-                    max_delta_depth: self.limits.max_delta_depth.min(u16::MAX as usize),
-                    ..PackReadLimits::default()
-                },
-            )?;
-            let base = self.replay(&frames, external)?;
-            let delta = self.inflate(index)?;
-            let body = self.apply(index, &base, &delta)?;
-            drop(base);
-            let info = ResolvedDelta {
-                base: parent.oid,
-                base_offset: parent.offset,
-                instructions: &delta,
-            };
-            let object_type = parent.object_type;
-            // Its last immediate dependent is now resolved; release before visiting.
-            if frames[last].children.len() == 0 {
-                frames[last].body.take();
-            }
-            let mut child =
-                self.publish(index, &body, object_type, depth, Some(info), completed)?;
-            if child.children.len() != 0 {
-                child.body = self.retain(body);
-                frames.push(child);
+                Ok(Node {
+                    index: None,
+                    oid,
+                    object_type: object.object_type,
+                    offset: 0,
+                    depth: 0,
+                    parent: None,
+                    pending: AtomicU32::new(children.len() as u32),
+                    body: Mutex::new(None),
+                    children: Mutex::new(children.into_iter()),
+                    external: Some(&object.body),
+                })
             }
         }
-        Ok(())
     }
-    fn run<P: FnMut(PackIndexProgress)>(
-        &self,
+    fn child<'a>(
+        &'a self,
+        parent: Arc<Node<'a>>,
+        index: usize,
+        completed: &AtomicUsize,
+    ) -> std::result::Result<Node<'a>, ResolveError<E>> {
+        parallel_index::check_delta_depth(
+            self.entries[index].offset,
+            parent.depth as usize + 1,
+            PackReadLimits {
+                max_delta_depth: self.limits.max_delta_depth.min(u16::MAX as usize),
+                ..PackReadLimits::default()
+            },
+        )?;
+        let base = self.replay(&parent)?;
+        let delta = self.inflate(index)?;
+        let body = self.apply(index, base.as_ref(), &delta)?;
+        drop(base);
+        // Last direct apply releases the parent's body before the child visitor.
+        parent.release()?;
+        let info = ResolvedDelta {
+            base: parent.oid,
+            base_offset: parent.offset,
+            instructions: &delta,
+        };
+        let ty = parent.object_type;
+        let mut node = self.publish(index, &body, ty, Some(parent), Some(info), completed)?;
+        if node.pending.load(AtomicOrdering::Relaxed) != 0 {
+            *node
+                .body
+                .get_mut()
+                .map_err(|_| invalid("pack body poisoned"))? = self.retain(body);
+        }
+        Ok(node)
+    }
+    fn run<'a, P: FnMut(PackIndexProgress)>(
+        &'a self,
         roots: &[u32],
-        external: Option<(ObjectId, &EncodedObject)>,
+        external: &'a [(ObjectId, EncodedObject)],
         threads: usize,
         progress: &mut P,
         count: &mut u64,
@@ -969,31 +1024,124 @@ where
             .checked_div(self.workspace)
             .unwrap_or(usize::MAX)
             .max(1);
-        let root_count = roots.len().max(usize::from(external.is_some()));
-        let workers = threads.max(1).min(root_count).min(slots);
+        let root_count = roots.len() + external.len();
+        if root_count == 0 {
+            return;
+        }
+        let workers = threads.max(1).min(self.entries.len()).min(slots);
+        let queues: Vec<Mutex<VecDeque<Arc<Node<'a>>>>> =
+            (0..workers).map(|_| Mutex::new(VecDeque::new())).collect();
+        // Seed unclaimed roots too: no worker can observe zero between a root
+        // claim and its publication. Enqueue increments before exposing a node.
+        let outstanding = AtomicUsize::new(root_count);
+        self.metrics.metadata.fetch_max(
+            self.metrics.metadata.load(AtomicOrdering::Relaxed)
+                + workers
+                    * (self.limits.max_delta_depth.min(u16::MAX as usize) + 1)
+                    * (std::mem::size_of::<Node<'_>>() + 16 + 4 * std::mem::size_of::<usize>()),
+            AtomicOrdering::Relaxed,
+        );
         let completed = AtomicUsize::new(0);
         let initial = *count;
         std::thread::scope(|scope| {
             let mut handles = Vec::new();
-            for _ in 0..workers {
+            for worker in 0..workers {
                 let completed = &completed;
                 let cursor = &cursor;
+                let queues = &queues;
+                let outstanding = &outstanding;
                 let handle = std::thread::Builder::new().spawn_scoped(
                     scope,
                     sley_core::diagnostics::inherit(move || {
-                        while !self.stop.is_cancelled() {
-                            let index = cursor.fetch_add(1, AtomicOrdering::Relaxed);
-                            if index >= root_count {
-                                break;
+                        // First local, last drop: includes buffers and all worker Arc clones.
+                        let _flight = if self.limits.is_unlimited() {
+                            None
+                        } else {
+                            match self.flight() {
+                                Ok(lease) => Some(lease),
+                                Err(error) => {
+                                    self.fail(error.into());
+                                    return;
+                                }
                             }
-                            let root = match external {
-                                Some((oid, object)) => Root::External(oid, object),
-                                None => Root::Entry(roots[index] as usize),
+                        };
+                        let _unwind = UnwindStop(&self.stop);
+                        let work = || -> std::result::Result<(), ResolveError<E>> {
+                            let pop = |i: usize, steal: bool| -> Result<Option<Arc<Node<'a>>>> {
+                                let mut queue = queues[i]
+                                    .lock()
+                                    .map_err(|_| invalid("pack queue poisoned"))?;
+                                Ok(if steal {
+                                    queue.pop_front()
+                                } else {
+                                    queue.pop_back()
+                                })
                             };
-                            if let Err(error) = self.walk(root, completed) {
-                                self.fail(error);
-                                break;
+                            let push = |node: Node<'a>| -> Result<()> {
+                                if node.pending.load(AtomicOrdering::Relaxed) != 0 {
+                                    outstanding.fetch_add(1, AtomicOrdering::AcqRel);
+                                    queues[worker]
+                                        .lock()
+                                        .map_err(|_| invalid("pack queue poisoned"))?
+                                        .push_back(Arc::new(node));
+                                }
+                                Ok(())
+                            };
+                            while !self.stop.is_cancelled() {
+                                self.check()?;
+                                let mut item = pop(worker, false)?;
+                                if item.is_none() {
+                                    let i = cursor.fetch_add(1, AtomicOrdering::Relaxed);
+                                    if i < root_count {
+                                        let root = if i < roots.len() {
+                                            Root::Entry(roots[i] as usize)
+                                        } else {
+                                            let (oid, object) = &external[i - roots.len()];
+                                            Root::External(*oid, object)
+                                        };
+                                        push(self.root(root, completed)?)?;
+                                        outstanding.fetch_sub(1, AtomicOrdering::AcqRel);
+                                        continue;
+                                    }
+                                    for other in 1..workers {
+                                        item = pop((worker + other) % workers, true)?;
+                                        if item.is_some() {
+                                            break;
+                                        }
+                                    }
+                                }
+                                if let Some(node) = item {
+                                    let (index, more) = {
+                                        let mut children = node
+                                            .children
+                                            .lock()
+                                            .map_err(|_| invalid("pack children poisoned"))?;
+                                        (
+                                            children
+                                                .next()
+                                                .ok_or_else(|| invalid("empty pack work item"))?,
+                                            children.len() != 0,
+                                        )
+                                    };
+                                    if more {
+                                        outstanding.fetch_add(1, AtomicOrdering::AcqRel);
+                                        queues[worker]
+                                            .lock()
+                                            .map_err(|_| invalid("pack queue poisoned"))?
+                                            .push_back(Arc::clone(&node));
+                                    }
+                                    push(self.child(node, index as usize, completed)?)?;
+                                    outstanding.fetch_sub(1, AtomicOrdering::AcqRel);
+                                } else if outstanding.load(AtomicOrdering::Acquire) == 0 {
+                                    break;
+                                } else {
+                                    std::thread::park_timeout(std::time::Duration::from_micros(50));
+                                }
                             }
+                            Ok(())
+                        };
+                        if let Err(error) = work() {
+                            self.fail(error);
                         }
                     }),
                 );
@@ -1156,7 +1304,6 @@ where
             decoded_work: 0,
             compressed_work: 0,
         }),
-        live: AtomicUsize::new(0),
         metrics,
         workspace,
         flight_wait: Mutex::new(()),
@@ -1166,20 +1313,23 @@ where
     if entries.is_empty() {
         progress(PackIndexProgress::default());
     }
-    engine.run(&roots, None, threads, progress, &mut count);
+    engine.run(&roots, &[], threads, progress, &mut count);
     // The pending REF map only shrinks. Snapshot once: repeatedly searching
     // past missing bases would make a thin pack with distinct bases quadratic.
     let pending: Vec<_> = engine
         .state()?
         .refs
         .iter()
-        .filter(|r| !r.1.is_empty())
-        .map(|r| r.0)
+        .enumerate()
+        .filter(|(_, r)| !r.1.is_empty())
+        .map(|(i, _)| i as u32)
         .collect();
     metrics
         .metadata
         .fetch_max(metadata + allocation(&pending), AtomicOrdering::Relaxed);
-    for oid in pending {
+    let mut externals = Vec::new();
+    for slot in pending {
+        let oid = engine.state()?.refs[slot as usize].0;
         let mut state = engine.state()?;
         if let Some(error) = state.error.take() {
             return Err(error);
@@ -1197,9 +1347,10 @@ where
             if object.object_id(format)? != oid {
                 return Err(invalid("external delta base identity mismatch").into());
             }
-            engine.run(&[], Some((oid, &object)), threads, progress, &mut count);
+            externals.push((oid, object));
         }
     }
+    engine.run(&[], &externals, threads, progress, &mut count);
     {
         let mut state = engine.state()?;
         if let Some(error) = state.error.take() {

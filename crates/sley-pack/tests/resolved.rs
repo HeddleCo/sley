@@ -301,43 +301,45 @@ fn forward_ref_chain_and_duplicate_oids_visit_each_entry() {
         compressed(&bodies[0], &mut p);
     }
     let p = finish(p, u32::from(depth) + 2);
-    let seen = Mutex::new(HashMap::new());
-    let built = resolve_pack(
-        &p,
-        ObjectFormat::Sha1,
-        16,
-        ResolveLimits {
-            max_live_base_bytes: 0,
-            ..ResolveLimits::default()
-        },
-        CancelFlag::never(),
-        &|o| {
-            assert_eq!(o.oid, ids[o.depth as usize]);
-            assert_eq!(o.body, bodies[o.depth as usize]);
-            if let Some(d) = &o.delta {
-                assert_eq!(d.base, ids[o.depth as usize - 1]);
-                assert_eq!(apply(&bodies[o.depth as usize - 1], d.instructions), o.body);
-            }
+    for threads in [1, 2, 16] {
+        let seen = Mutex::new(HashMap::new());
+        let built = resolve_pack(
+            &p,
+            ObjectFormat::Sha1,
+            threads,
+            ResolveLimits {
+                max_live_base_bytes: 0,
+                ..ResolveLimits::default()
+            },
+            CancelFlag::never(),
+            &|o| {
+                assert_eq!(o.oid, ids[o.depth as usize]);
+                assert_eq!(o.body, bodies[o.depth as usize]);
+                if let Some(d) = &o.delta {
+                    assert_eq!(d.base, ids[o.depth as usize - 1]);
+                    assert_eq!(apply(&bodies[o.depth as usize - 1], d.instructions), o.body);
+                }
+                assert!(
+                    seen.lock()
+                        .expect("seen")
+                        .insert(o.offset, o.delta.as_ref().map(|d| (d.base, d.base_offset)))
+                        .is_none()
+                );
+                Ok::<_, ()>(())
+            },
+        )
+        .expect("forward refs resolved from final root");
+        assert_eq!(built.entries.len(), depth as usize + 2);
+        let seen = seen.into_inner().expect("seen");
+        assert_eq!(seen.len(), depth as usize + 2);
+        for (base_oid, base_offset) in seen.values().flatten() {
             assert!(
-                seen.lock()
-                    .expect("seen")
-                    .insert(o.offset, o.delta.as_ref().map(|d| (d.base, d.base_offset)))
-                    .is_none()
+                built
+                    .entries
+                    .iter()
+                    .any(|entry| entry.offset == *base_offset && entry.oid == *base_oid)
             );
-            Ok::<_, ()>(())
-        },
-    )
-    .expect("forward refs resolved from final root");
-    assert_eq!(built.entries.len(), depth as usize + 2);
-    let seen = seen.into_inner().expect("seen");
-    assert_eq!(seen.len(), depth as usize + 2);
-    for (base_oid, base_offset) in seen.values().flatten() {
-        assert!(
-            built
-                .entries
-                .iter()
-                .any(|entry| entry.offset == *base_offset && entry.oid == *base_oid)
-        );
+        }
     }
 }
 
@@ -1282,54 +1284,58 @@ fn in_flight_gate_serializes_sixteen_roots_and_bounds_peak_memory() {
     const GATE: usize = 3 * SIZE;
     const BASES: usize = SIZE;
     let p = chains(16, 1, SIZE, false);
-    let metrics = ResolveMetrics::default();
-    let calls = AtomicUsize::new(0);
-    let built = resolve_pack_with_metrics(
-        &p,
-        ObjectFormat::Sha1,
-        16,
-        ResolveLimits {
-            max_in_flight_bytes: GATE,
-            max_live_base_bytes: BASES,
-            ..ResolveLimits::default()
-        },
-        CancelFlag::never(),
-        &|o| {
-            let held = o.body.len() + o.delta.as_ref().map_or(0, |d| d.instructions.len());
-            assert!(
-                metrics.in_flight_bytes() >= held,
-                "lease released while callback borrows buffers"
-            );
-            calls.fetch_add(1, Ordering::Relaxed);
-            if o.depth == 0 {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Ok::<_, ()>(())
-        },
-        &metrics,
-    )
-    .expect("workers serialize within one shared gate");
-    println!(
-        "flight: peak={}, gate={GATE}, after={}",
-        metrics.peak_in_flight_bytes(),
-        metrics.in_flight_bytes()
-    );
-    #[cfg(target_os = "linux")]
-    {
-        let peak = peak_bytes();
-        // Isolated child: 64 MiB covers the input, test builder, allocator,
-        // thread stacks, zlib state and metadata for these 32 objects.
-        let bound = GATE + BASES + 64 * 1024 * 1024;
-        println!("flight RSS: peak={peak}, gate+live+64MiB={bound}");
-        assert!(peak < bound, "in-flight working memory exceeded RSS bound");
+    for threads in [1, 2, 16] {
+        let metrics = ResolveMetrics::default();
+        let calls = AtomicUsize::new(0);
+        let built = resolve_pack_with_metrics(
+            &p,
+            ObjectFormat::Sha1,
+            threads,
+            ResolveLimits {
+                max_in_flight_bytes: GATE,
+                max_live_base_bytes: BASES,
+                ..ResolveLimits::default()
+            },
+            CancelFlag::never(),
+            &|o| {
+                let held = o.body.len() + o.delta.as_ref().map_or(0, |d| d.instructions.len());
+                assert!(
+                    metrics.in_flight_bytes() >= held,
+                    "lease released while callback borrows buffers"
+                );
+                calls.fetch_add(1, Ordering::Relaxed);
+                if o.depth == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Ok::<_, ()>(())
+            },
+            &metrics,
+        )
+        .expect("workers serialize within one shared gate");
+        println!(
+            "flight: peak={}, gate={GATE}, after={}",
+            metrics.peak_in_flight_bytes(),
+            metrics.in_flight_bytes()
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let peak = peak_bytes();
+            // Isolated child: 64 MiB covers the input, test builder, allocator,
+            // thread stacks, zlib state and metadata for these 32 objects.
+            let bound = GATE + BASES + 64 * 1024 * 1024;
+            println!("flight RSS: peak={peak}, gate+live+64MiB={bound}");
+            assert!(peak < bound, "in-flight working memory exceeded RSS bound");
+        }
+        assert!(
+            metrics.peak_in_flight_bytes() <= GATE,
+            "in-flight counter exceeded shared gate"
+        );
+        assert_eq!(metrics.in_flight_bytes(), 0);
+        assert_eq!(metrics.live_base_bytes(), 0);
+        assert!(metrics.peak_live_base_bytes() <= BASES);
+        assert_eq!(calls.load(Ordering::Relaxed), 32);
+        assert_eq!(built.entries.len(), 32);
     }
-    assert!(
-        metrics.peak_in_flight_bytes() <= GATE,
-        "in-flight counter exceeded shared gate"
-    );
-    assert_eq!(metrics.in_flight_bytes(), 0);
-    assert_eq!(calls.load(Ordering::Relaxed), 32);
-    assert_eq!(built.entries.len(), 32);
 }
 
 #[test]
@@ -1516,8 +1522,8 @@ fn resolve_ops_counts_discovery_inflate_apply_and_replay() {
 #[test]
 fn million_tiny_leaves_stop_at_resolve_op_budget() {
     const LEAVES: usize = 1_000_000;
-    // Keep the one-byte root retained with a second child; the 49 intermediate
-    // bodies cannot enter the full live pool. Each depth-50 leaf replays them.
+    // Disable retention so stealing cannot free the one-byte root and admit
+    // a deep ancestor instead. Each depth-50 leaf must replay its ancestors.
     let mut p = pack_start();
     header(3, 1, &mut p);
     compressed(&[0], &mut p);
@@ -1537,58 +1543,61 @@ fn million_tiny_leaves_stop_at_resolve_op_budget() {
     let objects = LEAVES + 51;
     let p = finish(p, objects as u32);
     let limit = objects as u64 + 10_000;
-    let metrics = ResolveMetrics::default();
-    let calls = AtomicUsize::new(0);
-    let cancel = AtomicCancel::new();
-    let done = (Mutex::new(false), std::sync::Condvar::new());
-    let result = std::thread::scope(|scope| {
-        scope.spawn(|| {
-            let guard = done.0.lock().expect("watchdog");
-            let (finished, timeout) = done
-                .1
-                .wait_timeout_while(guard, std::time::Duration::from_secs(30), |v| !*v)
-                .expect("watchdog wait");
-            if timeout.timed_out() && !*finished {
-                cancel.cancel();
-            }
+    for threads in [1, 2, 16] {
+        let metrics = ResolveMetrics::default();
+        let calls = AtomicUsize::new(0);
+        let cancel = AtomicCancel::new();
+        let done = (Mutex::new(false), std::sync::Condvar::new());
+        let result = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let guard = done.0.lock().expect("watchdog");
+                let (finished, timeout) = done
+                    .1
+                    .wait_timeout_while(guard, std::time::Duration::from_secs(30), |v| !*v)
+                    .expect("watchdog wait");
+                if timeout.timed_out() && !*finished {
+                    cancel.cancel();
+                }
+            });
+            let result = resolve_pack_with_metrics(
+                &p,
+                ObjectFormat::Sha1,
+                threads,
+                ResolveLimits {
+                    max_live_base_bytes: 0,
+                    max_resolve_ops: limit,
+                    ..ResolveLimits::default()
+                },
+                CancelFlag::new(&cancel),
+                &|_| {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    Ok::<_, ()>(())
+                },
+                &metrics,
+            );
+            *done.0.lock().expect("finish") = true;
+            done.1.notify_one();
+            result
         });
-        let result = resolve_pack_with_metrics(
-            &p,
-            ObjectFormat::Sha1,
-            16,
-            ResolveLimits {
-                max_live_base_bytes: 1,
-                max_resolve_ops: limit,
-                ..ResolveLimits::default()
-            },
-            CancelFlag::new(&cancel),
-            &|_| {
-                calls.fetch_add(1, Ordering::Relaxed);
-                Ok::<_, ()>(())
-            },
-            &metrics,
+        println!(
+            "tiny replay: pack={} bytes, objects={objects}, ops={}, limit={limit}, visits={}",
+            p.len(),
+            metrics.resolve_ops(),
+            calls.load(Ordering::Relaxed)
         );
-        *done.0.lock().expect("finish") = true;
-        done.1.notify_one();
-        result
-    });
-    println!(
-        "tiny replay: pack={} bytes, objects={objects}, ops={}, limit={limit}, visits={}",
-        p.len(),
-        metrics.resolve_ops(),
-        calls.load(Ordering::Relaxed)
-    );
-    assert!(
-        matches!(result, Err(ResolveError::ResolveOps { limit: n, attempted }) if n == limit && attempted == limit + 1),
-        "operation budget must fire during replay: {result:?}"
-    );
-    assert_eq!(metrics.resolve_ops(), limit);
-    assert_eq!(metrics.in_flight_bytes(), 0);
-    assert!(cancel.is_cancelled());
-    assert!(
-        calls.load(Ordering::Relaxed) < 1000,
-        "must stop before walking the million leaves"
-    );
+        assert!(
+            matches!(result, Err(ResolveError::ResolveOps { limit: n, attempted }) if n == limit && attempted == limit + 1),
+            "operation budget must fire during replay: {result:?}"
+        );
+        assert_eq!(metrics.resolve_ops(), limit);
+        assert_eq!(metrics.in_flight_bytes(), 0);
+        assert_eq!(metrics.live_base_bytes(), 0);
+        assert!(cancel.is_cancelled());
+        assert!(
+            calls.load(Ordering::Relaxed) < 1000,
+            "must stop before walking the million leaves"
+        );
+    }
 }
 
 #[test]
@@ -1885,7 +1894,7 @@ fn million_objects_fit_metadata_coefficient() {
     if !memory_child("million_objects_fit_metadata_coefficient") {
         return;
     }
-    const COEFFICIENT: usize = 300;
+    const COEFFICIENT: usize = 256;
     let count = std::env::var("SLEY_RESOLVE_METADATA_OBJECTS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -2099,4 +2108,98 @@ fn workspace_arithmetic_overflow_stays_a_typed_budget_error() {
         "untyped workspace refusal: {e:?}"
     );
     println!("workspace overflow: typed {expected:?}, refused before decoding");
+}
+
+#[test]
+fn one_hot_family_is_stolen_by_multiple_workers() {
+    use std::{
+        collections::HashSet,
+        time::{Duration, Instant},
+    };
+    let mut p = pack_start();
+    let root = p.len();
+    header(3, 32, &mut p);
+    compressed(&[0; 32], &mut p);
+    for branch in 0..64 {
+        let mut parent = root;
+        for depth in 1..=8 {
+            parent = append_delta(&mut p, parent, 32, (branch + depth) as u8);
+        }
+    }
+    let p = finish(p, 513);
+    let workers = Mutex::new(HashSet::new());
+    let start = Instant::now();
+    let metrics = sley_pack::ResolveMetrics::default();
+    let built = sley_pack::resolve_pack_with_metrics(
+        &p,
+        ObjectFormat::Sha1,
+        4,
+        ResolveLimits::default(),
+        CancelFlag::never(),
+        &|_| {
+            workers
+                .lock()
+                .expect("worker ids")
+                .insert(std::thread::current().id());
+            std::thread::sleep(Duration::from_millis(5));
+            Ok::<_, ()>(())
+        },
+        &metrics,
+    )
+    .expect("hot family resolves");
+    let elapsed = start.elapsed();
+    let worker_count = workers.into_inner().expect("worker ids").len();
+    eprintln!("hot family: workers={worker_count}, elapsed={elapsed:?}, serial=2.565s");
+    assert_eq!(built.entries.len(), 513);
+    assert!(worker_count >= 2, "one family must use multiple workers");
+    assert!(
+        elapsed.as_secs_f64() < 0.6 * 2.565,
+        "family remained serial: {elapsed:?}"
+    );
+    assert_eq!(metrics.in_flight_bytes(), 0);
+    assert_eq!(metrics.live_base_bytes(), 0);
+}
+
+#[test]
+fn panicking_visitor_stops_idle_workers_before_watchdog() {
+    use std::{
+        sync::{Arc, mpsc},
+        time::{Duration, Instant},
+    };
+    let p = chains(1, 8, 32, true);
+    let cancel = Arc::new(sley_core::AtomicCancel::new());
+    let watchdog_cancel = Arc::clone(&cancel);
+    let (done, receiver) = mpsc::channel();
+    let watchdog = std::thread::spawn(move || {
+        if receiver.recv_timeout(Duration::from_secs(30)).is_err() {
+            watchdog_cancel.cancel();
+        }
+    });
+    let start = Instant::now();
+    let metrics = sley_pack::ResolveMetrics::default();
+    let result = sley_pack::resolve_pack_with_metrics(
+        &p,
+        ObjectFormat::Sha1,
+        4,
+        ResolveLimits::default(),
+        CancelFlag::new(&*cancel),
+        &|o| {
+            if o.depth == 1 {
+                panic!("visitor failure");
+            }
+            Ok::<_, ()>(())
+        },
+        &metrics,
+    );
+    let elapsed = start.elapsed();
+    done.send(()).expect("watchdog signal");
+    watchdog.join().expect("watchdog joined");
+    eprintln!("panicking visitor returned after {elapsed:?} (watchdog=30s)");
+    assert!(result.is_err());
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "workers required watchdog cancellation"
+    );
+    assert_eq!(metrics.in_flight_bytes(), 0);
+    assert_eq!(metrics.live_base_bytes(), 0);
 }
