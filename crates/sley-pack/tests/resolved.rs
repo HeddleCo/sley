@@ -333,11 +333,11 @@ fn forward_ref_chain_and_duplicate_oids_visit_each_entry() {
 }
 
 #[cfg(target_os = "linux")]
-fn peak_bytes() -> usize {
+fn status_bytes(field: &str) -> usize {
     let status = std::fs::read_to_string("/proc/self/status").expect("read process peak");
     let kb = status
         .lines()
-        .find_map(|l| l.strip_prefix("VmHWM:"))
+        .find_map(|l| l.strip_prefix(field))
         .expect("VmHWM")
         .split_whitespace()
         .next()
@@ -345,6 +345,10 @@ fn peak_bytes() -> usize {
         .parse::<usize>()
         .expect("parse peak");
     kb * 1024
+}
+#[cfg(target_os = "linux")]
+fn peak_bytes() -> usize {
+    status_bytes("VmHWM:")
 }
 #[cfg(target_os = "linux")]
 fn memory_child(name: &str) -> bool {
@@ -404,6 +408,8 @@ fn delta_result_bomb_and_running_budgets_are_checked_before_visits() {
     }
     #[cfg(target_os = "linux")]
     let before = peak_bytes();
+    #[cfg(target_os = "linux")]
+    let virtual_before = status_bytes("VmPeak:");
     let mut p = pack_start();
     header(3, 4, &mut p);
     compressed(b"base", &mut p);
@@ -414,7 +420,14 @@ fn delta_result_bomb_and_running_budgets_are_checked_before_visits() {
     ofs(distance, &mut p);
     compressed(&d, &mut p);
     let p = finish(p, 2);
-    assert!(error(&p, ResolveLimits::default()).contains("max_object_bytes"));
+    // Isolate the per-object allocation guard from the separate running cap.
+    let diagnostic = error(
+        &p,
+        ResolveLimits {
+            max_total_decoded: u64::MAX,
+            ..ResolveLimits::default()
+        },
+    );
     #[cfg(target_os = "linux")]
     {
         let peak = peak_bytes();
@@ -423,7 +436,14 @@ fn delta_result_bomb_and_running_budgets_are_checked_before_visits() {
             peak.saturating_sub(before)
         );
         assert!(peak.saturating_sub(before) < 8 * 1024 * 1024);
+        let virtual_growth = status_bytes("VmPeak:").saturating_sub(virtual_before);
+        println!("delta-result bomb: peak virtual growth={virtual_growth}");
+        assert!(
+            virtual_growth < 8 * 1024 * 1024,
+            "declared result reserved virtual memory before refusal"
+        );
     }
+    assert!(diagnostic.contains("max_object_bytes"));
     let p = chains(1, 2, 32, false);
     for (limits, field) in [
         (

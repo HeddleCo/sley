@@ -299,7 +299,7 @@ fn discover(
 
 struct State<E> {
     children: Vec<Vec<usize>>,
-    refs: HashMap<ObjectId, Vec<usize>>,
+    refs: BTreeMap<ObjectId, Vec<usize>>,
     output: Vec<Option<(PackIndexEntry, PackIndexedObject)>>,
     error: Option<ResolveError<E>>,
     inflated_work: u64,
@@ -687,7 +687,7 @@ where
         let (checksum, entries) = discover(pack, format, limits, cancel)?;
         let mut children: Vec<Vec<usize>> = reserve(entries.len())?;
         children.resize_with(entries.len(), Vec::new);
-        let mut refs = HashMap::<ObjectId, Vec<usize>>::new();
+        let mut refs = BTreeMap::<ObjectId, Vec<usize>>::new();
         let mut roots = Vec::new();
         for (index, d) in entries.iter().enumerate() {
             match d.base {
