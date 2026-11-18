@@ -31,8 +31,17 @@ add('trusted-default-policy', 'trusted_legacy_defaults_remain_unlimited_and_expl
 for name, start, end in [('legacy-index-route', 'pub(crate) fn build_parallel_index', 'pub(crate) fn parse_parallel_pack'), ('legacy-parse-route', 'pub(crate) fn parse_parallel_pack', 'pub(crate) fn check_delta_depth')]:
     add(name, 'trusted_legacy_defaults_remain_unlimited_and_explicit_caps_apply', pp, lambda s, a=start, b=end: region(s, a, b, lambda block: block.replace('options.resolve_limits(),', 'ResolveLimits { max_total_decoded: 128, ..ResolveLimits::default() },')))
 add('shared-flight-gates', 'in_flight_gate_serializes_sixteen_roots_and_bounds_peak_memory', rp, gate_off)
-add('worker-arena-bound', 'in_flight_gate_serializes_sixteen_roots_and_bounds_peak_memory', rp, lambda s: s.replace('.min(self.entries.len()).min(slots)', '.min(self.entries.len())'))
-add('flight-lease-lifetime', 'in_flight_gate_serializes_sixteen_roots_and_bounds_peak_memory', rp, lambda s: s.replace('let _flight = if self.limits.is_unlimited()', 'let _ = if self.limits.is_unlimited()'))
+def per_item_leases(s):
+    # Round 7 replaces per-root leases with one worker-entry lease. Revert that
+    # policy together with the worker cap to reproduce the old arena fan-out.
+    s = s.replace('.min(self.entries.len()).min(slots)', '.min(self.entries.len())')
+    a=s.index('                        _flight = if self.limits.is_unlimited()'); b=s.index('                        let work =',a)
+    s=s[:a] + "                        _flight = None::<Flight<'_>>;\n" + s[b:]
+    lease='let _item_flight = if self.limits.is_unlimited() { None } else { Some(self.flight()?) };'
+    s=s.replace('                                        let root = if i < roots.len()', lease+'\n                                        let root = if i < roots.len()')
+    return s.replace('                                if let Some(node) = item {', '                                if let Some(node) = item {\n                                    '+lease)
+add('worker-arena-bound', 'in_flight_gate_serializes_sixteen_roots_and_bounds_peak_memory', rp, per_item_leases)
+add('flight-lease-lifetime', 'in_flight_gate_serializes_sixteen_roots_and_bounds_peak_memory', rp, lambda s: s.replace('                        let work =', '                        drop(_flight);\n                        let work ='))
 add('flight-error-release', 'flight_reservations_release_after_errors_and_waiters_observe_cancel', rp, lambda s: s.replace('self.used.fetch_sub(self.bytes, AtomicOrdering::AcqRel);', 'self.used.fetch_sub(0, AtomicOrdering::AcqRel);'))
 add('delta-stream-workspace', 'flight_reservations_release_after_errors_and_waiters_observe_cancel', rp, lambda s: s.replace('.and_then(|size| size.checked_add(d.header.size))', '.and_then(Some)'))
 add('replay-base-workspace', 'flight_reservations_release_after_errors_and_waiters_observe_cancel', rp, lambda s: s.replace('max_body\n                .checked_add(d.result_size)', 'Some(d.result_size)'))

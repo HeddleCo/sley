@@ -1731,7 +1731,19 @@ impl fmt::Display for ByteBudget {
     }
 }
 
-/// Which explicit budget rejected a resource-limit check.
+/// Which explicit budget rejected a resource-limit check. Callers must allow
+/// future budget kinds rather than matching the enum exhaustively.
+///
+/// ```compile_fail,E0004
+/// use sley_core::ResourceLimitKind::*;
+/// fn closed(kind: sley_core::ResourceLimitKind) {
+///     match kind {
+///         ResolveObjects | ResolveObjectBytes | ResolveTotalDecoded |
+///         ResolveInFlight | ResolveOps | CompressionWorkingSet |
+///         DecodedObject | DeltaBase => {}
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ResourceLimitKind {

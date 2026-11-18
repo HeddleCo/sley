@@ -632,7 +632,7 @@ impl Drop for Retained<'_> {
         self.live.fetch_sub(size, AtomicOrdering::AcqRel);
     }
 }
-// This lease is declared before any walk buffers and drops after all of them.
+// This lease is declared before any worker buffers and drops after all of them.
 struct Flight<'a> {
     used: &'a AtomicUsize,
     wake: &'a Condvar,
@@ -908,7 +908,7 @@ where
             object_type,
             body,
             offset: d.offset as u64,
-            depth: depth as u16,
+            depth,
             delta,
         })
         .map_err(ResolveError::Visitor)?;
@@ -1057,7 +1057,9 @@ where
                     scope,
                     sley_core::diagnostics::inherit(move || {
                         // First local, last drop: includes buffers and all worker Arc clones.
-                        let _flight = if self.limits.is_unlimited() {
+                        let _flight;
+                        let _unwind = UnwindStop(&self.stop);
+                        _flight = if self.limits.is_unlimited() {
                             None
                         } else {
                             match self.flight() {
@@ -1068,7 +1070,6 @@ where
                                 }
                             }
                         };
-                        let _unwind = UnwindStop(&self.stop);
                         let work = || -> std::result::Result<(), ResolveError<E>> {
                             let pop = |i: usize, steal: bool| -> Result<Option<Arc<Node<'a>>>> {
                                 let mut queue = queues[i]
