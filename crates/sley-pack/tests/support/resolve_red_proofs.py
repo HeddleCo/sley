@@ -25,13 +25,13 @@ def region(s, begin, end, mutate):
     a = s.index(begin); b = s.index(end, a)
     return s[:a] + mutate(s[a:b]) + s[b:]
 def gate_off(s):
-    return s.replace('.min(root_count).min(slots)', '.min(root_count)').replace('.filter(|next| *next <= self.limits.max_in_flight_bytes)', '.filter(|_| true)')
+    return s.replace('.min(self.entries.len()).min(slots)', '.min(self.entries.len())').replace('.filter(|next| *next <= self.limits.max_in_flight_bytes)', '.filter(|_| true)')
 add('deprecated-atomic', 'real_packs_match_original_indexes_and_visit_once_with_reproducible_instructions', rp, lambda s: region(s, '    fn retain<', '    fn replay<', lambda b: b.replace('.try_update(', '.fetch_update(')))
 add('trusted-default-policy', 'trusted_legacy_defaults_remain_unlimited_and_explicit_caps_apply', pp, lambda s: s.replace('resolve_limits: ResolveLimits::unlimited()', 'resolve_limits: ResolveLimits::default()'))
 for name, start, end in [('legacy-index-route', 'pub(crate) fn build_parallel_index', 'pub(crate) fn parse_parallel_pack'), ('legacy-parse-route', 'pub(crate) fn parse_parallel_pack', 'pub(crate) fn check_delta_depth')]:
     add(name, 'trusted_legacy_defaults_remain_unlimited_and_explicit_caps_apply', pp, lambda s, a=start, b=end: region(s, a, b, lambda block: block.replace('options.resolve_limits(),', 'ResolveLimits { max_total_decoded: 128, ..ResolveLimits::default() },')))
 add('shared-flight-gates', 'in_flight_gate_serializes_sixteen_roots_and_bounds_peak_memory', rp, gate_off)
-add('worker-arena-bound', 'in_flight_gate_serializes_sixteen_roots_and_bounds_peak_memory', rp, lambda s: s.replace('.min(root_count).min(slots)', '.min(root_count)'))
+add('worker-arena-bound', 'in_flight_gate_serializes_sixteen_roots_and_bounds_peak_memory', rp, lambda s: s.replace('.min(self.entries.len()).min(slots)', '.min(self.entries.len())'))
 add('flight-lease-lifetime', 'in_flight_gate_serializes_sixteen_roots_and_bounds_peak_memory', rp, lambda s: s.replace('let _flight = if self.limits.is_unlimited()', 'let _ = if self.limits.is_unlimited()'))
 add('flight-error-release', 'flight_reservations_release_after_errors_and_waiters_observe_cancel', rp, lambda s: s.replace('self.used.fetch_sub(self.bytes, AtomicOrdering::AcqRel);', 'self.used.fetch_sub(0, AtomicOrdering::AcqRel);'))
 add('delta-stream-workspace', 'flight_reservations_release_after_errors_and_waiters_observe_cancel', rp, lambda s: s.replace('.and_then(|size| size.checked_add(d.header.size))', '.and_then(Some)'))
@@ -72,7 +72,18 @@ def old_metadata(s):
     s = s.replace('let (oid, object_type, crc32) = entry.ok_or_else(|| invalid("unresolved pack entry"))?;', 'let (old_index, old_object) = entry.ok_or_else(|| invalid("unresolved pack entry"))?;\n        let (oid, object_type, crc32) = (old_index.oid, old_object.object_type, old_index.crc32);')
     s = s.replace('    drop(entries);', '    drop(entries);\n    drop(roots);')
     return s
-add('original-metadata-layout', 'million_objects_fit_metadata_coefficient', rp, old_metadata)
+# Restore the duplicated per-entry output fields; the meter must catch their cost.
+def duplicate_metadata(s):
+    s = s.replace('type Output = (ObjectId, ObjectType, u32);', 'type Output = (PackIndexEntry, PackIndexedObject);')
+    a = s.index('        state.output[index] = Some(('); b = s.index('        drop(state);', a)
+    s = s[:a] + '''        state.output[index] = Some((
+            PackIndexEntry { oid, offset: d.offset as u64, crc32: crc32fast::hash(&self.pack[d.offset..d.end]) },
+            PackIndexedObject { oid, offset: d.offset as u64, object_type, size: body.len() as u64 },
+        ));
+''' + s[b:]
+    return s.replace('let (oid, object_type, crc32) = entry.ok_or_else(|| invalid("unresolved pack entry"))?;',
+        'let (old_index, old_object) = entry.ok_or_else(|| invalid("unresolved pack entry"))?;\n        let (oid, object_type, crc32) = (old_index.oid, old_object.object_type, old_index.crc32);')
+add('original-metadata-layout', 'million_objects_fit_metadata_coefficient', rp, duplicate_metadata)
 for stage in ['Inflate', 'DeltaResolution']:
     add('profile-' + stage, 'trusted_index_restores_inflate_and_delta_profile_spans', rp, lambda s, stage=stage: s.replace('sley_core::fetch_profile::Stage::' + stage, 'sley_core::fetch_profile::Stage::ObjectStoreWrite'), 'fetch-profile')
 
@@ -85,6 +96,10 @@ add('small-pack-progress', 'trusted_small_packs_keep_intermediate_progress', rp,
 add('untrusted-speculation', 'embedded_zlib_members_have_linear_discovery_cpu_cost', rp, lambda s: region(s, 'fn discover<E>(', '// Only an explicitly unlimited', lambda b: b.replace('if limits.is_unlimited() {', 'if true {')))
 
 add('workspace-overflow-typing', 'workspace_arithmetic_overflow_stays_a_typed_budget_error', rp, lambda s: region(s, '    let overflow = ||', '    let max_body =', lambda b: '    let overflow = || invalid("pack workspace size overflow");\n'))
+
+add('subtree-stealing', 'one_hot_family_is_stolen_by_multiple_workers', rp, lambda s: s.replace('item = pop((worker + other) % workers, true)?;', 'let _ = other; item = None;'))
+add('panic-unwind-stop', 'panicking_visitor_stops_idle_workers_before_watchdog', rp, lambda s: s.replace('let _unwind = UnwindStop(&self.stop);', 'let _unwind = ();'))
+add('dependent-release-order', 'last_dependent_releases_base_before_visiting_child', rp, lambda s: s.replace('        parent.release()?;\n', '').replace('        let base = self.replay(&parent)?;', '        parent.release()?;\n        let base = self.replay(&parent)?;'))
 
 results = []
 try:

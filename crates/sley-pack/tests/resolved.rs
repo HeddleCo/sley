@@ -721,18 +721,34 @@ fn last_dependent_releases_base_before_visiting_child() {
         return;
     }
     let p = chains(1, 50, 1024 * 1024, false);
-    resolve_pack(
+    let metrics = ResolveMetrics::default();
+    resolve_pack_with_metrics(
         &p,
         ObjectFormat::Sha1,
         1,
         ResolveLimits {
             max_live_base_bytes: 100 * 1024 * 1024,
+            max_resolve_ops: 152,
             ..ResolveLimits::default()
         },
         CancelFlag::never(),
-        &|_| Ok::<_, ()>(()),
+        &|_| {
+            assert_eq!(
+                metrics.live_base_bytes(),
+                0,
+                "parent retained during child visit"
+            );
+            Ok::<_, ()>(())
+        },
+        &metrics,
     )
     .expect("chain resolves");
+    assert_eq!(
+        metrics.resolve_ops(),
+        152,
+        "last dependent used its retained parent through apply"
+    );
+    assert_eq!(metrics.live_base_bytes(), 0);
     let peak = peak_bytes();
     println!("last-dependent release: peak={peak} bytes");
     assert!(
@@ -1423,100 +1439,104 @@ fn flight_reservations_release_after_errors_and_waiters_observe_cancel() {
 
 #[test]
 fn resolve_ops_counts_discovery_inflate_apply_and_replay() {
-    let p = chains(1, 2, 32, false);
-    for (live, expected) in [(1024, 8), (0, 12)] {
+    for threads in [1, 2, 16] {
+        let p = chains(1, 2, 32, false);
+        for (live, expected) in [(1024, 8), (0, 12)] {
+            let metrics = ResolveMetrics::default();
+            let limits = ResolveLimits {
+                max_live_base_bytes: live,
+                max_resolve_ops: expected,
+                ..ResolveLimits::default()
+            };
+            resolve_pack_with_metrics(
+                &p,
+                ObjectFormat::Sha1,
+                threads,
+                limits,
+                CancelFlag::never(),
+                &|_| Ok::<_, ()>(()),
+                &metrics,
+            )
+            .expect("exact operation budget");
+            assert_eq!(metrics.resolve_ops(), expected);
+            let metrics = ResolveMetrics::default();
+            let e = resolve_pack_with_metrics(
+                &p,
+                ObjectFormat::Sha1,
+                threads,
+                ResolveLimits {
+                    max_resolve_ops: expected - 1,
+                    ..limits
+                },
+                CancelFlag::never(),
+                &|_| Ok::<_, ()>(()),
+                &metrics,
+            )
+            .expect_err("next op refused");
+            assert!(
+                matches!(e, ResolveError::ResolveOps { limit, attempted } if limit == expected - 1 && attempted == expected)
+            );
+            assert_eq!(metrics.resolve_ops(), expected - 1);
+            assert_eq!(metrics.in_flight_bytes(), 0);
+            assert_eq!(metrics.live_base_bytes(), 0);
+            println!(
+                "resolve ops: live={live}, exact successful count={expected}; budget={} refused attempted={expected}",
+                expected - 1
+            );
+        }
         let metrics = ResolveMetrics::default();
-        let limits = ResolveLimits {
-            max_live_base_bytes: live,
-            max_resolve_ops: expected,
-            ..ResolveLimits::default()
-        };
-        resolve_pack_with_metrics(
-            &p,
-            ObjectFormat::Sha1,
-            1,
-            limits,
-            CancelFlag::never(),
-            &|_| Ok::<_, ()>(()),
-            &metrics,
-        )
-        .expect("exact operation budget");
-        assert_eq!(metrics.resolve_ops(), expected);
-        let metrics = ResolveMetrics::default();
+        let calls = AtomicUsize::new(0);
         let e = resolve_pack_with_metrics(
             &p,
             ObjectFormat::Sha1,
-            1,
+            threads,
             ResolveLimits {
-                max_resolve_ops: expected - 1,
-                ..limits
+                max_resolve_ops: 2,
+                ..ResolveLimits::default()
+            },
+            CancelFlag::never(),
+            &|_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok::<_, ()>(())
+            },
+            &metrics,
+        )
+        .expect_err("discovery spends budget too");
+        assert!(matches!(
+            e,
+            ResolveError::ResolveOps {
+                limit: 2,
+                attempted: 3
+            }
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        let metrics = ResolveMetrics::default();
+        let p = chains(16, 2, 32, false);
+        let e = resolve_pack_with_metrics(
+            &p,
+            ObjectFormat::Sha1,
+            threads,
+            ResolveLimits {
+                max_resolve_ops: 120,
+                ..ResolveLimits::default()
             },
             CancelFlag::never(),
             &|_| Ok::<_, ()>(()),
             &metrics,
         )
-        .expect_err("next op refused");
-        assert!(
-            matches!(e, ResolveError::ResolveOps { limit, attempted } if limit == expected - 1 && attempted == expected)
-        );
-        assert_eq!(metrics.resolve_ops(), expected - 1);
+        .expect_err("all workers share one op ceiling");
+        assert!(matches!(
+            e,
+            ResolveError::ResolveOps {
+                limit: 120,
+                attempted: 121
+            }
+        ));
+        assert_eq!(metrics.resolve_ops(), 120);
         assert_eq!(metrics.in_flight_bytes(), 0);
-        println!(
-            "resolve ops: live={live}, exact successful count={expected}; budget={} refused attempted={expected}",
-            expected - 1
-        );
+        assert_eq!(metrics.live_base_bytes(), 0);
+        println!("resolve ops: 16 roots share cap=120, attempted=121");
     }
-    let metrics = ResolveMetrics::default();
-    let calls = AtomicUsize::new(0);
-    let e = resolve_pack_with_metrics(
-        &p,
-        ObjectFormat::Sha1,
-        16,
-        ResolveLimits {
-            max_resolve_ops: 2,
-            ..ResolveLimits::default()
-        },
-        CancelFlag::never(),
-        &|_| {
-            calls.fetch_add(1, Ordering::Relaxed);
-            Ok::<_, ()>(())
-        },
-        &metrics,
-    )
-    .expect_err("discovery spends budget too");
-    assert!(matches!(
-        e,
-        ResolveError::ResolveOps {
-            limit: 2,
-            attempted: 3
-        }
-    ));
-    assert_eq!(calls.load(Ordering::Relaxed), 0);
-    let metrics = ResolveMetrics::default();
-    let p = chains(16, 2, 32, false);
-    let e = resolve_pack_with_metrics(
-        &p,
-        ObjectFormat::Sha1,
-        16,
-        ResolveLimits {
-            max_resolve_ops: 120,
-            ..ResolveLimits::default()
-        },
-        CancelFlag::never(),
-        &|_| Ok::<_, ()>(()),
-        &metrics,
-    )
-    .expect_err("all workers share one op ceiling");
-    assert!(matches!(
-        e,
-        ResolveError::ResolveOps {
-            limit: 120,
-            attempted: 121
-        }
-    ));
-    assert_eq!(metrics.resolve_ops(), 120);
-    assert_eq!(metrics.in_flight_bytes(), 0);
-    println!("resolve ops: 16 roots share cap=120, attempted=121");
 }
 
 #[test]
@@ -2192,7 +2212,7 @@ fn panicking_visitor_stops_idle_workers_before_watchdog() {
         &metrics,
     );
     let elapsed = start.elapsed();
-    done.send(()).expect("watchdog signal");
+    let _ = done.send(());
     watchdog.join().expect("watchdog joined");
     eprintln!("panicking visitor returned after {elapsed:?} (watchdog=30s)");
     assert!(result.is_err());

@@ -1,104 +1,101 @@
-"""Reproduce the interleaved trusted-index timing gate without another worktree.
+"""Public-API trusted timing gate: interleaved median of six, at 4/16 threads.
 
-Usage: python3 crates/sley-pack/tests/support/resolve_timing.py SCRATCH TARGET
-Exports historical sources, builds the same public-API example in release mode,
-then alternates base/head three times on each 420,000-object fixture. All build
-output is captured. No existing source checkout or Git branch is changed.
+Usage: resolve_timing.py SCRATCH TARGET --fixtures FIXTURES [--only NAME]
+A fresh SCRATCH holds source exports (not worktrees), build logs and timings.
+FIXTURES holds whole.pack, mixed-ofs.pack, hot.pack, iroh.pack and heddle.pack.
+Use resolve_hot_fixture.py to generate hot.git; real packs are opt-in network
+fixtures, pinned and described in fixtures.json. All commands capture output.
 """
-import hashlib
-import io
-import json
-import os
+import argparse, hashlib, io, json, os, random, re, statistics, struct
+import subprocess, tarfile, zlib
 from pathlib import Path
-import random
-import re
-import statistics
-import struct
-import subprocess
-import sys
-import tarfile
-import time
-import zlib
+parser=argparse.ArgumentParser(description=__doc__)
+parser.add_argument('scratch',type=Path); parser.add_argument('target',type=Path)
+parser.add_argument('--fixtures',required=True,type=Path)
+parser.add_argument('--only',action='append'); parser.add_argument('--trials',type=int,default=6)
+parser.add_argument('--threads',type=int,nargs='+',default=[4,16])
+parser.add_argument('--steal-disabled',action='store_true')
+args=parser.parse_args(); scratch=args.scratch; target=args.target; fixtures=args.fixtures
+scratch.mkdir(parents=True,exist_ok=False); target.mkdir(parents=True,exist_ok=True)
+root=Path.cwd(); head=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+refs={'base':'61848386','head':head}
+example=(root/'crates/sley-pack/tests/support/resolve_timing.rs').read_bytes()
+env=os.environ.copy(); env['RUSTUP_TOOLCHAIN']='stable'
+for name,ref in refs.items():
+    source=scratch/name; source.mkdir()
+    with tarfile.open(fileobj=io.BytesIO(subprocess.check_output(['git','archive',ref]))) as tar:
+        tar.extractall(source,filter='data')
+    directory=source/'crates/sley-pack/examples'; directory.mkdir(exist_ok=True)
+    (directory/'r7_timing.rs').write_bytes(example)
+    if name=='head' and args.steal_disabled:
+        path=source/'crates/sley-pack/src/resolved.rs'; text=path.read_text()
+        text=text.replace('item = pop((worker + other) % workers, true)?;', 'let _ = other; item = None;')
+        path.write_text(text)
+    env['CARGO_TARGET_DIR']=str(target/name)
+    with (scratch/(name+'-build.log')).open('w') as log:
+        subprocess.run(['cargo','build','--manifest-path',str(source/'Cargo.toml'),'--locked','--release','-p','sley-pack','--example','r7_timing'],env=env,stdout=log,stderr=subprocess.STDOUT,check=True)
 
-scratch, target = map(Path, sys.argv[1:3])
-scratch.mkdir(parents=True, exist_ok=False)
-target.mkdir(parents=True, exist_ok=True)
-root = Path.cwd()
-head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
-refs = {'base': '61848386', 'head': head}
-example = (root / 'crates/sley-pack/tests/support/resolve_timing.rs').read_bytes()
-env = os.environ.copy(); env['RUSTUP_TOOLCHAIN'] = 'stable'
-for name, ref in refs.items():
-    source = scratch / name; source.mkdir()
-    archive = subprocess.check_output(['git', 'archive', ref])
-    with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
-        tar.extractall(source, filter='data')
-    directory = source / 'crates/sley-pack/examples'; directory.mkdir(exist_ok=True)
-    (directory / 'r5_timing.rs').write_bytes(example)
-    env['CARGO_TARGET_DIR'] = str(target / name)
-    with (scratch / (name + '-build.log')).open('w') as log:
-        subprocess.run(['cargo', 'build', '--manifest-path', str(source / 'Cargo.toml'), '--locked', '--release', '-p', 'sley-pack', '--example', 'r5_timing'], env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
-
-def header(kind, size):
-    result = bytearray([kind << 4 | (size & 15) | (128 if size > 15 else 0)])
-    size >>= 4
+def header(kind,size):
+    result=bytearray([kind<<4 | (size&15) | (128 if size>15 else 0)]); size>>=4
     while size:
-        byte = size & 127; size >>= 7; result.append(byte | (128 if size else 0))
+        byte=size&127; size>>=7; result.append(byte | (128 if size else 0))
     return result
 
 def varint(size):
-    out = bytearray()
+    out=bytearray()
     while True:
-        byte = size & 127; size >>= 7; out.append(byte | (128 if size else 0))
+        byte=size&127; size>>=7; out.append(byte | (128 if size else 0))
         if not size: return out
 
 def ofs(distance):
-    out = bytearray([distance & 127]); distance >>= 7
+    out=bytearray([distance&127]); distance>>=7
     while distance:
-        distance -= 1; out.append((distance & 127) | 128); distance >>= 7
+        distance-=1; out.append((distance&127)|128); distance>>=7
     return out[::-1]
 
-fixtures = []
-for mode in ['whole', 'mixed-ofs']:
-    path = scratch / (mode + '.pack'); count = 420000
-    payload = random.Random(1712).randbytes(880 if mode == 'whole' else 1740)
-    digest = hashlib.sha1(); offset = 0
+fixtures.mkdir(parents=True,exist_ok=True)
+for mode in ['whole','mixed-ofs']:
+    path=fixtures/(mode+'.pack')
+    if path.exists(): continue
+    count=420000; payload=random.Random(1712).randbytes(880 if mode=='whole' else 1740)
+    digest=hashlib.sha1(); offset=0
     with path.open('wb') as file:
         def emit(data):
             global offset
-            file.write(data); digest.update(data); offset += len(data)
-        emit(b'PACK' + struct.pack('>II', 2, count))
-        for i in range(count if mode == 'whole' else count // 2):
-            base = offset; body = struct.pack('>Q', i) + payload
-            emit(header(3, len(body))); emit(zlib.compress(body, 1))
-            if mode == 'mixed-ofs':
-                delta = varint(len(body)) + varint(len(body))
-                size = len(body) - 1
-                delta.extend([0xb0, size & 255, size >> 8, 1, i & 255])
-                entry_offset = offset
-                emit(header(6, len(delta))); emit(ofs(entry_offset - base))
-                emit(zlib.compress(delta, 1))
+            file.write(data); digest.update(data); offset+=len(data)
+        emit(b'PACK'+struct.pack('>II',2,count))
+        for i in range(count if mode=='whole' else count//2):
+            base=offset; body=struct.pack('>Q',i)+payload
+            emit(header(3,len(body))); emit(zlib.compress(body,1))
+            if mode=='mixed-ofs':
+                delta=varint(len(body))+varint(len(body)); size=len(body)-1
+                delta.extend([0xb0,size&255,size>>8,1,i&255]); at=offset
+                emit(header(6,len(delta))); emit(ofs(at-base)); emit(zlib.compress(delta,1))
         file.write(digest.digest())
-    fixtures.append((mode, path))
-    print(json.dumps(dict(fixture=mode, objects=count, bytes=path.stat().st_size, pack_sha1=digest.hexdigest())), flush=True)
 
-if hasattr(os, 'sched_getaffinity'):
-    affinity = sorted(os.sched_getaffinity(0))[-16:]
-    os.sched_setaffinity(0, affinity)
-rows = []
-for mode, path in fixtures:
-    for trial in range(1, 4):
-        for name in ['base', 'head']:
-            binary = target / name / 'release/examples/r5_timing'
-            result = subprocess.run([str(binary), str(path)], capture_output=True, text=True, check=True)
-            match = re.search(r'seconds=([\d.]+) objects=(\d+) idx_sha256=(\w+)', result.stdout)
-            assert match, result.stdout
-            row = dict(fixture=mode, version=name, ref=refs[name], trial=trial, seconds=float(match[1]), objects=int(match[2]), idx_sha256=match[3])
-            rows.append(row); (scratch / 'timings.json').write_text(json.dumps(rows, indent=2))
-            print(json.dumps(row), flush=True)
-    group = [r for r in rows if r['fixture'] == mode]
-    assert len({r['idx_sha256'] for r in group}) == 1
-    medians = {name: statistics.median(r['seconds'] for r in group if r['version'] == name) for name in refs}
-    ratio = medians['head'] / medians['base']
-    print(json.dumps(dict(fixture=mode, medians=medians, head_over_base=ratio, gate=ratio <= 1.05)), flush=True)
-    assert ratio <= 1.05, 'trusted performance regression exceeds 5%'
+if hasattr(os,'sched_getaffinity'):
+    os.sched_setaffinity(0,sorted(os.sched_getaffinity(0))[-16:])
+rows=[]; summary=[]
+for mode in args.only or ['whole','mixed-ofs','hot','iroh','heddle']:
+    path=fixtures/(mode+'.pack')
+    with path.open('rb') as file:
+        objects=struct.unpack('>I',file.read(12)[8:])[0]
+        file.seek(0); digest=hashlib.file_digest(file,'sha256').hexdigest()
+    print(json.dumps(dict(fixture=mode,objects=objects,bytes=path.stat().st_size,sha256=digest)),flush=True)
+    for threads in args.threads:
+        for trial in range(1,args.trials+1):
+            # Alternate order too, to reduce systematic thermal/cache bias.
+            for name in (['base','head'] if trial%2 else ['head','base']):
+                binary=target/name/'release/examples/r7_timing'
+                result=subprocess.run([str(binary),str(path),str(threads)],capture_output=True,text=True,check=True)
+                match=re.search(r'seconds=([\d.]+) objects=(\d+) idx_sha256=(\w+) tail=([\d.]+)',result.stdout)
+                assert match,result.stdout
+                row=dict(fixture=mode,threads=threads,version=name,ref=refs[name],trial=trial,seconds=float(match[1]),objects=int(match[2]),idx_sha256=match[3],tail=float(match[4]))
+                rows.append(row); (scratch/'timings.json').write_text(json.dumps(rows,indent=2)); print(json.dumps(row),flush=True)
+        group=[r for r in rows if r['fixture']==mode and r['threads']==threads]
+        assert len({r['idx_sha256'] for r in group})==1
+        medians={name:statistics.median(r['seconds'] for r in group if r['version']==name) for name in refs}
+        tails={name:statistics.median(r['tail'] for r in group if r['version']==name) for name in refs}
+        ratio=medians['head']/medians['base']; summary.append(dict(fixture=mode,threads=threads,medians=medians,tails=tails,head_over_base=ratio,gate=ratio<=1.05))
+        print(json.dumps(summary[-1]),flush=True); (scratch/'summary.json').write_text(json.dumps(summary,indent=2))
+assert all(row['gate'] for row in summary), 'trusted performance regression exceeds 5%'
