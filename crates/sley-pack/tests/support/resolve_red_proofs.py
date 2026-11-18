@@ -84,6 +84,8 @@ add('small-pack-progress', 'trusted_small_packs_keep_intermediate_progress', rp,
 
 add('untrusted-speculation', 'embedded_zlib_members_have_linear_discovery_cpu_cost', rp, lambda s: region(s, 'fn discover<E>(', '// Only an explicitly unlimited', lambda b: b.replace('if limits.is_unlimited() {', 'if true {')))
 
+add('workspace-overflow-typing', 'workspace_arithmetic_overflow_stays_a_typed_budget_error', rp, lambda s: region(s, '    let overflow = ||', '    let max_body =', lambda b: '    let overflow = || invalid("pack workspace size overflow");\n'))
+
 results = []
 try:
     for name, test, path, mutate, features in probes:

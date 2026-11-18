@@ -274,14 +274,11 @@ fn invalid(message: &str) -> GitError {
     GitError::InvalidFormat(message.into())
 }
 fn size_check(size: u64, limits: ResolveLimits) -> Result<usize> {
-    if size > limits.max_object_bytes {
-        return Err(budget(
-            ResourceLimitKind::ResolveObjectBytes,
-            limits.max_object_bytes,
-            size,
-        ));
+    let limit = limits.max_object_bytes.min(usize::MAX as u64);
+    if size > limit {
+        return Err(budget(ResourceLimitKind::ResolveObjectBytes, limit, size));
     }
-    usize::try_from(size).map_err(|_| invalid("pack object size overflows usize"))
+    Ok(size as usize)
 }
 fn charge(total: &mut u64, size: u64, limits: ResolveLimits) -> Result<()> {
     if limits.max_total_decoded == u64::MAX {
@@ -1063,6 +1060,13 @@ where
     P: FnMut(PackIndexProgress),
 {
     let (checksum, entries) = discover(pack, format, limits, cancel, metrics, threads)?;
+    let overflow = || {
+        budget(
+            ResourceLimitKind::ResolveInFlight,
+            limits.max_in_flight_bytes as u64,
+            u64::MAX,
+        )
+    };
     let max_body = entries.iter().map(|d| d.result_size).max().unwrap_or(0);
     let mut workspace = max_body;
     for d in entries.iter().filter(|d| d.base.is_some()) {
@@ -1070,11 +1074,10 @@ where
             max_body
                 .checked_add(d.result_size)
                 .and_then(|size| size.checked_add(d.header.size))
-                .ok_or_else(|| invalid("pack workspace size overflow"))?,
+                .ok_or_else(overflow)?,
         );
     }
-    let workspace =
-        usize::try_from(workspace).map_err(|_| invalid("pack workspace overflows usize"))?;
+    let workspace = usize::try_from(workspace).map_err(|_| overflow())?;
     let mut children: Vec<Vec<u32>> = reserve(entries.len())?;
     children.resize_with(entries.len(), Vec::new);
     let mut refs = reserve(

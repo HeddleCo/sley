@@ -2063,3 +2063,40 @@ fn trusted_small_packs_keep_intermediate_progress() {
     }
     println!("trusted progress: intermediate samples preserved at threads 1/16");
 }
+
+#[test]
+fn workspace_arithmetic_overflow_stays_a_typed_budget_error() {
+    let mut p = pack_start();
+    header(3, 0, &mut p);
+    compressed(&[], &mut p);
+    let mut d = vec![0];
+    varint(u64::MAX, &mut d);
+    let at = p.len();
+    header(6, d.len() as u64, &mut p);
+    ofs(at - 12, &mut p);
+    compressed(&d, &mut p);
+    let p = finish(p, 2);
+    let e = resolve_pack(
+        &p,
+        ObjectFormat::Sha1,
+        16,
+        ResolveLimits {
+            max_object_bytes: u64::MAX,
+            max_total_decoded: u64::MAX,
+            ..ResolveLimits::default()
+        },
+        CancelFlag::never(),
+        &|_| Ok::<_, ()>(()),
+    )
+    .expect_err("unrepresentable workspace");
+    let expected = if usize::BITS == 64 {
+        sley_core::ResourceLimitKind::ResolveInFlight
+    } else {
+        sley_core::ResourceLimitKind::ResolveObjectBytes
+    };
+    assert!(
+        matches!(e, ResolveError::Pack(GitError::ResourceLimit { kind, .. }) if kind == expected),
+        "untyped workspace refusal: {e:?}"
+    );
+    println!("workspace overflow: typed {expected:?}, refused before decoding");
+}
