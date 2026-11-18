@@ -8,6 +8,9 @@
 //! * S6 — gc.pid acquisition is single-step with pid liveness: a crashed
 //!   holder is recovered immediately; a live holder blocks.
 
+#[path = "support/times.rs"]
+mod times;
+
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -333,7 +336,7 @@ fn gc_default_still_expires_old_unreachable_packed_objects() {
         .expect("clock after epoch")
         .as_secs() as i64
         - 30 * 24 * 3600;
-    filetime::set_file_mtime(&pack_path, filetime::FileTime::from_unix_time(stamp, 0))
+    times::set_mtime(&pack_path, filetime::FileTime::from_unix_time(stamp, 0))
         .expect("backdate pack mtime");
 
     git_ok(&repo, &["config", "gc.cruftPacks", "false"]);
@@ -365,7 +368,7 @@ fn gc_cruft_mode_expires_aged_unreachable_loose_objects() {
             .expect("clock after epoch")
             .as_secs() as i64
             - 30 * 24 * 3600;
-        filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(stamp, 0))
+        times::set_mtime(&path, filetime::FileTime::from_unix_time(stamp, 0))
             .expect("backdate object");
     };
     backdate(&aged);

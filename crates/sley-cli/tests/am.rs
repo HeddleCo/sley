@@ -11,6 +11,9 @@
 //! no-op where git is unavailable. All git invocations use a fixed identity and
 //! date so commit OIDs are deterministic and comparable across the two binaries.
 
+#[path = "support/times.rs"]
+mod times;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -890,7 +893,7 @@ fn am_reject_partially_applies_and_writes_reject_like_git() {
     let rs_target = root.join("rs");
     for target in [&git_target, &rs_target] {
         init_repo(target, "1\n2\n3\n4\n5\n6\n7\n");
-        filetime::set_file_mtime(
+        times::set_mtime(
             target.join("file.txt"),
             filetime::FileTime::from_unix_time(1_700_000_000, 0),
         )

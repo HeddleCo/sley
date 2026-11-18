@@ -276,6 +276,25 @@ fn decimal_mbps(bytes: u64, duration: Duration) -> f64 {
 mod tests {
     use super::*;
 
+    #[inline(never)]
+    fn profiled_dependency_workload() {
+        let until = Instant::now() + Duration::from_millis(250);
+        let mut value = 1u64;
+        while Instant::now() < until {
+            value = std::hint::black_box(value.wrapping_mul(17).wrapping_add(3));
+        }
+        std::hint::black_box(value);
+    }
+
+    #[test]
+    fn live_profile_preserves_resolved_function_names() {
+        let guard = pprof::ProfilerGuard::new(1000).expect("start profiler");
+        profiled_dependency_workload();
+        let profile = guard.report().build().expect("resolve sampled stacks");
+        let folded = render_folded_stacks(&profile);
+        assert!(folded.contains("profiled_dependency_workload"), "{folded}");
+    }
+
     #[test]
     fn parser_keeps_sley_arguments_after_separator() {
         let options = parse_options(

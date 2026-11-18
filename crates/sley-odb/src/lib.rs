@@ -198,6 +198,93 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_cold_pack_reads_preserve_objects_and_transfer_bytes() {
+        use std::sync::{Barrier, mpsc};
+        use std::time::Duration;
+
+        for format in [ObjectFormat::Sha1, ObjectFormat::Sha256] {
+            let root = temp_root("concurrent-pack-read");
+            let db = FileObjectDatabase::new(root.join("objects"), format);
+            let objects: Vec<_> = (0..32).map(|byte| blob_of(byte, 4096)).collect();
+            let ids: Vec<_> = objects
+                .iter()
+                .map(|object| object.object_id(format).expect("hash fixture"))
+                .collect();
+            let pack =
+                PackFile::write_packed_with_options(&objects, format, &PackWriteOptions::new())
+                    .expect("write real pack");
+            let installed = db.install_pack(&pack).expect("install real pack");
+            let pack_before = fs::read(&installed.pack_path).expect("read installed pack");
+            let index_before = fs::read(&installed.index_path).expect("read installed index");
+            let mut expected_transfer = Vec::new();
+            write_object_id_pack_to_writer(
+                &db,
+                format,
+                ids.iter().copied(),
+                ids.len() as u32,
+                &mut expected_transfer,
+            )
+            .expect("serial transfer");
+            // A fresh handle shares initially cold caches among the readers.
+            let db = Arc::new(FileObjectDatabase::new(root.join("objects"), format));
+            let barrier = Arc::new(Barrier::new(8));
+            let (send, receive) = mpsc::channel();
+            let mut workers = Vec::new();
+            for worker in 0..8 {
+                let (db, barrier, send) = (db.clone(), barrier.clone(), send.clone());
+                let (objects, ids, expected) =
+                    (objects.clone(), ids.clone(), expected_transfer.clone());
+                workers.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    for round in 0..8 {
+                        for offset in 0..ids.len() {
+                            let i = (offset + worker + round) % ids.len();
+                            assert_eq!(read_object_for_assert(&*db, &ids[i]), objects[i]);
+                            assert_eq!(
+                                db.read_object_header(&ids[i]).expect("read header"),
+                                Some((ObjectType::Blob, objects[i].body.len() as u64))
+                            );
+                            assert!(db.contains(&ids[i]).expect("check presence"));
+                        }
+                    }
+                    let mut transfer = Vec::new();
+                    write_object_id_pack_to_writer(
+                        &*db,
+                        format,
+                        ids,
+                        objects.len() as u32,
+                        &mut transfer,
+                    )
+                    .expect("concurrent transfer");
+                    assert_eq!(
+                        transfer, expected,
+                        "transfer bytes changed under contention"
+                    );
+                    send.send(()).expect("report reader completion");
+                }));
+            }
+            drop(send);
+            for _ in 0..8 {
+                receive
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("all readers must make progress");
+            }
+            for worker in workers {
+                worker.join().expect("reader completed without panic");
+            }
+            assert_eq!(
+                fs::read(&installed.pack_path).expect("reread pack"),
+                pack_before
+            );
+            assert_eq!(
+                fs::read(&installed.index_path).expect("reread index"),
+                index_before
+            );
+            fs::remove_dir_all(root).expect("remove test repository");
+        }
+    }
+
+    #[test]
     fn injected_replacements_affect_reads_but_not_raw_enumeration() {
         let root = temp_root("replacement_reads");
         let db = FileObjectDatabase::new(root.join("objects"), ObjectFormat::Sha1);
