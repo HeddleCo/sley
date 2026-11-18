@@ -7,11 +7,10 @@
 //! A full gate trades repeated decoding for memory; replay never calls visitors.
 use super::*;
 use flate2::{Decompress, FlushDecompress};
-use sley_core::AtomicCancel;
+use sley_core::{AtomicCancel, ResourceLimitKind};
 use std::sync::{
     Condvar, Mutex,
     atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
-    mpsc,
 };
 
 /// Limits checked before reserving entry metadata, delta streams or bodies.
@@ -48,6 +47,12 @@ impl Default for ResolveLimits {
     }
 }
 impl ResolveLimits {
+    fn is_unlimited(self) -> bool {
+        self == Self {
+            max_delta_depth: self.max_delta_depth,
+            ..Self::unlimited()
+        }
+    }
     /// Trusted legacy policy: no object, work or memory caps; retain the depth limit.
     pub fn unlimited() -> Self {
         Self {
@@ -68,6 +73,7 @@ pub struct ResolveMetrics {
     in_flight: AtomicUsize,
     peak_in_flight: AtomicUsize,
     ops: AtomicU64,
+    metadata: AtomicUsize,
 }
 impl ResolveMetrics {
     pub fn in_flight_bytes(&self) -> usize {
@@ -75,6 +81,10 @@ impl ResolveMetrics {
     }
     pub fn peak_in_flight_bytes(&self) -> usize {
         self.peak_in_flight.load(AtomicOrdering::Acquire)
+    }
+    /// Peak allocated resolver/index metadata bytes, excluding decoding buffers.
+    pub fn peak_metadata_bytes(&self) -> usize {
+        self.metadata.load(AtomicOrdering::Acquire)
     }
     pub fn resolve_ops(&self) -> u64 {
         self.ops.load(AtomicOrdering::Acquire)
@@ -114,6 +124,7 @@ pub struct ResolvedObject<'a> {
 }
 /// The first pack or visitor error. Other workers stop cooperatively.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ResolveError<E> {
     Pack(GitError),
     Visitor(E),
@@ -183,7 +194,9 @@ pub(crate) fn infallible_error(error: ResolveError<std::convert::Infallible>) ->
 /// worker count also fits the gate to bound idle allocator arenas. Each worker
 /// reserves a complete worst-case workspace
 /// (base + instructions + result) before decoding, so waiting cannot deadlock
-/// while holding transient buffers. A workspace larger than the gate is refused.
+/// while holding transient buffers. The gate must fit `2 * largest result body +
+/// largest delta stream` (sufficiently, `3 * max_object_bytes`); otherwise a typed
+/// `ResourceLimitKind::ResolveInFlight` error refuses the pack before decoding.
 /// [`resolve_pack_with_metrics`] exposes the shared reservation/operation counters.
 pub fn resolve_pack<V, E>(
     pack: &[u8],
@@ -221,7 +234,7 @@ where
     V: Fn(&ResolvedObject<'_>) -> std::result::Result<(), E> + Sync,
     E: Send,
 {
-    resolve_with_base(
+    let result = resolve_with_base(
         pack,
         format,
         threads,
@@ -231,7 +244,13 @@ where
         &mut |_| Ok(None),
         &mut |_| {},
         metrics,
-    )
+    );
+    if result.is_err()
+        && let Some(source) = cancel.source()
+    {
+        source.cancel();
+    }
+    result
 }
 
 #[derive(Debug)]
@@ -243,21 +262,45 @@ struct Descriptor {
     base: Option<DeltaBase>,
     result_size: u64,
 }
+fn budget(kind: ResourceLimitKind, limit: u64, attempted: u64) -> GitError {
+    GitError::ResourceLimit {
+        kind,
+        limit,
+        attempted,
+    }
+}
 fn invalid(message: &str) -> GitError {
     GitError::InvalidFormat(message.into())
 }
 fn size_check(size: u64, limits: ResolveLimits) -> Result<usize> {
     if size > limits.max_object_bytes {
-        return Err(invalid("ResolveLimits::max_object_bytes exceeded"));
+        return Err(budget(
+            ResourceLimitKind::ResolveObjectBytes,
+            limits.max_object_bytes,
+            size,
+        ));
     }
     usize::try_from(size).map_err(|_| invalid("pack object size overflows usize"))
 }
 fn charge(total: &mut u64, size: u64, limits: ResolveLimits) -> Result<()> {
+    if limits.max_total_decoded == u64::MAX {
+        return Ok(());
+    }
+    let attempted = total.saturating_add(size);
     *total = total
         .checked_add(size)
         .filter(|sum| *sum <= limits.max_total_decoded)
-        .ok_or_else(|| invalid("ResolveLimits::max_total_decoded exceeded"))?;
+        .ok_or_else(|| {
+            budget(
+                ResourceLimitKind::ResolveTotalDecoded,
+                limits.max_total_decoded,
+                attempted,
+            )
+        })?;
     Ok(())
+}
+fn allocation<T>(v: &Vec<T>) -> usize {
+    v.capacity() * std::mem::size_of::<T>()
 }
 fn reserve<T>(size: usize) -> Result<Vec<T>> {
     let mut result = Vec::new();
@@ -275,13 +318,14 @@ fn measure(
     total: &mut u64,
     cancel: CancelFlag<'_>,
     scratch: &mut [u8],
+    z: &mut Decompress,
 ) -> Result<()> {
     let mut checked = d.base.is_none();
     if checked {
         charge(total, d.header.size, limits)?;
         d.result_size = d.header.size;
     }
-    let mut z = Decompress::new(true);
+    z.reset(true);
     let mut prefix = [0; 20];
     let mut prefix_len = 0;
     loop {
@@ -336,6 +380,7 @@ fn discover<E>(
     limits: ResolveLimits,
     cancel: CancelFlag<'_>,
     metrics: &ResolveMetrics,
+    threads: usize,
 ) -> std::result::Result<(ObjectId, Vec<Descriptor>), ResolveError<E>> {
     cancel.check()?;
     if pack.len() < 12 + format.raw_len() || &pack[..4] != b"PACK" {
@@ -347,8 +392,17 @@ fn discover<E>(
     let end = pack.len() - format.raw_len();
     let count = u32_be(&pack[8..12]) as usize;
     if count > limits.max_objects {
-        return Err(invalid("ResolveLimits::max_objects exceeded").into());
+        return Err(budget(
+            ResourceLimitKind::ResolveObjects,
+            limits.max_objects as u64,
+            count as u64,
+        )
+        .into());
     }
+    let entries = reserve(pack_entry_prealloc(count, end - 12))?;
+    metrics
+        .metadata
+        .fetch_max(allocation(&entries), AtomicOrdering::Relaxed);
     checked_pack_object_count(count as u32, (end - 12) as u64)?;
     let mut digest = StreamingDigest::new(format);
     for chunk in pack[..end].chunks(64 * 1024) {
@@ -359,10 +413,22 @@ fn discover<E>(
     if checksum.as_bytes() != &pack[end..] {
         return Err(invalid("pack checksum mismatch").into());
     }
-    let mut entries = reserve(pack_entry_prealloc(count))?;
+    #[cfg(feature = "fetch-profile")]
+    let _span = sley_core::fetch_profile::Span::enter(sley_core::fetch_profile::Stage::Inflate);
+    if limits.is_unlimited() {
+        if count != 0 {
+            parse_entry_header(&pack[..end], &mut 12)?;
+        }
+        return Ok((
+            checksum,
+            discover_trusted(&pack[..end], format, count, threads, cancel, entries)?,
+        ));
+    }
+    let mut entries = entries;
     // Fixed discovery scratch, independent of attacker-declared body sizes.
     let mut scratch = reserve(64 * 1024)?;
     scratch.resize(64 * 1024, 0);
+    let mut z = Decompress::new(true);
     let (mut offset, mut work, mut total) = (12, 0, 0);
     for _ in 0..count {
         cancel.check()?;
@@ -393,6 +459,7 @@ fn discover<E>(
             &mut total,
             cancel,
             &mut scratch,
+            &mut z,
         )?;
         offset = d.end;
         if entries.len() == entries.capacity() {
@@ -409,14 +476,126 @@ fn discover<E>(
     Ok((checksum, entries))
 }
 
+// Only an explicitly unlimited policy may speculate; bounded discovery never calls this.
+fn discover_trusted(
+    pack: &[u8],
+    format: ObjectFormat,
+    count: usize,
+    threads: usize,
+    cancel: CancelFlag<'_>,
+    mut entries: Vec<Descriptor>,
+) -> Result<Vec<Descriptor>> {
+    let workers = threads.max(1).min(count.max(1));
+    let chunk = (pack.len() - 12).div_ceil(workers).max(1);
+    let candidates = std::thread::scope(|scope| -> Result<Vec<Descriptor>> {
+        let mut handles = Vec::new();
+        for start in (12..pack.len()).step_by(chunk) {
+            handles.push(std::thread::Builder::new().spawn_scoped(
+                scope,
+                sley_core::diagnostics::inherit(move || -> Result<Vec<Descriptor>> {
+                    let mut found = Vec::new();
+                    let mut scratch = reserve(64 * 1024)?;
+                    scratch.resize(64 * 1024, 0);
+                    let mut z = Decompress::new(true);
+                    for offset in start..(start + chunk).min(pack.len()) {
+                        if offset & 4095 == 0 {
+                            cancel.check()?;
+                        }
+                        let candidate = (|| {
+                            let mut data = offset;
+                            let header = parse_entry_header(pack, &mut data).ok()?;
+                            let base = parse_entry_base(
+                                pack,
+                                &mut data,
+                                offset as u64,
+                                format,
+                                header.kind,
+                            )
+                            .ok()?;
+                            let bytes = pack.get(data..data.checked_add(2)?)?;
+                            if bytes[0] & 15 != 8
+                                || bytes[0] >> 4 > 7
+                                || bytes[1] & 32 != 0
+                                || !u16::from_be_bytes([bytes[0], bytes[1]]).is_multiple_of(31)
+                            {
+                                return None;
+                            }
+                            Some(Descriptor {
+                                offset,
+                                data,
+                                end: 0,
+                                header,
+                                base,
+                                result_size: 0,
+                            })
+                        })();
+                        if let Some(mut d) = candidate
+                            && measure(
+                                pack,
+                                &mut d,
+                                ResolveLimits::unlimited(),
+                                &mut 0,
+                                cancel,
+                                &mut scratch,
+                                &mut z,
+                            )
+                            .is_ok()
+                        {
+                            found.push(d);
+                        }
+                    }
+                    cancel.check()?;
+                    Ok(found)
+                }),
+            )?);
+        }
+        let mut found = Vec::new();
+        for handle in handles {
+            found.append(
+                &mut handle
+                    .join()
+                    .map_err(|_| invalid("pack discovery worker panicked"))??,
+            );
+        }
+        Ok(found)
+    })?;
+    let mut offset = 12;
+    for d in candidates {
+        if d.offset == offset && entries.len() < count {
+            offset = d.end;
+            if entries.len() == entries.capacity() {
+                entries
+                    .try_reserve_exact(entries.len().max(1).min(count - entries.len()))
+                    .map_err(|_| invalid("could not grow pack metadata"))?;
+            }
+            entries.push(d);
+        }
+    }
+    if entries.len() != count || offset != pack.len() {
+        return Err(invalid("invalid or truncated pack entries"));
+    }
+    Ok(entries)
+}
+
+type Output = (ObjectId, ObjectType, u32);
 struct State<E> {
-    children: Vec<Vec<usize>>,
-    refs: BTreeMap<ObjectId, Vec<usize>>,
-    output: Vec<Option<(PackIndexEntry, PackIndexedObject)>>,
+    children: Vec<Vec<u32>>,
+    refs: Vec<(ObjectId, Vec<u32>)>,
+    output: Vec<Option<Output>>,
     error: Option<ResolveError<E>>,
     inflated_work: u64,
     decoded_work: u64,
     compressed_work: u64,
+}
+impl<E> State<E> {
+    fn ref_slot(&self, oid: &ObjectId) -> Option<usize> {
+        self.refs.binary_search_by_key(oid, |entry| entry.0).ok()
+    }
+    fn take_refs(&mut self, oid: &ObjectId) -> Vec<u32> {
+        self.ref_slot(oid)
+            .map(|i| std::mem::take(&mut self.refs[i].1))
+            .unwrap_or_default()
+    }
 }
 struct Engine<'a, 'c, V, E> {
     pack: &'a [u8],
@@ -464,7 +643,7 @@ struct Frame<'a> {
     offset: u64,
     depth: usize,
     body: Option<Retained<'a>>,
-    children: std::vec::IntoIter<usize>,
+    children: std::vec::IntoIter<u32>,
 }
 #[derive(Clone, Copy)]
 enum Root<'a> {
@@ -481,6 +660,11 @@ where
     V: Fn(&ResolvedObject<'_>) -> std::result::Result<(), E> + Sync,
     E: Send,
 {
+    fn state(&self) -> Result<std::sync::MutexGuard<'_, State<E>>> {
+        self.state
+            .lock()
+            .map_err(|_| invalid("pack state poisoned"))
+    }
     fn check(&self) -> Result<()> {
         self.cancel.check()?;
         self.stop_flag().check()
@@ -495,18 +679,15 @@ where
             state.error = Some(error);
         }
         self.stop.cancel();
-        if let Some(source) = self.cancel.source() {
-            source.cancel();
-        }
     }
     // Replays must spend the same shared work budgets as first-time decoding;
     // otherwise a large discarded base with many tiny children amplifies CPU.
     fn work(&self, size: u64, kind: Work) -> Result<()> {
+        if self.limits.is_unlimited() {
+            return Ok(());
+        }
         self.check()?;
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| invalid("pack state poisoned"))?;
+        let mut state = self.state()?;
         let limit = self.limits.max_total_decoded;
         let (used, limit) = match kind {
             Work::Inflated => (&mut state.inflated_work, limit),
@@ -527,6 +708,9 @@ where
         )
     }
     fn operation(&self) -> Result<()> {
+        if self.limits.is_unlimited() {
+            return Ok(());
+        }
         if let Err(error) = resolve_op(self.metrics, self.limits.max_resolve_ops) {
             self.fail(error);
             return Err(GitError::Cancelled);
@@ -536,8 +720,10 @@ where
     fn flight(&self) -> Result<Flight<'_>> {
         let bytes = self.workspace;
         if bytes > self.limits.max_in_flight_bytes {
-            return Err(invalid(
-                "ResolveLimits::max_in_flight_bytes cannot fit workspace",
+            return Err(budget(
+                ResourceLimitKind::ResolveInFlight,
+                self.limits.max_in_flight_bytes as u64,
+                bytes as u64,
             ));
         }
         let mut wait = self
@@ -573,6 +759,8 @@ where
     }
     fn inflate(&self, index: usize) -> Result<Vec<u8>> {
         self.check()?;
+        #[cfg(feature = "fetch-profile")]
+        let _span = sley_core::fetch_profile::Span::enter(sley_core::fetch_profile::Stage::Inflate);
         self.operation()?;
         let d = &self.entries[index];
         let size = size_check(d.header.size, self.limits)?;
@@ -586,6 +774,9 @@ where
     }
     fn apply(&self, index: usize, base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
         self.check()?;
+        #[cfg(feature = "fetch-profile")]
+        let _span =
+            sley_core::fetch_profile::Span::enter(sley_core::fetch_profile::Stage::DeltaResolution);
         self.operation()?;
         let plan = plan_pack_delta(base, delta)?;
         let size = size_check(plan.result_size, self.limits)?;
@@ -640,7 +831,7 @@ where
         object_type: ObjectType,
         depth: usize,
         delta: Option<ResolvedDelta<'_>>,
-        completed: &mpsc::SyncSender<()>,
+        completed: &AtomicUsize,
     ) -> std::result::Result<Frame<'_>, ResolveError<E>> {
         self.check()?;
         let d = &self.entries[index];
@@ -660,31 +851,16 @@ where
         })
         .map_err(ResolveError::Visitor)?;
         self.check()?;
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| invalid("pack state poisoned"))?;
+        let mut state = self.state()?;
         let mut children = std::mem::take(&mut state.children[index]);
-        if let Some(mut refs) = state.refs.remove(&oid) {
-            children.append(&mut refs);
-        }
+        children.append(&mut state.take_refs(&oid));
         state.output[index] = Some((
-            PackIndexEntry {
-                oid,
-                offset: d.offset as u64,
-                crc32: crc32fast::hash(&self.pack[d.offset..d.end]),
-            },
-            PackIndexedObject {
-                oid,
-                object_type,
-                offset: d.offset as u64,
-                size: body.len() as u64,
-            },
+            oid,
+            object_type,
+            crc32fast::hash(&self.pack[d.offset..d.end]),
         ));
         drop(state);
-        completed
-            .send(())
-            .map_err(|_| invalid("pack progress receiver closed"))?;
+        completed.fetch_add(1, AtomicOrdering::Release);
         Ok(Frame {
             index: Some(index),
             oid,
@@ -698,9 +874,13 @@ where
     fn walk(
         &self,
         root: Root<'_>,
-        completed: &mpsc::SyncSender<()>,
+        completed: &AtomicUsize,
     ) -> std::result::Result<(), ResolveError<E>> {
-        let _flight = self.flight()?;
+        let _flight = if self.limits.is_unlimited() {
+            None
+        } else {
+            Some(self.flight()?)
+        };
         let (mut frame, body, external) = match root {
             Root::Entry(index) => {
                 let body = self.inflate(index)?;
@@ -712,13 +892,7 @@ where
                 )
             }
             Root::External(oid, object) => {
-                let children = self
-                    .state
-                    .lock()
-                    .map_err(|_| invalid("pack state poisoned"))?
-                    .refs
-                    .remove(&oid)
-                    .unwrap_or_default();
+                let children = self.state()?.take_refs(&oid);
                 (
                     Frame {
                         index: None,
@@ -746,6 +920,7 @@ where
                 frames.pop();
                 continue;
             };
+            let index = index as usize;
             let parent = &frames[last];
             let depth = parent.depth + 1;
             parallel_index::check_delta_depth(
@@ -781,7 +956,8 @@ where
     }
     fn run<P: FnMut(PackIndexProgress)>(
         &self,
-        roots: &[Root<'_>],
+        roots: &[u32],
+        external: Option<(ObjectId, &EncodedObject)>,
         threads: usize,
         progress: &mut P,
         count: &mut u64,
@@ -795,22 +971,28 @@ where
             .checked_div(self.workspace)
             .unwrap_or(usize::MAX)
             .max(1);
-        let workers = threads.max(1).min(roots.len()).min(slots);
-        let (send, recv) = mpsc::sync_channel(workers.max(1));
+        let root_count = roots.len().max(usize::from(external.is_some()));
+        let workers = threads.max(1).min(root_count).min(slots);
+        let completed = AtomicUsize::new(0);
+        let initial = *count;
         std::thread::scope(|scope| {
             let mut handles = Vec::new();
             for _ in 0..workers {
-                let send = send.clone();
+                let completed = &completed;
                 let cursor = &cursor;
                 let handle = std::thread::Builder::new().spawn_scoped(
                     scope,
                     sley_core::diagnostics::inherit(move || {
                         while !self.stop.is_cancelled() {
                             let index = cursor.fetch_add(1, AtomicOrdering::Relaxed);
-                            let Some(root) = roots.get(index) else {
+                            if index >= root_count {
                                 break;
+                            }
+                            let root = match external {
+                                Some((oid, object)) => Root::External(oid, object),
+                                None => Root::Entry(roots[index] as usize),
                             };
-                            if let Err(error) = self.walk(*root, &send) {
+                            if let Err(error) = self.walk(root, completed) {
                                 self.fail(error);
                                 break;
                             }
@@ -825,22 +1007,22 @@ where
                     }
                 }
             }
-            drop(send);
             loop {
-                match recv.recv_timeout(std::time::Duration::from_millis(10)) {
-                    Ok(()) => {
-                        *count += 1;
-                        progress(PackIndexProgress {
-                            completed_objects: *count,
-                            total_objects: self.entries.len() as u64,
-                        });
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                let finished = handles
+                    .iter()
+                    .all(std::thread::ScopedJoinHandle::is_finished);
+                *count = initial + completed.load(AtomicOrdering::Acquire) as u64;
+                progress(PackIndexProgress {
+                    completed_objects: *count,
+                    total_objects: self.entries.len() as u64,
+                });
+                if finished {
+                    break;
                 }
                 if let Err(error) = self.cancel.check() {
                     self.fail(error.into());
                 }
+                std::thread::park_timeout(std::time::Duration::from_millis(10));
             }
             for handle in handles {
                 if handle.join().is_err() {
@@ -870,143 +1052,187 @@ where
     F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
     P: FnMut(PackIndexProgress),
 {
-    let result = (|| {
-        let (checksum, entries) = discover(pack, format, limits, cancel, metrics)?;
-        let max_body = entries.iter().map(|d| d.result_size).max().unwrap_or(0);
-        let mut workspace = max_body;
-        for d in entries.iter().filter(|d| d.base.is_some()) {
-            workspace = workspace.max(
-                max_body
-                    .checked_add(d.result_size)
-                    .and_then(|size| size.checked_add(d.header.size))
-                    .ok_or_else(|| invalid("pack workspace size overflow"))?,
-            );
-        }
-        let workspace =
-            usize::try_from(workspace).map_err(|_| invalid("pack workspace overflows usize"))?;
-        let mut children: Vec<Vec<usize>> = reserve(entries.len())?;
-        children.resize_with(entries.len(), Vec::new);
-        let mut refs = BTreeMap::<ObjectId, Vec<usize>>::new();
-        let mut roots = Vec::new();
-        for (index, d) in entries.iter().enumerate() {
-            match d.base {
-                None => roots.push(Root::Entry(index)),
-                Some(DeltaBase::Ref(oid)) => refs.entry(oid).or_default().push(index),
-                Some(DeltaBase::Offset(offset)) => {
-                    let base = entries
-                        .binary_search_by_key(&offset, |d| d.offset as u64)
-                        .map_err(|_| invalid("ofs-delta base offset not found"))?;
-                    if base >= index {
-                        return Err(invalid("pack delta cycle detected").into());
-                    }
-                    children[base].push(index);
-                }
-            }
-        }
-        let mut output = reserve(entries.len())?;
-        output.resize_with(entries.len(), || None);
-        let engine = Engine {
-            pack,
-            entries: &entries,
-            format,
-            limits,
-            cancel,
-            stop: AtomicCancel::new(),
-            visit,
-            state: Mutex::new(State {
-                children,
-                refs,
-                output,
-                error: None,
-                inflated_work: 0,
-                decoded_work: 0,
-                compressed_work: 0,
-            }),
-            live: AtomicUsize::new(0),
-            metrics,
-            workspace,
-            flight_wait: Mutex::new(()),
-            flight_wake: Condvar::new(),
-        };
-        let mut count = 0;
-        if entries.is_empty() {
-            progress(PackIndexProgress::default());
-        }
-        engine.run(&roots, threads, progress, &mut count);
-        // The pending REF map only shrinks. Snapshot once: repeatedly searching
-        // past missing bases would make a thin pack with distinct bases quadratic.
-        let pending: Vec<_> = engine
-            .state
-            .lock()
-            .map_err(|_| invalid("pack state poisoned"))?
-            .refs
-            .keys()
-            .copied()
-            .collect();
-        for oid in pending {
-            let mut state = engine
-                .state
-                .lock()
-                .map_err(|_| invalid("pack state poisoned"))?;
-            if let Some(error) = state.error.take() {
-                return Err(error);
-            }
-            if !state.refs.contains_key(&oid) {
-                continue;
-            }
-            drop(state);
-            cancel.check()?;
-            if let Some(object) = external(&oid)? {
-                size_check(object.body.len() as u64, limits)?;
-                if object.object_id(format)? != oid {
-                    return Err(invalid("external delta base identity mismatch").into());
-                }
-                engine.run(
-                    &[Root::External(oid, &object)],
-                    threads,
-                    progress,
-                    &mut count,
-                );
-            }
-        }
-        {
-            let mut state = engine
-                .state
-                .lock()
-                .map_err(|_| invalid("pack state poisoned"))?;
-            if let Some(error) = state.error.take() {
-                return Err(error);
-            }
-        }
-        if count != entries.len() as u64 {
-            return Err(invalid("unresolved, cyclic, or external delta base").into());
-        }
-        cancel.check()?;
-        let state = engine
-            .state
-            .into_inner()
-            .map_err(|_| invalid("pack state poisoned"))?;
-        let mut indexed = reserve(entries.len())?;
-        let mut objects = reserve(entries.len())?;
-        for entry in state.output {
-            cancel.check()?;
-            let (index, object) = entry.ok_or_else(|| invalid("unresolved pack entry"))?;
-            indexed.push(index);
-            objects.push(object);
-        }
-        let index = PackIndex::write_v2(format, &indexed, &checksum)?;
-        cancel.check()?;
-        Ok(PackIndexBuild {
-            index,
-            pack_checksum: checksum,
-            entries: indexed,
-            objects,
-        })
-    })();
-    if result.is_err()
-        && let Some(source) = cancel.source()
-    {
-        source.cancel();
+    let (checksum, entries) = discover(pack, format, limits, cancel, metrics, threads)?;
+    let max_body = entries.iter().map(|d| d.result_size).max().unwrap_or(0);
+    let mut workspace = max_body;
+    for d in entries.iter().filter(|d| d.base.is_some()) {
+        workspace = workspace.max(
+            max_body
+                .checked_add(d.result_size)
+                .and_then(|size| size.checked_add(d.header.size))
+                .ok_or_else(|| invalid("pack workspace size overflow"))?,
+        );
     }
-    result
+    let workspace =
+        usize::try_from(workspace).map_err(|_| invalid("pack workspace overflows usize"))?;
+    let mut children: Vec<Vec<u32>> = reserve(entries.len())?;
+    children.resize_with(entries.len(), Vec::new);
+    let mut refs = reserve(
+        entries
+            .iter()
+            .filter(|d| matches!(d.base, Some(DeltaBase::Ref(_))))
+            .count(),
+    )?;
+    let mut roots = Vec::new();
+    for (index, d) in entries.iter().enumerate() {
+        match d.base {
+            None => roots.push(index as u32),
+            Some(DeltaBase::Ref(oid)) => refs.push((oid, index as u32)),
+            Some(DeltaBase::Offset(offset)) => {
+                let base = entries
+                    .binary_search_by_key(&offset, |d| d.offset as u64)
+                    .map_err(|_| invalid("ofs-delta base offset not found"))?;
+                if base >= index {
+                    return Err(invalid("pack delta cycle detected").into());
+                }
+                children[base].push(index as u32);
+            }
+        }
+    }
+    // Sorted, stable slots avoid opaque tree-node overhead and quadratic removal.
+    refs.sort_unstable_by_key(|entry| entry.0);
+    let ref_input = allocation(&refs);
+    let mut grouped: Vec<(ObjectId, Vec<u32>)> = reserve(refs.len())?;
+    for (oid, index) in refs {
+        if let Some((last, indices)) = grouped.last_mut()
+            && *last == oid
+        {
+            indices.push(index);
+        } else {
+            grouped.push((oid, vec![index]));
+        }
+    }
+    let refs = grouped;
+    let links = children.iter().map(allocation).sum::<usize>()
+        + refs.iter().map(|r| allocation(&r.1)).sum::<usize>();
+    let discovery_metadata = allocation(&entries)
+        + allocation(&roots)
+        + allocation(&children)
+        + allocation(&refs)
+        + 2 * links;
+    metrics
+        .metadata
+        .fetch_max(discovery_metadata + ref_input, AtomicOrdering::Relaxed);
+    let mut output = reserve(entries.len())?;
+    output.resize_with(entries.len(), || None);
+    let buffers = allocation(&entries) + allocation(&output);
+    let metadata = discovery_metadata + allocation(&output);
+    metrics.metadata.fetch_max(
+        metadata.max(
+            buffers
+                + entries.len()
+                    * (std::mem::size_of::<PackIndexEntry>()
+                        + std::mem::size_of::<PackIndexedObject>()),
+        ),
+        AtomicOrdering::Relaxed,
+    );
+    let engine = Engine {
+        pack,
+        entries: &entries,
+        format,
+        limits,
+        cancel,
+        stop: AtomicCancel::new(),
+        visit,
+        state: Mutex::new(State {
+            children,
+            refs,
+            output,
+            error: None,
+            inflated_work: 0,
+            decoded_work: 0,
+            compressed_work: 0,
+        }),
+        live: AtomicUsize::new(0),
+        metrics,
+        workspace,
+        flight_wait: Mutex::new(()),
+        flight_wake: Condvar::new(),
+    };
+    let mut count = 0;
+    if entries.is_empty() {
+        progress(PackIndexProgress::default());
+    }
+    engine.run(&roots, None, threads, progress, &mut count);
+    // The pending REF map only shrinks. Snapshot once: repeatedly searching
+    // past missing bases would make a thin pack with distinct bases quadratic.
+    let pending: Vec<_> = engine
+        .state()?
+        .refs
+        .iter()
+        .filter(|r| !r.1.is_empty())
+        .map(|r| r.0)
+        .collect();
+    metrics
+        .metadata
+        .fetch_max(metadata + allocation(&pending), AtomicOrdering::Relaxed);
+    for oid in pending {
+        let mut state = engine.state()?;
+        if let Some(error) = state.error.take() {
+            return Err(error);
+        }
+        if state
+            .ref_slot(&oid)
+            .is_none_or(|i| state.refs[i].1.is_empty())
+        {
+            continue;
+        }
+        drop(state);
+        cancel.check()?;
+        if let Some(object) = external(&oid)? {
+            size_check(object.body.len() as u64, limits)?;
+            if object.object_id(format)? != oid {
+                return Err(invalid("external delta base identity mismatch").into());
+            }
+            engine.run(&[], Some((oid, &object)), threads, progress, &mut count);
+        }
+    }
+    {
+        let mut state = engine.state()?;
+        if let Some(error) = state.error.take() {
+            return Err(error);
+        }
+    }
+    if count != entries.len() as u64 {
+        return Err(invalid("unresolved, cyclic, or external delta base").into());
+    }
+    cancel.check()?;
+    drop(roots);
+    let State { output, .. } = engine
+        .state
+        .into_inner()
+        .map_err(|_| invalid("pack state poisoned"))?;
+    let mut indexed = reserve(entries.len())?;
+    let mut objects = reserve(entries.len())?;
+    for (d, entry) in entries.iter().zip(output) {
+        cancel.check()?;
+        let (oid, object_type, crc32) = entry.ok_or_else(|| invalid("unresolved pack entry"))?;
+        indexed.push(PackIndexEntry {
+            oid,
+            offset: d.offset as u64,
+            crc32,
+        });
+        objects.push(PackIndexedObject {
+            oid,
+            offset: d.offset as u64,
+            object_type,
+            size: d.result_size,
+        });
+    }
+    drop(entries);
+    let index = PackIndex::write_v2(format, &indexed, &checksum)?;
+    metrics.metadata.fetch_max(
+        allocation(&indexed)
+            + allocation(&objects)
+            + allocation(&index)
+            + indexed.len() * 2 * std::mem::size_of::<&PackIndexEntry>(),
+        AtomicOrdering::Relaxed,
+    );
+    cancel.check()?;
+    Ok(PackIndexBuild {
+        index,
+        pack_checksum: checksum,
+        entries: indexed,
+        objects,
+    })
 }

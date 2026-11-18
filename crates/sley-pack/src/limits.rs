@@ -8,15 +8,9 @@
 
 use super::*;
 
-/// The smallest number of on-disk bytes a pack entry can possibly occupy.
-///
-/// An entry is a type/size varint header (at least one byte) followed by a
-/// zlib stream, whose two-byte header is itself the minimum any zlib stream
-/// can be. The true floor is higher — a real zlib stream also carries at least
-/// one deflate block and a four-byte Adler-32, so nine bytes — but the check
-/// below is a rejection test on untrusted input, and a deliberately loose
-/// lower bound cannot reject a pack that a conforming writer produced.
-const MIN_PACK_ENTRY_BYTES: u64 = 3;
+/// One type/size byte, two zlib header bytes, a two-byte empty DEFLATE
+/// block, and four Adler-32 bytes: no encodable pack entry is shorter.
+const MIN_PACK_ENTRY_BYTES: u64 = 9;
 
 /// Upper bound on the speculative `Vec::with_capacity` taken from a declared
 /// object count.
@@ -65,6 +59,8 @@ pub(crate) fn checked_pack_object_count(
 /// The count is attacker-controlled, so it selects the reservation but never
 /// dictates it; anything above [`PACK_OBJECT_COUNT_PREALLOC_CAP`] grows on
 /// demand as entries are actually parsed.
-pub(crate) fn pack_entry_prealloc(count: usize) -> usize {
-    count.min(PACK_OBJECT_COUNT_PREALLOC_CAP)
+pub(crate) fn pack_entry_prealloc(count: usize, entry_bytes: usize) -> usize {
+    count
+        .min(entry_bytes / MIN_PACK_ENTRY_BYTES as usize)
+        .min(PACK_OBJECT_COUNT_PREALLOC_CAP)
 }

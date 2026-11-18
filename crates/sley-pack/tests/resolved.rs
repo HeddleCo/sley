@@ -129,6 +129,7 @@ fn pack_message(error: ResolveError<()>) -> String {
         ResolveError::ResolveOps { limit, attempted } => {
             format!("resolve_ops budget {limit} exceeded at operation {attempted}")
         }
+        _ => panic!("unexpected resolve error"),
     }
 }
 fn apply(base: &[u8], d: &[u8]) -> Vec<u8> {
@@ -1599,7 +1600,7 @@ fn declared_count_preallocation_is_capped_before_parsing() {
     let mut p = pack_start();
     // Enough bytes for the existing conservative count/length test, but no real
     // entries: parsing fails immediately after bounded initial reservation.
-    p.resize(12 + 3_000_000, 0);
+    p.resize(12 + 9_000_000, 0);
     let p = finish(p, 1_000_000);
     #[cfg(target_os = "linux")]
     let before = status_bytes("VmPeak:");
@@ -1614,4 +1615,322 @@ fn declared_count_preallocation_is_capped_before_parsing() {
         );
     }
     assert!(e.contains("pack object type"), "{e}");
+}
+
+#[test]
+fn lying_maximum_object_count_over_one_kib_has_bounded_allocation() {
+    #[cfg(target_os = "linux")]
+    if !memory_child("lying_maximum_object_count_over_one_kib_has_bounded_allocation") {
+        return;
+    }
+    // PACK's count is u32: 2^32 - 1 is its largest representable claim.
+    let mut p = pack_start();
+    p.resize(1024 - 20, 0);
+    let p = finish(p, u32::MAX);
+    for limits in [
+        ResolveLimits::unlimited(),
+        ResolveLimits {
+            max_objects: usize::MAX,
+            ..ResolveLimits::default()
+        },
+    ] {
+        let metrics = ResolveMetrics::default();
+        #[cfg(target_os = "linux")]
+        let before = status_bytes("VmPeak:");
+        let result = resolve_pack_with_metrics(
+            &p,
+            ObjectFormat::Sha1,
+            16,
+            limits,
+            CancelFlag::never(),
+            &|_| Ok::<_, ()>(()),
+            &metrics,
+        );
+        assert!(result.is_err());
+        println!(
+            "lying count: preallocated={} bytes, ceiling=8388608",
+            metrics.peak_metadata_bytes()
+        );
+        assert!(metrics.peak_metadata_bytes() <= 8 * 1024 * 1024);
+        #[cfg(target_os = "linux")]
+        assert!(status_bytes("VmPeak:").saturating_sub(before) <= 8 * 1024 * 1024);
+    }
+}
+
+fn typed_budget(limits: ResolveLimits, kind: sley_core::ResourceLimitKind) {
+    let p = chains(1, 1, 32, false);
+    let e = resolve_pack(
+        &p,
+        ObjectFormat::Sha1,
+        16,
+        limits,
+        CancelFlag::never(),
+        &|_| Ok::<_, ()>(()),
+    )
+    .expect_err("typed limit");
+    assert!(
+        matches!(e, ResolveError::Pack(GitError::ResourceLimit { kind: actual, limit, attempted }) if actual == kind && attempted > limit),
+        "wrong budget variant: {e:?}"
+    );
+    println!("typed budget: {kind:?}");
+}
+#[test]
+fn object_count_budget_is_typed() {
+    typed_budget(
+        ResolveLimits {
+            max_objects: 1,
+            ..ResolveLimits::default()
+        },
+        sley_core::ResourceLimitKind::ResolveObjects,
+    );
+}
+#[test]
+fn object_bytes_budget_is_typed() {
+    typed_budget(
+        ResolveLimits {
+            max_object_bytes: 31,
+            ..ResolveLimits::default()
+        },
+        sley_core::ResourceLimitKind::ResolveObjectBytes,
+    );
+}
+#[test]
+fn decoded_bytes_budget_is_typed() {
+    typed_budget(
+        ResolveLimits {
+            max_total_decoded: 31,
+            ..ResolveLimits::default()
+        },
+        sley_core::ResourceLimitKind::ResolveTotalDecoded,
+    );
+}
+#[test]
+fn workspace_fit_budget_is_typed() {
+    typed_budget(
+        ResolveLimits {
+            max_in_flight_bytes: 1,
+            ..ResolveLimits::default()
+        },
+        sley_core::ResourceLimitKind::ResolveInFlight,
+    );
+}
+
+#[test]
+fn trusted_errors_leave_process_interrupt_clear() {
+    let mut thin = pack_start();
+    header(7, 4, &mut thin);
+    thin.extend([42; 20]);
+    compressed(&[1, 1, 1, b'x'], &mut thin);
+    let mut corrupt = chains(1, 0, 32, false);
+    corrupt[15] ^= 1;
+    for p in [corrupt, chains(1, 51, 32, false), finish(thin, 1)] {
+        let cancel = AtomicCancel::new();
+        PackIndex::write_v2_for_pack_with_options(
+            &p,
+            ObjectFormat::Sha1,
+            |_| Ok(None),
+            PackIndexOptions::default().with_threads(16),
+            CancelFlag::new(&cancel),
+            |_| {},
+        )
+        .expect_err("corrupt trusted pack");
+        assert!(
+            !cancel.is_cancelled(),
+            "trusted pack error changed process-wide interrupt flag"
+        );
+        resolve_pack(
+            &p,
+            ObjectFormat::Sha1,
+            16,
+            ResolveLimits::default(),
+            CancelFlag::new(&cancel),
+            &|_| Ok::<_, ()>(()),
+        )
+        .expect_err("untrusted pack also fails");
+        assert!(
+            cancel.is_cancelled(),
+            "visitor API sets its cancellation source"
+        );
+    }
+    println!(
+        "trusted errors: checksum, depth and thin failures preserve interrupt; public visitor sets cancel"
+    );
+}
+
+#[test]
+fn finite_limits_cannot_enter_unaccounted_trusted_discovery() {
+    let p = chains(1, 1, 32, false);
+    let unlimited = ResolveLimits::unlimited();
+    for limits in [
+        ResolveLimits::default(),
+        ResolveLimits {
+            max_objects: usize::MAX - 1,
+            ..unlimited
+        },
+        ResolveLimits {
+            max_object_bytes: u64::MAX - 1,
+            ..unlimited
+        },
+        ResolveLimits {
+            max_total_decoded: u64::MAX - 1,
+            ..unlimited
+        },
+        ResolveLimits {
+            max_live_base_bytes: 0,
+            ..unlimited
+        },
+        ResolveLimits {
+            max_in_flight_bytes: usize::MAX - 1,
+            ..unlimited
+        },
+        ResolveLimits {
+            max_resolve_ops: u64::MAX - 1,
+            ..unlimited
+        },
+    ] {
+        for threads in [0, 1, 2, 16] {
+            let metrics = ResolveMetrics::default();
+            resolve_pack_with_metrics(
+                &p,
+                ObjectFormat::Sha1,
+                threads,
+                limits,
+                CancelFlag::never(),
+                &|_| Ok::<_, ()>(()),
+                &metrics,
+            )
+            .expect("finite policy");
+            assert!(
+                metrics.resolve_ops() >= 5,
+                "finite policy bypassed operation accounting"
+            );
+            assert!(
+                metrics.peak_in_flight_bytes() > 0,
+                "finite policy bypassed workspace accounting"
+            );
+        }
+    }
+    for options in [
+        PackIndexOptions::default(),
+        PackIndexOptions::new(sley_pack::PackReadLimits::default()),
+    ] {
+        for threads in [0, 1, 16] {
+            for options in [
+                options
+                    .with_threads(threads)
+                    .with_resolve_limits(ResolveLimits {
+                        max_total_decoded: 1,
+                        ..ResolveLimits::default()
+                    }),
+                options
+                    .with_resolve_limits(ResolveLimits {
+                        max_total_decoded: 1,
+                        ..ResolveLimits::default()
+                    })
+                    .with_threads(threads),
+            ] {
+                let e = PackIndex::write_v2_for_pack_with_options(
+                    &p,
+                    ObjectFormat::Sha1,
+                    |_| Ok(None),
+                    options,
+                    CancelFlag::never(),
+                    |_| {},
+                )
+                .expect_err("builder retains finite policy");
+                assert!(matches!(
+                    e,
+                    GitError::ResourceLimit {
+                        kind: sley_core::ResourceLimitKind::ResolveTotalDecoded,
+                        ..
+                    }
+                ));
+                assert!(matches!(
+                    PackFile::parse_with_options(&p, ObjectFormat::Sha1, options),
+                    Err(GitError::ResourceLimit {
+                        kind: sley_core::ResourceLimitKind::ResolveTotalDecoded,
+                        ..
+                    })
+                ));
+            }
+        }
+    }
+    let metrics = ResolveMetrics::default();
+    resolve_pack_with_metrics(
+        &p,
+        ObjectFormat::Sha1,
+        16,
+        unlimited,
+        CancelFlag::never(),
+        &|_| Ok::<_, ()>(()),
+        &metrics,
+    )
+    .expect("explicit trusted policy");
+    assert_eq!(
+        (metrics.resolve_ops(), metrics.peak_in_flight_bytes()),
+        (0, 0)
+    );
+    println!(
+        "policy isolation: each finite field, threads 0/1/2/16, default/new builders and both builder orders accounted; explicit unlimited has zero accounting"
+    );
+}
+
+#[test]
+fn million_objects_fit_metadata_coefficient() {
+    #[cfg(target_os = "linux")]
+    if !memory_child("million_objects_fit_metadata_coefficient") {
+        return;
+    }
+    const COEFFICIENT: usize = 300;
+    let count = std::env::var("SLEY_RESOLVE_METADATA_OBJECTS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| [1_000_000, 4_000_000].contains(n))
+        .unwrap_or(1_000_000);
+    let mut encoded = vec![0x30];
+    compressed(&[], &mut encoded);
+    let mut p = pack_start();
+    p.reserve_exact(encoded.len() * count + 20);
+    for _ in 0..count {
+        p.extend(&encoded);
+    }
+    let p = finish(p, count as u32);
+    #[cfg(target_os = "linux")]
+    let before = status_bytes("VmRSS:");
+    let metrics = ResolveMetrics::default();
+    let built = resolve_pack_with_metrics(
+        &p,
+        ObjectFormat::Sha1,
+        1,
+        ResolveLimits::default(),
+        CancelFlag::never(),
+        &|_| Ok::<_, ()>(()),
+        &metrics,
+    )
+    .expect("million-object metadata");
+    let accounted = metrics.peak_metadata_bytes();
+    println!(
+        "metadata: objects={count}, accounted={accounted}, bytes/object={:.3}, coefficient={COEFFICIENT}",
+        accounted as f64 / count as f64
+    );
+    assert!(
+        accounted <= COEFFICIENT * count,
+        "per-object metadata exceeded coefficient"
+    );
+    assert_eq!(built.entries.len(), count);
+    #[cfg(target_os = "linux")]
+    {
+        let peak = peak_bytes();
+        let growth = peak.saturating_sub(before);
+        // Input is allocated before baseline; 64 MiB covers thread/zlib state,
+        // allocator slack, test runner and fixed index/header allocations.
+        println!(
+            "metadata RSS: baseline={before}, peak={peak}, growth={growth}, bytes/object={:.3}, fixed slack=67108864",
+            growth as f64 / count as f64
+        );
+        assert!(
+            growth <= COEFFICIENT * count + 64 * 1024 * 1024,
+            "metadata RSS exceeded coefficient plus slack"
+        );
+    }
 }

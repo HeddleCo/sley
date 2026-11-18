@@ -151,7 +151,10 @@ impl PackFile {
         // resolved object size for an undeltified entry, but the *delta
         // instruction stream* length for a delta entry (builtin/index-pack.c sets
         // `obj->size` from the entry header, before any delta is applied).
-        let mut on_disk: Vec<OnDiskEntry> = Vec::with_capacity(pack_entry_prealloc(count));
+        let mut on_disk: Vec<OnDiskEntry> = Vec::with_capacity(pack_entry_prealloc(
+            count,
+            entry_region.len().saturating_sub(12),
+        ));
         for _ in 0..count {
             let entry_offset = offset as u64;
             let header = parse_entry_header(entry_region, &mut offset)?;

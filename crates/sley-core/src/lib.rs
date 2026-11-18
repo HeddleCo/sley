@@ -1734,6 +1734,10 @@ impl fmt::Display for ByteBudget {
 /// Which explicit budget rejected a resource-limit check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceLimitKind {
+    ResolveObjects,
+    ResolveObjectBytes,
+    ResolveTotalDecoded,
+    ResolveInFlight,
     CompressionWorkingSet,
     DecodedObject,
     DeltaBase,
@@ -1742,6 +1746,10 @@ pub enum ResourceLimitKind {
 impl fmt::Display for ResourceLimitKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ResolveObjects => f.write_str("max_objects"),
+            Self::ResolveObjectBytes => f.write_str("max_object_bytes"),
+            Self::ResolveTotalDecoded => f.write_str("max_total_decoded"),
+            Self::ResolveInFlight => f.write_str("max_in_flight_bytes workspace"),
             Self::CompressionWorkingSet => f.write_str("compression working set"),
             Self::DecodedObject => f.write_str("decoded object"),
             Self::DeltaBase => f.write_str("delta base"),
