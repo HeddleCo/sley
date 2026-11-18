@@ -79,6 +79,8 @@ jobs:
           shared-key: rust-tests-${{ runner.os }}-worktree
       - name: Test sley-worktree on Windows
         run: cargo test --locked -p sley-worktree
+      - name: Prove Linux-only visitor scenario is guarded on Windows
+        run: python crates/sley-pack/tests/windows_cfg_probe.py
       - name: Test resolved-object visitor on Windows
         run: cargo test --locked -p sley-pack --test resolved
 
@@ -184,3 +186,6 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --workspace --no-deps --lib
+
+      - name: Assert public SHA-1 admission documentation
+        run: python3 crates/sley-pack/tests/public_docs.py target/doc/sley_pack
