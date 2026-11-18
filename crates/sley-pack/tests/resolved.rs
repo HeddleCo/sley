@@ -7,7 +7,6 @@ use sley_pack::{
 };
 use std::collections::HashMap;
 use std::io::Write;
-#[cfg(target_os = "linux")]
 use std::sync::Barrier;
 use std::sync::{
     Mutex,
@@ -378,6 +377,15 @@ fn declared_size_bomb_is_refused_before_allocation() {
     #[cfg(target_os = "linux")]
     let before = peak_bytes();
     assert!(error(&p, ResolveLimits::default()).contains("max_object_bytes"));
+    // A huge instruction stream is bounded independently of its tiny result.
+    let mut instructions = pack_start();
+    header(3, 0, &mut instructions);
+    compressed(b"", &mut instructions);
+    let at = instructions.len();
+    header(6, 1 << 40, &mut instructions);
+    ofs(at - 12, &mut instructions);
+    compressed(&[0, 0], &mut instructions);
+    assert!(error(&finish(instructions, 2), ResolveLimits::default()).contains("max_object_bytes"));
     #[cfg(target_os = "linux")]
     {
         let peak = peak_bytes();
@@ -390,6 +398,12 @@ fn declared_size_bomb_is_refused_before_allocation() {
 }
 #[test]
 fn delta_result_bomb_and_running_budgets_are_checked_before_visits() {
+    #[cfg(target_os = "linux")]
+    if !memory_child("delta_result_bomb_and_running_budgets_are_checked_before_visits") {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    let before = peak_bytes();
     let mut p = pack_start();
     header(3, 4, &mut p);
     compressed(b"base", &mut p);
@@ -401,6 +415,15 @@ fn delta_result_bomb_and_running_budgets_are_checked_before_visits() {
     compressed(&d, &mut p);
     let p = finish(p, 2);
     assert!(error(&p, ResolveLimits::default()).contains("max_object_bytes"));
+    #[cfg(target_os = "linux")]
+    {
+        let peak = peak_bytes();
+        println!(
+            "delta-result bomb: peak={peak}, growth={}",
+            peak.saturating_sub(before)
+        );
+        assert!(peak.saturating_sub(before) < 8 * 1024 * 1024);
+    }
     let p = chains(1, 2, 32, false);
     for (limits, field) in [
         (
@@ -478,7 +501,38 @@ fn thin_pack_is_an_unresolved_base_error() {
     compressed(&d, &mut p);
     let p = finish(p, 1);
     assert!(error(&p, ResolveLimits::default()).contains("unresolved"));
+
+    let mut late = pack_start();
+    header(3, 4, &mut late);
+    compressed(b"base", &mut late);
+    header(7, 2, &mut late);
+    late.extend([77; 20]);
+    compressed(&[4, 0], &mut late);
+    let late = finish(late, 2);
+    let seen = AtomicUsize::new(0);
+    let result = resolve_pack(
+        &late,
+        ObjectFormat::Sha1,
+        2,
+        ResolveLimits::default(),
+        CancelFlag::never(),
+        &|o| {
+            assert!(o.delta.is_none());
+            seen.fetch_add(1, Ordering::Relaxed);
+            Ok::<_, ()>(())
+        },
+    );
+    assert!(
+        matches!(result, Err(ResolveError::Pack(_))),
+        "an unresolved suffix must not return an index"
+    );
+    assert_eq!(
+        seen.load(Ordering::Relaxed),
+        1,
+        "valid-prefix visitor effects stay provisional"
+    );
 }
+
 #[test]
 fn truncation_and_trailing_bytes_are_errors() {
     let p = chains(1, 2, 32, false);
@@ -638,5 +692,485 @@ fn last_dependent_releases_base_before_visiting_child() {
     assert!(
         peak < 24 * 1024 * 1024,
         "completed ancestors still retained: {peak}"
+    );
+}
+
+#[test]
+fn replay_work_cannot_exceed_the_shared_decoded_budget() {
+    const SIZE: usize = 65536;
+    let mut p = pack_start();
+    let base = p.len();
+    header(3, SIZE as u64, &mut p);
+    compressed(&vec![0; SIZE], &mut p);
+    for _ in 0..32 {
+        let at = p.len();
+        let mut d = Vec::new();
+        varint(SIZE as u64, &mut d);
+        varint(0, &mut d);
+        header(6, d.len() as u64, &mut p);
+        ofs(at - base, &mut p);
+        compressed(&d, &mut p);
+    }
+    let p = finish(p, 33);
+    let calls = AtomicUsize::new(0);
+    let e = resolve_pack(
+        &p,
+        ObjectFormat::Sha1,
+        1,
+        ResolveLimits {
+            max_total_decoded: (2 * SIZE + 1024) as u64,
+            max_live_base_bytes: 0,
+            ..ResolveLimits::default()
+        },
+        CancelFlag::never(),
+        &|_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok::<_, ()>(())
+        },
+    )
+    .expect_err("repeated root inflation must spend work budget");
+    assert!(pack_message(e).contains("max_total_decoded"));
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        2,
+        "refuse before the third root allocation"
+    );
+}
+
+#[test]
+fn replayed_delta_result_budget_is_shared_across_workers() {
+    const SIZE: usize = 65536;
+    // Each root's work fits the limit by itself, but the sixteen subtrees
+    // together do not. The barrier prevents one worker consuming all roots.
+    let p = chains(16, 4, SIZE, true);
+    let barrier = Barrier::new(16);
+    let e = resolve_pack(
+        &p,
+        ObjectFormat::Sha1,
+        16,
+        ResolveLimits {
+            max_total_decoded: (160 * SIZE) as u64,
+            max_live_base_bytes: 0,
+            ..ResolveLimits::default()
+        },
+        CancelFlag::never(),
+        &|o| {
+            if o.depth == 0 {
+                barrier.wait();
+            }
+            Ok::<_, ()>(())
+        },
+    )
+    .expect_err("replayed delta results must spend a shared budget");
+    assert!(pack_message(e).contains("max_total_decoded"));
+}
+
+#[test]
+fn overflowing_entry_and_delta_size_varints_are_refused() {
+    let mut p = pack_start();
+    // The final 0x10 at shift 60 represents 2^64, not an empty body.
+    p.push(0xb0);
+    p.extend([0x80; 8]);
+    p.push(0x10);
+    compressed(b"", &mut p);
+    assert!(error(&finish(p, 1), ResolveLimits::default()).contains("pack size overflow"));
+    for result in [false, true] {
+        let mut p = pack_start();
+        header(3, 0, &mut p);
+        compressed(b"", &mut p);
+        let at = p.len();
+        let mut d = Vec::new();
+        if result {
+            d.push(0);
+        }
+        d.extend([0x80; 9]);
+        d.push(2); // 2 << 63 must not wrap to zero.
+        if !result {
+            d.push(0);
+        }
+        header(6, d.len() as u64, &mut p);
+        ofs(at - 12, &mut p);
+        compressed(&d, &mut p);
+        assert!(error(&finish(p, 2), ResolveLimits::default()).contains("delta size overflow"));
+    }
+}
+
+#[test]
+fn delta_commands_cannot_overrun_or_avoid_making_progress() {
+    fn vector(base: &[u8], instructions: &[u8]) -> Vec<u8> {
+        let mut p = pack_start();
+        header(3, base.len() as u64, &mut p);
+        compressed(base, &mut p);
+        let at = p.len();
+        header(6, instructions.len() as u64, &mut p);
+        ofs(at - 12, &mut p);
+        compressed(instructions, &mut p);
+        finish(p, 2)
+    }
+    #[cfg(target_os = "linux")]
+    if !memory_child("delta_commands_cannot_overrun_or_avoid_making_progress") {
+        return;
+    }
+    let base = vec![0; 65536];
+    let mut copies = Vec::new();
+    varint(65536, &mut copies);
+    varint(0, &mut copies);
+    copies.resize(copies.len() + 4096, 0x80);
+    #[cfg(target_os = "linux")]
+    let before = peak_bytes();
+    let e = error(&vector(&base, &copies), ResolveLimits::default());
+    #[cfg(target_os = "linux")]
+    {
+        let peak = peak_bytes();
+        println!(
+            "copy overrun: peak={peak}, growth={}",
+            peak.saturating_sub(before)
+        );
+        assert!(
+            peak.saturating_sub(before) < 8 * 1024 * 1024,
+            "copy output grew beyond its declared zero bytes"
+        );
+    }
+    assert!(e.contains("exceed declared result"));
+    for (base, d, diagnostic) in [
+        (
+            b"abcd".as_slice(),
+            vec![4, 1, 0x90, 4],
+            "exceed declared result",
+        ),
+        (b"abcd".as_slice(), vec![4, 1, 0x91, 4, 1], "exceeds base"),
+        (
+            b"abcd".as_slice(),
+            vec![4, 1, 2, b'x'],
+            "exceeds delta data",
+        ),
+        (b"abcd".as_slice(), vec![4, 0, 0], "reserved zero command"),
+        (b"abcd".as_slice(), vec![4, 1], "result size mismatch"),
+    ] {
+        let seen = AtomicUsize::new(0);
+        let e = resolve_pack(
+            &vector(base, &d),
+            ObjectFormat::Sha1,
+            1,
+            ResolveLimits::default(),
+            CancelFlag::never(),
+            &|o| {
+                assert!(o.delta.is_none(), "invalid delta was visited");
+                seen.fetch_add(1, Ordering::Relaxed);
+                Ok::<_, ()>(())
+            },
+        )
+        .expect_err("invalid instructions cannot return a partial index");
+        assert!(pack_message(e).contains(diagnostic), "{diagnostic}");
+        assert_eq!(seen.load(Ordering::Relaxed), 1);
+    }
+    // A copy opcode with a zero size means 64 KiB in Git, not zero work.
+    let base = vec![42; 65536];
+    let mut d = Vec::new();
+    varint(65536, &mut d);
+    varint(65536, &mut d);
+    d.push(0x80);
+    let p = vector(&base, &d);
+    let seen = AtomicUsize::new(0);
+    resolve_pack(
+        &p,
+        ObjectFormat::Sha1,
+        2,
+        ResolveLimits::default(),
+        CancelFlag::never(),
+        &|o| {
+            assert_eq!(o.body, base);
+            seen.fetch_add(1, Ordering::Relaxed);
+            Ok::<_, ()>(())
+        },
+    )
+    .expect("zero size copy is a bounded 64 KiB copy");
+    assert_eq!(seen.load(Ordering::Relaxed), 2);
+    let mut huge = vec![4, 0];
+    huge.resize(4096, 0x80);
+    assert!(
+        error(
+            &vector(b"abcd", &huge),
+            ResolveLimits {
+                max_object_bytes: 1024,
+                ..ResolveLimits::default()
+            }
+        )
+        .contains("max_object_bytes")
+    );
+}
+
+#[test]
+fn cyclic_or_missing_offsets_and_ref_bases_never_produce_an_index() {
+    for (distance, diagnostic) in [(0, "cycle"), (1, "not found"), (13, "before pack start")] {
+        let mut p = pack_start();
+        header(6, 2, &mut p);
+        ofs(distance, &mut p);
+        compressed(&[0, 0], &mut p);
+        assert!(error(&finish(p, 1), ResolveLimits::default()).contains(diagnostic));
+    }
+    let mut p = pack_start();
+    for oid in [1, 2] {
+        header(7, 2, &mut p);
+        p.extend([oid; 20]);
+        compressed(&[0, 0], &mut p);
+    }
+    assert!(error(&finish(p, 2), ResolveLimits::default()).contains("unresolved"));
+}
+
+#[test]
+fn caller_admission_rejection_is_preserved_without_returning_a_build() {
+    #[derive(Debug, PartialEq)]
+    struct AdmissionRejected;
+    let p = include_bytes!("fixtures/resolved/sha1.pack");
+    let cancel = AtomicCancel::new();
+    let calls = AtomicUsize::new(0);
+    let result = resolve_pack(
+        p,
+        ObjectFormat::Sha1,
+        1,
+        ResolveLimits::default(),
+        CancelFlag::new(&cancel),
+        &|o| {
+            // Heddle runs sha1dc over this canonical header and body here. This test
+            // models rejection by that caller-owned verifier, not the sha1dc algorithm.
+            let header = format!("{} {}\0", o.object_type.as_str(), o.body.len());
+            assert!(header.ends_with('\0'));
+            calls.fetch_add(1, Ordering::Relaxed);
+            Err(AdmissionRejected)
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(ResolveError::Visitor(AdmissionRejected))
+    ));
+    assert!(cancel.is_cancelled());
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn many_empty_objects_are_bounded_before_metadata_allocation() {
+    if !memory_child("many_empty_objects_are_bounded_before_metadata_allocation") {
+        return;
+    }
+    let one = sley_pack::PackFile::write_undeltified(
+        &[EncodedObject::new(ObjectType::Blob, Vec::new())],
+        ObjectFormat::Sha1,
+    )
+    .expect("real empty-object writer")
+    .pack;
+    // A format-conformance vector with repeated physical entries. The body and
+    // zlib member are taken unchanged from the real writer.
+    let mut p = pack_start();
+    p.extend(one[12..one.len() - 20].repeat(8192));
+    let p = finish(p, 8192);
+    let before = peak_bytes();
+    let calls = AtomicUsize::new(0);
+    let e = resolve_pack(
+        &p,
+        ObjectFormat::Sha1,
+        16,
+        ResolveLimits {
+            max_objects: 4096,
+            max_total_decoded: 0,
+            ..ResolveLimits::default()
+        },
+        CancelFlag::never(),
+        &|_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok::<_, ()>(())
+        },
+    )
+    .expect_err("count bound before metadata");
+    assert!(pack_message(e).contains("max_objects"));
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    assert!(peak_bytes().saturating_sub(before) < 8 * 1024 * 1024);
+    let built = resolve_pack(
+        &p,
+        ObjectFormat::Sha1,
+        16,
+        ResolveLimits {
+            max_objects: 8192,
+            max_total_decoded: 0,
+            ..ResolveLimits::default()
+        },
+        CancelFlag::never(),
+        &|_| Ok::<_, ()>(()),
+    )
+    .expect("zero decoded bytes still charge metadata count");
+    assert_eq!(built.entries.len(), 8192);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn embedded_zlib_members_have_linear_discovery_cpu_cost() {
+    if !memory_child("embedded_zlib_members_have_linear_discovery_cpu_cost") {
+        return;
+    }
+    // Thousands of plausible entry headers/zlib members inside a single stored
+    // blob: the old every-offset path inflates 4 GiB of irrelevant candidates.
+    let mut candidate = Vec::new();
+    header(3, 1024 * 1024, &mut candidate);
+    let mut nested = ZlibEncoder::new(Vec::new(), Compression::best());
+    nested
+        .write_all(&vec![0; 1024 * 1024])
+        .expect("nested zero body");
+    candidate.extend(nested.finish().expect("nested member"));
+
+    let body = candidate.repeat(4096);
+    let mut p = pack_start();
+    header(3, body.len() as u64, &mut p);
+    let mut z = ZlibEncoder::new(Vec::new(), Compression::none());
+    z.write_all(&body).expect("stored outer member");
+    p.extend(z.finish().expect("stored member end"));
+    let p = finish(p, 1);
+    let result = bounded_cpu("crafted nested-member pack", |cancel| {
+        resolve_pack(
+            &p,
+            ObjectFormat::Sha1,
+            16,
+            ResolveLimits::default(),
+            cancel,
+            &|o| {
+                assert_eq!(o.body, body);
+                Ok::<_, ()>(())
+            },
+        )
+    });
+    assert_eq!(
+        result
+            .expect("real member only; no speculative candidate work")
+            .entries
+            .len(),
+        1
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn bounded_cpu<R>(label: &str, work: impl FnOnce(CancelFlag<'_>) -> R) -> R {
+    fn ticks() -> u64 {
+        let s = std::fs::read_to_string("/proc/self/stat").expect("process CPU ticks");
+        let fields: Vec<_> = s
+            .rsplit_once(')')
+            .expect("stat command")
+            .1
+            .split_whitespace()
+            .collect();
+        fields[11].parse::<u64>().expect("user ticks")
+            + fields[12].parse::<u64>().expect("system ticks")
+    }
+    let hz = std::process::Command::new("getconf")
+        .arg("CLK_TCK")
+        .output()
+        .expect("clock ticks");
+    assert!(hz.status.success());
+    let hz = String::from_utf8(hz.stdout)
+        .expect("tick text")
+        .trim()
+        .parse::<u64>()
+        .expect("tick rate");
+    let source = AtomicCancel::new();
+    let done = (Mutex::new(false), std::sync::Condvar::new());
+    let start = ticks();
+    let result = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let lock = done.0.lock().expect("watchdog");
+            let (guard, timeout) = done
+                .1
+                .wait_timeout_while(lock, std::time::Duration::from_secs(8), |finished| {
+                    !*finished
+                })
+                .expect("watchdog wait");
+            if timeout.timed_out() && !*guard {
+                source.cancel();
+            }
+        });
+        let result = work(CancelFlag::new(&source));
+        *done.0.lock().expect("finish") = true;
+        done.1.notify_one();
+        result
+    });
+    let spent = ticks() - start;
+    println!("{label}: CPU ticks={spent}, bound={}", 4 * hz);
+    assert!(spent <= 4 * hz, "CPU exceeded linear-input budget");
+    result
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn many_missing_ref_bases_have_linear_lookup_cpu_cost() {
+    if !memory_child("many_missing_ref_bases_have_linear_lookup_cpu_cost") {
+        return;
+    }
+    const COUNT: u32 = 32768;
+    let mut member = Vec::new();
+    compressed(&[0, 0], &mut member);
+    let mut p = pack_start();
+    for i in 0..COUNT {
+        header(7, 2, &mut p);
+        let mut oid = [0; 20];
+        oid[..4].copy_from_slice(&i.to_be_bytes());
+        p.extend(oid);
+        p.extend_from_slice(&member);
+    }
+    let p = finish(p, COUNT);
+    let visits = AtomicUsize::new(0);
+    let result = bounded_cpu("distinct missing REF bases", |cancel| {
+        resolve_pack(
+            &p,
+            ObjectFormat::Sha1,
+            16,
+            ResolveLimits::default(),
+            cancel,
+            &|_| {
+                visits.fetch_add(1, Ordering::Relaxed);
+                Ok::<_, ()>(())
+            },
+        )
+    });
+    assert!(pack_message(result.expect_err("thin pack returns no index")).contains("unresolved"));
+    assert_eq!(visits.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn low_output_deflate_replay_spends_encoded_work_budget() {
+    let mut p = pack_start();
+    header(3, 1, &mut p);
+    p.extend([0x78, 0x01]);
+    for _ in 0..8192 {
+        p.extend([0, 0, 0, 255, 255]);
+    }
+    // Final stored block containing x, followed by Adler-32(x).
+    p.extend([1, 1, 0, 254, 255, b'x', 0, 0x79, 0, 0x79]);
+    for _ in 0..32 {
+        let at = p.len();
+        header(6, 2, &mut p);
+        ofs(at - 12, &mut p);
+        compressed(&[1, 0], &mut p);
+    }
+    let p = finish(p, 33);
+    let visits = AtomicUsize::new(0);
+    let e = resolve_pack(
+        &p,
+        ObjectFormat::Sha1,
+        1,
+        ResolveLimits {
+            max_total_decoded: 256,
+            max_live_base_bytes: 0,
+            ..ResolveLimits::default()
+        },
+        CancelFlag::never(),
+        &|_| {
+            visits.fetch_add(1, Ordering::Relaxed);
+            Ok::<_, ()>(())
+        },
+    )
+    .expect_err("encoded replay work must also be bounded");
+    assert!(pack_message(e).contains("max_total_decoded"));
+    assert_eq!(
+        visits.load(Ordering::Relaxed),
+        1,
+        "refuse before re-inflating the low-output base"
     );
 }

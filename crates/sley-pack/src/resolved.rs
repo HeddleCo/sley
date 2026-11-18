@@ -23,7 +23,9 @@ pub struct ResolveLimits {
     pub max_objects: usize,
     /// Maximum body or inflated delta stream size; defaults to 512 MiB.
     pub max_object_bytes: u64,
-    /// Sum of declared result sizes and, separately, discovery output; defaults to 16 GiB.
+    /// Bounds logical results, inflated streams and decoded work (including
+    /// replay), each independently across all workers; defaults to 16 GiB.
+    /// Compressed work is additionally capped at input length plus this limit.
     pub max_total_decoded: u64,
     /// Shared retained ancestor-body budget; defaults to 64 MiB. Zero forces replay.
     pub max_live_base_bytes: usize,
@@ -94,7 +96,16 @@ pub(crate) fn infallible_error(error: ResolveError<std::convert::Infallible>) ->
 /// A thin pack is an error. On any error the supplied cancel source is set.
 /// `threads == 0` selects one worker. Output is independent of worker count.
 /// Delta stream sizes are bounded as well as result sizes; the decoded budget
-/// separately bounds discovery work and the sum of whole bodies/delta results.
+/// separately bounds discovery, inflated streams and whole/delta result work,
+/// including replay. Exhausting a replay budget refuses the pack.
+///
+/// SHA-1 IDs use ordinary SHA-1, without collision detection. Admission callers
+/// must run sha1dc over `type + " " + decimal_length + NUL + body` in `visit`,
+/// compare its digest to `oid`, and reject collisions or mismatches there (the
+/// FAST-IMPORT design assigns this check to heddle's admission hasher).
+///
+/// An error returns no index. Visitor calls already made cannot be rolled back:
+/// keep callback effects provisional until this function returns `Ok`.
 pub fn resolve_pack<V, E>(
     pack: &[u8],
     format: ObjectFormat,
@@ -291,6 +302,9 @@ struct State<E> {
     refs: HashMap<ObjectId, Vec<usize>>,
     output: Vec<Option<(PackIndexEntry, PackIndexedObject)>>,
     error: Option<ResolveError<E>>,
+    inflated_work: u64,
+    decoded_work: u64,
+    compressed_work: u64,
 }
 struct Engine<'a, 'c, V, E> {
     pack: &'a [u8],
@@ -327,6 +341,11 @@ enum Root<'a> {
     Entry(usize),
     External(ObjectId, &'a EncodedObject),
 }
+enum Work {
+    Inflated,
+    Decoded,
+    Compressed,
+}
 impl<V, E> Engine<'_, '_, V, E>
 where
     V: Fn(&ResolvedObject<'_>) -> std::result::Result<(), E> + Sync,
@@ -350,10 +369,42 @@ where
             source.cancel();
         }
     }
+    // Replays must spend the same shared work budgets as first-time decoding;
+    // otherwise a large discarded base with many tiny children amplifies CPU.
+    fn work(&self, size: u64, kind: Work) -> Result<()> {
+        self.check()?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| invalid("pack state poisoned"))?;
+        let limit = self.limits.max_total_decoded;
+        let (used, limit) = match kind {
+            Work::Inflated => (&mut state.inflated_work, limit),
+            Work::Decoded => (&mut state.decoded_work, limit),
+            // Empty DEFLATE blocks consume CPU but produce no decoded bytes.
+            Work::Compressed => (
+                &mut state.compressed_work,
+                limit.saturating_add(self.pack.len() as u64),
+            ),
+        };
+        charge(
+            used,
+            size,
+            ResolveLimits {
+                max_total_decoded: limit,
+                ..self.limits
+            },
+        )
+    }
     fn inflate(&self, index: usize) -> Result<Vec<u8>> {
         self.check()?;
         let d = &self.entries[index];
         let size = size_check(d.header.size, self.limits)?;
+        self.work((d.end - d.data) as u64, Work::Compressed)?;
+        self.work(d.header.size, Work::Inflated)?;
+        if d.base.is_none() {
+            self.work(d.header.size, Work::Decoded)?;
+        }
         parallel_index::inflate_exact(&self.pack[d.data..d.end], size, self.stop_flag())
             .map(|pair| pair.0)
     }
@@ -361,6 +412,7 @@ where
         self.check()?;
         let plan = plan_pack_delta(base, delta)?;
         let size = size_check(plan.result_size, self.limits)?;
+        self.work(plan.result_size, Work::Decoded)?;
         let mut body = reserve(size)?;
         apply_pack_delta_exact(base, delta, plan, &mut body, self.stop_flag())?;
         if body.len() as u64 != self.entries[index].result_size {
@@ -564,18 +616,28 @@ where
             for _ in 0..workers {
                 let send = send.clone();
                 let cursor = &cursor;
-                handles.push(scope.spawn(sley_core::diagnostics::inherit(move || {
-                    while !self.stop.is_cancelled() {
-                        let index = cursor.fetch_add(1, AtomicOrdering::Relaxed);
-                        let Some(root) = roots.get(index) else {
-                            break;
-                        };
-                        if let Err(error) = self.walk(*root, &send) {
-                            self.fail(error);
-                            break;
+                let handle = std::thread::Builder::new().spawn_scoped(
+                    scope,
+                    sley_core::diagnostics::inherit(move || {
+                        while !self.stop.is_cancelled() {
+                            let index = cursor.fetch_add(1, AtomicOrdering::Relaxed);
+                            let Some(root) = roots.get(index) else {
+                                break;
+                            };
+                            if let Err(error) = self.walk(*root, &send) {
+                                self.fail(error);
+                                break;
+                            }
                         }
+                    }),
+                );
+                match handle {
+                    Ok(handle) => handles.push(handle),
+                    Err(error) => {
+                        self.fail(GitError::from(error).into());
+                        break;
                     }
-                })));
+                }
             }
             drop(send);
             loop {
@@ -657,6 +719,9 @@ where
                 refs,
                 output,
                 error: None,
+                inflated_work: 0,
+                decoded_work: 0,
+                compressed_work: 0,
             }),
             live: AtomicUsize::new(0),
         };
@@ -721,11 +786,13 @@ where
         let mut indexed = reserve(entries.len())?;
         let mut objects = reserve(entries.len())?;
         for entry in state.output {
+            cancel.check()?;
             let (index, object) = entry.ok_or_else(|| invalid("unresolved pack entry"))?;
             indexed.push(index);
             objects.push(object);
         }
         let index = PackIndex::write_v2(format, &indexed, &checksum)?;
+        cancel.check()?;
         Ok(PackIndexBuild {
             index,
             pack_checksum: checksum,

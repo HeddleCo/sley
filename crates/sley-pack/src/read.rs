@@ -1006,6 +1006,7 @@ pub(crate) fn parse_entry_header(bytes: &[u8], offset: &mut usize) -> Result<Ent
         size = size
             .checked_add(
                 part.checked_shl(shift)
+                    .filter(|_| part <= (u64::MAX >> shift))
                     .ok_or_else(|| GitError::InvalidFormat("pack size overflow".into()))?,
             )
             .ok_or_else(|| GitError::InvalidFormat("pack size overflow".into()))?;
@@ -1192,6 +1193,7 @@ pub(crate) fn read_delta_varint(delta: &[u8], cursor: &mut usize) -> Result<u64>
             .checked_add(
                 u64::from(byte & 0x7f)
                     .checked_shl(shift)
+                    .filter(|_| u64::from(byte & 0x7f) <= (u64::MAX >> shift))
                     .ok_or_else(|| GitError::InvalidObject("delta size overflow".into()))?,
             )
             .ok_or_else(|| GitError::InvalidObject("delta size overflow".into()))?;
