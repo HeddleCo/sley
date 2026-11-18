@@ -151,14 +151,14 @@ pub fn repo_rerere(
             .position(|entry| entry.path.as_bytes() == conflict.path)
         {
             if rr[pos].hash != hash_hex {
-                rr[pos].hash = hash_hex.clone();
+                rr[pos].hash = hash_hex;
                 rr[pos].variant = 0;
                 changed = true;
             }
             pos
         } else {
             rr.push(MergeRrEntry {
-                hash: hash_hex.clone(),
+                hash: hash_hex,
                 variant: 0,
                 path: bytes_to_path_string(&conflict.path)?,
             });

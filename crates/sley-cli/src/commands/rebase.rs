@@ -2989,10 +2989,7 @@ fn add_update_ref_commands(ctx: &Ctx, items: &[RebaseTodoItem]) -> Result<Vec<Re
             continue;
         };
         if wanted_oids.contains(&oid) {
-            refs_by_oid
-                .entry(oid)
-                .or_default()
-                .push(reference.name.clone());
+            refs_by_oid.entry(oid).or_default().push(reference.name);
         }
     }
     if refs_by_oid.is_empty() {

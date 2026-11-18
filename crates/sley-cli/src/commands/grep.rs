@@ -1259,7 +1259,7 @@ fn grep_no_index(
         let display = if opts.untracked {
             plan.pathspec.display(&file.match_path)
         } else {
-            file.display.clone()
+            file.display
         };
         let matched = grep_buffer(
             &content,

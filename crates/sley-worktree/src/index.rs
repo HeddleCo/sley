@@ -1523,12 +1523,7 @@ pub(crate) fn update_index_paths_impl(
                 && !existing_range.is_empty()
                 && sley_diff_merge::gitlink_head_oid(&absolute, format).is_none()
             {
-                record_resolve_undo_for_range(
-                    &mut index,
-                    format,
-                    &git_path,
-                    existing_range.clone(),
-                )?;
+                record_resolve_undo_for_range(&mut index, format, &git_path, existing_range)?;
                 remove_index_entries_with_path(&mut index.entries, &git_path);
                 untracked_cache_invalidation_paths.push(git_path.clone());
                 reports.push(format!("add '{}'", String::from_utf8_lossy(&git_path)));
@@ -1611,7 +1606,7 @@ pub(crate) fn update_index_paths_impl(
             );
             entry.mode = sley_index::GITLINK_MODE;
             reports.push(format!("add '{display}'"));
-            record_resolve_undo_for_range(&mut index, format, &git_path, existing_range.clone())?;
+            record_resolve_undo_for_range(&mut index, format, &git_path, existing_range)?;
             replace_index_entries_with_entry(&mut index.entries, entry);
             untracked_cache_invalidation_paths.push(git_path.clone());
             updated.push(head_oid);
@@ -1712,7 +1707,7 @@ pub(crate) fn update_index_paths_impl(
                 ));
             }
         }
-        record_resolve_undo_for_range(&mut index, format, &git_path, existing_range.clone())?;
+        record_resolve_undo_for_range(&mut index, format, &git_path, existing_range)?;
         replace_index_entries_with_entry(&mut index.entries, entry);
         untracked_cache_invalidation_paths.push(git_path);
         updated.push(oid);

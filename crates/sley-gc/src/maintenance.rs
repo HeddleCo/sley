@@ -426,10 +426,7 @@ fn maintenance_geometric_repack_needed(common_git_dir: &Path, config: &GitConfig
         return Ok(true);
     }
     let plan = maintenance_geometric_repack_plan(common_git_dir, config)?;
-    if plan.split > 0 {
-        return Ok(true);
-    }
-    Ok(false)
+    Ok(plan.split > 0)
 }
 
 fn maintenance_auto_limit(config: &GitConfig, task: &str, default: i64) -> i64 {

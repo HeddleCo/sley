@@ -3599,7 +3599,7 @@ fn update_push_remote_tracking_refs(
             if command.new_id.is_null() {
                 let _ = refs.delete_ref(&name);
             } else if refs.read_ref(&name)? == Some(RefTarget::Direct(command.new_id)) {
-                let packed_name = name.clone();
+                let packed_name = name;
                 refs.pack_refs_selected_with_timeout(
                     true,
                     false,

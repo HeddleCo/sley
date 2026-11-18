@@ -307,9 +307,7 @@ pub(crate) fn visit_reflog_roots_from_dir(
                 stack.push(path);
             } else {
                 let contents = fs::read(&path)?;
-                let source = GcRootSource::Reflog {
-                    path: path.clone().into(),
-                };
+                let source = GcRootSource::Reflog { path: path.into() };
                 for line in contents.split(|byte| *byte == b'\n') {
                     let mut fields = line.split(|byte| *byte == b' ');
                     for hex in [fields.next(), fields.next()].into_iter().flatten() {

@@ -150,45 +150,38 @@ pub fn prefetch_promisor_objects(
             .or(Some(sley_odb::PackObjectFilter::BlobNone));
         let quiet = config.get_bool("promisor", None, "quiet").unwrap_or(false);
         trace2_promisor_fetch_child_start(&remote_name, quiet);
-        let hydrated_ok =
-            if let Ok(remote_git_dir) = crate::resolve_local_remote_git_dir(resolution, url) {
-                crate::install_fetch_pack_via_local_upload_pack(
-                    policy,
-                    &git_dir,
-                    &remote_git_dir,
-                    db.object_format(),
-                    missing.clone(),
-                    None,
-                    true,
-                    false,
-                    filter,
-                    None,
-                    false,
-                    None,
-                )
-                .is_ok()
-            } else if let Some(hydrated) = maybe_hydrate_promisor_via_ssh(
+        let hydrated_ok = if let Ok(remote_git_dir) =
+            crate::resolve_local_remote_git_dir(resolution, url)
+        {
+            crate::install_fetch_pack_via_local_upload_pack(
                 policy,
-                &config,
-                &remote_name,
                 &git_dir,
-                db,
-                url,
-                &missing,
-            ) {
-                hydrated
-            } else {
-                maybe_hydrate_promisor_via_http(
-                    policy,
-                    &config,
-                    &git_dir,
-                    db,
-                    url,
-                    &missing,
-                    filter.clone(),
-                )
+                &remote_git_dir,
+                db.object_format(),
+                missing.clone(),
+                None,
+                true,
+                false,
+                filter,
+                None,
+                false,
+                None,
+            )
+            .is_ok()
+        } else if let Some(hydrated) = maybe_hydrate_promisor_via_ssh(
+            policy,
+            &config,
+            &remote_name,
+            &git_dir,
+            db,
+            url,
+            &missing,
+        ) {
+            hydrated
+        } else {
+            maybe_hydrate_promisor_via_http(policy, &config, &git_dir, db, url, &missing, filter)
                 .unwrap_or_default()
-            };
+        };
         if !hydrated_ok {
             continue;
         }
