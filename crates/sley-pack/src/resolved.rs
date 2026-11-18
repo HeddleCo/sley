@@ -1238,7 +1238,8 @@ where
         allocation(&indexed)
             + allocation(&objects)
             + allocation(&index)
-            + indexed.len() * 2 * std::mem::size_of::<&PackIndexEntry>(),
+            + indexed.len()
+                * (std::mem::size_of::<&PackIndexEntry>() + 2 * std::mem::size_of::<u64>()),
         AtomicOrdering::Relaxed,
     );
     cancel.check()?;

@@ -19,6 +19,7 @@ impl PackFile {
     }
 
     /// Parse with explicit resolver limits; default options preserve trusted policy.
+    /// Materialized return bodies are output storage outside the resolver's byte gates.
     pub fn parse_with_options(
         bytes: &[u8],
         format: ObjectFormat,
