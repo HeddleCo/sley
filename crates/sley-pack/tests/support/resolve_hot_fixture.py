@@ -4,17 +4,20 @@ Run with Git 2.55.0 and a fresh scratch directory; never edits a checkout.
 import hashlib,json,os,random,subprocess,time
 from pathlib import Path
 import sys
+assert subprocess.check_output(['git','--version'],text=True).strip()=='git version 2.55.0'
 root=Path(sys.argv[1]); root.mkdir(parents=True, exist_ok=True); repo=root/'hot.git'
 if '--verify-only' not in sys.argv:
-    subprocess.run(['git','init','--bare','-q',str(repo)],check=True)
+    assert not repo.exists(), 'fresh scratch directory required'
+    subprocess.run(['git','init','--bare','--object-format=sha1','-q',str(repo)],check=True)
     rng=random.Random(1712)
     lines=[(f'package-{i:04d} '+rng.randbytes(128).hex()).encode()[:255]+b'\n' for i in range(1024)]
     assert sum(map(len,lines))==256*1024
+    hot_lines=rng.sample(range(1024),3)  # fixed hot region keeps old revisions viable bases
     with (root/'hot-import.log').open('wb') as log:
      p=subprocess.Popen(['git','--git-dir='+str(repo),'fast-import','--quiet'],stdin=subprocess.PIPE,stdout=log,stderr=log)
      out=p.stdin
      for i in range(60000):
-      for line in rng.sample(range(1024),3):
+      for line in hot_lines:
        lines[line]=(f'package-{line:04d} revision-{i:05d} '+rng.randbytes(128).hex()).encode()[:255]+b'\n'
       body=b''.join(lines)
       out.write(f'commit refs/heads/main\ncommitter Timing <timing@example.test> {1700000000+i} +0000\ndata 12\ncommit {i:05d}\n'.encode())

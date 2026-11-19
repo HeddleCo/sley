@@ -4,7 +4,7 @@ Usage: resolve_timing.py SCRATCH TARGET --fixtures FIXTURES [--only NAME]
 A fresh SCRATCH holds source exports (not worktrees), build logs and timings.
 FIXTURES holds whole.pack, mixed-ofs.pack, hot.pack, iroh.pack and heddle.pack.
 Use resolve_hot_fixture.py to generate hot.git; real packs are opt-in network
-fixtures, pinned and described in fixtures.json. All commands capture output.
+fixtures, pinned in tests/fixtures/resolved/timing-pins.json. All commands capture output.
 """
 import argparse, hashlib, io, json, os, random, re, statistics, struct
 import subprocess, tarfile, zlib
@@ -27,13 +27,17 @@ for name,ref in refs.items():
         tar.extractall(source,filter='data')
     directory=source/'crates/sley-pack/examples'; directory.mkdir(exist_ok=True)
     (directory/'r7_timing.rs').write_bytes(example)
+    if name=='head':
+        (directory/'r7_bounded_timing.rs').write_bytes((root/'crates/sley-pack/tests/support/resolve_bounded_timing.rs').read_bytes())
     if name=='head' and args.steal_disabled:
         path=source/'crates/sley-pack/src/resolved.rs'; text=path.read_text()
+        original=text
         text=text.replace('item = pop((worker + other) % workers, true)?;', 'let _ = other; item = None;')
+        assert text!=original, 'steal guard mutation must apply'
         path.write_text(text)
     env['CARGO_TARGET_DIR']=str(target/name)
     with (scratch/(name+'-build.log')).open('w') as log:
-        subprocess.run(['cargo','build','--manifest-path',str(source/'Cargo.toml'),'--locked','--release','-p','sley-pack','--example','r7_timing'],env=env,stdout=log,stderr=subprocess.STDOUT,check=True)
+        subprocess.run(['cargo','build','--manifest-path',str(source/'Cargo.toml'),'--locked','--release','-p','sley-pack','--example','r7_timing'] + (['--example','r7_bounded_timing'] if name=='head' else []),env=env,stdout=log,stderr=subprocess.STDOUT,check=True)
 
 def header(kind,size):
     result=bytearray([kind<<4 | (size&15) | (128 if size>15 else 0)]); size>>=4
@@ -90,7 +94,7 @@ for mode in args.only or ['whole','mixed-ofs','hot','iroh','heddle']:
                 result=subprocess.run([str(binary),str(path),str(threads)],capture_output=True,text=True,check=True)
                 match=re.search(r'seconds=([\d.]+) objects=(\d+) idx_sha256=(\w+) tail=([\d.]+)',result.stdout)
                 assert match,result.stdout
-                row=dict(fixture=mode,threads=threads,version=name,ref=refs[name],trial=trial,seconds=float(match[1]),objects=int(match[2]),idx_sha256=match[3],tail=float(match[4]))
+                row=dict(fixture=mode,threads=threads,version=name,stealing_disabled=bool(args.steal_disabled and name=='head'),ref=refs[name],trial=trial,seconds=float(match[1]),objects=int(match[2]),idx_sha256=match[3],tail=float(match[4]))
                 rows.append(row); (scratch/'timings.json').write_text(json.dumps(rows,indent=2)); print(json.dumps(row),flush=True)
         group=[r for r in rows if r['fixture']==mode and r['threads']==threads]
         assert len({r['idx_sha256'] for r in group})==1
@@ -98,4 +102,5 @@ for mode in args.only or ['whole','mixed-ofs','hot','iroh','heddle']:
         tails={name:statistics.median(r['tail'] for r in group if r['version']==name) for name in refs}
         ratio=medians['head']/medians['base']; summary.append(dict(fixture=mode,threads=threads,medians=medians,tails=tails,head_over_base=ratio,gate=ratio<=1.05))
         print(json.dumps(summary[-1]),flush=True); (scratch/'summary.json').write_text(json.dumps(summary,indent=2))
+    assert len({r['idx_sha256'] for r in rows if r['fixture']==mode})==1
 assert all(row['gate'] for row in summary), 'trusted performance regression exceeds 5%'

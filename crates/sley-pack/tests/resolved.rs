@@ -755,6 +755,67 @@ fn last_dependent_releases_base_before_visiting_child() {
         peak < 24 * 1024 * 1024,
         "completed ancestors still retained: {peak}"
     );
+    // A retained reader keeps the live charge even if a faulty early release
+    // clears the node. Another branch must still find that retained ancestor
+    // while the last direct child is applying a long instruction stream.
+    const RESULT: usize = 16 * 1024 * 1024;
+    let mut pack = pack_start();
+    header(3, 1, &mut pack);
+    compressed(&[0], &mut pack);
+    let small = append_delta(&mut pack, 12, 1, 1);
+    append_delta(&mut pack, small, 1, 2);
+    let mut instructions = Vec::with_capacity(2 * RESULT + 8);
+    varint(1, &mut instructions);
+    varint(RESULT as u64, &mut instructions);
+    for _ in 0..RESULT {
+        instructions.extend([0x90, 1]);
+    }
+    let at = pack.len();
+    header(6, instructions.len() as u64, &mut pack);
+    ofs(at - 12, &mut pack);
+    compressed(&instructions, &mut pack);
+    drop(instructions);
+    let pack = finish(pack, 4);
+    let metrics = ResolveMetrics::default();
+    let cancel = AtomicCancel::new();
+    let seen_small = std::sync::atomic::AtomicBool::new(false);
+    let result = resolve_pack_with_metrics(
+        &pack,
+        ObjectFormat::Sha1,
+        2,
+        ResolveLimits {
+            max_live_base_bytes: 1,
+            max_resolve_ops: 13,
+            ..ResolveLimits::default()
+        },
+        CancelFlag::new(&cancel),
+        &|o| {
+            if o.offset == small as u64 {
+                let start = std::time::Instant::now();
+                while metrics.resolve_ops() < 9 {
+                    assert!(
+                        start.elapsed() < std::time::Duration::from_secs(30),
+                        "other worker did not enter apply"
+                    );
+                    std::thread::yield_now();
+                }
+                assert_eq!(
+                    metrics.live_base_bytes(),
+                    1,
+                    "apply must still hold the base"
+                );
+                seen_small.store(true, Ordering::Relaxed);
+            }
+            Ok::<_, ()>(())
+        },
+        &metrics,
+    );
+    assert!(seen_small.load(Ordering::Relaxed));
+    result.expect("a sibling replay finds the base throughout the last direct apply");
+    assert_eq!(metrics.resolve_ops(), 13);
+    assert_eq!(metrics.in_flight_bytes(), 0);
+    assert_eq!(metrics.live_base_bytes(), 0);
+    println!("last-dependent apply overlap: ops=13, flight=0, live=0");
 }
 
 #[test]
@@ -2193,6 +2254,7 @@ fn panicking_visitor_stops_idle_workers_before_watchdog() {
     let p = chains(1, 8, 32, true);
     let cancel = Arc::new(sley_core::AtomicCancel::new());
     let watchdog_cancel = Arc::clone(&cancel);
+    let panicked = std::sync::atomic::AtomicBool::new(false);
     let (done, receiver) = mpsc::channel();
     let watchdog = std::thread::spawn(move || {
         if receiver.recv_timeout(Duration::from_secs(30)).is_err() {
@@ -2209,6 +2271,7 @@ fn panicking_visitor_stops_idle_workers_before_watchdog() {
         CancelFlag::new(&cancel),
         &|o| {
             if o.depth == 1 {
+                panicked.store(true, Ordering::Relaxed);
                 panic!("visitor failure");
             }
             Ok::<_, ()>(())
@@ -2220,6 +2283,10 @@ fn panicking_visitor_stops_idle_workers_before_watchdog() {
     watchdog.join().expect("watchdog joined");
     eprintln!("panicking visitor returned after {elapsed:?} (watchdog=30s)");
     assert!(result.is_err());
+    assert!(
+        panicked.load(Ordering::Relaxed),
+        "visitor panic must execute"
+    );
     assert!(
         elapsed < Duration::from_secs(5),
         "workers required watchdog cancellation"
@@ -2246,6 +2313,11 @@ fn custom_deep_limit_releases_parent_chain_without_recursive_drop() {
             output.status.success(),
             "deep-chain cleanup failed: {}",
             output.status
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("custom-depth cleanup: objects=60001, flight=0, live=0"),
+            "child must execute the selected test"
         );
         return;
     }

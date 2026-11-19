@@ -1,0 +1,18 @@
+{
+  "iroh": {
+    "objects": 425195,
+    "bytes": 392483004,
+    "sha256": "86f23e43ac29390ef4715d9a33c2c5ea604e8c4492e5672fe2e85db1e1fd9486",
+    "main_pin": "fa0c1d1f9be8fe1030b4fac2aa5846922f3f5e02",
+    "refs_sha256": "6343b7b6042842d857009ef4a0beff9713842fc15f320f7ec452de21d57ad043",
+    "repository": "n0-computer/iroh",
+    "ref_manifest": "timing-iroh-refs.txt",
+    "git_version": "2.55.0"
+  },
+  "heddle": {
+    "repository": "HeddleCo/heddle-v7",
+    "pin": "c5ecbd0fbe2fefbd38237dc1b74af18249b188b7",
+    "objects": 50157,
+    "bytes": 61953307
+  }
+}

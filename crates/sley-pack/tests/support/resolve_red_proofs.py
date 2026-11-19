@@ -125,6 +125,8 @@ add('compressed-replay-work','low_output_deflate_replay_spends_encoded_work_budg
 
 add('iterative-parent-cleanup', 'custom_deep_limit_releases_parent_chain_without_recursive_drop', rp, lambda s: region(s, '// Custom depth limits may exceed', "impl Node<'_> {", lambda _: ''))
 
+add('dependent-release-before-apply', 'last_dependent_releases_base_before_visiting_child', rp, lambda s: s.replace('        parent.release()?;\n','').replace('        let body = self.apply(index, base.as_ref(), &delta)?;', '        parent.release()?;\n        let body = self.apply(index, base.as_ref(), &delta)?;'))
+
 results = []
 try:
     for name, test, path, mutate, features in probes:
