@@ -1852,7 +1852,17 @@ fn trusted_errors_leave_process_interrupt_clear() {
     compressed(&[1, 1, 1, b'x'], &mut thin);
     let mut corrupt = chains(1, 0, 32, false);
     corrupt[15] ^= 1;
-    for p in [corrupt, chains(1, 51, 32, false), finish(thin, 1)] {
+    // A delta that writes past its declared result fails inside a worker,
+    // where the resolver's internal stop is raised.
+    let mut overrun = pack_start();
+    header(3, 4, &mut overrun);
+    compressed(b"abcd", &mut overrun);
+    let at = overrun.len();
+    header(6, 4, &mut overrun);
+    ofs(at - 12, &mut overrun);
+    compressed(&[4, 1, 0x90, 4], &mut overrun);
+    let worker = finish(overrun, 2);
+    for p in [corrupt, chains(1, 51, 32, false), finish(thin, 1), worker] {
         let cancel = AtomicCancel::new();
         PackIndex::write_v2_for_pack_with_options(
             &p,
@@ -1882,7 +1892,7 @@ fn trusted_errors_leave_process_interrupt_clear() {
         );
     }
     println!(
-        "trusted errors: checksum, depth and thin failures preserve interrupt; public visitor sets cancel"
+        "trusted errors: checksum, depth, thin and worker failures preserve interrupt; public visitor sets cancel"
     );
 }
 
