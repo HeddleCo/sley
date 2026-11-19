@@ -6,6 +6,16 @@ A fresh SCRATCH holds source exports (not worktrees), build logs and timings.
 FIXTURES holds whole.pack, mixed-ofs.pack, hot.pack, iroh.pack.
 Use resolve_hot_fixture.py to generate hot.git; real packs are opt-in network
 fixtures, pinned in tests/fixtures/resolved/timing-pins.json. All commands capture output.
+
+Quiet-slot gate (base 61848386 vs HEAD, 6 interleaved runs per side; prints median
+in-process seconds, wall and CPU), run from a clean checkout of the head commit:
+  F=$SCRATCH/fixtures; python3 crates/sley-pack/tests/support/resolve_hot_fixture.py $F
+  python3 crates/sley-pack/tests/support/resolve_real_fixtures.py $F --network \
+    --iroh-pin fa0c1d1f9be8fe1030b4fac2aa5846922f3f5e02 \
+    --iroh-refs crates/sley-pack/tests/fixtures/resolved/timing-iroh-refs.txt
+  python3 crates/sley-pack/tests/support/resolve_timing.py $SCRATCH/run TARGET \
+    --fixtures $F --only hot --only iroh --trials 6
+TARGET is the configured Cargo target directory; summary.json holds the medians.
 """
 import argparse, hashlib, io, json, os, random, re, statistics, struct
 import subprocess, tarfile, zlib, shutil, resource, time
@@ -36,7 +46,7 @@ for name,ref in refs.items():
     if name=='head' and args.steal_disabled:
         path=source/'crates/sley-pack/src/resolved.rs'; text=path.read_text()
         original=text
-        text=text.replace('item = pop((worker + other) % workers, true)?;', 'let _ = other; item = None;')
+        text=text.replace('item = pop((worker + other) % workers, true)?\n                                            .map(|node| (node, None));', 'let _ = other; item = None;')
         assert text!=original, 'steal guard mutation must apply'
         path.write_text(text)
     with (scratch/(name+'-build.log')).open('w') as log:
