@@ -79,7 +79,7 @@ where
         progress,
         &ResolveMetrics::default(),
     )
-    .map_err(resolved::infallible_error)
+    .map_err(|e| resolved::into_git_error(e, |never| match never {}))
 }
 
 pub(crate) fn parse_parallel_pack<F>(
@@ -114,15 +114,7 @@ where
         &mut |_| {},
         &ResolveMetrics::default(),
     )
-    .map_err(|error| match error {
-        ResolveError::Pack(error) | ResolveError::Visitor(error) => error,
-        ResolveError::Panic => GitError::InvalidFormat("pack resolver callback panicked".into()),
-        ResolveError::ResolveOps { limit, attempted } => GitError::ResourceLimit {
-            kind: ResourceLimitKind::ResolveOps,
-            limit,
-            attempted,
-        },
-    })?;
+    .map_err(|e| resolved::into_git_error(e, |e| e))?;
     let mut objects = objects
         .into_inner()
         .map_err(|_| GitError::InvalidObject("pack visitor poisoned".into()))?;

@@ -1,4 +1,5 @@
 """Public-API trusted timing gate: interleaved median of six, at 4/16 threads.
+Reports median wall and child-process user+system CPU seconds per side.
 
 Usage: resolve_timing.py SCRATCH TARGET --fixtures FIXTURES [--only NAME]
 A fresh SCRATCH holds source exports (not worktrees), build logs and timings.
@@ -7,7 +8,7 @@ Use resolve_hot_fixture.py to generate hot.git; real packs are opt-in network
 fixtures, pinned in tests/fixtures/resolved/timing-pins.json. All commands capture output.
 """
 import argparse, hashlib, io, json, os, random, re, statistics, struct
-import subprocess, tarfile, zlib, shutil
+import subprocess, tarfile, zlib, shutil, resource, time
 from pathlib import Path
 parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('scratch',type=Path); parser.add_argument('target',type=Path)
@@ -15,7 +16,8 @@ parser.add_argument('--fixtures',required=True,type=Path)
 parser.add_argument('--only',action='append'); parser.add_argument('--trials',type=int,default=6)
 parser.add_argument('--threads',type=int,nargs='+',default=[4,16])
 parser.add_argument('--steal-disabled',action='store_true')
-args=parser.parse_args(); scratch=args.scratch; target=args.target; fixtures=args.fixtures
+args=parser.parse_args(); assert args.trials>=5, "at least five interleaved trials per side are required"
+scratch=args.scratch; target=args.target; fixtures=args.fixtures
 scratch.mkdir(parents=True,exist_ok=False)
 configured=Path(json.loads(subprocess.check_output(["cargo","metadata","--no-deps","--format-version","1"],text=True))["target_directory"])
 assert target.resolve()==configured.resolve(), "use the configured Cargo target; wait if busy"
@@ -101,17 +103,23 @@ for mode in args.only or ['whole','mixed-ofs','hot','iroh']:
             # Alternate order too, to reduce systematic thermal/cache bias.
             for name in (['base','head'] if trial%2 else ['head','base']):
                 binary=scratch/(name+'-timing')
+                before=resource.getrusage(resource.RUSAGE_CHILDREN); started=time.perf_counter()
                 result=subprocess.run([str(binary),str(path),str(threads)],capture_output=True,text=True,check=True)
+                wall=time.perf_counter()-started
+                after=resource.getrusage(resource.RUSAGE_CHILDREN)
+                cpu=after.ru_utime+after.ru_stime-before.ru_utime-before.ru_stime
                 match=re.search(r'seconds=([\d.]+) objects=(\d+) idx_sha256=(\w+) tail=([\d.]+)',result.stdout)
                 assert match,result.stdout
                 assert int(match[2])==objects, 'indexer object count drift'
-                row=dict(fixture=mode,threads=threads,version=name,stealing_disabled=bool(args.steal_disabled and name=='head'),ref=refs[name],trial=trial,seconds=float(match[1]),objects=int(match[2]),idx_sha256=match[3],tail=float(match[4]))
+                row=dict(fixture=mode,threads=threads,version=name,stealing_disabled=bool(args.steal_disabled and name=='head'),ref=refs[name],trial=trial,seconds=float(match[1]),wall_seconds=wall,cpu_seconds=cpu,objects=int(match[2]),idx_sha256=match[3],tail=float(match[4]))
                 rows.append(row); (scratch/'timings.json').write_text(json.dumps(rows,indent=2)); print(json.dumps(row),flush=True)
         group=[r for r in rows if r['fixture']==mode and r['threads']==threads]
         assert len({r['idx_sha256'] for r in group})==1
         medians={name:statistics.median(r['seconds'] for r in group if r['version']==name) for name in refs}
+        wall_medians={name:statistics.median(r['wall_seconds'] for r in group if r['version']==name) for name in refs}
+        cpu_medians={name:statistics.median(r['cpu_seconds'] for r in group if r['version']==name) for name in refs}
         tails={name:statistics.median(r['tail'] for r in group if r['version']==name) for name in refs}
-        ratio=medians['head']/medians['base']; summary.append(dict(fixture=mode,threads=threads,medians=medians,tails=tails,head_over_base=ratio,gate=ratio<=1.05))
+        ratio=medians['head']/medians['base']; summary.append(dict(fixture=mode,threads=threads,medians=medians,wall_medians=wall_medians,cpu_medians=cpu_medians,tails=tails,head_over_base=ratio,gate=ratio<=1.05))
         print(json.dumps(summary[-1]),flush=True); (scratch/'summary.json').write_text(json.dumps(summary,indent=2))
     assert len({r['idx_sha256'] for r in rows if r['fixture']==mode})==1
 assert all(row['gate'] for row in summary), 'trusted performance regression exceeds 5%'

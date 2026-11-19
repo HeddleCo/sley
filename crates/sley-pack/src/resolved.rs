@@ -23,15 +23,15 @@ pub struct ResolveLimits {
     pub max_objects: usize,
     /// Maximum body or inflated delta stream size; defaults to 512 MiB.
     pub max_object_bytes: u64,
-    /// Bounds first-pass logical results and inflated streams independently
-    /// across all workers; defaults to 16 GiB. Replay does not affect acceptance.
+    /// Bounds logical results, inflated streams and decoded work (including
+    /// replay), each independently across all workers; defaults to 16 GiB.
     /// Compressed work is additionally capped at input length plus this limit.
     pub max_total_decoded: u64,
-    /// Shared retained ancestor-body budget; defaults to 64 MiB. Zero disables the shared cache.
+    /// Shared budget for fan-out bases awaiting siblings; defaults to 64 MiB. Zero forces replay.
     pub max_live_base_bytes: usize,
     /// Shared transient workspace ceiling; defaults to 1 GiB. Workers wait for space.
     pub max_in_flight_bytes: usize,
-    /// Discovery inflations plus first-time resolve inflates and applies; defaults to 100M.
+    /// Discovery inflations plus every resolve/replay inflate or apply; defaults to 100M.
     pub max_resolve_ops: u64,
 }
 impl Default for ResolveLimits {
@@ -122,9 +122,8 @@ pub struct ResolvedDelta<'a> {
 /// One resolved pack entry. Order is unspecified; each entry is visited once.
 #[derive(Debug)]
 pub struct ResolvedObject<'a> {
-    /// Plain SHA-1/SHA-256, NOT SHA-1 collision detection. For untrusted SHA-1
-    /// input, re-hash canonical header + body with sha1dc and reject collisions
-    /// or a digest mismatch before admitting this object.
+    /// Plain SHA-1/SHA-256 without collision detection. Untrusted SHA-1 callers
+    /// must re-hash with sha1dc before admission; see [`resolve_pack`].
     pub oid: ObjectId,
     pub object_type: ObjectType,
     pub body: &'a [u8],
@@ -173,10 +172,10 @@ impl<E> From<GitError> for ResolveError<E> {
         Self::Pack(error)
     }
 }
-pub(crate) fn infallible_error(error: ResolveError<std::convert::Infallible>) -> GitError {
-    match error {
+pub(crate) fn into_git_error<E>(e: ResolveError<E>, visit: impl FnOnce(E) -> GitError) -> GitError {
+    match e {
         ResolveError::Pack(error) => error,
-        ResolveError::Visitor(never) => match never {},
+        ResolveError::Visitor(error) => visit(error),
         ResolveError::Panic => invalid("pack resolver callback panicked"),
         ResolveError::ResolveOps { limit, attempted } => {
             budget(ResourceLimitKind::ResolveOps, limit, attempted)
@@ -192,9 +191,9 @@ pub(crate) fn infallible_error(error: ResolveError<std::convert::Infallible>) ->
 /// refusals wait for shallower duplicates before any over-limit delta is applied.
 /// Delta stream sizes are bounded as well as result sizes; the decoded budget
 /// separately bounds discovery, inflated streams and whole/delta result work,
-/// excluding replay: acceptance is independent of scheduling and cache admission.
-/// A worker keeps each next DFS base inside its reserved workspace; chains never
-/// replay. Stolen branches may replay at most `max_delta_depth` ancestors.
+/// including replay. A worker keeps each next DFS base inside its reserved
+/// workspace, so a chain never replays; only siblings of a fan-out base that the
+/// live gate could not hold replay, at most `max_delta_depth` ancestors each.
 ///
 /// SHA-1 IDs use ordinary SHA-1, without collision detection. Admission callers
 /// must run sha1dc over `type + " " + decimal_length + NUL + body` in `visit`,
@@ -298,21 +297,19 @@ fn size_check(size: u64, limits: ResolveLimits) -> Result<usize> {
     }
     Ok(size as usize)
 }
-fn charge(total: &mut u64, size: u64, limits: ResolveLimits) -> Result<()> {
-    if limits.max_total_decoded == u64::MAX {
+fn charge(total: &mut u64, size: u64, limit: u64) -> Result<()> {
+    if limit == u64::MAX {
         return Ok(());
     }
     let attempted = total.saturating_add(size);
-    *total = total
-        .checked_add(size)
-        .filter(|sum| *sum <= limits.max_total_decoded)
-        .ok_or_else(|| {
-            budget(
-                ResourceLimitKind::ResolveTotalDecoded,
-                limits.max_total_decoded,
-                attempted,
-            )
-        })?;
+    if attempted > limit {
+        return Err(budget(
+            ResourceLimitKind::ResolveTotalDecoded,
+            limit,
+            attempted,
+        ));
+    }
+    *total = attempted;
     Ok(())
 }
 fn allocation<T>(v: &Vec<T>) -> usize {
@@ -338,7 +335,7 @@ fn measure(
 ) -> Result<()> {
     let mut checked = d.base.is_none();
     if checked {
-        charge(total, d.header.size, limits)?;
+        charge(total, d.header.size, limits.max_total_decoded)?;
         d.result_size = d.header.size;
     }
     z.reset(true);
@@ -372,7 +369,7 @@ fn measure(
             {
                 let size = decoded_delta_result_size(&prefix[..prefix_len])?;
                 size_check(size, limits)?;
-                charge(total, size, limits)?;
+                charge(total, size, limits.max_total_decoded)?;
                 d.result_size = size;
                 checked = true;
             }
@@ -451,7 +448,7 @@ fn discover<E>(
         let mut cursor = offset;
         let header = parse_entry_header(&pack[..end], &mut cursor)?;
         size_check(header.size, limits)?;
-        charge(&mut work, header.size, limits)?;
+        charge(&mut work, header.size, limits.max_total_decoded)?;
         let base = parse_entry_base(
             &pack[..end],
             &mut cursor,
@@ -599,9 +596,8 @@ struct State<E> {
     refs: Vec<(ObjectId, Vec<u32>, Option<u32>)>,
     output: Vec<Option<Output>>,
     error: Option<ResolveError<E>>,
-    inflated_work: u64,
-    decoded_work: u64,
-    compressed_work: u64,
+    /// Compressed input, inflated streams and decoded results charged so far.
+    work: [u64; 3],
     deferred: Vec<u32>,
 }
 impl<E> State<E> {
@@ -612,6 +608,16 @@ impl<E> State<E> {
         self.ref_slot(oid)
             .map(|i| std::mem::take(&mut self.refs[i].1))
             .unwrap_or_default()
+    }
+    // REF bases use the shallowest published duplicate; pack index breaks ties.
+    fn prefer(&mut self, oid: &ObjectId, index: usize, depth: u16) {
+        if let Some(slot) = self.ref_slot(oid)
+            && self.refs[slot].2.is_none_or(|b| {
+                self.output[b as usize].is_some_and(|o| (depth, index) < (o.3, b as usize))
+            })
+        {
+            self.refs[slot].2 = Some(index as u32);
+        }
     }
 }
 struct Engine<'a, 'c, V, E> {
@@ -714,11 +720,6 @@ enum Root<'a> {
     Retry(u32, &'a [(ObjectId, EncodedObject)]),
     External(ObjectId, &'a EncodedObject),
 }
-enum Work {
-    Inflated,
-    Decoded,
-    Compressed,
-}
 impl<V, E> Engine<'_, '_, V, E>
 where
     V: Fn(&ResolvedObject<'_>) -> std::result::Result<(), E> + Sync,
@@ -744,31 +745,18 @@ where
         }
         self.stop.cancel();
     }
-    // Acceptance charges each entry once, independent of retention or scheduling.
-    fn work(&self, size: u64, kind: Work) -> Result<()> {
+    // Every decode, replay included, spends the shared work budgets. Empty
+    // DEFLATE blocks cost CPU without output, so compressed input is charged too.
+    fn work(&self, compressed: u64, inflated: u64, decoded: u64) -> Result<()> {
         if self.limits.is_unlimited() {
             return Ok(());
         }
         self.check()?;
-        let mut state = self.state()?;
         let limit = self.limits.max_total_decoded;
-        let (used, limit) = match kind {
-            Work::Inflated => (&mut state.inflated_work, limit),
-            Work::Decoded => (&mut state.decoded_work, limit),
-            // Empty DEFLATE blocks consume CPU but produce no decoded bytes.
-            Work::Compressed => (
-                &mut state.compressed_work,
-                limit.saturating_add(self.pack.len() as u64),
-            ),
-        };
-        charge(
-            used,
-            size,
-            ResolveLimits {
-                max_total_decoded: limit,
-                ..self.limits
-            },
-        )
+        let [c, i, d] = &mut self.state()?.work;
+        charge(c, compressed, limit.saturating_add(self.pack.len() as u64))?;
+        charge(i, inflated, limit)?;
+        charge(d, decoded, limit)
     }
     fn operation(&self) -> Result<()> {
         if self.limits.is_unlimited() {
@@ -820,48 +808,38 @@ where
                 .0;
         }
     }
-    fn inflate(&self, index: usize, replay: bool) -> Result<Vec<u8>> {
+    // Replay spends the same budgets; only profiling excludes it.
+    fn inflate(&self, index: usize, _replay: bool) -> Result<Vec<u8>> {
         self.check()?;
         #[cfg(feature = "fetch-profile")]
-        let _span = (!replay).then(|| {
+        let _span = (!_replay).then(|| {
             sley_core::fetch_profile::Span::enter(sley_core::fetch_profile::Stage::Inflate)
         });
-        if !replay {
-            self.operation()?;
-        }
+        self.operation()?;
         let d = &self.entries[index];
         let size = size_check(d.header.size, self.limits)?;
-        if !replay {
-            self.work((d.end - d.data) as u64, Work::Compressed)?;
-            self.work(d.header.size, Work::Inflated)?;
-            if d.base.is_none() {
-                self.work(d.header.size, Work::Decoded)?;
-            }
-        }
+        let decoded = if d.base.is_none() { d.header.size } else { 0 };
+        self.work((d.end - d.data) as u64, d.header.size, decoded)?;
         parallel_index::inflate_exact(&self.pack[d.data..d.end], size, self.stop_flag())
             .map(|pair| pair.0)
     }
-    fn apply(&self, index: usize, base: &[u8], delta: &[u8], replay: bool) -> Result<Vec<u8>> {
+    fn apply(&self, index: usize, base: &[u8], delta: &[u8], _replay: bool) -> Result<Vec<u8>> {
         self.check()?;
         #[cfg(feature = "fetch-profile")]
-        let _span = (!replay).then(|| {
+        let _span = (!_replay).then(|| {
             sley_core::fetch_profile::Span::enter(sley_core::fetch_profile::Stage::DeltaResolution)
         });
-        if !replay {
-            self.operation()?;
-        }
+        self.operation()?;
         let plan = plan_pack_delta(base, delta)?;
         let size = size_check(plan.result_size, self.limits)?;
-        if !replay {
-            self.work(plan.result_size, Work::Decoded)?;
-        }
+        self.work(0, 0, plan.result_size)?;
         let mut body = reserve(size)?;
         apply_pack_delta_exact(base, delta, plan, &mut body, self.stop_flag())?;
         if body.len() as u64 != self.entries[index].result_size {
             return Err(invalid("delta result changed"));
         }
         #[cfg(feature = "fetch-profile")]
-        if !replay {
+        if !_replay {
             sley_core::fetch_profile::add_count(
                 sley_core::fetch_profile::Stage::DeltaResolution,
                 1,
@@ -871,7 +849,7 @@ where
     }
     fn retain<'a>(&'a self, node: &mut Node<'a>, body: Vec<u8>) -> Result<Base<'a>> {
         let size = body.len();
-        if node.pending.load(AtomicOrdering::Relaxed) != 0
+        if node.pending.load(AtomicOrdering::Relaxed) > 1
             && let Ok(used) = self.metrics.live.try_update(
                 AtomicOrdering::AcqRel,
                 AtomicOrdering::Acquire,
@@ -969,88 +947,69 @@ where
             crc32fast::hash(&self.pack[d.offset..d.end]),
             depth,
         ));
-        if let Some(slot) = state.ref_slot(&oid) {
-            let old = state.refs[slot].2;
-            if old.is_none_or(|old| {
-                state.output[old as usize].is_some_and(|o| (depth, index) < (o.3, old as usize))
-            }) {
-                state.refs[slot].2 = Some(index as u32);
-            }
-        }
+        state.prefer(&oid, index, depth);
         drop(state);
         completed.fetch_add(1, AtomicOrdering::Release);
-        let pending = AtomicU32::new(children.len() as u32);
-        Ok(Node {
-            index: Some(index as u32),
+        Ok(self.node(
+            Some(index as u32),
             oid,
             object_type,
-            offset: d.offset as u64,
             depth,
             parent,
-            body: Mutex::new(None),
-            children: Mutex::new(children.into_iter()),
-            pending,
-            external: None,
-        })
+            children,
+            None,
+        ))
     }
     // A depth refusal waits for all possible shallower duplicates. Only indices
-    // are deferred; their bodies and ancestor nodes stay inside the worker gates.
+    // are deferred; the retry rebuilds the base along settled shortest edges.
     fn retry<'a>(
         &'a self,
         index: u32,
         external: &'a [(ObjectId, EncodedObject)],
     ) -> Result<Arc<Node<'a>>> {
         let state = self.state()?;
-        let mut chain = Vec::new();
-        let mut current = index;
-        let mut parent = None;
-        while let Some(base) = self.entries[current as usize].base {
-            current = match base {
+        let (mut chain, mut at, mut parent) = (Vec::new(), index, None);
+        while let Some(base) = &self.entries[at as usize].base {
+            at = match *base {
                 DeltaBase::Offset(offset) => {
                     self.entries
                         .binary_search_by_key(&offset, |d| d.offset as u64)
                         .map_err(|_| invalid("missing resolved base"))? as u32
                 }
-                DeltaBase::Ref(oid) => {
-                    if let Ok(i) = external.binary_search_by_key(&oid, |e| e.0) {
-                        let body = &external[i].1;
-                        parent = Some(Arc::new(Node {
-                            index: None,
+                DeltaBase::Ref(oid) => match external.binary_search_by_key(&oid, |e| e.0) {
+                    Ok(i) => {
+                        let (ty, body) = (external[i].1.object_type, &external[i].1.body);
+                        parent = Some(Arc::new(self.node(
+                            None,
                             oid,
-                            object_type: body.object_type,
-                            offset: 0,
-                            depth: 0,
-                            parent: None,
-                            pending: AtomicU32::new(0),
-                            body: Mutex::new(None),
-                            children: Mutex::new(Vec::new().into_iter()),
-                            external: Some(&body.body),
-                        }));
+                            ty,
+                            0,
+                            None,
+                            vec![],
+                            Some(body),
+                        )));
                         break;
                     }
-                    state
+                    Err(_) => state
                         .ref_slot(&oid)
                         .and_then(|i| state.refs[i].2)
-                        .ok_or_else(|| invalid("missing settled REF base"))?
-                }
+                        .ok_or_else(|| invalid("missing settled REF base"))?,
+                },
             };
-            chain.push(current);
+            chain.push(at);
         }
         for i in chain.into_iter().rev() {
-            let (oid, object_type, _, depth) =
+            let (oid, ty, _, depth) =
                 state.output[i as usize].ok_or_else(|| invalid("unresolved REF candidate"))?;
-            parent = Some(Arc::new(Node {
-                index: Some(i),
+            parent = Some(Arc::new(self.node(
+                Some(i),
                 oid,
-                object_type,
-                offset: self.entries[i as usize].offset as u64,
+                ty,
                 depth,
                 parent,
-                pending: AtomicU32::new(0),
-                children: Mutex::new(Vec::new().into_iter()),
-                body: Mutex::new(None),
-                external: None,
-            }));
+                vec![],
+                None,
+            )));
         }
         let mut parent = parent.ok_or_else(|| invalid("missing deferred base"))?;
         let node = Arc::get_mut(&mut parent).ok_or_else(|| invalid("shared deferred base"))?;
@@ -1060,6 +1019,30 @@ where
             .map_err(|_| invalid("pack children poisoned"))? = vec![index].into_iter();
         node.pending = AtomicU32::new(1);
         Ok(parent)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn node<'a>(
+        &self,
+        index: Option<u32>,
+        oid: ObjectId,
+        object_type: ObjectType,
+        depth: u16,
+        parent: Option<Arc<Node<'a>>>,
+        children: Vec<u32>,
+        external: Option<&'a [u8]>,
+    ) -> Node<'a> {
+        Node {
+            index,
+            oid,
+            object_type,
+            offset: index.map_or(0, |i| self.entries[i as usize].offset as u64),
+            depth,
+            parent,
+            pending: AtomicU32::new(children.len() as u32),
+            children: Mutex::new(children.into_iter()),
+            body: Mutex::new(None),
+            external,
+        }
     }
     fn root<'a>(
         &'a self,
@@ -1081,21 +1064,9 @@ where
             }
             Root::External(oid, object) => {
                 let children = self.state()?.take_refs(&oid);
-                Ok((
-                    Arc::new(Node {
-                        index: None,
-                        oid,
-                        object_type: object.object_type,
-                        offset: 0,
-                        depth: 0,
-                        parent: None,
-                        pending: AtomicU32::new(children.len() as u32),
-                        body: Mutex::new(None),
-                        children: Mutex::new(children.into_iter()),
-                        external: Some(&object.body),
-                    }),
-                    Base::External(&object.body),
-                ))
+                let (ty, body) = (object.object_type, &object.body);
+                let node = self.node(None, oid, ty, 0, None, children, Some(body));
+                Ok((Arc::new(node), Base::External(body)))
             }
         }
     }
@@ -1106,17 +1077,9 @@ where
         base: Base<'a>,
         completed: &AtomicUsize,
     ) -> std::result::Result<Option<(Arc<Node<'a>>, Base<'a>)>, ResolveError<E>> {
-        if parallel_index::check_delta_depth(
-            self.entries[index].offset,
-            parent.depth as usize + 1,
-            PackReadLimits {
-                max_delta_depth: self.limits.max_delta_depth.min(u16::MAX as usize),
-                ..PackReadLimits::default()
-            },
-        )
-        .is_err()
-        {
+        if parent.depth as usize >= self.limits.max_delta_depth.min(u16::MAX as usize) {
             self.state()?.deferred.push(index as u32);
+            parent.release()?;
             return Ok(None);
         }
         let delta = self.inflate(index, false)?;
@@ -1134,6 +1097,26 @@ where
         let body = self.retain(&mut node, body)?;
         Ok(Some((Arc::new(node), body)))
     }
+    // Shortest depth of an entry through its base; None while that base is unpublished.
+    fn depth(
+        &self,
+        state: &State<E>,
+        index: usize,
+        external: &[(ObjectId, EncodedObject)],
+    ) -> Option<u16> {
+        let base = match self.entries[index].base {
+            None => return Some(0),
+            Some(DeltaBase::Offset(offset)) => self
+                .entries
+                .binary_search_by_key(&offset, |d| d.offset as u64)
+                .ok()?,
+            Some(DeltaBase::Ref(oid)) if external.binary_search_by_key(&oid, |e| e.0).is_ok() => {
+                return Some(1);
+            }
+            Some(DeltaBase::Ref(oid)) => state.refs[state.ref_slot(&oid)?].2? as usize,
+        };
+        state.output[base].and_then(|o| o.3.checked_add(1))
+    }
     fn settle<'a, P: FnMut(PackIndexProgress)>(
         &'a self,
         external: &'a [(ObjectId, EncodedObject)],
@@ -1141,78 +1124,50 @@ where
         progress: &mut P,
         count: &mut u64,
     ) -> Result<()> {
+        let limit = self.limits.max_delta_depth.min(u16::MAX as usize);
         loop {
             let mut state = self.state()?;
             if state.error.is_some() || state.deferred.is_empty() {
-                break;
+                return Ok(());
             }
-            // Shortest dependency depths decrease monotonically. REF edges use
-            // the shallowest duplicate; OFS edges keep their physical parent.
-            let parent_depth = |state: &State<E>, index: usize| -> Option<usize> {
-                let base = match self.entries[index].base? {
-                    DeltaBase::Offset(offset) => self
-                        .entries
-                        .binary_search_by_key(&offset, |d| d.offset as u64)
-                        .ok()?,
-                    DeltaBase::Ref(oid) => {
-                        if external.binary_search_by_key(&oid, |e| e.0).is_ok() {
-                            return Some(0);
-                        }
-                        state.refs[state.ref_slot(&oid)?].2? as usize
-                    }
-                };
-                state.output[base].map(|o| o.3 as usize)
-            };
-            loop {
-                let mut changed = false;
+            // Relax published depths to shortest paths; depths only fall, so
+            // this converges within max_delta_depth linear passes.
+            let mut changed = true;
+            while std::mem::take(&mut changed) {
                 for i in 0..self.entries.len() {
-                    let Some((oid, _, _, old)) = state.output[i] else {
-                        continue;
-                    };
-                    let depth = parent_depth(&state, i).map_or(0, |d| d + 1) as u16;
-                    if depth < old {
-                        state.output[i].as_mut().map(|o| o.3 = depth);
-                        if let Some(slot) = state.ref_slot(&oid) {
-                            let best = state.refs[slot].2;
-                            if best.is_none_or(|b| {
-                                state.output[b as usize]
-                                    .is_some_and(|o| (depth, i) < (o.3, b as usize))
-                            }) {
-                                state.refs[slot].2 = Some(i as u32);
-                            }
-                        }
+                    if let Some((oid, ty, crc, old)) = state.output[i]
+                        && let Some(depth) = self.depth(&state, i, external)
+                        && depth < old
+                    {
+                        state.output[i] = Some((oid, ty, crc, depth));
+                        state.prefer(&oid, i, depth);
                         changed = true;
                     }
                 }
-                if !changed {
-                    break;
-                }
             }
             let mut roots = std::mem::take(&mut state.deferred);
-            let limit = self.limits.max_delta_depth.min(u16::MAX as usize);
-            let first = roots[0];
-            let mut rejected = reserve(self.entries.len())?;
-            for i in &roots {
-                if parent_depth(&state, *i as usize).is_none_or(|d| d >= limit) {
-                    rejected.push(*i);
+            let (first, mut rejected) = (roots[0], reserve(self.entries.len())?);
+            roots.retain(|&i| {
+                let ready = self
+                    .depth(&state, i as usize, external)
+                    .is_some_and(|d| d as usize <= limit);
+                if !ready {
+                    rejected.push(i);
                 }
-            }
-            roots.retain(|i| parent_depth(&state, *i as usize).is_some_and(|d| d < limit));
+                ready
+            });
             state.deferred = rejected;
             if roots.is_empty() {
-                return parallel_index::check_delta_depth(
-                    self.entries[first as usize].offset,
-                    limit + 1,
-                    PackReadLimits {
-                        max_delta_depth: limit,
-                        ..PackReadLimits::default()
-                    },
-                );
+                let limits = PackReadLimits {
+                    max_delta_depth: limit,
+                    ..PackReadLimits::default()
+                };
+                let offset = self.entries[first as usize].offset;
+                return parallel_index::check_delta_depth(offset, limit + 1, limits);
             }
             drop(state);
             self.run(&roots, true, external, threads, progress, count);
         }
-        Ok(())
     }
     fn run<'a, P: FnMut(PackIndexProgress)>(
         &'a self,
@@ -1530,9 +1485,7 @@ where
             refs,
             output,
             error: None,
-            inflated_work: 0,
-            decoded_work: 0,
-            compressed_work: 0,
+            work: [0; 3],
             deferred: reserve(entries.len())?,
         }),
         metrics,
@@ -1559,21 +1512,13 @@ where
     metrics
         .metadata
         .fetch_max(metadata + allocation(&pending), AtomicOrdering::Relaxed);
+    if let Some(error) = engine.state()?.error.take() {
+        return Err(error);
+    }
     let mut externals = Vec::new();
     for slot in pending {
-        let oid = engine.state()?.refs[slot as usize].0;
-        let mut state = engine.state()?;
-        if let Some(error) = state.error.take() {
-            return Err(error);
-        }
-        if state
-            .ref_slot(&oid)
-            .is_none_or(|i| state.refs[i].1.is_empty())
-        {
-            continue;
-        }
-        drop(state);
         cancel.check()?;
+        let oid = engine.state()?.refs[slot as usize].0;
         if let Some(object) = external(&oid)? {
             size_check(object.body.len() as u64, limits)?;
             if object.object_id(format)? != oid {

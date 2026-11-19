@@ -762,12 +762,15 @@ fn last_dependent_releases_base_before_visiting_child() {
     // A retained reader keeps the live charge even if a faulty early release
     // clears the node. Another branch must still find that retained ancestor
     // while the last direct child is applying a long instruction stream.
+    // The small branch has two children: its second child must replay through
+    // the root, so clearing that root before the large apply adds a forbidden op.
     const RESULT: usize = 16 * 1024 * 1024;
     let mut pack = pack_start();
     header(3, 1, &mut pack);
     compressed(&[0], &mut pack);
     let small = append_delta(&mut pack, 12, 1, 1);
     append_delta(&mut pack, small, 1, 2);
+    append_delta(&mut pack, small, 1, 3);
     let mut instructions = Vec::with_capacity(2 * RESULT + 8);
     varint(1, &mut instructions);
     varint(RESULT as u64, &mut instructions);
@@ -779,7 +782,7 @@ fn last_dependent_releases_base_before_visiting_child() {
     ofs(at - 12, &mut pack);
     compressed(&instructions, &mut pack);
     drop(instructions);
-    let pack = finish(pack, 4);
+    let pack = finish(pack, 5);
     let metrics = ResolveMetrics::default();
     let cancel = AtomicCancel::new();
     let seen_small = std::sync::atomic::AtomicBool::new(false);
@@ -789,14 +792,14 @@ fn last_dependent_releases_base_before_visiting_child() {
         2,
         ResolveLimits {
             max_live_base_bytes: 1,
-            max_resolve_ops: 13,
+            max_resolve_ops: 16,
             ..ResolveLimits::default()
         },
         CancelFlag::new(&cancel),
         &|o| {
             if o.offset == small as u64 {
                 let start = std::time::Instant::now();
-                while metrics.resolve_ops() < 9 {
+                while metrics.resolve_ops() < 10 {
                     assert!(
                         start.elapsed() < std::time::Duration::from_secs(30),
                         "other worker did not enter apply"
@@ -816,10 +819,10 @@ fn last_dependent_releases_base_before_visiting_child() {
     );
     assert!(seen_small.load(Ordering::Relaxed));
     result.expect("a sibling replay finds the base throughout the last direct apply");
-    assert_eq!(metrics.resolve_ops(), 13);
+    assert_eq!(metrics.resolve_ops(), 16);
     assert_eq!(metrics.in_flight_bytes(), 0);
     assert_eq!(metrics.live_base_bytes(), 0);
-    println!("last-dependent apply overlap: ops=13, flight=0, live=0");
+    println!("last-dependent apply overlap: ops=16, flight=0, live=0");
 }
 
 #[test]
@@ -859,8 +862,8 @@ fn replay_work_cannot_exceed_the_shared_decoded_budget() {
     assert!(pack_message(e).contains("max_total_decoded"));
     assert_eq!(
         calls.load(Ordering::Relaxed),
-        2,
-        "refuse before the third root allocation"
+        3,
+        "the first child uses the local base; refuse before the third root inflation"
     );
 }
 
@@ -1297,8 +1300,8 @@ fn low_output_deflate_replay_spends_encoded_work_budget() {
     assert!(pack_message(e).contains("max_total_decoded"));
     assert_eq!(
         visits.load(Ordering::Relaxed),
-        1,
-        "refuse before re-inflating the low-output base"
+        2,
+        "the first child uses the local base; refuse before replaying the low-output base"
     );
 }
 
@@ -1505,8 +1508,8 @@ fn flight_reservations_release_after_errors_and_waiters_observe_cancel() {
 #[test]
 fn resolve_ops_counts_discovery_inflate_apply_and_replay() {
     for threads in [1, 2, 16] {
-        let p = chains(1, 2, 32, false);
-        for (live, expected) in [(1024, 8), (0, 12)] {
+        let p = chains(1, 2, 32, true);
+        for (live, expected) in [(1024, 14), (0, 18)] {
             let metrics = ResolveMetrics::default();
             let limits = ResolveLimits {
                 max_live_base_bytes: live,
@@ -2101,6 +2104,25 @@ fn ref_slots_and_pending_snapshot_are_in_metadata_accounting() {
 #[test]
 fn trusted_index_restores_inflate_and_delta_profile_spans() {
     use sley_core::fetch_profile::{Stage, snapshot};
+    // The process-global profiler must be isolated from other parallel tests.
+    if std::env::var_os("SLEY_RESOLVE_PROFILE_CHILD").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test exe"))
+            .args([
+                "--exact",
+                "trusted_index_restores_inflate_and_delta_profile_spans",
+                "--nocapture",
+            ])
+            .env("SLEY_RESOLVE_PROFILE_CHILD", "1")
+            .output()
+            .expect("profile child");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+        return;
+    }
     let p = chains(16, 2, 4096, false);
     let before = snapshot();
     PackIndex::write_v2_for_pack_with_options(
@@ -2119,7 +2141,38 @@ fn trusted_index_restores_inflate_and_delta_profile_spans() {
             "missing profile stage {stage:?}"
         );
     }
-    println!("fetch-profile: Inflate and DeltaResolution both recorded");
+    assert_eq!(
+        after.stages[Stage::DeltaResolution as usize].count
+            - before.stages[Stage::DeltaResolution as usize].count,
+        32
+    );
+    let p = chains(1, 2, 32, true);
+    let before = snapshot();
+    let metrics = ResolveMetrics::default();
+    resolve_pack_with_metrics(
+        &p,
+        ObjectFormat::Sha1,
+        1,
+        ResolveLimits {
+            max_live_base_bytes: 0,
+            ..ResolveLimits::default()
+        },
+        CancelFlag::never(),
+        &|_| Ok::<_, ()>(()),
+        &metrics,
+    )
+    .expect("profiled replay");
+    let after = snapshot();
+    assert_eq!(metrics.resolve_ops(), 18, "sibling replay remains charged");
+    assert_eq!(
+        after.stages[Stage::DeltaResolution as usize].count
+            - before.stages[Stage::DeltaResolution as usize].count,
+        4,
+        "profile count excludes the two replay applies"
+    );
+    println!(
+        "fetch-profile: Inflate/DeltaResolution spans, count=32; replay fixture count=4, charged ops=18"
+    );
 }
 
 #[test]
@@ -2544,4 +2597,104 @@ fn progress_panic_stops_workers_before_the_watchdog() {
         "coordinator unwind waited for workers: {elapsed:?}"
     );
     println!("progress panic stopped workers in {elapsed:?}; process interrupt remains clear");
+}
+
+#[test]
+fn duplicate_ref_base_sibling_amplification_spends_the_shared_budget() {
+    const SIZE: usize = 65536;
+    let mut p = chains(1, 50, SIZE, false);
+    p.truncate(p.len() - 20);
+    let mut body = vec![0; SIZE];
+    body[SIZE - 1] = 50;
+    let oid = EncodedObject::new(ObjectType::Blob, body.clone())
+        .object_id(ObjectFormat::Sha1)
+        .expect("duplicate oid");
+    header(3, SIZE as u64, &mut p);
+    compressed(&body, &mut p);
+    let mut instructions = Vec::new();
+    varint(SIZE as u64, &mut instructions);
+    varint(0, &mut instructions);
+    for _ in 0..32 {
+        header(7, instructions.len() as u64, &mut p);
+        p.extend_from_slice(oid.as_bytes());
+        compressed(&instructions, &mut p);
+    }
+    let p = finish(p, 84);
+    for threads in [1, 4, 16] {
+        let metrics = ResolveMetrics::default();
+        let visits = AtomicUsize::new(0);
+        let limit = 60 * SIZE as u64;
+        let error = resolve_pack_with_metrics(
+            &p,
+            ObjectFormat::Sha1,
+            threads,
+            ResolveLimits {
+                max_live_base_bytes: 0,
+                max_total_decoded: limit,
+                ..ResolveLimits::default()
+            },
+            CancelFlag::never(),
+            &|_| {
+                visits.fetch_add(1, Ordering::Relaxed);
+                Ok::<_, ()>(())
+            },
+            &metrics,
+        )
+        .expect_err("duplicate REF bases cannot bypass sibling replay charges");
+        assert!(
+            matches!(error, ResolveError::Pack(GitError::ResourceLimit { kind: sley_core::ResourceLimitKind::ResolveTotalDecoded, limit: l, attempted }) if l == limit && attempted > limit),
+            "{error:?}"
+        );
+        assert!(visits.load(Ordering::Relaxed) < 84);
+        assert_eq!(
+            (metrics.live_base_bytes(), metrics.in_flight_bytes()),
+            (0, 0)
+        );
+        println!(
+            "duplicate REF amplification: threads={threads}, {error:?}, visits={}, live=0, flight=0",
+            visits.load(Ordering::Relaxed)
+        );
+    }
+}
+
+#[test]
+fn maximum_custom_depth_does_not_saturate_and_retry_forever() {
+    use std::sync::{Arc, mpsc};
+    let p = chains(1, 65536, 1, false);
+    let cancel = Arc::new(AtomicCancel::new());
+    let watchdog_cancel = Arc::clone(&cancel);
+    let (done, receiver) = mpsc::channel();
+    let watchdog = std::thread::spawn(move || {
+        if receiver
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .is_err()
+        {
+            watchdog_cancel.cancel();
+        }
+    });
+    let metrics = ResolveMetrics::default();
+    let result = resolve_pack_with_metrics(
+        &p,
+        ObjectFormat::Sha1,
+        1,
+        ResolveLimits {
+            max_delta_depth: usize::MAX,
+            max_live_base_bytes: 0,
+            ..ResolveLimits::default()
+        },
+        CancelFlag::new(&cancel),
+        &|_| Ok::<_, ()>(()),
+        &metrics,
+    );
+    let _ = done.send(());
+    watchdog.join().expect("watchdog joined");
+    assert!(
+        matches!(result, Err(ResolveError::Pack(GitError::InvalidFormat(ref m))) if m.contains("observed depth 65536") && m.contains("65535")),
+        "{result:?}"
+    );
+    assert_eq!(
+        (metrics.live_base_bytes(), metrics.in_flight_bytes()),
+        (0, 0)
+    );
+    println!("depth 65536 refused before apply; no saturating retry, live=0, flight=0");
 }

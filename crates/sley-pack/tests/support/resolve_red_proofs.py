@@ -42,7 +42,7 @@ def per_item_leases(s):
     s=s[:a] + "                        _flight = None::<Flight<'_>>;\n" + s[b:]
     lease='let _item_flight = if self.limits.is_unlimited() { None } else { Some(self.flight()?) };'
     s=s.replace('                                        let root = if i < roots.len()', lease+'\n                                        let root = if i < roots.len()')
-    return s.replace('                                if let Some(node) = item {', '                                if let Some(node) = item {\n                                    '+lease)
+    return s.replace('                                if let Some((node, body)) = item {', '                                if let Some((node, body)) = item {\n                                    '+lease)
 add('worker-arena-bound', 'in_flight_gate_serializes_sixteen_roots_and_bounds_peak_memory', rp, per_item_leases)
 add('flight-lease-lifetime', 'in_flight_gate_serializes_sixteen_roots_and_bounds_peak_memory', rp, lambda s: s.replace('                        let work =', '                        drop(_flight);\n                        let work ='))
 add('flight-error-release', 'flight_reservations_release_after_errors_and_waiters_observe_cancel', rp, lambda s: s.replace('self.used.fetch_sub(self.bytes, AtomicOrdering::AcqRel);', 'self.used.fetch_sub(0, AtomicOrdering::AcqRel);'))
@@ -56,7 +56,7 @@ add('bounded-preallocation', 'declared_count_preallocation_is_capped_before_pars
 def thin(s):
     a = s.index('    if count != entries.len() as u64 {'); b = s.index('    cancel.check()?;', a)
     s = s[:a] + s[b:]
-    return s.replace('let (oid, object_type, crc32) = entry.ok_or_else(|| invalid("unresolved pack entry"))?;', 'let Some((oid, object_type, crc32)) = entry else { continue };')
+    return s.replace('let (oid, object_type, crc32, _) = entry.ok_or_else(|| invalid("unresolved pack entry"))?;', 'let Some((oid, object_type, crc32, _)) = entry else { continue };')
 add('thin-completion', 'thin_pack_is_an_unresolved_base_error', rp, thin)
 add('caller-verifier-error', 'caller_admission_rejection_is_preserved_without_returning_a_build', rp, lambda s: s.replace('.map_err(ResolveError::Visitor)?;', '.ok();'))
 # Round 5: the same byte-derived bound on both policies, with the existing
@@ -65,20 +65,18 @@ add('physical-preallocation-bound', 'lying_maximum_object_count_over_one_kib_has
 for test in ['object_count_budget_is_typed', 'object_bytes_budget_is_typed', 'decoded_bytes_budget_is_typed', 'workspace_fit_budget_is_typed']:
     add('typed-' + test, test, rp, lambda s: region(s, 'fn budget(', '\nfn invalid(', lambda b: b[:b.index('    GitError::ResourceLimit')] + '    invalid(&format!("{kind}: limit {limit}, attempted {attempted}"))\n}'))
 add('legacy-ops-index-typing', 'legacy_operation_budget_remains_typed', rp, lambda s: s.replace('budget(ResourceLimitKind::ResolveOps, limit, attempted)', 'invalid(&format!("resolve_ops {limit} {attempted}"))'))
-add('legacy-ops-parse-typing', 'legacy_operation_budget_remains_typed', pp, lambda s: region(s, '        ResolveError::ResolveOps {', '\n    })?;', lambda b: '        ResolveError::ResolveOps { limit, attempted } => GitError::InvalidFormat(format!("resolve_ops {limit} {attempted}")),'))
+add('legacy-ops-parse-typing', 'legacy_operation_budget_remains_typed', pp, lambda s: s.replace('.map_err(|e| resolved::into_git_error(e, |e| e))?', '.map_err(|_| GitError::InvalidFormat("untyped budget".into()))?'))
 add('trusted-cancel-isolation', 'trusted_errors_leave_process_interrupt_clear', rp, lambda s: s.replace('        self.stop.cancel();', '        self.stop.cancel();\n        if let Some(source) = self.cancel.source() { source.cancel(); }'))
 add('limited-fast-path-isolation', 'finite_limits_cannot_enter_unaccounted_trusted_discovery', rp, lambda s: region(s, '    fn is_unlimited(self)', '    /// Trusted legacy policy:', lambda b: '    fn is_unlimited(self) -> bool { true }\n'))
 # Restore the duplicated per-entry output fields; the meter must catch their cost.
 def duplicate_metadata(s):
-    s = s.replace('type Output = (ObjectId, ObjectType, u32);', 'type Output = (PackIndexEntry, PackIndexedObject);')
-    a = s.index('        state.output[index] = Some(('); b = s.index('        drop(state);', a)
-    s = s[:a] + '''        state.output[index] = Some((
-            PackIndexEntry { oid, offset: d.offset as u64, crc32: crc32fast::hash(&self.pack[d.offset..d.end]) },
-            PackIndexedObject { oid, offset: d.offset as u64, object_type, size: body.len() as u64 },
-        ));
-''' + s[b:]
-    return s.replace('let (oid, object_type, crc32) = entry.ok_or_else(|| invalid("unresolved pack entry"))?;',
-        'let (old_index, old_object) = entry.ok_or_else(|| invalid("unresolved pack entry"))?;\n        let (oid, object_type, crc32) = (old_index.oid, old_object.object_type, old_index.crc32);')
+    # Restore the removed per-object index/object copies while preserving the
+    # shortest-depth field added since round 7. The capacity meter sees their cost.
+    s=s.replace('type Output = (ObjectId, ObjectType, u32, u16);', 'type Output = (ObjectId, ObjectType, u32, u16, Option<(ObjectId, u64, u32)>, Option<(ObjectId, ObjectType, u64, u64)>);')
+    s=s.replace('            depth,\n        ));', '            depth,\n            Some((oid, d.offset as u64, crc32fast::hash(&self.pack[d.offset..d.end]))),\n            Some((oid, object_type, body.len() as u64, d.offset as u64)),\n        ));',1)
+    s=s.replace('let (oid, ty, _, depth) =', 'let (oid, ty, _, depth, _, _) =').replace('Some((oid, ty, crc, old)) =', 'Some((oid, ty, crc, old, _, _)) =')
+    s=s.replace('Some((oid, ty, crc, depth));', 'Some((oid, ty, crc, depth, state.output[i].and_then(|o| o.4), state.output[i].and_then(|o| o.5)));')
+    return s.replace('let (oid, object_type, crc32, _) = entry.ok_or_else', 'let (oid, object_type, crc32, _, _, _) = entry.ok_or_else')
 add('original-metadata-layout', 'million_objects_fit_metadata_coefficient', rp, duplicate_metadata)
 for stage in ['Inflate', 'DeltaResolution']:
     add('profile-' + stage, 'trusted_index_restores_inflate_and_delta_profile_spans', rp, lambda s, stage=stage: s.replace('sley_core::fetch_profile::Stage::' + stage, 'sley_core::fetch_profile::Stage::ObjectStoreWrite'), 'fetch-profile')
@@ -93,28 +91,51 @@ add('untrusted-speculation', 'embedded_zlib_members_have_linear_discovery_cpu_co
 
 add('workspace-overflow-typing', 'workspace_arithmetic_overflow_stays_a_typed_budget_error', rp, lambda s: region(s, '    let overflow = ||', '    let max_body =', lambda b: '    let overflow = || invalid("pack workspace size overflow");\n'))
 
-add('subtree-stealing', 'one_hot_family_is_stolen_by_multiple_workers', rp, lambda s: s.replace('item = pop((worker + other) % workers, true)?;', 'let _ = other; item = None;'))
-add('panic-unwind-stop', 'panicking_visitor_stops_idle_workers_before_watchdog', rp, lambda s: s.replace('let _unwind = UnwindStop(&self.stop);', 'let _unwind = ();'))
-add('dependent-release-order', 'last_dependent_releases_base_before_visiting_child', rp, lambda s: s.replace('        parent.release()?;\n', '').replace('        let base = self.replay(&parent)?;', '        parent.release()?;\n        let base = self.replay(&parent)?;'))
+add('subtree-stealing', 'one_hot_family_is_stolen_by_multiple_workers', rp, lambda s: s.replace('item = pop((worker + other) % workers, true)?\n                                            .map(|node| (node, None));', 'let _ = other; item = None;'))
+add('panic-unwind-stop', 'panicking_visitor_stops_idle_workers_before_watchdog', rp, lambda s: s.replace('let _unwind = UnwindStop(|| self.fail(ResolveError::Panic));', 'let _unwind = ();'))
+def release_before_base(s):
+    s=region(s, '    fn child<', '    // Shortest depth', lambda b: b.replace('        parent.release()?;\n',''))
+    return s.replace('                                    let base = match body {', '                                    node.release()?;\n                                    let base = match body {')
+add('dependent-release-order', 'last_dependent_releases_base_before_visiting_child', rp, release_before_base)
 
 # Original hostile-input contracts retained by the scheduler change.
 add('shared-live-gate', 'live_base_bound_is_shared_and_replay_stays_within_peak_memory', rp, lambda s: s.replace('.filter(|sum| *sum <= self.limits.max_live_base_bytes)', '.filter(|_| true)'))
 for name,test in [('declared-body-bomb','declared_size_bomb_is_refused_before_allocation'), ('declared-result-bomb','delta_result_bomb_and_running_budgets_are_checked_before_visits')]:
     add(name,test,rp,lambda s: region(s,'fn size_check(', 'fn charge(',lambda b:b.replace('if size > limit {','if false {')))
-add('depth-before-apply','depth_51_is_refused_before_visiting_the_deep_object',pp,lambda s:s.replace('if depth <= limits.max_delta_depth {','if true {'))
+add('depth-before-apply','depth_51_is_refused_before_visiting_the_deep_object',rp,lambda s:s.replace('if parent.depth as usize >= self.limits.max_delta_depth.min(u16::MAX as usize) {','if false {'))
 add('truncated-discovery','truncation_and_trailing_bytes_are_errors',rp,lambda s:s.replace('return Err(invalid("truncated pack zlib stream"));','d.end = d.data + z.total_in() as usize; return Ok(());'))
 def cancel_off(s):
     s=s.replace('        self.cancel.check()?;\n        self.stop_flag().check()', '        self.stop_flag().check()')
     return s.replace('                if let Err(error) = self.cancel.check() {\n                    self.fail(error.into());\n                }','')
 add('cancel-polls','cancel_mid_pass_and_visitor_error_set_cancel_and_preserve_first_error',rp,cancel_off)
-add('replayed-result-work','replayed_delta_result_budget_is_shared_across_workers',rp,lambda s:s.replace('        self.work(plan.result_size, Work::Decoded)?;',''))
-add('compressed-replay-work','low_output_deflate_replay_spends_encoded_work_budget',rp,lambda s:s.replace('        self.work((d.end - d.data) as u64, Work::Compressed)?;',''))
+add('replayed-result-work','replayed_delta_result_budget_is_shared_across_workers',rp,lambda s:s.replace('self.work(0, 0, plan.result_size)?;', 'self.work(0, 0, 0)?;'))
+add('compressed-replay-work','low_output_deflate_replay_spends_encoded_work_budget',rp,lambda s:s.replace('self.work((d.end - d.data) as u64, d.header.size, decoded)?;', 'self.work(0, d.header.size, decoded)?;'))
 
 add('iterative-parent-cleanup', 'custom_deep_limit_releases_parent_chain_without_recursive_drop', rp, lambda s: region(s, '// Custom depth limits may exceed', "impl Node<'_> {", lambda _: ''))
 
-add('dependent-release-before-apply', 'last_dependent_releases_base_before_visiting_child', rp, lambda s: s.replace('        parent.release()?;\n','').replace('        let body = self.apply(index, base.as_ref(), &delta)?;', '        parent.release()?;\n        let body = self.apply(index, base.as_ref(), &delta)?;'))
+def release_before_apply(s):
+    return region(s, '    fn child<', '    // Shortest depth', lambda b: b.replace('        parent.release()?;\n','').replace('        let body = self.apply(index, base.as_ref(), &delta, false)?;', '        parent.release()?;\n        let body = self.apply(index, base.as_ref(), &delta, false)?;'))
+add('dependent-release-before-apply', 'last_dependent_releases_base_before_visiting_child', rp, release_before_apply)
 
 add('resource-kind-nonexhaustive', 'ResourceLimitKind', cp, lambda s: s.replace('#[non_exhaustive]\npub enum ResourceLimitKind {', 'pub enum ResourceLimitKind {'), 'core-doc')
+
+# D1: removing only sibling-replay charges must reopen each amplification route.
+def uncharged_replay(s):
+    def skip(b):
+        b=b.replace('        self.operation()?;', '        if !_replay { self.operation()?; }')
+        b=b.replace('        self.work((d.end - d.data) as u64, d.header.size, decoded)?;', '        if !_replay { self.work((d.end - d.data) as u64, d.header.size, decoded)?; }')
+        return b.replace('        self.work(0, 0, plan.result_size)?;', '        if !_replay { self.work(0, 0, plan.result_size)?; }')
+    return region(s, '    fn inflate(&self,', '    fn retain<', skip)
+for test in ['replay_work_cannot_exceed_the_shared_decoded_budget', 'low_output_deflate_replay_spends_encoded_work_budget', 'replayed_delta_result_budget_is_shared_across_workers', 'million_tiny_leaves_stop_at_resolve_op_budget', 'duplicate_ref_base_sibling_amplification_spends_the_shared_budget']:
+    add('D1-' + test, test, rp, uncharged_replay)
+add('maximum-depth-overflow', 'maximum_custom_depth_does_not_saturate_and_retry_forever', rp, lambda s: s.replace('state.output[base].and_then(|o| o.3.checked_add(1))', 'state.output[base].map(|o| o.3.saturating_add(1))'))
+add('coordinator-unwind-stop', 'progress_panic_stops_workers_before_the_watchdog', rp, lambda s: s.replace('let _coordinator = UnwindStop(|| self.fail(ResolveError::Panic));', 'let _coordinator = ();'))
+add('panic-error-kind', 'panicking_visitor_stops_idle_workers_before_watchdog', rp, lambda s: s.replace('let _unwind = UnwindStop(|| self.fail(ResolveError::Panic));', 'let _unwind = UnwindStop(|| self.fail(GitError::Cancelled.into()));'))
+def first_duplicate(s):
+    return region(s, '    fn prefer(', '\n}\nstruct Engine', lambda _: '    fn prefer(&mut self, oid: &ObjectId, index: usize, _depth: u16) {\n        if let Some(slot) = self.ref_slot(oid) && self.refs[slot].2.is_none() { self.refs[slot].2 = Some(index as u32); }\n    }')
+add('shallowest-duplicate', 'shallowest_duplicate_wins_even_when_the_deep_copy_publishes_first', rp, first_duplicate)
+add('profile-excludes-replays', 'trusted_index_restores_inflate_and_delta_profile_spans', rp, lambda s: s.replace('        if !_replay {\n            sley_core::fetch_profile::add_count(', '        if true {\n            sley_core::fetch_profile::add_count('), 'fetch-profile')
+add('chain-local-workspace', 'chain_acceptance_is_independent_of_retention_and_scheduling', rp, lambda s: s.replace('                                        Some(body) => body,', '                                        Some(body) => { drop(body); self.replay(&node)? },'))
 
 results = []
 try:
