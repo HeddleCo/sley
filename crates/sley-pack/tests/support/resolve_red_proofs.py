@@ -15,7 +15,8 @@ scratch.mkdir(parents=True, exist_ok=True)
 rp = Path('crates/sley-pack/src/resolved.rs')
 pp = Path('crates/sley-pack/src/parallel_index.rs')
 lp = Path('crates/sley-pack/src/limits.rs')
-original = {p: p.read_text() for p in (rp, pp, lp)}
+cp = Path('crates/sley-core/src/lib.rs')
+original = {p: p.read_text() for p in (rp, pp, lp, cp)}
 env = os.environ.copy()
 env['RUSTUP_TOOLCHAIN'] = 'stable'
 probes = []
@@ -65,22 +66,6 @@ add('legacy-ops-index-typing', 'legacy_operation_budget_remains_typed', rp, lamb
 add('legacy-ops-parse-typing', 'legacy_operation_budget_remains_typed', pp, lambda s: region(s, '        ResolveError::ResolveOps {', '\n    })?;', lambda b: '        ResolveError::ResolveOps { limit, attempted } => GitError::InvalidFormat(format!("resolve_ops {limit} {attempted}")),'))
 add('trusted-cancel-isolation', 'trusted_errors_leave_process_interrupt_clear', rp, lambda s: s.replace('        self.stop.cancel();', '        self.stop.cancel();\n        if let Some(source) = self.cancel.source() { source.cancel(); }'))
 add('limited-fast-path-isolation', 'finite_limits_cannot_enter_unaccounted_trusted_discovery', rp, lambda s: region(s, '    fn is_unlimited(self)', '    /// Trusted legacy policy:', lambda b: '    fn is_unlimited(self) -> bool { true }\n'))
-def old_metadata(s):
-    # Restore the original 48-byte root and 104-byte output layouts, plus the
-    # original root lifetime. The meter counts the actually restored live root
-    # allocation during conversion; the coefficient assertion is unchanged.
-    s = s.replace('type Output = (ObjectId, ObjectType, u32);', 'type Output = (PackIndexEntry, PackIndexedObject);')
-    s = s.replace('roots: &[u32]', 'roots: &[Root<\'_>]')
-    s = s.replace('None => Root::Entry(roots[index] as usize)', 'None => roots[index]')
-    s = s.replace('None => roots.push(index as u32)', 'None => roots.push(Root::Entry(index))')
-    a = s.index('        state.output[index] = Some(('); b = s.index('        drop(state);', a)
-    s = s[:a] + '''        state.output[index] = Some((PackIndexEntry { oid, offset: d.offset as u64, crc32: crc32fast::hash(&self.pack[d.offset..d.end]) }, PackIndexedObject { oid, object_type, offset: d.offset as u64, size: body.len() as u64 }));
-''' + s[b:]
-    s = s.replace('    drop(roots);\n', '')
-    s = s.replace('            buffers\n                + entries.len()', '            buffers + allocation(&roots)\n                + entries.len()')
-    s = s.replace('let (oid, object_type, crc32) = entry.ok_or_else(|| invalid("unresolved pack entry"))?;', 'let (old_index, old_object) = entry.ok_or_else(|| invalid("unresolved pack entry"))?;\n        let (oid, object_type, crc32) = (old_index.oid, old_object.object_type, old_index.crc32);')
-    s = s.replace('    drop(entries);', '    drop(entries);\n    drop(roots);')
-    return s
 # Restore the duplicated per-entry output fields; the meter must catch their cost.
 def duplicate_metadata(s):
     s = s.replace('type Output = (ObjectId, ObjectType, u32);', 'type Output = (PackIndexEntry, PackIndexedObject);')
@@ -127,19 +112,24 @@ add('iterative-parent-cleanup', 'custom_deep_limit_releases_parent_chain_without
 
 add('dependent-release-before-apply', 'last_dependent_releases_base_before_visiting_child', rp, lambda s: s.replace('        parent.release()?;\n','').replace('        let body = self.apply(index, base.as_ref(), &delta)?;', '        parent.release()?;\n        let body = self.apply(index, base.as_ref(), &delta)?;'))
 
+add('resource-kind-nonexhaustive', 'ResourceLimitKind', cp, lambda s: s.replace('#[non_exhaustive]\npub enum ResourceLimitKind {', 'pub enum ResourceLimitKind {'), 'core-doc')
+
 results = []
 try:
     for name, test, path, mutate, features in probes:
         if len(sys.argv) > 2 and name not in sys.argv[2:]: continue
-        for p, s in original.items(): p.write_text(s)
+        for p, s in original.items():
+            if p.read_text() != s: p.write_text(s)
         changed = mutate(original[path])
         assert changed != original[path], name + ': mutation did not apply'
         path.write_text(changed)
         runenv = env.copy()
         if name == 'deprecated-atomic': runenv['RUSTFLAGS'] = '-D warnings'
         args = ['cargo', 'test', '--locked', '-p', 'sley-pack', '--test', 'resolved']
-        if features: args += ['--features', features]
-        args += [test, '--', '--exact', '--nocapture']
+        if features == 'core-doc':
+            args = ['cargo','test','--locked','-p','sley-core','--doc']
+        elif features: args += ['--features', features]
+        args += [test, '--', '--nocapture'] if features == 'core-doc' else [test, '--', '--exact', '--nocapture']
         start = time.monotonic()
         logpath = scratch / (name + '.log')
         with logpath.open('w') as log:
@@ -152,4 +142,5 @@ try:
         print(json.dumps(row), flush=True)
         if not red: raise RuntimeError(name + ': expected executed RED missing')
 finally:
-    for p, s in original.items(): p.write_text(s)
+    for p, s in original.items():
+        if p.read_text() != s: p.write_text(s)
