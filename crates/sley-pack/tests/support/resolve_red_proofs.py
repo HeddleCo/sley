@@ -1,6 +1,7 @@
 """Revert one security guard at a time; require an executed public-API RED.
 
-Run from the repository root. Originals are restored even if a probe fails.
+Run from the root of an isolated git-archive source export with its own target.
+Do not share a checkout with concurrent checks. Originals are restored on failure.
 Logs and the result table go under the supplied scratch directory.
 """
 from pathlib import Path

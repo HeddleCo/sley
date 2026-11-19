@@ -85,6 +85,13 @@ for mode in args.only or ['whole','mixed-ofs','hot','iroh','heddle']:
     with path.open('rb') as file:
         objects=struct.unpack('>I',file.read(12)[8:])[0]
         file.seek(0); digest=hashlib.file_digest(file,'sha256').hexdigest()
+    pins=json.loads((root/'crates/sley-pack/tests/fixtures/resolved/timing-pins.json').read_text())
+    expected=420000 if mode in ['whole','mixed-ofs','hot'] else pins[mode]['objects']
+    assert objects==expected, 'fixture object count drift'
+    if mode=='hot':
+        metadata=json.loads((fixtures/'hot.json').read_text())
+        assert metadata['max_depth']==50 and metadata['largest_family']>=50000
+        assert metadata['sha256']==digest and metadata['objects']==objects
     print(json.dumps(dict(fixture=mode,objects=objects,bytes=path.stat().st_size,sha256=digest)),flush=True)
     for threads in args.threads:
         for trial in range(1,args.trials+1):
@@ -94,6 +101,7 @@ for mode in args.only or ['whole','mixed-ofs','hot','iroh','heddle']:
                 result=subprocess.run([str(binary),str(path),str(threads)],capture_output=True,text=True,check=True)
                 match=re.search(r'seconds=([\d.]+) objects=(\d+) idx_sha256=(\w+) tail=([\d.]+)',result.stdout)
                 assert match,result.stdout
+                assert int(match[2])==objects, 'indexer object count drift'
                 row=dict(fixture=mode,threads=threads,version=name,stealing_disabled=bool(args.steal_disabled and name=='head'),ref=refs[name],trial=trial,seconds=float(match[1]),objects=int(match[2]),idx_sha256=match[3],tail=float(match[4]))
                 rows.append(row); (scratch/'timings.json').write_text(json.dumps(rows,indent=2)); print(json.dumps(row),flush=True)
         group=[r for r in rows if r['fixture']==mode and r['threads']==threads]
