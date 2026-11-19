@@ -23,15 +23,15 @@ pub struct ResolveLimits {
     pub max_objects: usize,
     /// Maximum body or inflated delta stream size; defaults to 512 MiB.
     pub max_object_bytes: u64,
-    /// Bounds logical results, inflated streams and decoded work (including
-    /// replay), each independently across all workers; defaults to 16 GiB.
+    /// Bounds first-pass logical results and inflated streams independently
+    /// across all workers; defaults to 16 GiB. Replay does not affect acceptance.
     /// Compressed work is additionally capped at input length plus this limit.
     pub max_total_decoded: u64,
-    /// Shared retained ancestor-body budget; defaults to 64 MiB. Zero forces replay.
+    /// Shared retained ancestor-body budget; defaults to 64 MiB. Zero disables the shared cache.
     pub max_live_base_bytes: usize,
     /// Shared transient workspace ceiling; defaults to 1 GiB. Workers wait for space.
     pub max_in_flight_bytes: usize,
-    /// Discovery inflations plus every resolve/replay inflate or apply; defaults to 100M.
+    /// Discovery inflations plus first-time resolve inflates and applies; defaults to 100M.
     pub max_resolve_ops: u64,
 }
 impl Default for ResolveLimits {
@@ -187,16 +187,19 @@ pub(crate) fn infallible_error(error: ResolveError<std::convert::Infallible>) ->
 ///
 /// A thin pack is an error. On any error the supplied cancel source is set.
 /// `threads == 0` selects one worker. Index bytes are independent of worker count.
-/// With duplicate OIDs, REF children attach to the first duplicate published;
-/// visitor depth/base offsets and depth-limit acceptance can therefore race.
+/// Depth-limit acceptance uses the shallowest duplicate OID; pack offset breaks
+/// ties. Visitor depth/base offsets describe the actual resolution path. Depth
+/// refusals wait for shallower duplicates before any over-limit delta is applied.
 /// Delta stream sizes are bounded as well as result sizes; the decoded budget
 /// separately bounds discovery, inflated streams and whole/delta result work,
-/// including replay. Exhausting a replay budget refuses the pack.
+/// excluding replay: acceptance is independent of scheduling and cache admission.
+/// A worker keeps each next DFS base inside its reserved workspace; chains never
+/// replay. Stolen branches may replay at most `max_delta_depth` ancestors.
 ///
 /// SHA-1 IDs use ordinary SHA-1, without collision detection. Admission callers
 /// must run sha1dc over `type + " " + decimal_length + NUL + body` in `visit`,
 /// compare its digest to `oid`, and reject collisions or mismatches there (the
-/// FAST-IMPORT design assigns this check to heddle's admission hasher).
+/// admission contract assigns this check to the caller).
 ///
 /// An error returns no index. Visitor calls already made cannot be rolled back:
 /// keep callback effects provisional until this function returns `Ok`. Stage
@@ -590,15 +593,16 @@ fn discover_trusted(
     Ok(entries)
 }
 
-type Output = (ObjectId, ObjectType, u32);
+type Output = (ObjectId, ObjectType, u32, u16);
 struct State<E> {
     children: Vec<Vec<u32>>,
-    refs: Vec<(ObjectId, Vec<u32>)>,
+    refs: Vec<(ObjectId, Vec<u32>, Option<u32>)>,
     output: Vec<Option<Output>>,
     error: Option<ResolveError<E>>,
     inflated_work: u64,
     decoded_work: u64,
     compressed_work: u64,
+    deferred: Vec<u32>,
 }
 impl<E> State<E> {
     fn ref_slot(&self, oid: &ObjectId) -> Option<usize> {
@@ -621,6 +625,7 @@ struct Engine<'a, 'c, V, E> {
     state: Mutex<State<E>>,
     metrics: &'a ResolveMetrics,
     workspace: usize,
+    metadata_base: usize,
     flight_wait: Mutex<()>,
     flight_wake: Condvar,
 }
@@ -695,17 +700,18 @@ impl AsRef<[u8]> for Base<'_> {
         }
     }
 }
-struct UnwindStop<'a>(&'a AtomicCancel);
-impl Drop for UnwindStop<'_> {
+struct UnwindStop<F: Fn()>(F);
+impl<F: Fn()> Drop for UnwindStop<F> {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            self.0.cancel();
+            (self.0)();
         }
     }
 }
 #[derive(Clone, Copy)]
 enum Root<'a> {
     Entry(usize),
+    Retry(u32, &'a [(ObjectId, EncodedObject)]),
     External(ObjectId, &'a EncodedObject),
 }
 enum Work {
@@ -738,8 +744,7 @@ where
         }
         self.stop.cancel();
     }
-    // Replays must spend the same shared work budgets as first-time decoding;
-    // otherwise a large discarded base with many tiny children amplifies CPU.
+    // Acceptance charges each entry once, independent of retention or scheduling.
     fn work(&self, size: u64, kind: Work) -> Result<()> {
         if self.limits.is_unlimited() {
             return Ok(());
@@ -815,55 +820,83 @@ where
                 .0;
         }
     }
-    fn inflate(&self, index: usize) -> Result<Vec<u8>> {
+    fn inflate(&self, index: usize, replay: bool) -> Result<Vec<u8>> {
         self.check()?;
         #[cfg(feature = "fetch-profile")]
-        let _span = sley_core::fetch_profile::Span::enter(sley_core::fetch_profile::Stage::Inflate);
-        self.operation()?;
+        let _span = (!replay).then(|| {
+            sley_core::fetch_profile::Span::enter(sley_core::fetch_profile::Stage::Inflate)
+        });
+        if !replay {
+            self.operation()?;
+        }
         let d = &self.entries[index];
         let size = size_check(d.header.size, self.limits)?;
-        self.work((d.end - d.data) as u64, Work::Compressed)?;
-        self.work(d.header.size, Work::Inflated)?;
-        if d.base.is_none() {
-            self.work(d.header.size, Work::Decoded)?;
+        if !replay {
+            self.work((d.end - d.data) as u64, Work::Compressed)?;
+            self.work(d.header.size, Work::Inflated)?;
+            if d.base.is_none() {
+                self.work(d.header.size, Work::Decoded)?;
+            }
         }
         parallel_index::inflate_exact(&self.pack[d.data..d.end], size, self.stop_flag())
             .map(|pair| pair.0)
     }
-    fn apply(&self, index: usize, base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
+    fn apply(&self, index: usize, base: &[u8], delta: &[u8], replay: bool) -> Result<Vec<u8>> {
         self.check()?;
         #[cfg(feature = "fetch-profile")]
-        let _span =
-            sley_core::fetch_profile::Span::enter(sley_core::fetch_profile::Stage::DeltaResolution);
-        self.operation()?;
+        let _span = (!replay).then(|| {
+            sley_core::fetch_profile::Span::enter(sley_core::fetch_profile::Stage::DeltaResolution)
+        });
+        if !replay {
+            self.operation()?;
+        }
         let plan = plan_pack_delta(base, delta)?;
         let size = size_check(plan.result_size, self.limits)?;
-        self.work(plan.result_size, Work::Decoded)?;
+        if !replay {
+            self.work(plan.result_size, Work::Decoded)?;
+        }
         let mut body = reserve(size)?;
         apply_pack_delta_exact(base, delta, plan, &mut body, self.stop_flag())?;
         if body.len() as u64 != self.entries[index].result_size {
             return Err(invalid("delta result changed"));
         }
+        #[cfg(feature = "fetch-profile")]
+        if !replay {
+            sley_core::fetch_profile::add_count(
+                sley_core::fetch_profile::Stage::DeltaResolution,
+                1,
+            );
+        }
         Ok(body)
     }
-    fn retain<'a>(&'a self, body: Vec<u8>) -> Option<Arc<Retained<'a>>> {
+    fn retain<'a>(&'a self, node: &mut Node<'a>, body: Vec<u8>) -> Result<Base<'a>> {
         let size = body.len();
-        self.metrics
-            .live
-            .try_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |used| {
-                used.checked_add(size)
-                    .filter(|sum| *sum <= self.limits.max_live_base_bytes)
-            })
-            .ok()
-            .map(|used| {
-                self.metrics
-                    .peak_live
-                    .fetch_max(used + size, AtomicOrdering::AcqRel);
-                Arc::new(Retained {
-                    body,
-                    live: &self.metrics.live,
-                })
-            })
+        if node.pending.load(AtomicOrdering::Relaxed) != 0
+            && let Ok(used) = self.metrics.live.try_update(
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+                |used| {
+                    used.checked_add(size)
+                        .filter(|sum| *sum <= self.limits.max_live_base_bytes)
+                },
+            )
+        {
+            self.metrics
+                .peak_live
+                .fetch_max(used + size, AtomicOrdering::AcqRel);
+            let retained = Arc::new(Retained {
+                body,
+                live: &self.metrics.live,
+            });
+            *node
+                .body
+                .get_mut()
+                .map_err(|_| invalid("pack body poisoned"))? = Some(Arc::clone(&retained));
+            Ok(Base::Retained(retained))
+        } else {
+            // The next DFS base belongs to this worker's existing workspace.
+            Ok(Base::Owned(body))
+        }
     }
     fn replay<'a>(&'a self, node: &Arc<Node<'a>>) -> Result<Base<'a>> {
         let mut chain = Vec::new();
@@ -883,7 +916,7 @@ where
                 current = parent;
             } else {
                 break match current.index {
-                    Some(index) => Base::Owned(self.inflate(index as usize)?),
+                    Some(index) => Base::Owned(self.inflate(index as usize, true)?),
                     None => Base::External(
                         current
                             .external
@@ -894,8 +927,8 @@ where
         };
         for node in chain.into_iter().rev() {
             let index = node.index.ok_or_else(|| invalid("missing replay entry"))? as usize;
-            let delta = self.inflate(index)?;
-            body = Base::Owned(self.apply(index, body.as_ref(), &delta)?);
+            let delta = self.inflate(index, true)?;
+            body = Base::Owned(self.apply(index, body.as_ref(), &delta, true)?);
         }
         Ok(body)
     }
@@ -934,7 +967,16 @@ where
             oid,
             object_type,
             crc32fast::hash(&self.pack[d.offset..d.end]),
+            depth,
         ));
+        if let Some(slot) = state.ref_slot(&oid) {
+            let old = state.refs[slot].2;
+            if old.is_none_or(|old| {
+                state.output[old as usize].is_some_and(|o| (depth, index) < (o.3, old as usize))
+            }) {
+                state.refs[slot].2 = Some(index as u32);
+            }
+        }
         drop(state);
         completed.fetch_add(1, AtomicOrdering::Release);
         let pending = AtomicU32::new(children.len() as u32);
@@ -951,38 +993,109 @@ where
             external: None,
         })
     }
+    // A depth refusal waits for all possible shallower duplicates. Only indices
+    // are deferred; their bodies and ancestor nodes stay inside the worker gates.
+    fn retry<'a>(
+        &'a self,
+        index: u32,
+        external: &'a [(ObjectId, EncodedObject)],
+    ) -> Result<Arc<Node<'a>>> {
+        let state = self.state()?;
+        let mut chain = Vec::new();
+        let mut current = index;
+        let mut parent = None;
+        while let Some(base) = self.entries[current as usize].base {
+            current = match base {
+                DeltaBase::Offset(offset) => {
+                    self.entries
+                        .binary_search_by_key(&offset, |d| d.offset as u64)
+                        .map_err(|_| invalid("missing resolved base"))? as u32
+                }
+                DeltaBase::Ref(oid) => {
+                    if let Ok(i) = external.binary_search_by_key(&oid, |e| e.0) {
+                        let body = &external[i].1;
+                        parent = Some(Arc::new(Node {
+                            index: None,
+                            oid,
+                            object_type: body.object_type,
+                            offset: 0,
+                            depth: 0,
+                            parent: None,
+                            pending: AtomicU32::new(0),
+                            body: Mutex::new(None),
+                            children: Mutex::new(Vec::new().into_iter()),
+                            external: Some(&body.body),
+                        }));
+                        break;
+                    }
+                    state
+                        .ref_slot(&oid)
+                        .and_then(|i| state.refs[i].2)
+                        .ok_or_else(|| invalid("missing settled REF base"))?
+                }
+            };
+            chain.push(current);
+        }
+        for i in chain.into_iter().rev() {
+            let (oid, object_type, _, depth) =
+                state.output[i as usize].ok_or_else(|| invalid("unresolved REF candidate"))?;
+            parent = Some(Arc::new(Node {
+                index: Some(i),
+                oid,
+                object_type,
+                offset: self.entries[i as usize].offset as u64,
+                depth,
+                parent,
+                pending: AtomicU32::new(0),
+                children: Mutex::new(Vec::new().into_iter()),
+                body: Mutex::new(None),
+                external: None,
+            }));
+        }
+        let mut parent = parent.ok_or_else(|| invalid("missing deferred base"))?;
+        let node = Arc::get_mut(&mut parent).ok_or_else(|| invalid("shared deferred base"))?;
+        *node
+            .children
+            .get_mut()
+            .map_err(|_| invalid("pack children poisoned"))? = vec![index].into_iter();
+        node.pending = AtomicU32::new(1);
+        Ok(parent)
+    }
     fn root<'a>(
         &'a self,
         root: Root<'a>,
         completed: &AtomicUsize,
-    ) -> std::result::Result<Node<'a>, ResolveError<E>> {
+    ) -> std::result::Result<(Arc<Node<'a>>, Base<'a>), ResolveError<E>> {
         match root {
             Root::Entry(index) => {
-                let body = self.inflate(index)?;
+                let body = self.inflate(index, false)?;
                 let ty = parallel_index::object_type_for_kind(self.entries[index].header.kind)?;
                 let mut node = self.publish(index, &body, ty, None, None, completed)?;
-                if node.pending.load(AtomicOrdering::Relaxed) != 0 {
-                    *node
-                        .body
-                        .get_mut()
-                        .map_err(|_| invalid("pack body poisoned"))? = self.retain(body);
-                }
-                Ok(node)
+                let body = self.retain(&mut node, body)?;
+                Ok((Arc::new(node), body))
+            }
+            Root::Retry(index, external) => {
+                let node = self.retry(index, external)?;
+                let body = self.replay(&node)?;
+                Ok((node, body))
             }
             Root::External(oid, object) => {
                 let children = self.state()?.take_refs(&oid);
-                Ok(Node {
-                    index: None,
-                    oid,
-                    object_type: object.object_type,
-                    offset: 0,
-                    depth: 0,
-                    parent: None,
-                    pending: AtomicU32::new(children.len() as u32),
-                    body: Mutex::new(None),
-                    children: Mutex::new(children.into_iter()),
-                    external: Some(&object.body),
-                })
+                Ok((
+                    Arc::new(Node {
+                        index: None,
+                        oid,
+                        object_type: object.object_type,
+                        offset: 0,
+                        depth: 0,
+                        parent: None,
+                        pending: AtomicU32::new(children.len() as u32),
+                        body: Mutex::new(None),
+                        children: Mutex::new(children.into_iter()),
+                        external: Some(&object.body),
+                    }),
+                    Base::External(&object.body),
+                ))
             }
         }
     }
@@ -990,19 +1103,24 @@ where
         &'a self,
         parent: Arc<Node<'a>>,
         index: usize,
+        base: Base<'a>,
         completed: &AtomicUsize,
-    ) -> std::result::Result<Node<'a>, ResolveError<E>> {
-        parallel_index::check_delta_depth(
+    ) -> std::result::Result<Option<(Arc<Node<'a>>, Base<'a>)>, ResolveError<E>> {
+        if parallel_index::check_delta_depth(
             self.entries[index].offset,
             parent.depth as usize + 1,
             PackReadLimits {
                 max_delta_depth: self.limits.max_delta_depth.min(u16::MAX as usize),
                 ..PackReadLimits::default()
             },
-        )?;
-        let base = self.replay(&parent)?;
-        let delta = self.inflate(index)?;
-        let body = self.apply(index, base.as_ref(), &delta)?;
+        )
+        .is_err()
+        {
+            self.state()?.deferred.push(index as u32);
+            return Ok(None);
+        }
+        let delta = self.inflate(index, false)?;
+        let body = self.apply(index, base.as_ref(), &delta, false)?;
         drop(base);
         // Last direct apply releases the parent's body before the child visitor.
         parent.release()?;
@@ -1013,17 +1131,93 @@ where
         };
         let ty = parent.object_type;
         let mut node = self.publish(index, &body, ty, Some(parent), Some(info), completed)?;
-        if node.pending.load(AtomicOrdering::Relaxed) != 0 {
-            *node
-                .body
-                .get_mut()
-                .map_err(|_| invalid("pack body poisoned"))? = self.retain(body);
+        let body = self.retain(&mut node, body)?;
+        Ok(Some((Arc::new(node), body)))
+    }
+    fn settle<'a, P: FnMut(PackIndexProgress)>(
+        &'a self,
+        external: &'a [(ObjectId, EncodedObject)],
+        threads: usize,
+        progress: &mut P,
+        count: &mut u64,
+    ) -> Result<()> {
+        loop {
+            let mut state = self.state()?;
+            if state.error.is_some() || state.deferred.is_empty() {
+                break;
+            }
+            // Shortest dependency depths decrease monotonically. REF edges use
+            // the shallowest duplicate; OFS edges keep their physical parent.
+            let parent_depth = |state: &State<E>, index: usize| -> Option<usize> {
+                let base = match self.entries[index].base? {
+                    DeltaBase::Offset(offset) => self
+                        .entries
+                        .binary_search_by_key(&offset, |d| d.offset as u64)
+                        .ok()?,
+                    DeltaBase::Ref(oid) => {
+                        if external.binary_search_by_key(&oid, |e| e.0).is_ok() {
+                            return Some(0);
+                        }
+                        state.refs[state.ref_slot(&oid)?].2? as usize
+                    }
+                };
+                state.output[base].map(|o| o.3 as usize)
+            };
+            loop {
+                let mut changed = false;
+                for i in 0..self.entries.len() {
+                    let Some((oid, _, _, old)) = state.output[i] else {
+                        continue;
+                    };
+                    let depth = parent_depth(&state, i).map_or(0, |d| d + 1) as u16;
+                    if depth < old {
+                        state.output[i].as_mut().map(|o| o.3 = depth);
+                        if let Some(slot) = state.ref_slot(&oid) {
+                            let best = state.refs[slot].2;
+                            if best.is_none_or(|b| {
+                                state.output[b as usize]
+                                    .is_some_and(|o| (depth, i) < (o.3, b as usize))
+                            }) {
+                                state.refs[slot].2 = Some(i as u32);
+                            }
+                        }
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            let mut roots = std::mem::take(&mut state.deferred);
+            let limit = self.limits.max_delta_depth.min(u16::MAX as usize);
+            let first = roots[0];
+            let mut rejected = reserve(self.entries.len())?;
+            for i in &roots {
+                if parent_depth(&state, *i as usize).is_none_or(|d| d >= limit) {
+                    rejected.push(*i);
+                }
+            }
+            roots.retain(|i| parent_depth(&state, *i as usize).is_some_and(|d| d < limit));
+            state.deferred = rejected;
+            if roots.is_empty() {
+                return parallel_index::check_delta_depth(
+                    self.entries[first as usize].offset,
+                    limit + 1,
+                    PackReadLimits {
+                        max_delta_depth: limit,
+                        ..PackReadLimits::default()
+                    },
+                );
+            }
+            drop(state);
+            self.run(&roots, true, external, threads, progress, count);
         }
-        Ok(node)
+        Ok(())
     }
     fn run<'a, P: FnMut(PackIndexProgress)>(
         &'a self,
         roots: &[u32],
+        settled: bool,
         external: &'a [(ObjectId, EncodedObject)],
         threads: usize,
         progress: &mut P,
@@ -1038,7 +1232,7 @@ where
             .checked_div(self.workspace)
             .unwrap_or(usize::MAX)
             .max(1);
-        let root_count = roots.len() + external.len();
+        let root_count = roots.len() + if settled { 0 } else { external.len() };
         if root_count == 0 {
             return;
         }
@@ -1049,7 +1243,7 @@ where
         // claim and its publication. Enqueue increments before exposing a node.
         let outstanding = AtomicUsize::new(root_count);
         self.metrics.metadata.fetch_max(
-            self.metrics.metadata.load(AtomicOrdering::Relaxed)
+            self.metadata_base
                 + workers
                     * (self.limits.max_delta_depth.min(u16::MAX as usize) + 1)
                     * (std::mem::size_of::<Node<'_>>()
@@ -1061,6 +1255,7 @@ where
         let completed = AtomicUsize::new(0);
         let initial = *count;
         std::thread::scope(|scope| {
+            let _coordinator = UnwindStop(|| self.fail(ResolveError::Panic));
             let mut handles = Vec::new();
             for worker in 0..workers {
                 let completed = &completed;
@@ -1072,7 +1267,7 @@ where
                     sley_core::diagnostics::inherit(move || {
                         // First local, last drop: includes buffers and all worker Arc clones.
                         let _flight;
-                        let _unwind = UnwindStop(&self.stop);
+                        let _unwind = UnwindStop(|| self.fail(ResolveError::Panic));
                         _flight = if self.limits.is_unlimited() {
                             None
                         } else {
@@ -1095,19 +1290,13 @@ where
                                     queue.pop_back()
                                 })
                             };
-                            let push = |node: Node<'a>| -> Result<()> {
-                                if node.pending.load(AtomicOrdering::Relaxed) != 0 {
-                                    outstanding.fetch_add(1, AtomicOrdering::AcqRel);
-                                    queues[worker]
-                                        .lock()
-                                        .map_err(|_| invalid("pack queue poisoned"))?
-                                        .push_back(Arc::new(node));
-                                }
-                                Ok(())
-                            };
+                            let mut local = None;
                             while !self.stop.is_cancelled() {
                                 self.check()?;
-                                let mut item = pop(worker, false)?;
+                                let mut item = local.take();
+                                if item.is_none() {
+                                    item = pop(worker, false)?.map(|node| (node, None));
+                                }
                                 if item.is_none() {
                                     if let Ok(i) = cursor.try_update(
                                         AtomicOrdering::Relaxed,
@@ -1115,23 +1304,32 @@ where
                                         |i| if i < root_count { Some(i + 1) } else { None },
                                     ) {
                                         let root = if i < roots.len() {
-                                            Root::Entry(roots[i] as usize)
+                                            if settled {
+                                                Root::Retry(roots[i], external)
+                                            } else {
+                                                Root::Entry(roots[i] as usize)
+                                            }
                                         } else {
                                             let (oid, object) = &external[i - roots.len()];
                                             Root::External(*oid, object)
                                         };
-                                        push(self.root(root, completed)?)?;
-                                        outstanding.fetch_sub(1, AtomicOrdering::AcqRel);
+                                        let (node, body) = self.root(root, completed)?;
+                                        if node.pending.load(AtomicOrdering::Relaxed) != 0 {
+                                            local = Some((node, Some(body)));
+                                        } else {
+                                            outstanding.fetch_sub(1, AtomicOrdering::AcqRel);
+                                        }
                                         continue;
                                     }
                                     for other in 1..workers {
-                                        item = pop((worker + other) % workers, true)?;
+                                        item = pop((worker + other) % workers, true)?
+                                            .map(|node| (node, None));
                                         if item.is_some() {
                                             break;
                                         }
                                     }
                                 }
-                                if let Some(node) = item {
+                                if let Some((node, body)) = item {
                                     let (index, more) = {
                                         let mut children = node
                                             .children
@@ -1151,8 +1349,18 @@ where
                                             .map_err(|_| invalid("pack queue poisoned"))?
                                             .push_back(Arc::clone(&node));
                                     }
-                                    push(self.child(node, index as usize, completed)?)?;
-                                    outstanding.fetch_sub(1, AtomicOrdering::AcqRel);
+                                    let base = match body {
+                                        Some(body) => body,
+                                        None => self.replay(&node)?,
+                                    };
+                                    if let Some((child, body)) =
+                                        self.child(node, index as usize, base, completed)?
+                                        && child.pending.load(AtomicOrdering::Relaxed) != 0
+                                    {
+                                        local = Some((child, Some(body)));
+                                    } else {
+                                        outstanding.fetch_sub(1, AtomicOrdering::AcqRel);
+                                    }
                                 } else if outstanding.load(AtomicOrdering::Acquire) == 0 {
                                     break;
                                 } else {
@@ -1202,7 +1410,7 @@ where
             }
             for handle in handles {
                 if handle.join().is_err() {
-                    self.fail(invalid("parallel pack worker panicked").into());
+                    self.fail(ResolveError::Panic);
                 }
             }
         });
@@ -1274,14 +1482,14 @@ where
     // Sorted, stable slots avoid opaque tree-node overhead and quadratic removal.
     refs.sort_unstable_by_key(|entry| entry.0);
     let ref_input = allocation(&refs);
-    let mut grouped: Vec<(ObjectId, Vec<u32>)> = reserve(refs.len())?;
+    let mut grouped: Vec<(ObjectId, Vec<u32>, Option<u32>)> = reserve(refs.len())?;
     for (oid, index) in refs {
-        if let Some((last, indices)) = grouped.last_mut()
+        if let Some((last, indices, _)) = grouped.last_mut()
             && *last == oid
         {
             indices.push(index);
         } else {
-            grouped.push((oid, vec![index]));
+            grouped.push((oid, vec![index], None));
         }
     }
     let refs = grouped;
@@ -1298,7 +1506,8 @@ where
     let mut output = reserve(entries.len())?;
     output.resize_with(entries.len(), || None);
     let buffers = allocation(&entries) + allocation(&output);
-    let metadata = discovery_metadata + allocation(&output);
+    let metadata =
+        discovery_metadata + allocation(&output) + 2 * entries.len() * std::mem::size_of::<u32>();
     metrics.metadata.fetch_max(
         metadata.max(
             buffers
@@ -1324,9 +1533,11 @@ where
             inflated_work: 0,
             decoded_work: 0,
             compressed_work: 0,
+            deferred: reserve(entries.len())?,
         }),
         metrics,
         workspace,
+        metadata_base: metadata,
         flight_wait: Mutex::new(()),
         flight_wake: Condvar::new(),
     };
@@ -1334,7 +1545,7 @@ where
     if entries.is_empty() {
         progress(PackIndexProgress::default());
     }
-    engine.run(&roots, &[], threads, progress, &mut count);
+    engine.run(&roots, false, &[], threads, progress, &mut count);
     // The pending REF map only shrinks. Snapshot once: repeatedly searching
     // past missing bases would make a thin pack with distinct bases quadratic.
     let pending: Vec<_> = engine
@@ -1371,7 +1582,8 @@ where
             externals.push((oid, object));
         }
     }
-    engine.run(&[], &externals, threads, progress, &mut count);
+    engine.run(&[], false, &externals, threads, progress, &mut count);
+    engine.settle(&externals, threads, progress, &mut count)?;
     {
         let mut state = engine.state()?;
         if let Some(error) = state.error.take() {
@@ -1391,7 +1603,7 @@ where
     let mut objects = reserve(entries.len())?;
     for (d, entry) in entries.iter().zip(output) {
         cancel.check()?;
-        let (oid, object_type, crc32) = entry.ok_or_else(|| invalid("unresolved pack entry"))?;
+        let (oid, object_type, crc32, _) = entry.ok_or_else(|| invalid("unresolved pack entry"))?;
         indexed.push(PackIndexEntry {
             oid,
             offset: d.offset as u64,
