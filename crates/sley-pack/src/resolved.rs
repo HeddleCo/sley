@@ -138,6 +138,8 @@ pub struct ResolvedObject<'a> {
 pub enum ResolveError<E> {
     Pack(GitError),
     Visitor(E),
+    /// A worker or coordinator panicked; distinct from cooperative cancellation.
+    Panic,
     /// Map to IMPORT_BUDGET_EXCEEDED{resolve_ops}; the attempted op did not run.
     ResolveOps {
         limit: u64,
@@ -149,6 +151,7 @@ impl<E: fmt::Display> fmt::Display for ResolveError<E> {
         match self {
             Self::Pack(e) => e.fmt(f),
             Self::Visitor(e) => write!(f, "pack visitor: {e}"),
+            Self::Panic => write!(f, "pack resolver callback panicked"),
             Self::ResolveOps { limit, attempted } => write!(
                 f,
                 "resolve_ops budget {limit} exceeded at operation {attempted}"
@@ -161,7 +164,7 @@ impl<E: std::error::Error + 'static> std::error::Error for ResolveError<E> {
         Some(match self {
             Self::Pack(e) => e,
             Self::Visitor(e) => e,
-            Self::ResolveOps { .. } => return None,
+            Self::ResolveOps { .. } | Self::Panic => return None,
         })
     }
 }
@@ -174,6 +177,7 @@ pub(crate) fn infallible_error(error: ResolveError<std::convert::Infallible>) ->
     match error {
         ResolveError::Pack(error) => error,
         ResolveError::Visitor(never) => match never {},
+        ResolveError::Panic => invalid("pack resolver callback panicked"),
         ResolveError::ResolveOps { limit, attempted } => {
             budget(ResourceLimitKind::ResolveOps, limit, attempted)
         }

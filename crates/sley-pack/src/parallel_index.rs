@@ -116,6 +116,7 @@ where
     )
     .map_err(|error| match error {
         ResolveError::Pack(error) | ResolveError::Visitor(error) => error,
+        ResolveError::Panic => GitError::InvalidFormat("pack resolver callback panicked".into()),
         ResolveError::ResolveOps { limit, attempted } => GitError::ResourceLimit {
             kind: ResourceLimitKind::ResolveOps,
             limit,

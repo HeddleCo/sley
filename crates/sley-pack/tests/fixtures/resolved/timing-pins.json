@@ -9,12 +9,6 @@
     "ref_manifest": "timing-iroh-refs.txt",
     "git_version": "2.55.0"
   },
-  "heddle": {
-    "repository": "HeddleCo/heddle-v7",
-    "pin": "c5ecbd0fbe2fefbd38237dc1b74af18249b188b7",
-    "objects": 50157,
-    "bytes": 61953307
-  },
   "hot": {
     "fixture": "hot",
     "pin": "dc36678cbef6b0df61a9719f9adeda86814de0a7",

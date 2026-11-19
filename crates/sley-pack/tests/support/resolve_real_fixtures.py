@@ -1,6 +1,6 @@
 """Opt-in network fixture builder. All revisions must be supplied as pinned OIDs.
 
-resolve_real_fixtures.py DIR --network --iroh-pin SHA --heddle-pin SHA
+resolve_real_fixtures.py DIR --network --iroh-pin SHA
 Uses Git 2.55.0, a single pack thread and captured logs. No existing checkout is
 read or changed. The timing driver consumes the resulting packs and manifests.
 """
@@ -8,10 +8,10 @@ import argparse,hashlib,json,re,struct,subprocess
 from pathlib import Path
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('directory',type=Path); p.add_argument('--network',action='store_true',required=True)
-p.add_argument('--iroh-refs',type=Path,help='optional pinned full-clone ref manifest'); p.add_argument('--iroh-pin',required=True); p.add_argument('--heddle-pin',required=True)
+p.add_argument('--iroh-refs',type=Path,help='optional pinned full-clone ref manifest'); p.add_argument('--iroh-pin',required=True)
 a=p.parse_args(); a.directory.mkdir(parents=True,exist_ok=True)
 assert subprocess.check_output(['git','--version'],text=True).strip()=='git version 2.55.0'
-for name,repo,pin in [('iroh','n0-computer/iroh',a.iroh_pin),('heddle','HeddleCo/heddle-v7',a.heddle_pin)]:
+for name,repo,pin in [('iroh','n0-computer/iroh',a.iroh_pin)]:
     pins=[line.split()[0] for line in a.iroh_refs.read_text().splitlines()] if name=='iroh' and a.iroh_refs else [pin]
     assert pin in pins
     assert all(re.fullmatch('[0-9a-f]{40}',oid) for oid in pins), 'full pinned OIDs are required'

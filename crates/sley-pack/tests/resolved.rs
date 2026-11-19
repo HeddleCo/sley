@@ -68,13 +68,17 @@ fn delta(size: usize, marker: u8) -> Vec<u8> {
         return d;
     }
     // Copy all but the final byte, then insert the replacement byte.
-    let n = size - 1;
-    d.push(0xf0);
-    d.extend([
-        (n & 255) as u8,
-        ((n >> 8) & 255) as u8,
-        ((n >> 16) & 255) as u8,
-    ]);
+    let mut remaining = size - 1;
+    while remaining != 0 {
+        let n = remaining.min(0xff_ffff);
+        d.push(0xf0);
+        d.extend([
+            (n & 255) as u8,
+            ((n >> 8) & 255) as u8,
+            ((n >> 16) & 255) as u8,
+        ]);
+        remaining -= n;
+    }
     d.extend([1, marker]);
     d
 }
@@ -2282,7 +2286,7 @@ fn panicking_visitor_stops_idle_workers_before_watchdog() {
     let _ = done.send(());
     watchdog.join().expect("watchdog joined");
     eprintln!("panicking visitor returned after {elapsed:?} (watchdog=30s)");
-    assert!(result.is_err());
+    assert!(matches!(result, Err(ResolveError::Panic)), "{result:?}");
     assert!(
         panicked.load(Ordering::Relaxed),
         "visitor panic must execute"
@@ -2341,4 +2345,203 @@ fn custom_deep_limit_releases_parent_chain_without_recursive_drop() {
     assert_eq!(metrics.in_flight_bytes(), 0);
     assert_eq!(metrics.live_base_bytes(), 0);
     println!("custom-depth cleanup: objects=60001, flight=0, live=0");
+}
+
+#[test]
+fn chain_acceptance_is_independent_of_retention_and_scheduling() {
+    let p = chains(16, 50, 4096, false);
+    let limits = ResolveLimits {
+        max_live_base_bytes: 3 * 4096,
+        max_total_decoded: 2 * 16 * 51 * 4096,
+        max_resolve_ops: 16 * (2 + 3 * 50),
+        ..ResolveLimits::default()
+    };
+    let expected = resolve_pack(
+        &p,
+        ObjectFormat::Sha1,
+        1,
+        ResolveLimits::unlimited(),
+        CancelFlag::never(),
+        &|_| Ok::<_, ()>(()),
+    )
+    .expect("reference index")
+    .index;
+    for threads in [1, 4, 8, 16] {
+        for run in 0..20 {
+            let metrics = ResolveMetrics::default();
+            let built = resolve_pack_with_metrics(
+                &p,
+                ObjectFormat::Sha1,
+                threads,
+                limits,
+                CancelFlag::never(),
+                &|_| Ok::<_, ()>(()),
+                &metrics,
+            )
+            .unwrap_or_else(|e| panic!("threads={threads}, run={run}: {e:?}"));
+            assert_eq!(built.index, expected);
+            assert_eq!(metrics.resolve_ops(), limits.max_resolve_ops);
+            assert!(metrics.peak_live_base_bytes() <= limits.max_live_base_bytes);
+            assert!(metrics.peak_in_flight_bytes() <= limits.max_in_flight_bytes);
+            assert_eq!(
+                (metrics.live_base_bytes(), metrics.in_flight_bytes()),
+                (0, 0)
+            );
+        }
+        println!(
+            "chain acceptance: threads={threads}, 20/20 accepted, identical idx, gates released"
+        );
+    }
+}
+
+#[test]
+fn default_limits_accept_a_chain_with_bodies_over_the_live_gate() {
+    let size = ResolveLimits::default().max_live_base_bytes + 1;
+    let p = chains(1, 50, size, false);
+    let metrics = ResolveMetrics::default();
+    let seen = AtomicUsize::new(0);
+    let built = resolve_pack_with_metrics(
+        &p,
+        ObjectFormat::Sha1,
+        16,
+        ResolveLimits::default(),
+        CancelFlag::never(),
+        &|o| {
+            assert_eq!(o.body.len(), size);
+            seen.fetch_add(1, Ordering::Relaxed);
+            Ok::<_, ()>(())
+        },
+        &metrics,
+    )
+    .expect("a chain larger than the live cache fits the flight workspace");
+    assert_eq!(built.objects.len(), 51);
+    assert_eq!(seen.load(Ordering::Relaxed), 51);
+    assert_eq!(metrics.resolve_ops(), 152);
+    assert_eq!(
+        (
+            metrics.peak_live_base_bytes(),
+            metrics.live_base_bytes(),
+            metrics.in_flight_bytes()
+        ),
+        (0, 0, 0)
+    );
+    println!("default chain: 51 bodies of {size} bytes, 152 ops, no retained bases");
+}
+
+#[test]
+fn shallowest_duplicate_wins_even_when_the_deep_copy_publishes_first() {
+    for indirect in [false, true] {
+        let mut p = chains(1, 50, 1, false);
+        p.truncate(p.len() - 20);
+        let oid = EncodedObject::new(ObjectType::Blob, vec![50])
+            .object_id(ObjectFormat::Sha1)
+            .expect("base oid");
+        let d = delta(1, 99);
+        header(7, d.len() as u64, &mut p);
+        p.extend_from_slice(oid.as_bytes());
+        compressed(&d, &mut p);
+        if indirect {
+            let root = EncodedObject::new(ObjectType::Blob, vec![0])
+                .object_id(ObjectFormat::Sha1)
+                .expect("root oid");
+            let d = delta(1, 50);
+            header(7, d.len() as u64, &mut p);
+            p.extend_from_slice(root.as_bytes());
+            compressed(&d, &mut p);
+        } else {
+            header(3, 1, &mut p);
+            compressed(&[50], &mut p);
+        }
+        let p = finish(p, 53);
+        let expected = resolve_pack(
+            &p,
+            ObjectFormat::Sha1,
+            1,
+            ResolveLimits {
+                max_delta_depth: 100,
+                ..ResolveLimits::unlimited()
+            },
+            CancelFlag::never(),
+            &|_| Ok::<_, ()>(()),
+        )
+        .expect("reference")
+        .index;
+        for threads in [1, 4, 8, 16] {
+            for _ in 0..10 {
+                let built = resolve_pack(
+                    &p,
+                    ObjectFormat::Sha1,
+                    threads,
+                    ResolveLimits::default(),
+                    CancelFlag::never(),
+                    &|o| {
+                        if o.body == [99] {
+                            assert_eq!(o.depth, if indirect { 2 } else { 1 });
+                        }
+                        if o.body == [50] && o.depth == 0 {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Ok::<_, ()>(())
+                    },
+                )
+                .expect("the shallowest duplicate must supply the REF base");
+                assert_eq!(built.index, expected);
+            }
+        }
+    }
+    println!("duplicate OIDs: whole and REF-produced shallow bases, deterministic depth and idx");
+}
+
+#[test]
+fn progress_panic_stops_workers_before_the_watchdog() {
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind},
+        sync::{Arc, mpsc},
+        time::{Duration, Instant},
+    };
+    let mut entry = Vec::new();
+    header(3, 8 * 1024 * 1024, &mut entry);
+    compressed(&vec![0; 8 * 1024 * 1024], &mut entry);
+    let mut p = pack_start();
+    for _ in 0..512 {
+        p.extend_from_slice(&entry);
+    }
+    let p = finish(p, 512);
+    let cancel = Arc::new(AtomicCancel::new());
+    let watchdog_cancel = Arc::clone(&cancel);
+    let (started, receiver) = mpsc::channel();
+    let (done, finished) = mpsc::channel();
+    let watchdog = std::thread::spawn(move || {
+        if receiver.recv().is_ok() && finished.recv_timeout(Duration::from_secs(5)).is_err() {
+            watchdog_cancel.cancel();
+        }
+    });
+    let mut panic_at = None;
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        PackIndex::write_v2_for_pack_with_options(
+            &p,
+            ObjectFormat::Sha1,
+            |_| Ok(None),
+            PackIndexOptions::default().with_threads(4),
+            CancelFlag::new(&cancel),
+            |_| {
+                panic_at = Some(Instant::now());
+                started.send(()).expect("notify watchdog");
+                panic!("progress callback failure");
+            },
+        )
+    }));
+    let elapsed = panic_at.expect("callback ran").elapsed();
+    let _ = done.send(());
+    watchdog.join().expect("join watchdog");
+    assert!(result.is_err(), "callback panic propagates");
+    assert!(
+        !cancel.is_cancelled(),
+        "workers required watchdog cancellation"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "coordinator unwind waited for workers: {elapsed:?}"
+    );
+    println!("progress panic stopped workers in {elapsed:?}; process interrupt remains clear");
 }

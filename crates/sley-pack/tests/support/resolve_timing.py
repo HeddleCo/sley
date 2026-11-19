@@ -2,12 +2,12 @@
 
 Usage: resolve_timing.py SCRATCH TARGET --fixtures FIXTURES [--only NAME]
 A fresh SCRATCH holds source exports (not worktrees), build logs and timings.
-FIXTURES holds whole.pack, mixed-ofs.pack, hot.pack, iroh.pack and heddle.pack.
+FIXTURES holds whole.pack, mixed-ofs.pack, hot.pack, iroh.pack.
 Use resolve_hot_fixture.py to generate hot.git; real packs are opt-in network
 fixtures, pinned in tests/fixtures/resolved/timing-pins.json. All commands capture output.
 """
 import argparse, hashlib, io, json, os, random, re, statistics, struct
-import subprocess, tarfile, zlib
+import subprocess, tarfile, zlib, shutil
 from pathlib import Path
 parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('scratch',type=Path); parser.add_argument('target',type=Path)
@@ -16,7 +16,9 @@ parser.add_argument('--only',action='append'); parser.add_argument('--trials',ty
 parser.add_argument('--threads',type=int,nargs='+',default=[4,16])
 parser.add_argument('--steal-disabled',action='store_true')
 args=parser.parse_args(); scratch=args.scratch; target=args.target; fixtures=args.fixtures
-scratch.mkdir(parents=True,exist_ok=False); target.mkdir(parents=True,exist_ok=True)
+scratch.mkdir(parents=True,exist_ok=False)
+configured=Path(json.loads(subprocess.check_output(["cargo","metadata","--no-deps","--format-version","1"],text=True))["target_directory"])
+assert target.resolve()==configured.resolve(), "use the configured Cargo target; wait if busy"
 root=Path.cwd(); head=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
 refs={'base':'61848386','head':head}
 example=(root/'crates/sley-pack/tests/support/resolve_timing.rs').read_bytes()
@@ -35,9 +37,10 @@ for name,ref in refs.items():
         text=text.replace('item = pop((worker + other) % workers, true)?;', 'let _ = other; item = None;')
         assert text!=original, 'steal guard mutation must apply'
         path.write_text(text)
-    env['CARGO_TARGET_DIR']=str(target/name)
     with (scratch/(name+'-build.log')).open('w') as log:
         subprocess.run(['cargo','build','--manifest-path',str(source/'Cargo.toml'),'--locked','--release','-p','sley-pack','--example','r7_timing'] + (['--example','r7_bounded_timing'] if name=='head' else []),env=env,stdout=log,stderr=subprocess.STDOUT,check=True)
+    shutil.copy2(target/'release/examples/r7_timing',scratch/(name+'-timing'))
+    if name=='head': shutil.copy2(target/'release/examples/r7_bounded_timing',scratch/'head-bounded-timing')
 
 def header(kind,size):
     result=bytearray([kind<<4 | (size&15) | (128 if size>15 else 0)]); size>>=4
@@ -80,7 +83,7 @@ for mode in ['whole','mixed-ofs']:
 if hasattr(os,'sched_getaffinity'):
     os.sched_setaffinity(0,sorted(os.sched_getaffinity(0))[-16:])
 rows=[]; summary=[]
-for mode in args.only or ['whole','mixed-ofs','hot','iroh','heddle']:
+for mode in args.only or ['whole','mixed-ofs','hot','iroh']:
     path=fixtures/(mode+'.pack')
     with path.open('rb') as file:
         objects=struct.unpack('>I',file.read(12)[8:])[0]
@@ -97,7 +100,7 @@ for mode in args.only or ['whole','mixed-ofs','hot','iroh','heddle']:
         for trial in range(1,args.trials+1):
             # Alternate order too, to reduce systematic thermal/cache bias.
             for name in (['base','head'] if trial%2 else ['head','base']):
-                binary=target/name/'release/examples/r7_timing'
+                binary=scratch/(name+'-timing')
                 result=subprocess.run([str(binary),str(path),str(threads)],capture_output=True,text=True,check=True)
                 match=re.search(r'seconds=([\d.]+) objects=(\d+) idx_sha256=(\w+) tail=([\d.]+)',result.stdout)
                 assert match,result.stdout

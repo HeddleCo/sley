@@ -1,6 +1,6 @@
 """Revert one security guard at a time; require an executed public-API RED.
 
-Run from the root of an isolated git-archive source export with its own target.
+Run from the root of an isolated git-archive source export using the configured target. Wait for its build lock.
 Do not share a checkout with concurrent checks. Originals are restored on failure.
 Logs and the result table go under the supplied scratch directory.
 """
@@ -10,8 +10,9 @@ import os
 import subprocess
 import sys
 import time
+import tempfile
 
-scratch = Path(sys.argv[1] if len(sys.argv) > 1 else '/tmp/sley267-r5-proofs')
+scratch = Path(sys.argv[1] if len(sys.argv) > 1 else tempfile.mkdtemp(prefix='resolve-proofs-'))
 scratch.mkdir(parents=True, exist_ok=True)
 rp = Path('crates/sley-pack/src/resolved.rs')
 pp = Path('crates/sley-pack/src/parallel_index.rs')
