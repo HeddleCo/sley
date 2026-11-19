@@ -1,0 +1,1 @@
+Real packs produced by Git 2.55.0: six revisions of eight similar blobs, commits, trees and an annotated tag, followed by aggressive gc. Both SHA-1 and SHA-256 formats are included. The idx fixtures were captured using sley at a71654f5, before replacing its indexer. Its outputs at threads 1, 2 and 16 were byte-identical to each other and to Git’s idx files.

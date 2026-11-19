@@ -1731,9 +1731,27 @@ impl fmt::Display for ByteBudget {
     }
 }
 
-/// Which explicit budget rejected a resource-limit check.
+/// Which explicit budget rejected a resource-limit check. Callers must allow
+/// future budget kinds rather than matching the enum exhaustively.
+///
+/// ```compile_fail,E0004
+/// use sley_core::ResourceLimitKind::*;
+/// fn closed(kind: sley_core::ResourceLimitKind) {
+///     match kind {
+///         ResolveObjects | ResolveObjectBytes | ResolveTotalDecoded |
+///         ResolveInFlight | ResolveOps | CompressionWorkingSet |
+///         DecodedObject | DeltaBase => {}
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ResourceLimitKind {
+    ResolveObjects,
+    ResolveObjectBytes,
+    ResolveTotalDecoded,
+    ResolveInFlight,
+    ResolveOps,
     CompressionWorkingSet,
     DecodedObject,
     DeltaBase,
@@ -1742,6 +1760,11 @@ pub enum ResourceLimitKind {
 impl fmt::Display for ResourceLimitKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ResolveObjects => f.write_str("max_objects"),
+            Self::ResolveObjectBytes => f.write_str("max_object_bytes"),
+            Self::ResolveTotalDecoded => f.write_str("max_total_decoded"),
+            Self::ResolveOps => f.write_str("resolve_ops"),
+            Self::ResolveInFlight => f.write_str("max_in_flight_bytes workspace"),
             Self::CompressionWorkingSet => f.write_str("compression working set"),
             Self::DecodedObject => f.write_str("decoded object"),
             Self::DeltaBase => f.write_str("delta base"),

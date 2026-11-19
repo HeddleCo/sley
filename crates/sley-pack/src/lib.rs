@@ -46,6 +46,7 @@ pub mod inflate;
 mod limits;
 mod parallel_index;
 mod read;
+pub mod resolved;
 mod scan;
 mod write;
 
@@ -58,6 +59,7 @@ pub use limits::{MAX_READ_DELTA_CHAIN_DEPTH, PACK_OBJECT_COUNT_PREALLOC_CAP};
 pub(crate) use limits::{checked_pack_object_count, pack_entry_prealloc};
 pub use parallel_index::*;
 pub use read::*;
+pub use resolved::*;
 pub use scan::*;
 pub use write::*;
 

@@ -18,6 +18,22 @@ impl PackFile {
         Self::parse_with_limits(bytes, format, PackReadLimits::default())
     }
 
+    /// Parse with explicit resolver limits; default options preserve trusted policy.
+    /// Materialized return bodies are output storage outside the resolver's byte gates.
+    pub fn parse_with_options(
+        bytes: &[u8],
+        format: ObjectFormat,
+        options: PackIndexOptions,
+    ) -> Result<Self> {
+        parse_parallel_pack(
+            bytes,
+            format,
+            &mut |_| Ok(None),
+            options,
+            CancelFlag::never(),
+        )
+    }
+
     /// Parse and resolve a complete pack with explicit read limits.
     pub fn parse_with_limits(
         bytes: &[u8],
@@ -136,7 +152,10 @@ impl PackFile {
         // resolved object size for an undeltified entry, but the *delta
         // instruction stream* length for a delta entry (builtin/index-pack.c sets
         // `obj->size` from the entry header, before any delta is applied).
-        let mut on_disk: Vec<OnDiskEntry> = Vec::with_capacity(pack_entry_prealloc(count));
+        let mut on_disk: Vec<OnDiskEntry> = Vec::with_capacity(pack_entry_prealloc(
+            count,
+            entry_region.len().saturating_sub(12),
+        ));
         for _ in 0..count {
             let entry_offset = offset as u64;
             let header = parse_entry_header(entry_region, &mut offset)?;
@@ -1006,6 +1025,7 @@ pub(crate) fn parse_entry_header(bytes: &[u8], offset: &mut usize) -> Result<Ent
         size = size
             .checked_add(
                 part.checked_shl(shift)
+                    .filter(|_| part <= (u64::MAX >> shift))
                     .ok_or_else(|| GitError::InvalidFormat("pack size overflow".into()))?,
             )
             .ok_or_else(|| GitError::InvalidFormat("pack size overflow".into()))?;
@@ -1192,6 +1212,7 @@ pub(crate) fn read_delta_varint(delta: &[u8], cursor: &mut usize) -> Result<u64>
             .checked_add(
                 u64::from(byte & 0x7f)
                     .checked_shl(shift)
+                    .filter(|_| u64::from(byte & 0x7f) <= (u64::MAX >> shift))
                     .ok_or_else(|| GitError::InvalidObject("delta size overflow".into()))?,
             )
             .ok_or_else(|| GitError::InvalidObject("delta size overflow".into()))?;
