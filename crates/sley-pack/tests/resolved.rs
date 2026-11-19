@@ -750,7 +750,7 @@ fn last_dependent_releases_base_before_visiting_child() {
     assert_eq!(
         metrics.resolve_ops(),
         152,
-        "last dependent used its retained parent through apply"
+        "last dependent used its flight base through apply"
     );
     assert_eq!(metrics.live_base_bytes(), 0);
     let peak = peak_bytes();
@@ -758,6 +758,34 @@ fn last_dependent_releases_base_before_visiting_child() {
     assert!(
         peak < 24 * 1024 * 1024,
         "completed ancestors still retained: {peak}"
+    );
+    let fanout = chains(1, 1, 32, true);
+    let metrics = ResolveMetrics::default();
+    resolve_pack_with_metrics(
+        &fanout,
+        ObjectFormat::Sha1,
+        1,
+        ResolveLimits {
+            max_live_base_bytes: 32,
+            ..ResolveLimits::default()
+        },
+        CancelFlag::never(),
+        &|o| {
+            if o.body.last() == Some(&128) {
+                assert_eq!(
+                    metrics.live_base_bytes(),
+                    0,
+                    "last fan-out base survives into its child visitor"
+                );
+            }
+            Ok::<_, ()>(())
+        },
+        &metrics,
+    )
+    .expect("last sibling releases its cached base before visit");
+    assert_eq!(
+        (metrics.live_base_bytes(), metrics.in_flight_bytes()),
+        (0, 0)
     );
     // A retained reader keeps the live charge even if a faulty early release
     // clears the node. Another branch must still find that retained ancestor

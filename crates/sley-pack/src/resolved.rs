@@ -27,7 +27,7 @@ pub struct ResolveLimits {
     /// replay), each independently across all workers; defaults to 16 GiB.
     /// Compressed work is additionally capped at input length plus this limit.
     pub max_total_decoded: u64,
-    /// Shared budget for fan-out bases awaiting siblings; defaults to 64 MiB. Zero forces replay.
+    /// Shared budget for fan-out bases awaiting siblings; defaults to 64 MiB. Zero disables caching.
     pub max_live_base_bytes: usize,
     /// Shared transient workspace ceiling; defaults to 1 GiB. Workers wait for space.
     pub max_in_flight_bytes: usize,

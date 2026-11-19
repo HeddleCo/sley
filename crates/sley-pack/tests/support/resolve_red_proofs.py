@@ -137,6 +137,10 @@ add('shallowest-duplicate', 'shallowest_duplicate_wins_even_when_the_deep_copy_p
 add('profile-excludes-replays', 'trusted_index_restores_inflate_and_delta_profile_spans', rp, lambda s: s.replace('        if !_replay {\n            sley_core::fetch_profile::add_count(', '        if true {\n            sley_core::fetch_profile::add_count('), 'fetch-profile')
 add('chain-local-workspace', 'chain_acceptance_is_independent_of_retention_and_scheduling', rp, lambda s: s.replace('                                        Some(body) => body,', '                                        Some(body) => { drop(body); self.replay(&node)? },'))
 
+def release_after_visit(s):
+    return region(s, '    fn child<', '    // Shortest depth', lambda b: b.replace('        parent.release()?;\n','').replace('        let body = self.retain(&mut node, body)?;', '        if let Some(parent) = &node.parent { parent.release()?; }\n        let body = self.retain(&mut node, body)?;'))
+add('dependent-release-before-visitor', 'last_dependent_releases_base_before_visiting_child', rp, release_after_visit)
+
 results = []
 try:
     for name, test, path, mutate, features in probes:
