@@ -1598,6 +1598,12 @@ pub(super) fn trace_protocol_v2_upload_pack_capabilities(git_dir: &Path, format:
     sley_protocol::trace_packet_read_payload(
         format!("object-format={}\n", format.name()).as_bytes(),
     );
+    if config
+        .get_bool("transfer", None, "advertiseobjectinfo")
+        .unwrap_or(false)
+    {
+        sley_protocol::trace_packet_read_payload(b"object-info=size type\n");
+    }
     sley_protocol::trace_packet_read_payload(b"0000");
 }
 

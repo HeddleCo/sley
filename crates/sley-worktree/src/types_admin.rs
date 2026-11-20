@@ -252,6 +252,12 @@ pub struct UpdateIndexPath {
 pub struct WriteTreeOptions {
     pub missing_ok: bool,
     pub prefix: Option<Vec<u8>>,
+    /// Run git's `verify_cache` (unmerged entries, then directory/file conflicts).
+    ///
+    /// `git write-tree` sets this. Merge and rebase also call
+    /// [`crate::write_tree_from_index`] while an index still has conflict stages,
+    /// to record `AUTO_MERGE`; that path must keep writing.
+    pub verify_cache: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -812,6 +812,7 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
         if matches!(source, ConfigSource::Repository(_)) {
             crate::injected_config_parameters()?;
         }
+        let write_options = config_file_write_options(cli_session)?;
         // Writes operate on the target file's document alone — never on the
         // merged stack, and never with includes spliced in (git edits the file
         // in place and leaves include directives untouched).
@@ -828,7 +829,15 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
                 // already multi-valued (CONFIG_NOTHING_SET → "cannot overwrite
                 // multiple values with a single value").
                 let value = normalize_set_value(&key, positional[1], value_type)?;
-                if !config_raw_edit(&source, &key, Some(&value), comment.as_deref(), None, false)? {
+                if !config_raw_edit(
+                    &source,
+                    &key,
+                    Some(&value),
+                    comment.as_deref(),
+                    None,
+                    false,
+                    write_options,
+                )? {
                     print_config_multiple_values_error(&key);
                     return Err(crate::cli_exit(5));
                 }
@@ -846,6 +855,7 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
                     comment.as_deref(),
                     pred.as_deref(),
                     false,
+                    write_options,
                 )? {
                     print_config_multiple_values_error(&key);
                     return Err(crate::cli_exit(5));
@@ -863,6 +873,7 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
                     comment.as_deref(),
                     pred.as_deref(),
                     true,
+                    write_options,
                 )?;
             }
             ConfigAction::Add => {
@@ -878,27 +889,49 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
                     comment.as_deref(),
                     Some(&never),
                     true,
+                    write_options,
                 )?;
             }
             ConfigAction::Unset => {
                 let key = key.expect("validated config key");
                 let pred = value_pattern_filter.map(filter_predicate);
-                if !config_raw_edit(&source, &key, None, None, pred.as_deref(), false)? {
+                if !config_raw_edit(
+                    &source,
+                    &key,
+                    None,
+                    None,
+                    pred.as_deref(),
+                    false,
+                    write_options,
+                )? {
                     return Err(crate::cli_exit(5));
                 }
             }
             ConfigAction::UnsetAll => {
                 let key = key.expect("validated config key");
                 let pred = value_pattern_filter.map(filter_predicate);
-                if !config_raw_edit(&source, &key, None, None, pred.as_deref(), true)? {
+                if !config_raw_edit(
+                    &source,
+                    &key,
+                    None,
+                    None,
+                    pred.as_deref(),
+                    true,
+                    write_options,
+                )? {
                     return Err(crate::cli_exit(5));
                 }
             }
             ConfigAction::RenameSection => {
-                config_rename_or_remove_section(&source, positional[0], Some(positional[1]))?;
+                config_rename_or_remove_section(
+                    &source,
+                    positional[0],
+                    Some(positional[1]),
+                    write_options,
+                )?;
             }
             ConfigAction::RemoveSection => {
-                config_rename_or_remove_section(&source, positional[0], None)?;
+                config_rename_or_remove_section(&source, positional[0], None, write_options)?;
             }
             _ => unreachable!("write actions handled above"),
         }
@@ -1548,6 +1581,21 @@ fn config_core_editor_from_entries(entries: &[sley_config::ConfigStackEntry]) ->
 /// filter (already folding in `!` negation and `--fixed-value`). Returns `false`
 /// when the edit matched nothing to unset, or matched several entries under a
 /// single-value set (git's exit code 5).
+#[derive(Debug)]
+enum ConfigEditAbort {
+    NothingSet,
+}
+
+impl std::fmt::Display for ConfigEditAbort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NothingSet => write!(f, "nothing set"),
+        }
+    }
+}
+
+impl std::error::Error for ConfigEditAbort {}
+
 fn config_raw_edit(
     source: &ConfigSource,
     key: &ConfigKey,
@@ -1555,6 +1603,7 @@ fn config_raw_edit(
     comment: Option<&str>,
     value_matches: Option<&dyn Fn(Option<&str>) -> bool>,
     multi_replace: bool,
+    options: sley_config::raw_edit::ConfigFileWriteOptions,
 ) -> Result<bool> {
     let Some(path) = config_write_path(source) else {
         match source {
@@ -1563,39 +1612,81 @@ fn config_raw_edit(
         }
         return Err(crate::cli_exit(128));
     };
-    let contents = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Vec::new(),
-        Err(err) => {
-            eprintln!(
-                "fatal: unable to read config file '{}': {err}",
-                path.display()
-            );
-            return Err(crate::cli_exit(128));
+    // Read under the lock. A snapshot taken before waiting would clobber a
+    // concurrent writer (stock git) that held `config.lock` and then committed.
+    let edited = sley_config::raw_edit::edit_config_file_locked(&path, options, |contents| {
+        let mut editor = sley_config::raw_edit::RawConfigEditor::new(
+            contents.to_vec(),
+            &key.section,
+            key.subsection.as_deref(),
+            &key.key,
+        );
+        match editor.set_multivar(value, comment, value_matches, multi_replace) {
+            sley_config::raw_edit::RawEditOutcome::NothingSet => Err(ConfigEditAbort::NothingSet),
+            sley_config::raw_edit::RawEditOutcome::Changed => Ok(editor.into_bytes()),
         }
-    };
-    let mut editor = sley_config::raw_edit::RawConfigEditor::new(
-        contents,
-        &key.section,
-        key.subsection.as_deref(),
-        &key.key,
-    );
-    match editor.set_multivar(value, comment, value_matches, multi_replace) {
-        sley_config::raw_edit::RawEditOutcome::NothingSet => Ok(false),
-        sley_config::raw_edit::RawEditOutcome::Changed => {
-            write_raw_config_file(&path, editor.into_bytes())?;
-            Ok(true)
+    });
+    match edited {
+        Ok(()) => Ok(true),
+        Err(sley_config::raw_edit::ConfigFileEditError::Edit(ConfigEditAbort::NothingSet)) => {
+            Ok(false)
+        }
+        Err(sley_config::raw_edit::ConfigFileEditError::Write(err)) => {
+            Err(fail_config_write(&path, err))
         }
     }
 }
 
-fn write_raw_config_file(path: &std::path::Path, bytes: Vec<u8>) -> Result<()> {
-    sley_config::raw_edit::write_config_file_locked(
-        path,
-        &bytes,
-        sley_config::raw_edit::ConfigFileWriteOptions::default(),
-    )
-    .map_err(GitError::from)
+/// `core.configLockTimeout` from the on-disk layers (includes resolved) with
+/// `-c` / `GIT_CONFIG_*` applied last. Invalid integers keep the previous
+/// value so a bad timeout cannot block an unrelated config edit. Default is
+/// git's 1000ms.
+fn config_file_write_options(
+    cli_session: &crate::session::CliSession,
+) -> Result<sley_config::raw_edit::ConfigFileWriteOptions> {
+    let mut timeout_ms = 1000_i64;
+    let common = match cli_session.git_dir() {
+        Ok(git_dir) => cli_session.common_git_dir(&git_dir).ok(),
+        Err(_) => None,
+    };
+    let context = config_include_context(cli_session);
+    if let Ok(config) = sley_config::load_pre_dispatch_config(common.as_deref(), &context)
+        && let Some(value) = config.get("core", None, "configlocktimeout")
+        && let Some(parsed) = sley_config::parse_config_int(value)
+    {
+        timeout_ms = parsed;
+    }
+    for parameter in crate::injected_config_parameters()? {
+        let (section, subsection, key) = parameter.split_key();
+        if section.eq_ignore_ascii_case("core")
+            && subsection.is_none()
+            && key.eq_ignore_ascii_case("configlocktimeout")
+            && let Some(value) = parameter.value.as_deref()
+            && let Some(parsed) = sley_config::parse_config_int(value)
+        {
+            timeout_ms = parsed;
+        }
+    }
+    Ok(sley_config::raw_edit::ConfigFileWriteOptions {
+        fsync: false,
+        lock_timeout_ms: timeout_ms,
+    })
+}
+
+fn fail_config_write(
+    path: &std::path::Path,
+    err: sley_config::raw_edit::ConfigFileWriteError,
+) -> GitError {
+    match err {
+        sley_config::raw_edit::ConfigFileWriteError::Read { source, .. } => {
+            eprintln!(
+                "fatal: unable to read config file '{}': {source}",
+                path.display()
+            );
+            crate::cli_exit(128)
+        }
+        other => GitError::from(other),
+    }
 }
 
 /// git's `section_name_is_ok`: a new section name must be non-empty, and the
@@ -1632,6 +1723,7 @@ fn config_rename_or_remove_section(
     source: &ConfigSource,
     old: &str,
     new: Option<&str>,
+    options: sley_config::raw_edit::ConfigFileWriteOptions,
 ) -> Result<()> {
     // Validate the names the same way git does (subsection/section syntax).
     let old_name = parse_config_section_name(old)?;
@@ -1657,38 +1749,42 @@ fn config_rename_or_remove_section(
         return Err(crate::cli_exit(128));
     };
     let display_path = config_source_display_name(source, &path);
-    let contents = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        // git: a missing config file means nothing to rename — no error.
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Vec::new(),
-        Err(err) => {
-            eprintln!(
-                "fatal: unable to read config file '{}': {err}",
-                path.display()
-            );
-            return Err(crate::cli_exit(128));
+    let edited = sley_config::raw_edit::edit_config_file_locked(&path, options, |contents| {
+        match sley_config::raw_edit::rename_or_remove_section(
+            contents,
+            &old_rendered,
+            new_name.as_deref(),
+        ) {
+            sley_config::raw_edit::SectionEditOutcome::Changed(out) => Ok(out),
+            sley_config::raw_edit::SectionEditOutcome::NotFound => Err(SectionEditAbort::NotFound),
+            sley_config::raw_edit::SectionEditOutcome::LineTooLong(line) => {
+                Err(SectionEditAbort::LineTooLong(line))
+            }
         }
-    };
-    match sley_config::raw_edit::rename_or_remove_section(
-        &contents,
-        &old_rendered,
-        new_name.as_deref(),
-    ) {
-        sley_config::raw_edit::SectionEditOutcome::Changed(out) => {
-            write_raw_config_file(&path, out)?;
-            Ok(())
-        }
-        sley_config::raw_edit::SectionEditOutcome::NotFound => {
+    });
+    match edited {
+        Ok(()) => Ok(()),
+        Err(sley_config::raw_edit::ConfigFileEditError::Edit(SectionEditAbort::NotFound)) => {
             eprintln!("fatal: no such section: {old_rendered}");
             Err(crate::cli_exit(128))
         }
-        sley_config::raw_edit::SectionEditOutcome::LineTooLong(line) => {
+        Err(sley_config::raw_edit::ConfigFileEditError::Edit(SectionEditAbort::LineTooLong(
+            line,
+        ))) => {
             eprintln!(
                 "error: refusing to work with overly long line in '{display_path}' on line {line}"
             );
             Err(crate::cli_exit(128))
         }
+        Err(sley_config::raw_edit::ConfigFileEditError::Write(err)) => {
+            Err(fail_config_write(&path, err))
+        }
     }
+}
+
+enum SectionEditAbort {
+    NotFound,
+    LineTooLong(usize),
 }
 
 /// The filename git prints in diagnostics for the given source: the explicit
@@ -1706,10 +1802,16 @@ fn config_include_context(
     cli_session: &crate::session::CliSession,
 ) -> sley_config::ConfigIncludeContext {
     match cli_session.git_dir() {
-        Ok(git_dir) => sley_config::ConfigIncludeContext::new(
-            Some(sley_config::git_dir_for_include_context(&git_dir)),
-            repo_current_branch_name(&git_dir),
-        ),
+        Ok(git_dir) => {
+            let mut context = sley_config::ConfigIncludeContext::new(
+                Some(sley_config::git_dir_for_include_context(&git_dir)),
+                repo_current_branch_name(&git_dir),
+            );
+            if let Some(work_tree) = cli_session.explicit_work_tree() {
+                context.work_tree = Some(work_tree);
+            }
+            context
+        }
         Err(_) => sley_config::ConfigIncludeContext::default(),
     }
 }

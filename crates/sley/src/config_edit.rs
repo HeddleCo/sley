@@ -734,7 +734,10 @@ impl Repository {
         write_config_file_locked(
             &plan.target_path,
             &contents,
-            ConfigFileWriteOptions { fsync: plan.fsync },
+            ConfigFileWriteOptions {
+                fsync: plan.fsync,
+                ..ConfigFileWriteOptions::default()
+            },
         )
         .map_err(ConfigEditError::from_config_write)
     }
@@ -1213,7 +1216,9 @@ impl ConfigEditError {
     fn from_config_write(err: ConfigFileWriteError) -> Self {
         match err {
             ConfigFileWriteError::ExistingLock(path) => Self::Locked { path },
-            ConfigFileWriteError::Io { source, .. } => Self::Io(source),
+            ConfigFileWriteError::Read { source, .. } | ConfigFileWriteError::Io { source, .. } => {
+                Self::Io(source)
+            }
         }
     }
 }

@@ -522,4 +522,212 @@ s -C "${SLEY_FILE_PARTIAL}" cat-file -s "${OLD_BLOB}" >/dev/null
 s -C "${SLEY_FILE_PARTIAL}" cat-file -t "${OLD_BLOB}" >/dev/null
 s -C "${SLEY_FILE_PARTIAL}" cat-file -e "${OLD_BLOB}"
 
+say "includeIf worktree"
+INC=${ROOT}/incwt
+LINKED=${ROOT}/inc-linked
+PREFIX=${ROOT}/wt-prefix/linked
+BARE=${ROOT}/wt-bare
+g init -q -b main "${INC}"
+printf 'f\n' >"${INC}/f"
+g -C "${INC}" add f
+g -C "${INC}" -c commit.gpgsign=false commit -qm init
+g -C "${INC}" worktree add -q -b linked "${LINKED}" HEAD
+g -C "${INC}" worktree add -q -b prefix "${PREFIX}" HEAD
+MAIN_ABS=$(cd "${INC}" && pwd)
+LINKED_ABS=$(cd "${LINKED}" && pwd)
+PREFIX_PARENT=$(cd "${ROOT}/wt-prefix" && pwd)
+MAIN_UPPER=$(printf '%s' "${MAIN_ABS}" | tr '[:lower:]' '[:upper:]')
+cat >>"${INC}/.git/config" <<EOF
+[includeIf "worktree:${MAIN_ABS}"]
+	path = main-inc
+[includeIf "worktree:${LINKED_ABS}"]
+	path = linked-inc
+[includeIf "worktree:${PREFIX_PARENT}/"]
+	path = prefix-inc
+[includeIf "worktree/i:${MAIN_UPPER}"]
+	path = icase-inc
+EOF
+printf '[test]\n\tmainvar = main\n' >"${INC}/.git/main-inc"
+printf '[test]\n\tlinkedvar = linked\n' >"${INC}/.git/linked-inc"
+printf '[test]\n\tprefixvar = prefix\n' >"${INC}/.git/prefix-inc"
+printf '[test]\n\ticase = 1\n' >"${INC}/.git/icase-inc"
+test "$(s -C "${INC}" config test.mainvar)" = main
+test "$(g -C "${INC}" config test.mainvar)" = main
+test "$(s -C "${INC}" config test.icase)" = 1
+test "$(g -C "${INC}" config test.icase)" = 1
+if s -C "${INC}" config test.linkedvar >/dev/null 2>&1; then
+    echo "main worktree matched the linked include" >&2
+    exit 1
+fi
+test "$(s -C "${LINKED}" config test.linkedvar)" = linked
+test "$(g -C "${LINKED}" config test.linkedvar)" = linked
+if s -C "${LINKED}" config test.mainvar >/dev/null 2>&1; then
+    echo "linked worktree matched the main include" >&2
+    exit 1
+fi
+test "$(s -C "${PREFIX}" config test.prefixvar)" = prefix
+test "$(g -C "${PREFIX}" config test.prefixvar)" = prefix
+g init -q --bare "${BARE}"
+printf '[includeIf "worktree:/"]\n\tpath = bar-bare\n' >>"${BARE}/config"
+printf '[test]\n\twtbare = 1\n' >"${BARE}/bar-bare"
+if s -C "${BARE}" config test.wtbare >/dev/null 2>&1; then
+    echo "bare repo matched includeIf worktree:/" >&2
+    exit 1
+fi
+if g -C "${BARE}" config test.wtbare >/dev/null 2>&1; then
+    echo "stock git bare repo matched includeIf worktree:/ (oracle drift)" >&2
+    exit 1
+fi
+
+say "config lock retry"
+LOCK=${ROOT}/lockrepo
+g init -q -b main "${LOCK}"
+g -C "${LOCK}" config set keep.me 1
+LOCKFILE=${LOCK}/.git/config.lock
+touch "${LOCKFILE}"
+(
+    sleep 0.3
+    rm -f "${LOCKFILE}"
+) &
+s -C "${LOCK}" config k.yes 1
+wait
+test "$(g -C "${LOCK}" config k.yes)" = 1
+touch "${LOCKFILE}"
+start_ns=$(date +%s%N)
+set +e
+s -C "${LOCK}" -c core.configLockTimeout=0 config k.no 1 >/dev/null 2>"${ROOT}/lock-timeout.err"
+lock_rc=$?
+set -e
+end_ns=$(date +%s%N)
+rm -f "${LOCKFILE}"
+if [[ "${lock_rc}" -eq 0 ]]; then
+    echo "configLockTimeout=0 acquired a held lock" >&2
+    exit 1
+fi
+elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
+if [[ "${elapsed_ms}" -ge 800 ]]; then
+    echo "configLockTimeout=0 waited ${elapsed_ms}ms" >&2
+    exit 1
+fi
+if g -C "${LOCK}" config k.no >/dev/null 2>&1; then
+    echo "failed lock write still stored k.no" >&2
+    exit 1
+fi
+touch "${LOCKFILE}"
+(
+    sleep 0.25
+    printf '\n[injected]\n\tfromstock = 1\n' >>"${LOCK}/.git/config"
+    rm -f "${LOCKFILE}"
+) &
+s -C "${LOCK}" config sley.side 1
+wait
+test "$(g -C "${LOCK}" config keep.me)" = 1
+test "$(g -C "${LOCK}" config injected.fromstock)" = 1
+test "$(g -C "${LOCK}" config sley.side)" = 1
+g -C "${LOCK}" config --list >/dev/null
+
+say "write-tree directory/file conflict"
+DF=${ROOT}/df-index
+g init -q -b main "${DF}"
+BLOB=$(printf 'blob\n' | g -C "${DF}" hash-object -w --stdin)
+python3 - "${DF}/.git/index" "${BLOB}" <<'PY'
+import hashlib, struct, sys
+path, oid_hex = sys.argv[1], sys.argv[2]
+oid = bytes.fromhex(oid_hex)
+names = [b"a", b"a/b", b"docs", b"docs-internal/README.md", b"docs/requirements.txt"]
+out = bytearray(b"DIRC")
+out += struct.pack(">II", 2, len(names))
+for name in names:
+    start = len(out)
+    out += struct.pack(">10I", 0, 0, 0, 0, 0, 0, 0o100644, 0, 0, len(b"blob\n"))
+    out += oid
+    out += struct.pack(">H", len(name))
+    out += name + b"\0"
+    while (len(out) - start) % 8:
+        out.append(0)
+out += hashlib.sha1(out).digest()
+open(path, "wb").write(out)
+PY
+set +e
+g -C "${DF}" write-tree >"${ROOT}/df-stock.out" 2>"${ROOT}/df-stock.err"
+stock_rc=$?
+s -C "${DF}" write-tree >"${ROOT}/df-sley.out" 2>"${ROOT}/df-sley.err"
+sley_rc=$?
+set -e
+if [[ "${stock_rc}" -eq 0 || "${sley_rc}" -eq 0 ]]; then
+    echo "write-tree accepted a D/F index (stock=${stock_rc} sley=${sley_rc})" >&2
+    echo "stock:" >&2
+    cat "${ROOT}/df-stock.err" >&2
+    echo "sley:" >&2
+    cat "${ROOT}/df-sley.err" >&2
+    exit 1
+fi
+if ! cmp -s "${ROOT}/df-stock.err" "${ROOT}/df-sley.err"; then
+    echo "write-tree D/F stderr differs" >&2
+    diff -u "${ROOT}/df-stock.err" "${ROOT}/df-sley.err" >&2 || true
+    exit 1
+fi
+grep -q "You have both docs and docs/requirements.txt" "${ROOT}/df-sley.err"
+grep -q "You have both a and a/b" "${ROOT}/df-sley.err"
+grep -q "fatal: git-write-tree: error building trees" "${ROOT}/df-sley.err"
+
+say "object-info"
+OI=${ROOT}/oi-client
+OI_EXEC=${ROOT}/oi-exec
+mkdir -p "${OI_EXEC}"
+cat >"${OI_EXEC}/git-upload-pack" <<EOF
+#!/bin/sh
+exec "${SLEY}" upload-pack "\$@"
+EOF
+chmod +x "${OI_EXEC}/git-upload-pack"
+g clone -q --no-local -u "${UPLOAD}" "file://${SRV}" "${OI}"
+BLOB_OID=$(g -C "${SRV}" rev-parse HEAD:a)
+COMMIT_OID=$(g -C "${SRV}" rev-parse HEAD)
+MISSING=1111111111111111111111111111111111111111
+if g -C "${SRV}" cat-file -e "${MISSING}" >/dev/null 2>&1; then
+    echo "missing oid unexpectedly exists" >&2
+    exit 1
+fi
+FMT='%(objectname) %(objecttype) %(objectsize)'
+oi_query() {
+    printf 'remote-object-info origin %s %s %s\n' "${BLOB_OID}" "${COMMIT_OID}" "${MISSING}"
+}
+if GIT_EXEC_PATH="${OI_EXEC}" g -C "${OI}" cat-file --batch-command="${FMT}" >"${ROOT}/oi-off.out" 2>"${ROOT}/oi-off.err" < <(oi_query); then
+    echo "object-info succeeded while transfer.advertiseObjectInfo was unset" >&2
+    exit 1
+fi
+grep -q "object-info capability is not enabled" "${ROOT}/oi-off.err"
+GIT_TRACE_PACKET=${ROOT}/oi-caps GIT_EXEC_PATH="${OI_EXEC}" g -C "${OI}" ls-remote origin >/dev/null
+if grep -q object-info "${ROOT}/oi-caps"; then
+    echo "sley advertised object-info by default" >&2
+    exit 1
+fi
+s -C "${SRV}" config transfer.advertiseObjectInfo true
+GIT_EXEC_PATH="${OI_EXEC}" g -C "${OI}" cat-file --batch-command="${FMT}" >"${ROOT}/oi-sley.out" 2>"${ROOT}/oi-sley.err" < <(oi_query)
+g -C "${OI}" cat-file --batch-command="${FMT}" >"${ROOT}/oi-stock.out" 2>"${ROOT}/oi-stock.err" < <(oi_query)
+if ! cmp -s "${ROOT}/oi-sley.out" "${ROOT}/oi-stock.out"; then
+    echo "object-info answers differ" >&2
+    diff -u "${ROOT}/oi-stock.out" "${ROOT}/oi-sley.out" >&2 || true
+    echo "sley stderr:" >&2
+    cat "${ROOT}/oi-sley.err" >&2
+    echo "stock stderr:" >&2
+    cat "${ROOT}/oi-stock.err" >&2
+    exit 1
+fi
+SMALL=$(printf 'x' | g -C "${SRV}" hash-object -w --stdin)
+BIG=$(printf 'yyyyyyyy\n' | g -C "${SRV}" hash-object -w --stdin)
+g -C "${SRV}" replace "${SMALL}" "${BIG}"
+# A normal reader follows the replace ref. upload-pack disables replace refs,
+# so both servers must still report the stored object's size.
+test "$(g -C "${SRV}" cat-file -s "${SMALL}")" = 9
+printf 'remote-object-info origin %s\n' "${SMALL}" >"${ROOT}/oi-replace.in"
+GIT_EXEC_PATH="${OI_EXEC}" g -C "${OI}" cat-file --batch-command="${FMT}" <"${ROOT}/oi-replace.in" >"${ROOT}/oi-repl-sley.out"
+g -C "${OI}" cat-file --batch-command="${FMT}" <"${ROOT}/oi-replace.in" >"${ROOT}/oi-repl-stock.out"
+if ! cmp -s "${ROOT}/oi-repl-sley.out" "${ROOT}/oi-repl-stock.out"; then
+    echo "replaced object-info answers differ" >&2
+    diff -u "${ROOT}/oi-repl-stock.out" "${ROOT}/oi-repl-sley.out" >&2 || true
+    exit 1
+fi
+grep -qx "${SMALL} blob 1" "${ROOT}/oi-repl-sley.out"
+
 say "interop ok"

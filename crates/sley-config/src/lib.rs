@@ -425,6 +425,13 @@ pub struct ConfigIncludeContext {
     pub git_dir: Option<PathBuf>,
     /// Name of the currently checked-out branch, used by `onbranch:` conditions.
     pub current_branch: Option<String>,
+    /// Explicit work tree (`--work-tree` / `$GIT_WORK_TREE`). `None` derives the
+    /// checkout from `git_dir` (bare repositories derive none).
+    pub work_tree: Option<PathBuf>,
+    /// Early config reads (alias resolution) have no work tree yet. Git's
+    /// `read_early_config` sees `repo_get_work_tree() == NULL`, so `worktree:`
+    /// conditions do not match.
+    pub skip_work_tree: bool,
 }
 
 impl ConfigIncludeContext {
@@ -432,6 +439,8 @@ impl ConfigIncludeContext {
         Self {
             git_dir,
             current_branch,
+            work_tree: None,
+            skip_work_tree: false,
         }
     }
 }
@@ -907,6 +916,12 @@ fn include_condition_matches(
     if let Some(pattern) = condition.strip_prefix("gitdir/i:") {
         return gitdir_condition_matches(pattern, base_dir, context, true);
     }
+    if let Some(pattern) = condition.strip_prefix("worktree/i:") {
+        return worktree_condition_matches(pattern, base_dir, context, true);
+    }
+    if let Some(pattern) = condition.strip_prefix("worktree:") {
+        return worktree_condition_matches(pattern, base_dir, context, false);
+    }
     if let Some(pattern) = condition.strip_prefix("onbranch:") {
         return match &context.current_branch {
             Some(branch) => onbranch_pattern_matches(pattern, branch),
@@ -988,19 +1003,127 @@ fn gitdir_condition_matches(
     let Some(git_dir) = &context.git_dir else {
         return false;
     };
+    path_condition_matches(pattern, base_dir, git_dir, case_insensitive)
+}
 
-    // Expand the pattern's own prefixes, then normalise separators.
+/// Match a `worktree:`/`worktree/i:` pattern against the repository work tree.
+///
+/// Git's `include_by_path` is shared with `gitdir:`. A bare repository (and any
+/// read with no work tree, including early config) does not match.
+fn worktree_condition_matches(
+    pattern: &str,
+    base_dir: Option<&Path>,
+    context: &ConfigIncludeContext,
+    case_insensitive: bool,
+) -> bool {
+    let Some(work_tree) = work_tree_for_include(context) else {
+        return false;
+    };
+    path_condition_matches(pattern, base_dir, &work_tree, case_insensitive)
+}
+
+/// Expand a `gitdir:`/`worktree:` pattern and test it against `path`.
+///
+/// The pattern rules match git's `prepare_include_condition_pattern`: `~/` and
+/// `./` expansion, an unanchored pattern gains `**/`, and a trailing `/`
+/// means the directory and everything under it. Both the given spelling and
+/// its realpath are tried.
+fn path_condition_matches(
+    pattern: &str,
+    base_dir: Option<&Path>,
+    path: &Path,
+    case_insensitive: bool,
+) -> bool {
     let expanded = expand_gitdir_pattern(pattern, base_dir);
     let mut pattern = normalize_separators(&expanded);
-
-    // A trailing slash means "match this directory and everything under it",
-    // i.e. an implicit `/**` suffix.
     if pattern.ends_with('/') {
         pattern.push_str("**");
     }
-    gitdir_match_targets(git_dir)
+    gitdir_match_targets(path)
         .into_iter()
         .any(|target| glob_match_dir(&pattern, &target, case_insensitive))
+}
+
+fn work_tree_for_include(context: &ConfigIncludeContext) -> Option<PathBuf> {
+    if context.skip_work_tree {
+        return None;
+    }
+    if let Some(work_tree) = &context.work_tree {
+        return Some(absolute_include_path(work_tree));
+    }
+    if let Some(env) = std::env::var_os("GIT_WORK_TREE") {
+        let path = PathBuf::from(env);
+        if !path.as_os_str().is_empty() {
+            return Some(absolute_include_path(&path));
+        }
+    }
+    let git_dir = context.git_dir.as_ref()?;
+    include_work_tree_from_git_dir(git_dir)
+}
+
+fn absolute_include_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+/// Repository work tree for `includeIf worktree:`, without include expansion.
+///
+/// Mirrors `worktree_root_for_git_dir` but parses `<git_dir>/config` directly.
+/// Following includes here would re-enter this matcher (`sley-formats` calls
+/// back into [`read_repo_config`]).
+///
+/// 1. A linked worktree (both `commondir` and `gitdir` admin files) uses the
+///    parent of the `gitdir` file target.
+/// 2. `core.bare=true` has no work tree (`core.worktree` is ignored).
+/// 3. `core.worktree` is absolute, or relative to the git directory.
+/// 4. A git directory named `.git` uses its parent.
+/// 5. Otherwise the repository is bare.
+fn include_work_tree_from_git_dir(git_dir: &Path) -> Option<PathBuf> {
+    let git_dir = absolute_include_path(git_dir);
+    if git_dir.join("commondir").is_file() {
+        let gitdir_file = git_dir.join("gitdir");
+        if gitdir_file.is_file()
+            && let Ok(value) = fs::read_to_string(&gitdir_file)
+        {
+            let path = PathBuf::from(value.trim());
+            let worktree_git_file = if path.is_absolute() {
+                path
+            } else {
+                git_dir.join(path)
+            };
+            if let Some(worktree) = worktree_git_file.parent()
+                && !worktree.as_os_str().is_empty()
+            {
+                return Some(worktree.to_path_buf());
+            }
+        }
+    }
+    if let Ok(bytes) = fs::read(git_dir.join("config"))
+        && let Ok(config) = GitConfig::parse(&bytes)
+    {
+        if config.get_bool("core", None, "bare") == Some(true) {
+            return None;
+        }
+        if let Some(worktree) = config.get("core", None, "worktree") {
+            let worktree = PathBuf::from(worktree);
+            if worktree.is_absolute() {
+                return Some(worktree);
+            }
+            return Some(git_dir.join(worktree));
+        }
+    }
+    if git_dir.file_name().and_then(|name| name.to_str()) == Some(".git") {
+        return git_dir
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf);
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1497,6 +1620,12 @@ fn stack_include_condition_matches(
     }
     if let Some(pattern) = condition.strip_prefix("gitdir/i:") {
         return gitdir_condition_matches(pattern, base_dir, context, true);
+    }
+    if let Some(pattern) = condition.strip_prefix("worktree/i:") {
+        return worktree_condition_matches(pattern, base_dir, context, true);
+    }
+    if let Some(pattern) = condition.strip_prefix("worktree:") {
+        return worktree_condition_matches(pattern, base_dir, context, false);
     }
     if let Some(pattern) = condition.strip_prefix("onbranch:") {
         return match &context.current_branch {
@@ -2801,7 +2930,7 @@ pub fn load_identity_effective_config(
     cwd: &Path,
 ) -> Option<GitConfig> {
     let context = ConfigIncludeContext::new(
-        Some(common_git_dir.to_path_buf()),
+        Some(git_dir_for_include_context(git_dir)),
         repo_current_branch_name(git_dir),
     );
     let mut config = load_effective_config(common_git_dir, &context).ok()?;
@@ -3917,6 +4046,76 @@ mod tests {
         let config =
             load_config_with_includes(&main, &other).expect("test operation should succeed");
         assert_eq!(config.get("user", None, "name"), None);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_include_if_worktree_matches_main_linked_and_bare() {
+        let dir = unique_include_dir("inc-worktree");
+        let main = dir.join("main");
+        let linked = dir.join("linked");
+        let bare = dir.join("bare.git");
+        fs::create_dir_all(main.join(".git")).expect("main git dir");
+        fs::create_dir_all(&linked).expect("linked worktree");
+        fs::create_dir_all(&bare).expect("bare git dir");
+        let linked_git = main.join(".git").join("worktrees").join("linked");
+        fs::create_dir_all(&linked_git).expect("linked git dir");
+        fs::write(linked_git.join("commondir"), b"../..\n").expect("commondir");
+        fs::write(
+            linked_git.join("gitdir"),
+            format!("{}\n", linked.join(".git").display()),
+        )
+        .expect("gitdir");
+        let main_abs = fs::canonicalize(&main).expect("main realpath");
+        let linked_abs = fs::canonicalize(&linked).expect("linked realpath");
+        fs::write(
+            main.join(".git").join("config"),
+            format!(
+                "[includeIf \"worktree:{}/\"]\n\tpath = main.cfg\n[includeIf \"worktree:{}\"]\n\tpath = linked.cfg\n[includeIf \"worktree/i:{}\"]\n\tpath = icase.cfg\n",
+                main_abs.display(),
+                linked_abs.display(),
+                main_abs.display().to_string().to_ascii_uppercase(),
+            ),
+        )
+        .expect("repo config");
+        fs::write(main.join(".git").join("main.cfg"), "[test]\n\tmain = 1\n").expect("main inc");
+        fs::write(
+            main.join(".git").join("linked.cfg"),
+            "[test]\n\tlinked = 1\n",
+        )
+        .expect("linked inc");
+        fs::write(main.join(".git").join("icase.cfg"), "[test]\n\ticase = 1\n").expect("icase inc");
+
+        let main_ctx = ConfigIncludeContext::new(Some(main.join(".git")), None);
+        let main_config = load_config_with_includes(&main.join(".git").join("config"), &main_ctx)
+            .expect("load main");
+        assert_eq!(main_config.get("test", None, "main"), Some("1"));
+        assert_eq!(main_config.get("test", None, "icase"), Some("1"));
+        assert_eq!(main_config.get("test", None, "linked"), None);
+
+        let linked_ctx = ConfigIncludeContext::new(Some(linked_git), None);
+        let linked_config =
+            load_config_with_includes(&main.join(".git").join("config"), &linked_ctx)
+                .expect("load linked");
+        assert_eq!(linked_config.get("test", None, "linked"), Some("1"));
+        assert_eq!(linked_config.get("test", None, "main"), None);
+
+        fs::write(
+            bare.join("config"),
+            "[core]\n\tbare = true\n[includeIf \"worktree:/\"]\n\tpath = bare.cfg\n",
+        )
+        .expect("bare config");
+        fs::write(bare.join("bare.cfg"), "[test]\n\tbare = 1\n").expect("bare inc");
+        let bare_ctx = ConfigIncludeContext::new(Some(bare.clone()), None);
+        let bare_config =
+            load_config_with_includes(&bare.join("config"), &bare_ctx).expect("load bare");
+        assert_eq!(bare_config.get("test", None, "bare"), None);
+
+        let mut early = main_ctx;
+        early.skip_work_tree = true;
+        let early_config = load_config_with_includes(&main.join(".git").join("config"), &early)
+            .expect("load early");
+        assert_eq!(early_config.get("test", None, "main"), None);
         fs::remove_dir_all(&dir).ok();
     }
 

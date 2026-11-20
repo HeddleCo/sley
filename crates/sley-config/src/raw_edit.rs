@@ -20,6 +20,7 @@ use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::quote_config_value;
 
@@ -68,10 +69,25 @@ pub enum RawEditOutcome {
 }
 
 /// Options for writing a config file through `<path>.lock`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConfigFileWriteOptions {
     /// Sync the lockfile contents to disk before promoting it into place.
     pub fsync: bool,
+    /// How long to retry a held `<path>.lock`, in milliseconds.
+    ///
+    /// `1000` is git's default (`core.configLockTimeout`, same as
+    /// `core.packedRefsTimeout`). `0` tries once. A negative value retries
+    /// until the lock is acquired or a non-lock error occurs.
+    pub lock_timeout_ms: i64,
+}
+
+impl Default for ConfigFileWriteOptions {
+    fn default() -> Self {
+        Self {
+            fsync: false,
+            lock_timeout_ms: 1000,
+        }
+    }
 }
 
 /// A config file write failed before the lockfile could be atomically promoted.
@@ -79,6 +95,11 @@ pub struct ConfigFileWriteOptions {
 pub enum ConfigFileWriteError {
     /// `<path>.lock` already exists; the original config was left untouched.
     ExistingLock(PathBuf),
+    /// Reading the config file failed after the lock was acquired.
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     /// Filesystem failure at the given path.
     Io {
         path: PathBuf,
@@ -123,6 +144,13 @@ impl fmt::Display for ConfigFileWriteError {
             Self::ExistingLock(path) => {
                 write!(f, "config lock already exists: {}", path.display())
             }
+            Self::Read { path, source } => {
+                write!(
+                    f,
+                    "unable to read config file '{}': {source}",
+                    path.display()
+                )
+            }
             Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
         }
     }
@@ -132,7 +160,7 @@ impl std::error::Error for ConfigFileWriteError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::ExistingLock(_) => None,
-            Self::Io { source, .. } => Some(source),
+            Self::Read { source, .. } | Self::Io { source, .. } => Some(source),
         }
     }
 }
@@ -141,7 +169,9 @@ impl From<ConfigFileWriteError> for sley_core::GitError {
     fn from(error: ConfigFileWriteError) -> Self {
         let kind = match &error {
             ConfigFileWriteError::ExistingLock(_) => std::io::ErrorKind::AlreadyExists,
-            ConfigFileWriteError::Io { source, .. } => source.kind(),
+            ConfigFileWriteError::Read { source, .. } | ConfigFileWriteError::Io { source, .. } => {
+                source.kind()
+            }
         };
         Self::IoKind {
             kind,
@@ -196,7 +226,7 @@ pub fn write_config_file_locked(
     }
 
     let lock_path = config_lock_path(path)?;
-    let mut lock = ConfigFileLock::acquire(lock_path)?;
+    let mut lock = ConfigFileLock::acquire(lock_path, options.lock_timeout_ms)?;
     lock.write_all(contents, options.fsync)?;
     let lock_path = lock.close();
     // git: `chmod(lockfile, st.st_mode & 07777)` using the original config's
@@ -232,14 +262,16 @@ pub fn edit_config_file_locked<E>(
     }
 
     let lock_path = config_lock_path(path).map_err(ConfigFileEditError::Write)?;
-    let mut lock = ConfigFileLock::acquire(lock_path).map_err(ConfigFileEditError::Write)?;
+    let mut lock = ConfigFileLock::acquire(lock_path, options.lock_timeout_ms)
+        .map_err(ConfigFileEditError::Write)?;
     let original = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(error) => {
-            return Err(ConfigFileEditError::Write(ConfigFileWriteError::io(
-                path, error,
-            )));
+            return Err(ConfigFileEditError::Write(ConfigFileWriteError::Read {
+                path: path.to_path_buf(),
+                source: error,
+            }));
         }
     };
     let replacement = edit(&original).map_err(ConfigFileEditError::Edit)?;
@@ -300,6 +332,30 @@ fn preserve_existing_mode(path: &Path, lock_path: &Path) {
 #[cfg(not(unix))]
 fn preserve_existing_mode(_path: &Path, _lock_path: &Path) {}
 
+/// git's `INITIAL_BACKOFF_MS` is 1, so the multiplier itself is the backoff.
+const LOCK_BACKOFF_MAX_MULTIPLIER: i64 = 1000;
+
+fn lock_backoff_seed() -> u64 {
+    let pid = u64::from(std::process::id());
+    if pid == 0 { 0x9e37_79b9_7f4a_7c15 } else { pid }
+}
+
+/// `(750 + rand() % 500) * backoff_ms / 1000`, with `rand` seeded by pid the
+/// way git's `lock_file_timeout` seeds `srand`.
+fn lock_backoff_wait_ms(multiplier: i64, rng_state: &mut u64) -> i64 {
+    let mut x = *rng_state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    if x == 0 {
+        x = 0x9e37_79b9_7f4a_7c15;
+    }
+    *rng_state = x;
+    let jitter = 750 + i64::try_from(x % 500).unwrap_or(0);
+    let backoff = if multiplier > 0 { multiplier } else { 1 };
+    jitter.saturating_mul(backoff) / 1000
+}
+
 fn config_lock_path(path: &Path) -> Result<PathBuf, ConfigFileWriteError> {
     let file_name = path.file_name().ok_or_else(|| {
         ConfigFileWriteError::io(
@@ -322,21 +378,47 @@ struct ConfigFileLock {
 }
 
 impl ConfigFileLock {
-    fn acquire(path: PathBuf) -> Result<Self, ConfigFileWriteError> {
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(file) => Ok(Self {
-                path,
-                file: Some(file),
-                active: true,
-            }),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                Err(ConfigFileWriteError::ExistingLock(path))
+    /// git's `lock_file_timeout`: one try when `timeout_ms == 0`, forever when
+    /// negative, otherwise quadratic backoff for at least `timeout_ms`.
+    fn acquire(path: PathBuf, timeout_ms: i64) -> Result<Self, ConfigFileWriteError> {
+        let mut rng_state = lock_backoff_seed();
+        let mut attempt = 1_i64;
+        let mut multiplier = 1_i64;
+        let mut remaining_ms = if timeout_ms > 0 { timeout_ms } else { 0 };
+        loop {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => {
+                    return Ok(Self {
+                        path,
+                        file: Some(file),
+                        active: true,
+                    });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if timeout_ms == 0 || (timeout_ms > 0 && remaining_ms <= 0) {
+                        return Err(ConfigFileWriteError::ExistingLock(path));
+                    }
+                    let wait_ms = lock_backoff_wait_ms(multiplier, &mut rng_state);
+                    if wait_ms > 0 {
+                        std::thread::sleep(Duration::from_millis(wait_ms as u64));
+                    }
+                    if timeout_ms > 0 {
+                        remaining_ms -= wait_ms;
+                    }
+                    let next_multiplier = multiplier.saturating_add(2 * attempt + 1);
+                    if next_multiplier > LOCK_BACKOFF_MAX_MULTIPLIER {
+                        multiplier = LOCK_BACKOFF_MAX_MULTIPLIER;
+                    } else {
+                        multiplier = next_multiplier;
+                        attempt += 1;
+                    }
+                }
+                Err(err) => return Err(ConfigFileWriteError::io(path, err)),
             }
-            Err(err) => Err(ConfigFileWriteError::io(path, err)),
         }
     }
 
@@ -1456,7 +1538,10 @@ mod tests {
         let err = write_config_file_locked(
             &path,
             b"[user]\n\tname = New\n",
-            ConfigFileWriteOptions::default(),
+            ConfigFileWriteOptions {
+                fsync: false,
+                lock_timeout_ms: 0,
+            },
         )
         .expect_err("held lock must fail");
 
@@ -1466,6 +1551,69 @@ mod tests {
             b"[user]\n\tname = Old\n"
         );
         assert_eq!(fs::read(&lock_path).expect("read lock"), b"held\n");
+    }
+
+    #[test]
+    fn write_config_file_locked_retries_until_the_holder_releases() {
+        let temp = TempDir::new();
+        let path = temp.path.join("config");
+        let lock_path = path.with_file_name("config.lock");
+        fs::write(&path, b"[user]\n\tname = Old\n").expect("write original");
+        fs::write(&lock_path, b"held\n").expect("write lock");
+        let release = lock_path;
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            let _ = fs::remove_file(release);
+        });
+        write_config_file_locked(
+            &path,
+            b"[user]\n\tname = New\n",
+            ConfigFileWriteOptions {
+                fsync: false,
+                lock_timeout_ms: 1000,
+            },
+        )
+        .expect("retry should acquire the lock");
+        holder.join().expect("holder thread");
+        assert_eq!(
+            fs::read(&path).expect("read config"),
+            b"[user]\n\tname = New\n"
+        );
+        assert!(!path.with_file_name("config.lock").exists());
+    }
+
+    #[test]
+    fn edit_config_file_locked_sees_bytes_written_while_waiting() {
+        let temp = TempDir::new();
+        let path = temp.path.join("config");
+        let lock_path = path.with_file_name("config.lock");
+        fs::write(&path, b"[keep]\n\tme = 1\n").expect("seed");
+        fs::write(&lock_path, b"held\n").expect("write lock");
+        let release = lock_path;
+        let append = path.clone();
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(append)
+                .expect("append");
+            file.write_all(b"[injected]\n\tfromstock = 1\n")
+                .expect("write injected");
+            let _ = fs::remove_file(release);
+        });
+        edit_config_file_locked(&path, ConfigFileWriteOptions::default(), |original| {
+            let mut editor = RawConfigEditor::new(original.to_vec(), "sley", None, "side");
+            match editor.set_multivar(Some("1"), None, None, false) {
+                RawEditOutcome::Changed => Ok::<Vec<u8>, ()>(editor.into_bytes()),
+                RawEditOutcome::NothingSet => Err(()),
+            }
+        })
+        .expect("edit under lock");
+        holder.join().expect("holder thread");
+        let text = String::from_utf8(fs::read(&path).expect("read")).expect("utf8");
+        assert!(text.contains("me = 1"), "{text}");
+        assert!(text.contains("fromstock = 1"), "{text}");
+        assert!(text.contains("side = 1"), "{text}");
     }
 
     #[test]
