@@ -16,21 +16,15 @@ use crate::install::{
     install_protocol_v2_fetch_response_from_reader_with_cancel,
     install_upload_pack_raw_promisor_response_from_reader_with_cancel,
     install_upload_pack_raw_response_from_reader_with_cancel,
-    install_upload_pack_shallow_raw_promisor_response_from_reader_with_cancel,
-    install_upload_pack_shallow_raw_response_from_reader_with_cancel,
     shallow_info_from_protocol_v2_fetch_header,
 };
 use sley_core::{CancelFlag, Capability, GitError, ObjectFormat, ObjectId, Result};
 use sley_odb::FileObjectDatabase;
 use sley_protocol::{
-    GitService, ProtocolV2CommandOptions, ProtocolV2FetchRequest, ProtocolV2FetchShallowInfo,
-    ProtocolV2LsRefsRequest, ProtocolVersion, ReceivePackCommand, ReceivePackFeatures,
-    RefAdvertisement, TransportHandshake, TransportLimits, UploadPackFeatures,
-    UploadPackNegotiationRequest, UploadPackRequest, parse_protocol_v2_fetch_features,
-    parse_receive_pack_features, parse_refspec, parse_upload_pack_features, plan_push_commands,
-    protocol_v2_ls_refs_records_to_ref_advertisement_set, protocol_v2_object_format,
-    read_protocol_v2_advertisement, read_protocol_v2_ls_refs_response, read_ref_advertisement_set,
-    read_to_end_bounded, write_protocol_v2_command_request, write_protocol_v2_fetch_request,
+    GitService, ProtocolV2FetchShallowInfo, ProtocolVersion, ReceivePackCommand,
+    ReceivePackFeatures, RefAdvertisement, TransportLimits, UploadPackFeatures,
+    UploadPackNegotiationRequest, UploadPackRequest, parse_receive_pack_features, parse_refspec,
+    plan_push_commands, read_ref_advertisement_set, read_to_end_bounded,
     write_upload_pack_negotiation_request, write_upload_pack_request,
 };
 use sley_refs::FileRefStore;
@@ -78,11 +72,21 @@ pub struct GitFetchPackRequest<'a> {
     pub haves: Option<Vec<ObjectId>>,
     pub shallow: Vec<ObjectId>,
     pub deepen: Option<u32>,
+    pub deepen_since: Option<i64>,
+    pub deepen_not: Vec<String>,
+    pub deepen_relative: bool,
+    pub filter: Option<&'a sley_odb::PackObjectFilter>,
     pub promisor: bool,
+    /// Historical caller hint. The connection negotiates from the configured
+    /// protocol version and the server greeting, so this flag does not force
+    /// protocol v0.
     pub protocol_v2: bool,
     /// Maximum raw pack bytes to accept from the remote (`fetch.maxInputSize` /
     /// `transfer.maxSize`). `None` means unlimited.
     pub max_input_size: Option<u64>,
+    /// Send v2 `no-progress` so a quiet or non-terminal fetch does not print
+    /// sideband progress. Ignored on the v0 path, which installs a raw pack.
+    pub no_progress: bool,
 }
 
 pub struct GitUploadPackAdvertisements {
@@ -99,19 +103,12 @@ pub(crate) fn ls_remote_git(
     protocol_v2: bool,
     config: Option<&GitConfig>,
 ) -> Result<(Vec<crate::ls_remote::LsRemoteRecord>, ObjectFormat)> {
-    let set = if protocol_v2 {
-        git_protocol_v2_ls_refs(remote, ObjectFormat::Sha1, config)?
-    } else {
-        let mut stream = connect_git_service(remote, GitService::UploadPack, None, config)?;
-        read_ref_advertisement_set(ObjectFormat::Sha1, &mut stream)?
-    };
-    let features = set
-        .refs
-        .first()
-        .map(|advertisement| parse_upload_pack_features(&advertisement.capabilities))
-        .transpose()?
-        .unwrap_or_default();
+    let _ = protocol_v2;
+    let discovered =
+        git_upload_pack_advertisements_with_protocol(remote, ObjectFormat::Sha1, false, config)?;
+    let features = discovered.features;
     let format = features.object_format.unwrap_or(ObjectFormat::Sha1);
+    let refs = discovered.refs;
     if format != ObjectFormat::Sha1 {
         return Err(GitError::Unsupported(format!(
             "git:// ls-remote currently supports SHA-1 advertisements, got {}",
@@ -125,7 +122,7 @@ pub(crate) fn ls_remote_git(
         .map(|(name, target)| (name.to_string(), target.to_string()))
         .collect::<HashMap<_, _>>();
     let mut records = Vec::new();
-    for advertisement in set.refs {
+    for advertisement in refs {
         if advertisement.oid.is_null() {
             continue;
         }
@@ -164,46 +161,8 @@ pub fn git_upload_pack_advertisements_with_protocol(
     protocol_v2: bool,
     config: Option<&GitConfig>,
 ) -> Result<GitUploadPackAdvertisements> {
-    if protocol_v2 {
-        let mut stream = connect_git_service(
-            remote,
-            GitService::UploadPack,
-            Some(ProtocolVersion::V2),
-            config,
-        )?;
-        let handshake = read_protocol_v2_advertisement(&mut stream)?;
-        let object_format = protocol_v2_object_format(&handshake.capabilities)?;
-        if object_format != format {
-            return Err(GitError::InvalidObjectId(format!(
-                "remote repository uses {}, local repository uses {}",
-                object_format.name(),
-                format.name()
-            )));
-        }
-        let set = git_protocol_v2_ls_refs_on_stream(format, &mut stream)?;
-        let features = upload_pack_features_from_v2(&handshake, &set.refs)?;
-        return Ok(GitUploadPackAdvertisements {
-            refs: set.refs,
-            features,
-            protocol_v2: true,
-            object_format: format,
-        });
-    }
-
-    let mut stream = connect_git_service(remote, GitService::UploadPack, None, config)?;
-    let set = read_ref_advertisement_set(format, &mut stream)?;
-    let features = set
-        .refs
-        .first()
-        .map(|advertisement| parse_upload_pack_features(&advertisement.capabilities))
-        .transpose()?
-        .unwrap_or_default();
-    Ok(GitUploadPackAdvertisements {
-        refs: set.refs,
-        features,
-        protocol_v2: false,
-        object_format: format,
-    })
+    let _ = protocol_v2;
+    read_git_upload_pack_advertisements(remote, Some(format), config)
 }
 
 /// Discover upload-pack capabilities and object format before creating a clone.
@@ -212,38 +171,80 @@ pub fn discover_git_upload_pack_advertisements(
     protocol_v2: bool,
     config: Option<&GitConfig>,
 ) -> Result<GitUploadPackAdvertisements> {
-    if protocol_v2 {
-        let mut stream = connect_git_service(
-            remote,
-            GitService::UploadPack,
-            Some(ProtocolVersion::V2),
-            config,
-        )?;
-        let handshake = read_protocol_v2_advertisement(&mut stream)?;
-        let object_format = protocol_v2_object_format(&handshake.capabilities)?;
-        let set = git_protocol_v2_ls_refs_on_stream(object_format, &mut stream)?;
-        let features = upload_pack_features_from_v2(&handshake, &set.refs)?;
-        return Ok(GitUploadPackAdvertisements {
-            refs: set.refs,
-            features,
-            protocol_v2: true,
-            object_format,
-        });
-    }
+    let _ = protocol_v2;
+    read_git_upload_pack_advertisements(remote, None, config)
+}
 
-    let mut stream = connect_git_service(remote, GitService::UploadPack, None, config)?;
-    let (set, object_format) = crate::read_discovered_upload_pack_advertisements(&mut stream)?;
-    let features = set
-        .refs
-        .first()
-        .map(|advertisement| parse_upload_pack_features(&advertisement.capabilities))
-        .transpose()?
-        .unwrap_or_default();
+fn read_git_upload_pack_advertisements(
+    remote: &RemoteUrl,
+    format: Option<ObjectFormat>,
+    config: Option<&GitConfig>,
+) -> Result<GitUploadPackAdvertisements> {
+    let wire = crate::v2_client::upload_pack_protocol_parameter(
+        crate::v2_client::client_upload_pack_version(config),
+    );
+    let mut stream = connect_git_service(remote, GitService::UploadPack, wire, config)?;
+    let discovered = match format {
+        Some(format) => {
+            match crate::v2_client::read_stateful_upload_pack_greeting(format, &mut stream)? {
+                crate::v2_client::StatefulUploadPackGreeting::V2(handshake) => {
+                    finish_git_v2_ls_refs(&mut stream, format, &handshake)?
+                }
+                crate::v2_client::StatefulUploadPackGreeting::Legacy(set) => {
+                    let features = crate::v2_client::legacy_upload_pack_features(&set.refs)?;
+                    GitUploadPackAdvertisements {
+                        refs: set.refs,
+                        features,
+                        protocol_v2: false,
+                        object_format: format,
+                    }
+                }
+            }
+        }
+        None => match crate::v2_client::read_discovered_stateful_upload_pack_greeting(&mut stream)?
+        {
+            crate::v2_client::DiscoveredStatefulUploadPack::V2 {
+                handshake,
+                object_format,
+            } => finish_git_v2_ls_refs(&mut stream, object_format, &handshake)?,
+            crate::v2_client::DiscoveredStatefulUploadPack::Legacy { set, object_format } => {
+                let features = crate::v2_client::legacy_upload_pack_features(&set.refs)?;
+                GitUploadPackAdvertisements {
+                    refs: set.refs,
+                    features,
+                    protocol_v2: false,
+                    object_format,
+                }
+            }
+        },
+    };
+    let _ = stream.shutdown(Shutdown::Both);
+    Ok(discovered)
+}
+
+fn finish_git_v2_ls_refs(
+    stream: &mut GitConnection,
+    format: ObjectFormat,
+    handshake: &sley_protocol::TransportHandshake,
+) -> Result<GitUploadPackAdvertisements> {
+    let remote_format = sley_protocol::protocol_v2_object_format(&handshake.capabilities)?;
+    if remote_format != format {
+        return Err(GitError::InvalidObjectId(format!(
+            "remote repository uses {}, local repository uses {}",
+            remote_format.name(),
+            format.name()
+        )));
+    }
+    crate::v2_client::write_stateful_v2_ls_refs(stream, format, handshake)?;
+    stream.flush()?;
+    let _ = stream.shutdown(Shutdown::Write);
+    let set = crate::v2_client::read_stateful_v2_ls_refs(format, stream)?;
+    let features = crate::v2_client::upload_pack_features_from_v2(handshake, &set.refs)?;
     Ok(GitUploadPackAdvertisements {
         refs: set.refs,
         features,
-        protocol_v2: false,
-        object_format,
+        protocol_v2: true,
+        object_format: format,
     })
 }
 
@@ -256,76 +257,133 @@ pub fn install_fetch_pack_via_git_upload_pack(
     if request.wants.is_empty() {
         return Ok(Vec::new());
     }
+    let _ = request.protocol_v2;
     let local_db = FileObjectDatabase::from_git_dir(request.git_dir, request.format);
-    if request.deepen.is_none() && all_wants_present(&local_db, &request.wants)? {
+    let boundary_may_move = request.deepen.is_some()
+        || request.deepen_since.is_some()
+        || !request.deepen_not.is_empty()
+        || request.deepen_relative;
+    if !boundary_may_move
+        && request.filter.is_none()
+        && all_wants_present(&local_db, &request.wants)?
+    {
         return Ok(Vec::new());
     }
     let haves = request.haves.clone().map(Ok).unwrap_or_else(|| {
         crate::local::local_have_oids(policy, request.git_dir, request.format)
     })?;
-    if request.protocol_v2 {
-        return git_protocol_v2_fetch_into_repository(&request, haves, &local_db, progress, cancel);
-    }
-
-    let upload_request = UploadPackRequest {
-        wants: request.wants,
-        capabilities: shallow_request_capabilities(request.deepen),
-        shallow: request.shallow,
-        deepen: request.deepen,
-        ..UploadPackRequest::default()
-    };
+    let wire = crate::v2_client::upload_pack_protocol_parameter(
+        crate::v2_client::client_upload_pack_version(request.config),
+    );
     let mut stream =
-        connect_git_service(request.remote, GitService::UploadPack, None, request.config)?;
-    read_ref_advertisement_set(request.format, &mut stream)?;
-    write_upload_pack_request(&mut stream, Some(&upload_request))?;
-    write_upload_pack_negotiation_request(
-        &mut stream,
-        &UploadPackNegotiationRequest { haves, done: true },
-    )?;
-    stream.flush()?;
-    let _ = stream.shutdown(Shutdown::Write);
-    if request.deepen.is_some() {
-        let shallow_info = if request.promisor {
-            let (shallow_info, _) =
-                install_upload_pack_shallow_raw_promisor_response_from_reader_with_cancel(
+        connect_git_service(request.remote, GitService::UploadPack, wire, request.config)?;
+    match crate::v2_client::read_stateful_upload_pack_greeting(request.format, &mut stream)? {
+        crate::v2_client::StatefulUploadPackGreeting::V2(handshake) => {
+            let remote_format = sley_protocol::protocol_v2_object_format(&handshake.capabilities)?;
+            if remote_format != request.format {
+                return Err(GitError::InvalidObjectId(format!(
+                    "remote repository uses {}, local repository uses {}",
+                    remote_format.name(),
+                    request.format.name()
+                )));
+            }
+            let sideband_all = crate::v2_client::write_stateful_v2_fetch(
+                &mut stream,
+                crate::v2_client::StatefulV2FetchParams {
+                    format: request.format,
+                    handshake: &handshake,
+                    wants: request.wants.clone(),
+                    want_refs: Vec::new(),
+                    haves,
+                    shallow: request.shallow.clone(),
+                    deepen: request.deepen,
+                    deepen_since: request.deepen_since,
+                    deepen_not: request.deepen_not.clone(),
+                    deepen_relative: request.deepen_relative,
+                    filter: request.filter,
+                    packfile_uri_protocols: None,
+                    no_progress: request.no_progress,
+                },
+            )?;
+            stream.flush()?;
+            let _ = stream.shutdown(Shutdown::Write);
+            let (header, _) = if request.promisor {
+                install_protocol_v2_fetch_promisor_response_from_reader_with_cancel(
+                    request.format,
+                    &mut stream,
+                    sideband_all,
+                    &local_db,
+                    request.max_input_size,
+                    cancel,
+                    Some(&mut |chunk: &[u8]| emit_remote_sideband_progress(&mut *progress, chunk)),
+                )?
+            } else {
+                let installer = ProgressInstaller::new(&local_db, progress);
+                install_protocol_v2_fetch_response_from_reader_with_cancel(
+                    request.format,
+                    &mut stream,
+                    sideband_all,
+                    &installer,
+                    request.max_input_size,
+                    cancel,
+                    Some(&mut installer.remote_sideband_forwarder()),
+                )?
+            };
+            Ok(shallow_info_from_protocol_v2_fetch_header(&header))
+        }
+        crate::v2_client::StatefulUploadPackGreeting::Legacy(set) => {
+            let advertised = crate::v2_client::legacy_upload_pack_features(&set.refs)?;
+            let filter = request
+                .filter
+                .filter(|_| advertised.filter)
+                .and_then(crate::local::upload_pack_filter_protocol_spec);
+            let expects_shallow = request.deepen.is_some()
+                || request.deepen_since.is_some()
+                || !request.deepen_not.is_empty();
+            let upload_request = UploadPackRequest {
+                wants: request.wants.clone(),
+                capabilities: shallow_request_capabilities(expects_shallow, filter.is_some()),
+                shallow: request.shallow.clone(),
+                deepen: request.deepen,
+                deepen_since: crate::v2_client::deepen_since_u64(request.deepen_since),
+                deepen_not: request.deepen_not.clone(),
+                filter,
+            };
+            write_upload_pack_request(&mut stream, Some(&upload_request))?;
+            stream.flush()?;
+            // A shallow request is stateful: the server writes shallow/unshallow
+            // and a flush before it will read haves.
+            let shallow_info = if expects_shallow {
+                sley_protocol::read_upload_pack_shallow_info_section(request.format, &mut stream)?
+            } else {
+                Vec::new()
+            };
+            write_upload_pack_negotiation_request(
+                &mut stream,
+                &UploadPackNegotiationRequest { haves, done: true },
+            )?;
+            stream.flush()?;
+            let _ = stream.shutdown(Shutdown::Write);
+            if request.promisor {
+                install_upload_pack_raw_promisor_response_from_reader_with_cancel(
                     request.format,
                     &mut stream,
                     &local_db,
                     request.max_input_size,
                     cancel,
                 )?;
-            shallow_info
-        } else {
-            let (shallow_info, _) =
-                install_upload_pack_shallow_raw_response_from_reader_with_cancel(
+            } else {
+                install_upload_pack_raw_response_from_reader_with_cancel(
                     request.format,
                     &mut stream,
                     &ProgressInstaller::new(&local_db, progress),
                     request.max_input_size,
                     cancel,
                 )?;
-            shallow_info
-        };
-        return Ok(shallow_info);
+            }
+            Ok(shallow_info)
+        }
     }
-    if request.promisor {
-        install_upload_pack_raw_promisor_response_from_reader_with_cancel(
-            request.format,
-            &mut stream,
-            &local_db,
-            request.max_input_size,
-            cancel,
-        )?;
-    } else {
-        install_upload_pack_raw_response_from_reader_with_cancel(
-            request.format,
-            &mut stream,
-            &ProgressInstaller::new(&local_db, progress),
-            request.max_input_size,
-            cancel,
-        )?;
-    }
-    Ok(Vec::new())
 }
 
 pub(crate) fn plan_push_git(request: GitPushRequest<'_>) -> Result<GitPushPlan> {
@@ -565,132 +623,6 @@ fn configured_git_protocol_v1(config: Option<&GitConfig>) -> Option<ProtocolVers
         .then_some(ProtocolVersion::V1)
 }
 
-fn git_protocol_v2_command_options(format: ObjectFormat) -> Vec<Capability> {
-    sley_protocol::encode_protocol_v2_command_options(&ProtocolV2CommandOptions {
-        object_format: Some(format),
-        ..ProtocolV2CommandOptions::default()
-    })
-    .unwrap_or_default()
-}
-
-fn git_protocol_v2_ls_refs(
-    remote: &RemoteUrl,
-    format: ObjectFormat,
-    config: Option<&GitConfig>,
-) -> Result<sley_protocol::RefAdvertisementSet> {
-    let mut stream = connect_git_service(
-        remote,
-        GitService::UploadPack,
-        Some(ProtocolVersion::V2),
-        config,
-    )?;
-    let handshake = read_protocol_v2_advertisement(&mut stream)?;
-    let object_format = protocol_v2_object_format(&handshake.capabilities)?;
-    if object_format != format {
-        return Err(GitError::InvalidObjectId(format!(
-            "remote repository uses {}, local repository uses {}",
-            object_format.name(),
-            format.name()
-        )));
-    }
-    git_protocol_v2_ls_refs_on_stream(format, &mut stream)
-}
-
-fn git_protocol_v2_ls_refs_on_stream(
-    format: ObjectFormat,
-    stream: &mut GitConnection,
-) -> Result<sley_protocol::RefAdvertisementSet> {
-    let mut request = ProtocolV2LsRefsRequest {
-        peel: true,
-        symrefs: true,
-        unborn: true,
-        ref_prefixes: vec!["HEAD".into(), "refs/heads/".into(), "refs/tags/".into()],
-    }
-    .to_command_request()?;
-    request.capabilities = git_protocol_v2_command_options(format);
-    write_protocol_v2_command_request(stream, &request)?;
-    stream.flush()?;
-    let records = read_protocol_v2_ls_refs_response(format, stream)?;
-    protocol_v2_ls_refs_records_to_ref_advertisement_set(&records)
-}
-
-fn upload_pack_features_from_v2(
-    handshake: &TransportHandshake,
-    refs: &[RefAdvertisement],
-) -> Result<UploadPackFeatures> {
-    let v2 = parse_protocol_v2_fetch_features(&handshake.capabilities)?.unwrap_or_default();
-    let mut features = UploadPackFeatures {
-        object_format: Some(protocol_v2_object_format(&handshake.capabilities)?),
-        shallow: v2.shallow,
-        deepen_since: v2.shallow,
-        deepen_not: v2.shallow,
-        filter: v2.filter,
-        ..UploadPackFeatures::default()
-    };
-    if let Some(first) = refs.first() {
-        let bridged = parse_upload_pack_features(&first.capabilities)?;
-        features.symrefs = bridged.symrefs;
-    }
-    Ok(features)
-}
-
-fn git_protocol_v2_fetch_into_repository(
-    request: &GitFetchPackRequest<'_>,
-    haves: Vec<ObjectId>,
-    local_db: &FileObjectDatabase,
-    progress: &mut dyn ProgressSink,
-    cancel: CancelFlag<'_>,
-) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
-    let mut stream = connect_git_service(
-        request.remote,
-        GitService::UploadPack,
-        Some(ProtocolVersion::V2),
-        request.config,
-    )?;
-    let handshake = read_protocol_v2_advertisement(&mut stream)?;
-    let v2_features =
-        parse_protocol_v2_fetch_features(&handshake.capabilities)?.unwrap_or_default();
-    let fetch = ProtocolV2FetchRequest {
-        wants: request.wants.clone(),
-        haves,
-        shallow: request.shallow.clone(),
-        deepen: request.deepen,
-        thin_pack: true,
-        include_tag: true,
-        ofs_delta: true,
-        done: true,
-        wait_for_done: v2_features.wait_for_done,
-        sideband_all: v2_features.sideband_all,
-        ..ProtocolV2FetchRequest::default()
-    };
-    write_protocol_v2_fetch_request(&mut stream, &fetch)?;
-    stream.flush()?;
-    let _ = stream.shutdown(Shutdown::Write);
-    let (header, _install) = if request.promisor {
-        install_protocol_v2_fetch_promisor_response_from_reader_with_cancel(
-            request.format,
-            &mut stream,
-            v2_features.sideband_all,
-            local_db,
-            request.max_input_size,
-            cancel,
-            Some(&mut |chunk: &[u8]| emit_remote_sideband_progress(&mut *progress, chunk)),
-        )?
-    } else {
-        let installer = ProgressInstaller::new(local_db, progress);
-        install_protocol_v2_fetch_response_from_reader_with_cancel(
-            request.format,
-            &mut stream,
-            v2_features.sideband_all,
-            &installer,
-            request.max_input_size,
-            cancel,
-            Some(&mut installer.remote_sideband_forwarder()),
-        )?
-    };
-    Ok(shallow_info_from_protocol_v2_fetch_header(&header))
-}
-
 fn git_host_parameter(remote: &RemoteUrl, host: &str, port: u16) -> String {
     match remote.port {
         Some(_) if host.contains(':') && !host.starts_with('[') => format!("[{host}]:{port}"),
@@ -699,15 +631,21 @@ fn git_host_parameter(remote: &RemoteUrl, host: &str, port: u16) -> String {
     }
 }
 
-fn shallow_request_capabilities(deepen: Option<u32>) -> Vec<Capability> {
-    if deepen.is_some() {
-        vec![Capability {
+fn shallow_request_capabilities(shallow: bool, filter: bool) -> Vec<Capability> {
+    let mut capabilities = Vec::new();
+    if shallow {
+        capabilities.push(Capability {
             name: "shallow".into(),
             value: None,
-        }]
-    } else {
-        Vec::new()
+        });
     }
+    if filter {
+        capabilities.push(Capability {
+            name: "filter".into(),
+            value: None,
+        });
+    }
+    capabilities
 }
 
 fn all_wants_present(db: &FileObjectDatabase, wants: &[ObjectId]) -> Result<bool> {

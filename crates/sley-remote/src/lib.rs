@@ -106,6 +106,8 @@ pub use http::{HttpOperationBatch, new_http_client, new_http_client_with_config}
 pub use sley_transport::UreqHttpClient;
 pub use sley_transport::{HttpClient, HttpResponse};
 
+mod v2_client;
+
 mod ssh;
 pub use ssh::{
     SshFetchPackRequest, SshTransportOptions, SshUploadPackDiscovery,
